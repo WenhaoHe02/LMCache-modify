@@ -1209,52 +1209,57 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
         offset = starts[0]
         current_stream = torch.cuda.current_stream()
 
-        for layer_id in range(self.num_layers):
-            memory_objs_layer = yield
+        layer_group_size: int = kwargs.get("layer_group_size", 1)
+        num_groups = (self.num_layers + layer_group_size - 1) // layer_group_size
+        abs_layer_id = 0
+        for group_id in range(num_groups):
+            memory_objs_group = yield
             if sync:
                 current_stream.wait_stream(self.load_stream)
-            if layer_id > 0:
-                logger.debug(f"Finished loading layer {layer_id - 1}")
+            if group_id > 0:
+                logger.debug(f"Finished loading layer {abs_layer_id - 1}")
 
-            # memobj -> gpu_buffer -> kvcaches
+            # memobj -> gpu_buffer -> kvcaches (one layer at a time within group)
             with torch.cuda.stream(self.load_stream):
-                for start, end, memory_obj in zip(
-                    starts, ends, memory_objs_layer, strict=False
-                ):
-                    # Validate memory format
-                    if self.use_mla:
-                        assert memory_obj.metadata.fmt == MemoryFormat.KV_MLA_FMT, (
-                            f"Expected memory format {MemoryFormat.KV_MLA_FMT}, "
-                            f"got {memory_obj.metadata.fmt}"
-                        )
-                    else:
-                        assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D, (
-                            f"Expected memory format {MemoryFormat.KV_T2D}, "
-                            f"got {memory_obj.metadata.fmt}"
-                        )
+                for memory_objs_layer in memory_objs_group:
+                    for start, end, memory_obj in zip(
+                        starts, ends, memory_objs_layer, strict=False
+                    ):
+                        # Validate memory format
+                        if self.use_mla:
+                            assert memory_obj.metadata.fmt == MemoryFormat.KV_MLA_FMT, (
+                                f"Expected memory format {MemoryFormat.KV_MLA_FMT}, "
+                                f"got {memory_obj.metadata.fmt}"
+                            )
+                        else:
+                            assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D, (
+                                f"Expected memory format {MemoryFormat.KV_T2D}, "
+                                f"got {memory_obj.metadata.fmt}"
+                            )
+                        if self.use_gpu:
+                            tmp_gpu_buffer_obj.tensor[
+                                start - offset : end - offset
+                            ].copy_(memory_obj.tensor, non_blocking=True)
+                        else:
+                            lmc_ops.single_layer_kv_transfer(
+                                memory_obj.tensor,
+                                self.kvcaches[abs_layer_id],
+                                slot_mapping_full,
+                                lmc_ops.TransferDirection.H2D,
+                                self.gpu_kv_format,
+                                token_major=True,
+                            )
+
                     if self.use_gpu:
-                        tmp_gpu_buffer_obj.tensor[start - offset : end - offset].copy_(
-                            memory_obj.tensor, non_blocking=True
-                        )
-                    else:
                         lmc_ops.single_layer_kv_transfer(
-                            memory_obj.tensor,
-                            self.kvcaches[layer_id],
+                            tmp_gpu_buffer_obj.tensor,
+                            self.kvcaches[abs_layer_id],
                             slot_mapping_full,
                             lmc_ops.TransferDirection.H2D,
                             self.gpu_kv_format,
                             token_major=True,
                         )
-
-                if self.use_gpu:
-                    lmc_ops.single_layer_kv_transfer(
-                        tmp_gpu_buffer_obj.tensor,
-                        self.kvcaches[layer_id],
-                        slot_mapping_full,
-                        lmc_ops.TransferDirection.H2D,
-                        self.gpu_kv_format,
-                        token_major=True,
-                    )
+                    abs_layer_id += 1
         yield
 
         # synchronize the last layer

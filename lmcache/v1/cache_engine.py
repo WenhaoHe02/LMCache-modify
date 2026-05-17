@@ -993,32 +993,56 @@ class LMCacheEngine:
             # Transpose the keys into layer major format
             keys_layer_major = [list(row) for row in zip(*keys, strict=False)]
 
+            group_size = self.config.layer_group_size
             get_generator = self.storage_manager.layerwise_batched_get(
                 keys_layer_major,
                 location=location,
+                group_size=group_size,
             )
 
             assert_layerwise_gpu_connector(self.gpu_connector)
 
-            mem_obj_consumer = self.gpu_connector.batched_to_gpu(starts, ends, **kwargs)
+            mem_obj_consumer = self.gpu_connector.batched_to_gpu(
+                starts, ends, layer_group_size=group_size, **kwargs
+            )
             next(mem_obj_consumer)
 
             to_count_down = []
-            for layer_id in range(self.num_layers):
-                task = next(get_generator)
+            num_groups = (self.num_layers + group_size - 1) // group_size
 
-                assert task is not None
+            # Submit group 0 fetches before the first yield so IO overlaps
+            # with the attention computation that follows.
+            group_tasks = next(get_generator)
 
-                if layer_id == 0:
-                    # NOTE(Yuwei): For sglang integration we need to provide retrieved
-                    # tokens number in the first layer loading since there is no lookup
-                    yield torch.sum(ret_mask)
-                else:
-                    yield None
+            # NOTE(Yuwei): For sglang integration we need to provide retrieved
+            # tokens number in the first layer loading since there is no lookup
+            yield torch.sum(ret_mask)
 
-                mem_objs_layer = task.result()
-                mem_obj_consumer.send(mem_objs_layer)
+            # Wait for group 0 results, scatter, then submit group 1 (if any).
+            # Yield group_size - 1 more times so remaining layers in the group
+            # each get one attention step while group 1 is in flight.
+            mem_objs_group = [task.result() for task in group_tasks]
+            mem_obj_consumer.send(mem_objs_group)
+            for mem_objs_layer in mem_objs_group:
                 to_count_down.extend(mem_objs_layer)
+            if 1 < num_groups:
+                group_tasks = next(get_generator)
+            first_group_size = min(group_size, self.num_layers)
+            for _ in range(first_group_size - 1):
+                yield None
+
+            for group_id in range(1, num_groups):
+                # Wait for this group's fetches, scatter, then prefetch the
+                # next group so IO overlaps with the attention steps below.
+                mem_objs_group = [task.result() for task in group_tasks]
+                mem_obj_consumer.send(mem_objs_group)
+                for mem_objs_layer in mem_objs_group:
+                    to_count_down.extend(mem_objs_layer)
+                if group_id + 1 < num_groups:
+                    group_tasks = next(get_generator)
+                actual_gs = min(group_size, self.num_layers - group_id * group_size)
+                for _ in range(actual_gs):
+                    yield None
 
             for mem_obj in to_count_down:
                 mem_obj.ref_count_down()

@@ -516,28 +516,42 @@ class StorageManager:
         self,
         keys: List[List[CacheEngineKey]],
         location: Optional[str] = None,
-    ) -> Generator[Future, None, None]:
+        group_size: int = 1,
+    ) -> Generator[List[Future], None, None]:
         """
-        Non-blocking function to get the memory objects into the storages
-        in a layerwise manner.
-        Do not store if the same object is being stored (handled here by
-        storage manager) or has been stored (handled by storage backend).
+        Non-blocking function to get the memory objects from storage in a
+        layerwise manner, submitting ``group_size`` layers concurrently per
+        iteration to allow overlap with GPU computation.
 
         :param List[List[CacheEngineKey]] keys: The keys to get. The first
             dimension corresponds to the number of layers, and the second
             dimension corresponds to the number of chunks.
 
-        :return: A generator that yields a future for each layer.
+        :param Optional[str] location: Storage backend location key.
+
+        :param int group_size: Number of layers to fetch concurrently per
+            generator step. Defaults to 1 (original one-layer-at-a-time
+            behaviour).
+
+        :return: A generator that yields ``List[Future]`` — one future per
+            layer in the group, each future resolving to
+            ``List[Optional[MemoryObj]]`` for that layer's chunks.
         """
         if location is None:
             location = "LocalCPUBackend"
-        for keys_multi_chunk in keys:
-            # Retrieve all chunks for one layer
-            backend = self.storage_backends[location]
-            # TODO(Jiayi): need to make async loading and layerwise compatible
-            coro = backend.batched_get_non_blocking("fake_lookup_id", keys_multi_chunk)
-            task = asyncio.run_coroutine_threadsafe(coro, self.loop)
-            yield task
+        backend = self.storage_backends[location]
+        num_layers = len(keys)
+        for group_start in range(0, num_layers, group_size):
+            group_end = min(group_start + group_size, num_layers)
+            group_tasks: List[Future] = []
+            for layer_idx in range(group_start, group_end):
+                # TODO(Jiayi): need to make async loading and layerwise compatible
+                coro = backend.batched_get_non_blocking(
+                    "fake_lookup_id", keys[layer_idx]
+                )
+                task = asyncio.run_coroutine_threadsafe(coro, self.loop)
+                group_tasks.append(task)
+            yield group_tasks
 
     def prefetch_single_done_callback(
         self,

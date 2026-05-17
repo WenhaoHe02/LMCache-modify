@@ -99,6 +99,11 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
+    "layer_group_size": {
+        "type": int,
+        "default": 1,
+        "env_converter": int,
+    },
     "save_decode_cache": {
         "type": bool,
         "default": False,
