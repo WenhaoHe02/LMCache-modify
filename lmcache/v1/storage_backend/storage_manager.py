@@ -545,7 +545,6 @@ class StorageManager:
             group_end = min(group_start + group_size, num_layers)
             group_tasks: List[Future] = []
             for layer_idx in range(group_start, group_end):
-                # TODO(Jiayi): need to make async loading and layerwise compatible
                 coro = backend.batched_get_non_blocking(
                     "fake_lookup_id", keys[layer_idx]
                 )
