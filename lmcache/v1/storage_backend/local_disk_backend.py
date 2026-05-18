@@ -151,6 +151,15 @@ class LocalDiskBackend(StorageBackendInterface):
 
         self.disk_worker = LocalDiskWorker(loop)
 
+        # Persistent thread pool for concurrent intra-group reads.
+        # Size matches layer_group_size so each file in a group gets its own
+        # thread without over-provisioning.
+        _group_size = max(1, config.layer_group_size)
+        self._read_executor = ThreadPoolExecutor(
+            max_workers=_group_size,
+            thread_name_prefix="lmcache-disk-read",
+        )
+
         # TODO(Jiayi): We need a disk space allocator to avoid fragmentation
         # and hide the following details away from the backend.
         self.max_cache_size = int(config.max_local_disk_size * 1024**3)
@@ -596,13 +605,12 @@ class LocalDiskBackend(StorageBackendInterface):
 
         n = len(paths)
         if n > 1:
-            with ThreadPoolExecutor(max_workers=n) as ex:
-                futs = [
-                    ex.submit(_read_one, path, key, mem_obj)
-                    for path, key, mem_obj in zip(paths, keys, memory_objs)
-                ]
-                for fut in futs:
-                    fut.result()
+            futs = [
+                self._read_executor.submit(_read_one, path, key, mem_obj)
+                for path, key, mem_obj in zip(paths, keys, memory_objs)
+            ]
+            for fut in futs:
+                fut.result()
         else:
             for path, key, mem_obj in zip(paths, keys, memory_objs):
                 _read_one(path, key, mem_obj)
@@ -739,3 +747,4 @@ class LocalDiskBackend(StorageBackendInterface):
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.close()
         self.disk_worker.close()
+        self._read_executor.shutdown(wait=False)
