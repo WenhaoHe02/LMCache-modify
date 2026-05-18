@@ -1018,28 +1018,28 @@ class LMCacheEngine:
             # tokens number in the first layer loading since there is no lookup
             yield torch.sum(ret_mask)
 
-            # Wait for group 0 results, scatter, then submit group 1 (if any).
-            # Yield group_size - 1 more times so remaining layers in the group
-            # each get one attention step while group 1 is in flight.
+            # Wait for group 0 results, submit group 1 IO immediately, then
+            # scatter group 0 -- so NVMe DMA (group 1) and PCIe DMA (group 0
+            # H2D copy inside send) run concurrently on independent paths.
             mem_objs_group = [task.result() for task in group_tasks]
+            if 1 < num_groups:
+                group_tasks = next(get_generator)
             mem_obj_consumer.send(mem_objs_group)
             for mem_objs_layer in mem_objs_group:
                 to_count_down.extend(mem_objs_layer)
-            if 1 < num_groups:
-                group_tasks = next(get_generator)
             first_group_size = min(group_size, self.num_layers)
             for _ in range(first_group_size - 1):
                 yield None
 
             for group_id in range(1, num_groups):
-                # Wait for this group's fetches, scatter, then prefetch the
-                # next group so IO overlaps with the attention steps below.
+                # Submit next group IO before scattering current group so that
+                # NVMe DMA and PCIe DMA overlap on independent DMA controllers.
                 mem_objs_group = [task.result() for task in group_tasks]
+                if group_id + 1 < num_groups:
+                    group_tasks = next(get_generator)
                 mem_obj_consumer.send(mem_objs_group)
                 for mem_objs_layer in mem_objs_group:
                     to_count_down.extend(mem_objs_layer)
-                if group_id + 1 < num_groups:
-                    group_tasks = next(get_generator)
                 actual_gs = min(group_size, self.num_layers - group_id * group_size)
                 for _ in range(actual_gs):
                     yield None
