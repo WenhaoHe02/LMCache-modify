@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 import asyncio
 import os
@@ -355,7 +355,7 @@ class LocalDiskBackend(StorageBackendInterface):
 
         memory_obj.ref_count_up()
 
-        asyncio.run_coroutine_threadsafe(
+        fut = asyncio.run_coroutine_threadsafe(
             self.disk_worker.submit_task(
                 "put",
                 self.async_save_bytes_to_disk,
@@ -365,6 +365,18 @@ class LocalDiskBackend(StorageBackendInterface):
             ),
             self.loop,
         )
+
+        def _log_put_error(f: Future) -> None:
+            exc = f.exception()
+            if exc is not None:
+                logger.error(
+                    "Async disk write failed for key %s: %s",
+                    key,
+                    exc,
+                    exc_info=exc,
+                )
+
+        fut.add_done_callback(_log_put_error)
 
     # TODO(Jiayi): enable real batching
     def batched_submit_put_task(
@@ -573,22 +585,37 @@ class LocalDiskBackend(StorageBackendInterface):
     ) -> list[MemoryObj]:
         """
         Async load bytearray from disk.
+
+        Reads within the batch are issued concurrently so that group_size > 1
+        actually overlaps multiple SSD I/Os instead of serializing them.
         """
-
         logger.debug("Executing `async_load_bytes` from disk.")
-        # TODO (Jiayi): handle the case where loading fails.
-        for path, key, mem_obj in zip(paths, keys, memory_objs, strict=False):
-            buffer = mem_obj.byte_array
-            self.read_file(key, buffer, path)
 
+        def _read_one(path: str, key: CacheEngineKey, mem_obj: MemoryObj) -> None:
+            self.read_file(key, mem_obj.byte_array, path)
+
+        n = len(paths)
+        if n > 1:
+            with ThreadPoolExecutor(max_workers=n) as ex:
+                futs = [
+                    ex.submit(_read_one, path, key, mem_obj)
+                    for path, key, mem_obj in zip(paths, keys, memory_objs)
+                ]
+                for fut in futs:
+                    fut.result()
+        else:
+            for path, key, mem_obj in zip(paths, keys, memory_objs):
+                _read_one(path, key, mem_obj)
+
+        # Update metadata and unpin after all reads have completed.
+        for key, mem_obj in zip(keys, memory_objs):
             # TODO(Jiayi): Please recover the metadata in a more
             # elegant way in the future.
             cached_positions = self.dict[key].cached_positions
             mem_obj.metadata.cached_positions = cached_positions
 
-            self.disk_lock.acquire()
-            self.dict[key].unpin()
-            self.disk_lock.release()
+            with self.disk_lock:
+                self.dict[key].unpin()
 
         return memory_objs
 
@@ -624,9 +651,30 @@ class LocalDiskBackend(StorageBackendInterface):
             with open(path, "wb") as f:
                 f.write(buffer)
         else:
-            fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_DIRECT, 0o644)
-            os.write(fd, buffer)
-            os.close(fd)
+            fd = -1
+            try:
+                fd = os.open(
+                    path,
+                    os.O_CREAT | os.O_WRONLY | getattr(os, "O_DIRECT", 0),
+                    0o644,
+                )
+                os.write(fd, buffer)
+                os.close(fd)
+                fd = -1
+            except OSError as e:
+                logger.warning(
+                    "O_DIRECT write failed for %s (%s); falling back to buffered IO.",
+                    path,
+                    e,
+                )
+                with open(path, "wb") as f:
+                    f.write(buffer)
+            finally:
+                if fd >= 0:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
         disk_write_time = time.time() - start_time
         logger.debug(
             f"Disk write size: {size} bytes, "
@@ -648,9 +696,30 @@ class LocalDiskBackend(StorageBackendInterface):
                 with open(path, "rb") as f:
                     f.readinto(buffer)
             else:
-                fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
-                with os.fdopen(fd, "rb", buffering=0) as fdo:
-                    fdo.readinto(buffer)
+                fd = -1
+                try:
+                    fd = os.open(
+                        path, os.O_RDONLY | getattr(os, "O_DIRECT", 0)
+                    )
+                    with os.fdopen(fd, "rb", buffering=0) as fdo:
+                        fd = -1
+                        fdo.readinto(buffer)
+                except FileNotFoundError:
+                    raise
+                except OSError as e:
+                    logger.warning(
+                        "O_DIRECT read failed for %s (%s); falling back to buffered IO.",
+                        path,
+                        e,
+                    )
+                    with open(path, "rb") as f:
+                        f.readinto(buffer)
+                finally:
+                    if fd >= 0:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
         except FileNotFoundError:
             logger.warning(f"File not found on disk: {path}")
             if self.dict.get(key, None):
