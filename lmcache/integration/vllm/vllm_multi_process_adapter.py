@@ -729,6 +729,7 @@ class LMCacheMPWorkerAdapter:
             "LMCache chunk size should be a multiple of vLLM block size"
         )
         self.blocks_in_chunk = chunk_size // vllm_block_size
+        self.vllm_block_size: int = vllm_block_size
 
         # Health state (shared with heartbeat thread)
         self._health_event = threading.Event()
@@ -833,6 +834,7 @@ class LMCacheMPWorkerAdapter:
                 self.model_name,
                 self.world_size,
                 EngineType.VLLM,
+                self.vllm_block_size,
                 layout_hints,
             ],
         )

@@ -284,7 +284,8 @@ class PageBufferShapeDesc:
     without the compiled extension.
     """
 
-    __slots__ = ("kv_size", "nl", "nb", "bs", "nh", "hs", "element_size")
+    __slots__ = ("kv_size", "nl", "nb", "bs", "nh", "hs", "element_size",
+                 "block_stride_elems")
 
     def __init__(self) -> None:
         self.kv_size: int = 0
@@ -294,6 +295,7 @@ class PageBufferShapeDesc:
         self.nh: int = 0
         self.hs: int = 0
         self.element_size: int = 0
+        self.block_stride_elems: int = 0  # 0 = dense layout
 
 
 # On XPU (Intel GPU), PyTorch 2.4+ supports pin_memory=True via SYCL USM

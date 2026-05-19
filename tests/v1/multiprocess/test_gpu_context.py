@@ -55,7 +55,7 @@ def _make_context(
             for _ in range(num_layers)
         ]
         fmt = lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS
-    manager = KVLayerGroupsManager(kv_caches, fmt, num_blocks=1, block_size=1)
+    manager = KVLayerGroupsManager(kv_caches, fmt, num_blocks=1)
     ctx.kv_layer_groups_manager_ = manager
 
     # Build flat tmp_gpu_buffer_ with prefix-sum offsets (new layout)
@@ -110,7 +110,6 @@ def _make_context_multi_group(
         kv_caches,
         lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
         num_blocks=1,
-        block_size=1,
     )
     ctx.kv_layer_groups_manager_ = manager
 

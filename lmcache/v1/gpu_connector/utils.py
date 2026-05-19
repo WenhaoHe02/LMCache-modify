@@ -94,9 +94,18 @@ def attempt_permute_to_contiguous_view(
     ``[2, NB, BS, NH, HS]`` via a dim permute. Sorting dims by stride
     undoes the permute without touching storage.
 
+    Also handles the DeepSeek V4 mixed-compression KV layout where vLLM
+    pads the block dimension: tensors that are non-contiguous **only** in
+    dim 0 (i.e. ``stride[-1] == 1``, inner dims tightly packed,
+    ``storage_offset == 0``, and ``stride[0] >= product of inner dims``)
+    are returned as-is.  The padded stride is preserved in dim 0 and
+    later detected by :func:`make_page_buffer_shape_desc` so the kernel
+    can account for it via ``block_stride_elems``.
+
     Raises:
         ValueError: If a tensor leaf is non-contiguous for a reason
-            other than dim permutation (e.g. slicing, ``as_strided``).
+            other than dim permutation or dim-0-only padding
+            (e.g. slicing or ``as_strided`` that affects inner dims).
             We refuse to fall back to ``.contiguous()`` (which would
             copy) so the caller's invariant is never silently violated.
     """
@@ -106,12 +115,44 @@ def attempt_permute_to_contiguous_view(
         strides = kv_caches.stride()
         perm = sorted(range(kv_caches.ndim), key=lambda i: strides[i], reverse=True)
         result = kv_caches.permute(perm)
-        if not result.is_contiguous():
-            raise ValueError(
-                "tensor is non-contiguous for reasons other than permutation "
-                "(e.g. slicing or as_strided). Cannot recover contiguous view."
-            )
-        return result
+        if result.is_contiguous():
+            return result
+        # Check for "dim-0 only padded" pattern: stride[-1] == 1, all inner
+        # dims tightly packed, storage_offset == 0, and stride[0] is at least
+        # as large as the product of the remaining dimensions.
+        # This arises in DeepSeek V4 MLA/Flash-Infer layers where vLLM adds
+        # padding so that each block's storage region is larger than its data.
+        shape = kv_caches.shape
+        strides_orig = kv_caches.stride()
+        ndim = kv_caches.ndim
+        if (
+            kv_caches.storage_offset() == 0
+            and strides_orig[-1] == 1
+            and ndim >= 2
+        ):
+            # Verify inner dims (1 … ndim-1) are tightly packed.
+            inner_tight = True
+            inner_product = 1
+            for d in range(ndim - 1, 0, -1):
+                if strides_orig[d] != inner_product:
+                    inner_tight = False
+                    break
+                inner_product *= shape[d]
+            if inner_tight and strides_orig[0] >= inner_product:
+                logger.debug(
+                    "attempt_permute_to_contiguous_view: accepting dim-0 "
+                    "padded tensor %s strides=%s (inner dims are tight, "
+                    "padding only in dim 0)",
+                    list(shape),
+                    list(strides_orig),
+                )
+                return kv_caches
+        raise ValueError(
+            "tensor is non-contiguous for reasons other than dim permutation "
+            "or dim-0-only padding. Cannot recover contiguous view without "
+            f"copying. shape={list(shape)}, strides={list(strides_orig)}, "
+            f"storage_offset={kv_caches.storage_offset()}"
+        )
     return [attempt_permute_to_contiguous_view(sub) for sub in kv_caches]
 
 
@@ -527,10 +568,29 @@ def get_num_blocks(
 
 
 def get_block_size(
-    kv_caches: DiscoverableKVCache, gpu_kv_format: "lmc_ops.GPUKVFormat"
+    kv_caches: DiscoverableKVCache,
+    gpu_kv_format: "lmc_ops.GPUKVFormat",
+    layer_idx: int = 0,
 ) -> int:
-    """
-    Get the block size from the kv_caches
+    """Get the block size from kv_caches.
+
+    For per-layer formats (``NL_X_*``), ``layer_idx`` selects which layer
+    tensor to inspect.  Different layers in a mixed-compression model such
+    as DeepSeek V4 may report different block sizes, so callers that need
+    per-layer accuracy should pass the target layer index.  The default
+    (``layer_idx=0``) is safe for homogeneous models.
+
+    Args:
+        kv_caches: Full kv_caches structure.
+        gpu_kv_format: Format returned by :func:`normalize_kv_and_discover_format`.
+        layer_idx: 0-based index of the layer to inspect (default 0).
+
+    Returns:
+        Block size (tokens per block) for the selected layer.
+
+    Raises:
+        ValueError: If the format has no block-size dimension
+            (e.g. SGLang flat formats) or is unknown.
     """
     if gpu_kv_format == lmc_ops.GPUKVFormat.NB_NL_TWO_BS_NH_HS:
         return kv_caches.shape[3]
@@ -542,15 +602,15 @@ def get_block_size(
         lmc_ops.GPUKVFormat.NL_X_NB_TWO_BS_NH_HS,
     ):
         # NHD: [..., BS, NH, HS] — block_size at shape[2]
-        return kv_caches[0].shape[2]
+        return kv_caches[layer_idx].shape[2]
     elif gpu_kv_format in (
         lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS,
         lmc_ops.GPUKVFormat.NL_X_NB_TWO_NH_BS_HS,
     ):
         # HND: [..., NH, BS, HS] — block_size at shape[3]
-        return kv_caches[0].shape[3]
+        return kv_caches[layer_idx].shape[3]
     elif gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_NB_BS_HS:
-        return kv_caches[0].shape[1]
+        return kv_caches[layer_idx].shape[1]
     elif gpu_kv_format == lmc_ops.GPUKVFormat.TWO_X_NL_X_NBBS_NH_HS:
         raise ValueError(_ATTRIBUTE_NOT_EXIST_ERROR.format(format=gpu_kv_format))
     elif gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_NBBS_ONE_HS:
@@ -943,10 +1003,22 @@ def get_device(kv_caches: DiscoverableKVCache) -> torch.device:
     Descends into any list nesting until a tensor is found; assumes all
     tensors in *kv_caches* live on the same device (true for every
     current :class:`GPUKVFormat`).
+
+    Raises:
+        ValueError: If an empty list is encountered or the leaf is not a
+            :class:`torch.Tensor`.
     """
     probe: DiscoverableKVCache = kv_caches
     while isinstance(probe, list):
+        if not probe:
+            raise ValueError(
+                "get_device: encountered an empty list inside kv_caches"
+            )
         probe = probe[0]
+    if not isinstance(probe, torch.Tensor):
+        raise ValueError(
+            f"get_device: expected a tensor leaf, got {type(probe).__name__}"
+        )
     return probe.device
 
 
@@ -957,6 +1029,7 @@ def make_page_buffer_shape_desc(
     num_layers_in_group: int,
     num_blocks: int,
     block_size: int,
+    block_stride_elems: Optional[int] = None,
 ) -> "lmc_ops.PageBufferShapeDesc":
     """Build a :class:`PageBufferShapeDesc` from a representative layer.
 
@@ -967,6 +1040,10 @@ def make_page_buffer_shape_desc(
         num_layers_in_group: Number of layers in the group (``nl``).
         num_blocks: Number of paged blocks (``nb``).
         block_size: Tokens per block (``bs``).
+        block_stride_elems: If not ``None``, the padded dim-0 stride in
+            element units (for DeepSeek V4 mixed-compression layouts).
+            Written into ``desc.block_stride_elems``; 0 (dense) is the
+            default when this argument is omitted.
 
     Returns:
         A populated ``PageBufferShapeDesc``.
@@ -983,6 +1060,16 @@ def make_page_buffer_shape_desc(
     )
     desc.hs = get_head_size(kv_caches, gpu_kv_format, layer_idx)
     desc.element_size = get_dtype(kv_caches, gpu_kv_format, layer_idx).itemsize
+    if block_stride_elems is not None:
+        try:
+            desc.block_stride_elems = block_stride_elems
+        except AttributeError:
+            # Compiled extension predates block_stride_elems — silently
+            # ignore so the rest of the stack still functions normally.
+            logger.debug(
+                "make_page_buffer_shape_desc: compiled extension does not "
+                "expose block_stride_elems; padded stride will be ignored"
+            )
     return desc
 
 

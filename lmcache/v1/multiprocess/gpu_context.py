@@ -20,7 +20,6 @@ from lmcache.utils import EngineType
 from lmcache.v1.gpu_connector.utils import (
     LayoutHints,
     get_attention_backend,
-    get_block_size,
     get_concrete_gpu_kv_shape,
     get_device,
     get_dtype,
@@ -70,7 +69,22 @@ class GPUCacheContext:
         lmcache_chunk_size: int = 256,
         layout_hints: LayoutHints | None = None,
         engine_type: EngineType = EngineType.VLLM,
+        vllm_block_size: int = 0,
     ):
+        """Initialize the GPU cache context.
+
+        Args:
+            kv_caches: KV cache tensor wrappers from the serving engine.
+            lmcache_chunk_size: Number of tokens per LMCache chunk.
+            layout_hints: KV cache layout hints for format detection.
+            engine_type: Serving engine type (vLLM, SGLang, etc.).
+            vllm_block_size: The vLLM block size (tokens per block from
+                ``cache_config.block_size``). Used to derive per-group
+                compression ratios for DeepSeek V4 mixed-compression layouts
+                where different layer groups have different physical block
+                sizes. When 0 (default), falls back to the first group's
+                ``shape_desc.bs`` for homogeneous models.
+        """
         unwrapped = unwrap_kv_cache_tensors(kv_caches)
         self.gpu_kv_format_, self.kv_caches_ = normalize_kv_and_discover_format(
             unwrapped,
@@ -81,7 +95,6 @@ class GPUCacheContext:
         self.is_mla_ = is_mla(self.gpu_kv_format_)
         self.num_layers_ = get_num_layers(self.kv_caches_, self.gpu_kv_format_)
         self.num_blocks_ = get_num_blocks(self.kv_caches_, self.gpu_kv_format_)
-        self.block_size_ = get_block_size(self.kv_caches_, self.gpu_kv_format_)
 
         # Build per-layer KV groups. The manager owns each group's
         # PageBufferShapeDesc (kernel-facing shape); this context only
@@ -90,8 +103,30 @@ class GPUCacheContext:
             self.kv_caches_,
             gpu_kv_format=self.gpu_kv_format_,
             num_blocks=self.num_blocks_,
-            block_size=self.block_size_,
         )
+
+        # Resolve vllm_block_size: if the caller did not supply it, fall back
+        # to the first group's bs (safe for homogeneous models).
+        if vllm_block_size <= 0:
+            if self.kv_layer_groups_manager_.kv_layer_groups:
+                vllm_block_size = (
+                    self.kv_layer_groups_manager_.kv_layer_groups[0].shape_desc.bs
+                )
+            else:
+                vllm_block_size = 1  # degenerate; no groups
+
+        # Per-group compression metadata for DSV4 mixed-compression layouts.
+        # compress_ratio = vllm_block_size // group.shape_desc.bs
+        # (1 for normal MHA groups; > 1 for compressed MLA groups).
+        self.vllm_block_size_: int = vllm_block_size
+        self.group_compress_ratios_: list[int] = []
+        self.group_lmcache_chunk_slots_: list[int] = []
+        for group in self.kv_layer_groups_manager_.kv_layer_groups:
+            ratio = vllm_block_size // group.shape_desc.bs
+            if ratio < 1:
+                ratio = 1
+            self.group_compress_ratios_.append(ratio)
+            self.group_lmcache_chunk_slots_.append(lmcache_chunk_size // ratio)
 
         self.group_kv_pointers_: list[torch.Tensor] = []
         for group in self.kv_layer_groups_manager_.kv_layer_groups:
@@ -129,7 +164,8 @@ class GPUCacheContext:
         for group_idx, group in enumerate(
             self.kv_layer_groups_manager_.kv_layer_groups
         ):
-            shape = self.get_kv_buffer_shape(lmcache_chunk_size, group_idx)
+            chunk_slots = self.group_lmcache_chunk_slots_[group_idx]
+            shape = self.get_kv_buffer_shape(chunk_slots, group_idx)
             byte_size = shape.numel() * group.dtype.itemsize
             self.tmp_chunk_group_offsets_.append(
                 self.tmp_chunk_group_offsets_[-1] + byte_size
@@ -195,11 +231,73 @@ class GPUCacheContext:
         return self.high_priority_cupy_stream_
 
     @property
+    def vllm_block_size(self) -> int:
+        """Returns the vLLM block size (tokens per block from cache_config)."""
+        return self.vllm_block_size_
+
+    @property
     def block_size(self) -> int:
+        """Returns the vLLM block size (tokens per block).
+
+        For homogeneous models this equals ``shape_desc.bs`` for every group.
+        For mixed-compression models (e.g. DeepSeek V4) this is the vLLM
+        paging block size; individual groups may have smaller ``bs`` values.
+        Use :meth:`get_group_block_size` for per-group accuracy.
         """
-        Returns the block size (number of tokens per block)
+        return self.vllm_block_size_
+
+    def get_group_compress_ratio(self, group_idx: int) -> int:
+        """Return the compression ratio for the given KV layer group.
+
+        ``compress_ratio = vllm_block_size // group.shape_desc.bs``.
+        For normal (non-compressed) groups this is 1.
+
+        Args:
+            group_idx: 0-based group index.
+
+        Returns:
+            Integer compression ratio (>= 1).
         """
-        return self.block_size_
+        return self.group_compress_ratios_[group_idx]
+
+    def get_group_lmcache_chunk_slots(self, group_idx: int) -> int:
+        """Return the effective LMCache chunk size (in tokens) for a group.
+
+        For compressed groups this equals
+        ``lmcache_chunk_size // compress_ratio`` so that the group's
+        per-chunk token count matches its physical block size.
+
+        Args:
+            group_idx: 0-based group index.
+
+        Returns:
+            Effective chunk size in tokens for the group.
+        """
+        return self.group_lmcache_chunk_slots_[group_idx]
+
+    def get_group_block_size(self, group_idx: int) -> int:
+        """Return the physical block size for the given KV layer group.
+
+        Args:
+            group_idx: 0-based group index.
+
+        Returns:
+            Tokens per block (``shape_desc.bs``) for the group.
+        """
+        return self.kv_layer_groups_manager_.kv_layer_groups[group_idx].shape_desc.bs
+
+    @property
+    def group_block_sizes(self) -> list[int]:
+        """Return a list of per-group physical block sizes."""
+        return [
+            group.shape_desc.bs
+            for group in self.kv_layer_groups_manager_.kv_layer_groups
+        ]
+
+    @property
+    def group_compress_ratios(self) -> list[int]:
+        """Return a list of per-group compression ratios."""
+        return list(self.group_compress_ratios_)
 
     @property
     def num_layers(self) -> int:
@@ -285,13 +383,15 @@ class GPUCacheContext:
     def get_tmp_chunk_gpu_buffer(self, group_idx: int = 0) -> torch.Tensor:
         """
         Returns a view of the temporary GPU buffer for the given group,
-        sized for a single chunk of ``lmcache_chunk_size`` tokens.
+        sized for ``group_lmcache_chunk_slots`` tokens (= ``lmcache_chunk_size //
+        compress_ratio``).
 
         Args:
             group_idx: Index of the KV layer group (default 0).
         """
         group = self.kv_layer_groups_manager_.kv_layer_groups[group_idx]
-        shape = self.get_kv_buffer_shape(self.lmcache_chunk_size, group_idx)
+        chunk_slots = self.group_lmcache_chunk_slots_[group_idx]
+        shape = self.get_kv_buffer_shape(chunk_slots, group_idx)
         start = self.tmp_chunk_group_offsets_[group_idx]
         end = self.tmp_chunk_group_offsets_[group_idx + 1]
         return self.tmp_gpu_buffer_[start:end].view(group.dtype).view(shape)
@@ -302,7 +402,8 @@ class GPUCacheContext:
         """
         Returns a list of ``batch_size`` non-overlapping views into the
         pre-allocated temporary GPU buffer for the given group, each
-        sized for ``lmcache_chunk_size`` tokens.
+        sized for ``group_lmcache_chunk_slots`` tokens (= ``lmcache_chunk_size //
+        compress_ratio``).
 
         Args:
             batch_size: Number of concurrent requests (must be <= max_batch_size).
@@ -313,7 +414,8 @@ class GPUCacheContext:
                 f"batch_size {batch_size} exceeds max_batch_size {self.max_batch_size}"
             )
         group = self.kv_layer_groups_manager_.kv_layer_groups[group_idx]
-        shape = self.get_kv_buffer_shape(self.lmcache_chunk_size, group_idx)
+        chunk_slots = self.group_lmcache_chunk_slots_[group_idx]
+        shape = self.get_kv_buffer_shape(chunk_slots, group_idx)
         g_start = self.tmp_chunk_group_offsets_[group_idx]
         g_end = self.tmp_chunk_group_offsets_[group_idx + 1]
         chunk = self.tmp_chunk_bytes_
@@ -356,15 +458,21 @@ class GPUCacheContext:
         )
 
     def cache_size_per_token(self) -> int:
-        """
-        Returns the cache size per token (in bytes), summed across all groups.
+        """Return the cache size per vLLM token (in bytes), summed across groups.
+
+        For compressed groups (compress_ratio > 1) the group stores fewer
+        physical tokens per vLLM token, so the contribution is scaled down
+        accordingly.
         """
         total = 0
         for group_idx, group in enumerate(
             self.kv_layer_groups_manager_.kv_layer_groups
         ):
+            ratio = self.group_compress_ratios_[group_idx]
+            # get_kv_buffer_shape(1, ...) gives shape for 1 *group* token;
+            # 1 vLLM token corresponds to 1/ratio group tokens.
             numels = self.get_kv_buffer_shape(1, group_idx).numel()
-            total += numels * group.dtype.itemsize
+            total += (numels * group.dtype.itemsize) // ratio
         return total
 
 

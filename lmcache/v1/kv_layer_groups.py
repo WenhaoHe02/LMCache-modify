@@ -18,11 +18,14 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-# The 4-tuple that uniquely identifies a set of kernel-equivalent layers:
-# ``(kv_size, num_heads, head_size, dtype)``. Two layers share a transfer-
-# kernel launch iff they share this identity — see the grouping loop in
-# :meth:`KVLayerGroupsManager.__init__` for the derivation.
-LayerGroupIdentity = tuple[int, int, int, torch.dtype]
+# The 5-tuple that uniquely identifies a set of kernel-equivalent layers:
+# ``(kv_size, num_heads, head_size, block_size, dtype)``. Two layers share a
+# transfer-kernel launch iff they share this identity — see the grouping loop
+# in :meth:`KVLayerGroupsManager.__init__` for the derivation.
+# ``block_size`` is the 4th element to support DeepSeek V4 mixed-compression
+# layouts where MLA layers may have a different physical block size than
+# standard attention layers.
+LayerGroupIdentity = tuple[int, int, int, int, torch.dtype]
 
 
 @dataclass
@@ -33,8 +36,8 @@ class KVLayerGroupInfo:
     Membership is decided by :class:`KVLayerGroupsManager` according to
     :data:`LayerGroupIdentity`; every layer referenced by
     ``layer_indices`` shares the same ``(kv_size, num_heads, head_size,
-    dtype)`` signature. Consumers use ``layer_indices`` to pull the
-    matching device pointers out of ``kv_caches`` (via
+    block_size, dtype)`` signature. Consumers use ``layer_indices`` to pull
+    the matching device pointers out of ``kv_caches`` (via
     :func:`~lmcache.v1.gpu_connector.utils.get_group_data_ptrs`) and feed
     them to the kernel alongside ``shape_desc``.
 
@@ -54,8 +57,8 @@ class KVLayerGroupInfo:
     the per-group pointer array."""
     shape_desc: "lmc_ops.PageBufferShapeDesc"
     """Kernel-facing shape descriptor shared by every layer in the group.
-    All seven fields (``kv_size, nl, nb, bs, nh, hs, element_size``) are
-    stamped once at construction."""
+    All eight fields (``kv_size, nl, nb, bs, nh, hs, element_size,
+    block_stride_elems``) are stamped once at construction."""
     dtype: torch.dtype
     """Torch dtype of the KV cache tensors for this group. Used for
     kernel template instantiation; see class docstring for why we keep
@@ -91,8 +94,8 @@ class KVLayerGroupsManager:
 
     At construction time, every layer in ``kv_caches`` is bucketed by its
     :data:`LayerGroupIdentity` (``(kv_size, num_heads, head_size,
-    dtype)``). Each bucket becomes one :class:`KVLayerGroupInfo` holding
-    the layer indices, a shared :class:`PageBufferShapeDesc`, and the
+    block_size, dtype)``). Each bucket becomes one :class:`KVLayerGroupInfo`
+    holding the layer indices, a shared :class:`PageBufferShapeDesc`, and the
     group's torch dtype.
 
     Downstream consumers (``VLLMPagedMemGPUConnectorV3``,
@@ -106,20 +109,29 @@ class KVLayerGroupsManager:
     grouping and look-up.
     """
 
+    # Formats where dim 0 of the per-layer tensor is the block axis.
+    # For these formats we check the actual dim-0 stride to detect padding
+    # (DeepSeek V4 mixed-compression layouts).
+    _BLOCK_AXIS_FORMATS: frozenset = frozenset(
+        {
+            lmc_ops.GPUKVFormat.NL_X_NB_TWO_BS_NH_HS,
+            lmc_ops.GPUKVFormat.NL_X_NB_BS_HS,
+        }
+    )
+
     def __init__(
         self,
         kv_caches: "DiscoverableKVCache",
         gpu_kv_format: "lmc_ops.GPUKVFormat",
         num_blocks: int,
-        block_size: int,
     ) -> None:
         """Partition layers into groups keyed by
         :data:`LayerGroupIdentity`.
 
         For each layer ``i`` in ``kv_caches``, read
-        ``(kv_size, num_heads, head_size, dtype)`` via the format-aware
-        accessors in ``utils.py``. Layers with identical identities are
-        bucketed together; each bucket becomes one
+        ``(kv_size, num_heads, head_size, block_size, dtype)`` via the
+        format-aware accessors in ``utils.py``. Layers with identical
+        identities are bucketed together; each bucket becomes one
         :class:`KVLayerGroupInfo`.
 
         Groups are emitted in the order of their first-appearing layer,
@@ -132,13 +144,12 @@ class KVLayerGroupsManager:
                 :func:`normalize_kv_and_discover_format`.
             num_blocks: Number of paged blocks. Stamped into every
                 ``shape_desc.nb``.
-            block_size: Tokens per block. Stamped into every
-                ``shape_desc.bs``.
         """
         # Import here to break a circular import via
         # lmcache.v1.gpu_connector.__init__ → metadata → kv_layer_groups.
         # First Party
         from lmcache.v1.gpu_connector.utils import (
+            get_block_size,
             get_dtype,
             get_head_size,
             get_num_heads,
@@ -167,19 +178,44 @@ class KVLayerGroupsManager:
             nh = 1 if mla else get_num_heads(kv_caches, gpu_kv_format, idx)
             hs = get_head_size(kv_caches, gpu_kv_format, idx)
             dt = get_dtype(kv_caches, gpu_kv_format, idx)
-            groups_dict[(kv_size, nh, hs, dt)].append(idx)
+            # Per-layer block_size: DSV4 MLA layers may differ from MHA layers.
+            bs = get_block_size(kv_caches, gpu_kv_format, layer_idx=idx)
+            groups_dict[(kv_size, nh, hs, bs, dt)].append(idx)
 
         # Emit groups in order of their first-appearing layer.
-        for (_, _, _, dt), indices in sorted(
+        for (_, _, _, bs, dt), indices in sorted(
             groups_dict.items(), key=lambda kv: kv[1][0]
         ):
+            # Detect padded dim-0 stride for formats where the block axis
+            # is dim 0 of the per-layer tensor (DSV4 mixed-compression).
+            block_stride_elems: int | None = None
+            if gpu_kv_format in self._BLOCK_AXIS_FORMATS:
+                rep_tensor = kv_caches[indices[0]]
+                # Tight stride = product of all dims that follow dim 0.
+                tight = 1
+                for d in range(1, rep_tensor.ndim):
+                    tight *= rep_tensor.shape[d]
+                actual_stride0 = rep_tensor.stride(0)
+                if actual_stride0 > tight:
+                    block_stride_elems = actual_stride0
+                    logger.debug(
+                        "KVLayerGroupsManager: group starting at layer %d "
+                        "has padded dim-0 stride %d > tight %d "
+                        "(block_stride_elems=%d)",
+                        indices[0],
+                        actual_stride0,
+                        tight,
+                        block_stride_elems,
+                    )
+
             shape_desc = make_page_buffer_shape_desc(
                 kv_caches,
                 gpu_kv_format,
                 layer_idx=indices[0],
                 num_layers_in_group=len(indices),
                 num_blocks=num_blocks,
-                block_size=block_size,
+                block_size=bs,
+                block_stride_elems=block_stride_elems,
             )
             self.kv_layer_groups.append(
                 KVLayerGroupInfo(

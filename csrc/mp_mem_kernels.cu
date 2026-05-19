@@ -39,11 +39,15 @@ __device__ inline size_t calculate_engine_global_offset(
            k_or_v * shape_desc.nb * scalars_per_block;
   } else if constexpr (format == GPUKVFormat::NL_X_NB_TWO_BS_NH_HS) {
     // Flash Infer: L tensors [NB, 2, BS, NH, HS]
-    return engine_block_idx * shape_desc.kv_size * scalars_per_block +
-           k_or_v * scalars_per_block;
+    // Use block_stride_or() to honour any dim-0 padding (DSV4 mixed-layout).
+    size_t tight_block_stride = shape_desc.kv_size * scalars_per_block;
+    size_t per_block = shape_desc.block_stride_or<ScalarType>(tight_block_stride);
+    return engine_block_idx * per_block + k_or_v * scalars_per_block;
   } else if constexpr (format == GPUKVFormat::NL_X_NB_BS_HS) {
     // MLA: L tensors [NB, BS, HS]
-    return engine_block_idx * scalars_per_block;
+    // Use block_stride_or() to honour any dim-0 padding (DSV4 mixed-layout).
+    return engine_block_idx *
+           shape_desc.block_stride_or<ScalarType>(scalars_per_block);
   } else if constexpr (format == GPUKVFormat::TWO_X_NL_X_NBBS_NH_HS) {
     // SGLang MHA: 2L tensors [NBBS, NH, HS] — K/V via separate tensor ptrs
     return engine_block_idx * scalars_per_block;

@@ -113,17 +113,21 @@ def get_layout_desc(gpu_context: GPUCacheContext, num_tokens: int) -> MemoryLayo
     """Get the memory layout description for a given GPU context and number of tokens.
 
     Supports multiple KV layer groups with different shapes and dtypes.
+    For mixed-compression models (e.g. DeepSeek V4) each group may have a
+    different physical token count: ``num_tokens // compress_ratio``.
 
     Args:
         gpu_context: The GPU cache context containing the KV cache information.
-        num_tokens: The number of tokens to determine the layout for.
+        num_tokens: Logical (vLLM) token count for the chunk.
 
     Returns:
         MemoryLayoutDesc: The memory layout description containing shapes and dtypes.
     """
     num_groups = gpu_context.kv_layer_groups_manager.num_groups
     shapes = [
-        gpu_context.get_kv_buffer_shape(num_tokens, group_idx)
+        gpu_context.get_kv_buffer_shape(
+            num_tokens // gpu_context.get_group_compress_ratio(group_idx), group_idx
+        )
         for group_idx in range(num_groups)
     ]
     dtypes = [
@@ -219,19 +223,23 @@ class MPCacheEngine:
         model_name: str,
         world_size: int,
         engine_type: EngineType,
+        vllm_block_size: int,
         layout_hints: LayoutHints,
     ) -> None:
-        """
-        Registers the KV cache tensors for a given GPU instance ID.
+        """Register the KV cache tensors for a given GPU instance ID.
 
         Args:
-            instance_id (int): The GPU instance ID (such as PID).
-            kv_caches (KVCache): The KV cache tensor wrappers from the
-                serving engine.
-            model_name (str): The name of the model associated with this KV cache.
-            world_size (int): The world size associated with this KV cache.
+            instance_id: The GPU instance ID (such as PID).
+            kv_caches: The KV cache tensor wrappers from the serving engine.
+            model_name: The name of the model associated with this KV cache.
+            world_size: The world size associated with this KV cache.
             engine_type: Which serving engine produced the caches.
                 Forwarded to :class:`GPUCacheContext` for format detection.
+            vllm_block_size: The vLLM paging block size
+                (``cache_config.block_size``). Forwarded to
+                :class:`GPUCacheContext` so it can derive per-group
+                compression ratios for mixed-compression models (e.g.
+                DeepSeek V4).
             layout_hints: See :class:`LayoutHints`.  Forwarded to
                 :class:`GPUCacheContext` for GPU KV format detection.
         """
@@ -248,6 +256,7 @@ class MPCacheEngine:
             self.chunk_size,
             layout_hints=layout_hints or None,
             engine_type=engine_type,
+            vllm_block_size=vllm_block_size,
         )
         self.gpu_contexts[instance_id] = gpu_context
         self.gpu_context_meta[instance_id] = (model_name, world_size)
@@ -312,7 +321,7 @@ class MPCacheEngine:
         gpu_context = self.gpu_contexts[instance_id]
         model_name = self.gpu_context_meta[instance_id][0]
 
-        blocks_per_chunk = self.chunk_size // gpu_context.block_size
+        blocks_per_chunk = self.chunk_size // gpu_context.vllm_block_size
 
         with (
             torch.cuda.device(gpu_context.device),
@@ -379,6 +388,9 @@ class MPCacheEngine:
                     for group_idx in range(num_groups):
                         tmp_buffer = gpu_context.get_tmp_chunk_gpu_buffer(group_idx)
                         group_kv_pointers = gpu_context.get_group_kv_pointers(group_idx)
+                        group_chunk_slots = gpu_context.get_group_lmcache_chunk_slots(
+                            group_idx
+                        )
                         lmc_ops.multi_layer_block_kv_transfer(
                             group_kv_pointers,
                             [tmp_buffer.data_ptr()],
@@ -386,7 +398,7 @@ class MPCacheEngine:
                             gpu_context.device,
                             lmc_ops.TransferDirection.D2H,
                             gpu_context.get_shape_desc(group_idx),
-                            self.chunk_size,
+                            group_chunk_slots,
                             gpu_context.gpu_kv_format_,
                             0,
                         )
@@ -503,11 +515,12 @@ class MPCacheEngine:
             ),
         )
 
-        blocks_per_chunk = self.chunk_size // gpu_context.block_size
+        blocks_per_chunk = self.chunk_size // gpu_context.vllm_block_size
 
         def _retrieve_loop(keys: list[ObjectKey], memory_objs: list[MemoryObj]) -> None:
             _BATCH_SIZE = gpu_context.max_batch_size
             num_groups = gpu_context.kv_layer_groups_manager.num_groups
+            vllm_bs = gpu_context.vllm_block_size
             for batch_idx, memory_obj_batch in enumerate(
                 batched_iteration(memory_objs, batch_size=_BATCH_SIZE)
             ):
@@ -527,16 +540,17 @@ class MPCacheEngine:
                         self.chunk_size * batch_len - 1,
                     ),
                 )
-                if skip_tokens_in_chunk % gpu_context.block_size != 0:
+                if skip_tokens_in_chunk % vllm_bs != 0:
                     logger.error(
-                        "skip_first_n_tokens (%d) is not aligned to block_size (%d), "
-                        "rounding down from %d tokens to %d blocks",
+                        "skip_first_n_tokens (%d) is not aligned to "
+                        "vllm_block_size (%d), rounding down from %d tokens "
+                        "to %d blocks",
                         skip_first_n_tokens,
-                        gpu_context.block_size,
+                        vllm_bs,
                         skip_tokens_in_chunk,
-                        skip_tokens_in_chunk // gpu_context.block_size,
+                        skip_tokens_in_chunk // vllm_bs,
                     )
-                skip_blocks_in_chunk = skip_tokens_in_chunk // gpu_context.block_size
+                skip_blocks_in_chunk = skip_tokens_in_chunk // vllm_bs
 
                 start_chunk_id = batch_idx * _BATCH_SIZE
                 end_chunk_id = start_chunk_id + batch_len
@@ -556,6 +570,9 @@ class MPCacheEngine:
                         batch_len, group_idx
                     )
                     group_kv_pointers = gpu_context.get_group_kv_pointers(group_idx)
+                    group_chunk_slots = gpu_context.get_group_lmcache_chunk_slots(
+                        group_idx
+                    )
 
                     lmc_ops.multi_layer_block_kv_transfer(
                         group_kv_pointers,
@@ -564,7 +581,7 @@ class MPCacheEngine:
                         gpu_context.device,
                         lmc_ops.TransferDirection.H2D,
                         gpu_context.get_shape_desc(group_idx),
-                        self.chunk_size,
+                        group_chunk_slots,
                         gpu_context.gpu_kv_format_,
                         skip_blocks_in_chunk,
                     )
@@ -970,7 +987,9 @@ class MPCacheEngine:
             if ctx is not None:
                 entry["kv_cache_layout"] = {
                     "num_layers": ctx.num_layers,
-                    "block_size": ctx.block_size,
+                    "vllm_block_size": ctx.vllm_block_size,
+                    "group_block_sizes": ctx.group_block_sizes,
+                    "group_compress_ratios": ctx.group_compress_ratios,
                     "hidden_dim_sizes": str(ctx.hidden_dim_sizes),
                     "dtype": str(ctx.dtype),
                     "is_mla": ctx.is_mla,

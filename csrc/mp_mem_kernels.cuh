@@ -15,6 +15,10 @@ struct PageBufferShapeDesc {
   int nh;            // num heads
   int hs;            // head size
   int element_size;  // bytes (1 or 2)
+  // 0 = dense (use scalars_per_block); > 0 = padded stride in element units.
+  // Used for DeepSeek V4 mixed-compression KV layouts where vLLM pads the
+  // block dimension so that dim-0 strides differ from the tight product.
+  int block_stride_elems;
 
   template <typename ScalarType>
   __host__ __device__ inline size_t scalars_per_head() const {
@@ -29,6 +33,25 @@ struct PageBufferShapeDesc {
   template <typename ScalarType>
   __host__ __device__ inline size_t scalars_per_block() const {
     return bs * nh * hs * element_size / sizeof(ScalarType);
+  }
+
+  /**
+   * Return the stride (in ScalarType units) between consecutive dim-0
+   * entries in the paged buffer.
+   *
+   * If ``block_stride_elems == 0`` (dense layout) this is identical to
+   * ``tight_in_scalar_type``; otherwise it converts the element-unit
+   * padded stride to ScalarType units.
+   *
+   * @param tight_in_scalar_type  The dense/tight stride expressed in
+   *                              ScalarType units, as computed by the
+   *                              caller from ``scalars_per_block()``.
+   */
+  template <typename ScalarType>
+  __host__ __device__ inline size_t block_stride_or(
+      size_t tight_in_scalar_type) const {
+    if (block_stride_elems == 0) return tight_in_scalar_type;
+    return (size_t)block_stride_elems * element_size / sizeof(ScalarType);
   }
 };
 
