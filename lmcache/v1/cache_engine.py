@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-import os
 from collections import defaultdict
 from collections.abc import Iterable
 from typing import (
@@ -1019,29 +1018,23 @@ class LMCacheEngine:
             # tokens number in the first layer loading since there is no lookup
             yield torch.sum(ret_mask)
 
-            _overlap = os.environ.get("LMCACHE_IO_OVERLAP", "1") != "0"
-
             mem_objs_group = [task.result() for task in group_tasks]
-            if _overlap and 1 < num_groups:
+            if 1 < num_groups:
                 group_tasks = next(get_generator)
             mem_obj_consumer.send(mem_objs_group)
             for mem_objs_layer in mem_objs_group:
                 to_count_down.extend(mem_objs_layer)
-            if not _overlap and 1 < num_groups:
-                group_tasks = next(get_generator)
             first_group_size = min(group_size, self.num_layers)
             for _ in range(first_group_size - 1):
                 yield None
 
             for group_id in range(1, num_groups):
                 mem_objs_group = [task.result() for task in group_tasks]
-                if _overlap and group_id + 1 < num_groups:
+                if group_id + 1 < num_groups:
                     group_tasks = next(get_generator)
                 mem_obj_consumer.send(mem_objs_group)
                 for mem_objs_layer in mem_objs_group:
                     to_count_down.extend(mem_objs_layer)
-                if not _overlap and group_id + 1 < num_groups:
-                    group_tasks = next(get_generator)
                 actual_gs = min(group_size, self.num_layers - group_id * group_size)
                 for _ in range(actual_gs):
                     yield None
