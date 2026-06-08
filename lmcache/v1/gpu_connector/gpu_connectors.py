@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import List, Optional, Tuple, Union
 import abc
+import os
+import re
+from typing import Any, List, Optional, Sequence, Tuple, Union
 
 # Third Party
 import torch
@@ -27,7 +29,7 @@ from lmcache.v1.gpu_connector.utils import (
     get_tokens_per_layer,
     normalize_kv_and_discover_format,
 )
-from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
+from lmcache.v1.kv_layer_groups import KVLayerGroupInfo, KVLayerGroupsManager
 from lmcache.v1.memory_management import GPUMemoryAllocator  # noqa: E501
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
@@ -434,6 +436,30 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         self.init = False
         self.group_kv_cache_pointers_on_gpu: Optional[list[torch.Tensor]] = None
         self.group_tmp_buffer: Optional[list[torch.Tensor]] = None
+        self.group_tmp_buffer_flat: Optional[torch.Tensor] = None
+        self.group_tmp_buffer_offsets: list[int] = []
+        self.dsv4_optimized_kv = self._read_config_flag(
+            "dsv4_optimized_kv",
+            "LMCACHE_DSV4_OPTIMIZED_KV",
+        )
+        self.dsv4_optimized_tail_tokens = self._read_config_int(
+            "dsv4_optimized_tail_tokens",
+            "LMCACHE_DSV4_OPTIMIZED_TAIL_TOKENS",
+            default=self.chunk_size,
+            minimum=self.chunk_size,
+        )
+        self.dsv4_defer_hca_to_moe = self._read_config_flag(
+            "dsv4_defer_hca_to_moe",
+            "LMCACHE_DSV4_DEFER_HCA_TO_MOE",
+        )
+        self._dsv4_layout_valid: Optional[bool] = None
+        self._dsv4_policy_logged = False
+        self._dsv4_hca_defer_logged = False
+        self._dsv4_hca_defer_fallback_logged = False
+        self._kv_cache_layer_names: tuple[str, ...] = ()
+        self._layer_name_to_vllm_group: dict[str, int] = {}
+        self._vllm_group_block_sizes: tuple[int, ...] = ()
+        self._hma_layout_logged = False
 
         self.store_stream = torch.cuda.Stream()
         self.load_stream = torch.cuda.Stream()
@@ -473,41 +499,27 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                 self.kvcaches,
                 gpu_kv_format=self.gpu_kv_format,
                 num_blocks=self.num_blocks,
+                layout_hints=self.layout_hints,
+                lmcache_logical_chunk_size=self.chunk_size,
             )
         klg_manager = self.metadata.kv_layer_groups_manager
 
-        # Heterogeneous-block_size sanity check.
-        #
-        # ``self.block_size`` is a single scalar sampled from the first
-        # layer's ``bs`` and is forwarded to ``multi_layer_kv_transfer``
-        # as a *global* kernel parameter below (see ``to_gpu`` /
-        # ``from_gpu`` / layerwise paths). That works only when every
-        # group shares the same ``shape_desc.bs``. Mixed-compression
-        # deployments (e.g. DeepSeek V4 with compressed + dense groups
-        # in the same model) violate this assumption and will silently
-        # corrupt transfers on this non-MP path. Log loudly so the
-        # mismatch surfaces before it turns into a data-corruption bug;
-        # the MP path (see ``GPUCacheContext`` / mp server) handles
-        # per-group ``bs`` correctly and should be used instead.
-        heterogeneous_bs = {g.shape_desc.bs for g in klg_manager.kv_layer_groups}
-        if len(heterogeneous_bs) > 1:
-            logger.warning(
-                "VLLMPagedMemGPUConnectorV3 detected heterogeneous per-group "
-                "block_size %s but forwards a single scalar block_size=%d to "
-                "multi_layer_kv_transfer. This non-MP path is NOT adapted for "
-                "mixed-compression KV layouts and may corrupt transfers. Use "
-                "the multi-process connector path for such models.",
-                sorted(heterogeneous_bs),
-                self.block_size,
-            )
-
         if self.use_gpu:
-            tmp_buf_shapes = self.metadata.get_shapes(self.chunk_size)
-            tmp_buf_dtypes = self.metadata.get_dtypes()
-            assert len(tmp_buf_shapes) == len(tmp_buf_dtypes)
+            self.group_tmp_buffer_offsets = [0]
+            for group in klg_manager.kv_layer_groups:
+                shape = self._group_shape_for_tokens(group, self.chunk_size)
+                byte_size = shape.numel() * group.dtype.itemsize
+                self.group_tmp_buffer_offsets.append(
+                    self.group_tmp_buffer_offsets[-1] + byte_size
+                )
+            self.group_tmp_buffer_flat = torch.empty(
+                self.group_tmp_buffer_offsets[-1],
+                dtype=torch.uint8,
+                device=self.device,
+            )
             self.group_tmp_buffer = [
-                torch.empty(shape, dtype=dtype, device=self.device)
-                for shape, dtype in zip(tmp_buf_shapes, tmp_buf_dtypes, strict=True)
+                self._group_tmp_view(group_idx)
+                for group_idx in range(len(klg_manager.kv_layer_groups))
             ]
 
         self.group_kv_cache_pointers_on_gpu = []
@@ -524,6 +536,549 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         self.init = True
         logger.info("init kv cache pointers success in VLLMPagedMemGPUConnectorV3")
 
+    def register_kv_caches(self, kvcaches: list[torch.Tensor]) -> None:
+        """Register vLLM KV cache tensors and discover heterogeneous groups."""
+        self.kvcaches = kvcaches
+        self._initialize_kv_cache_pointers()
+
+    @staticmethod
+    def _read_env_flag(name: str) -> bool:
+        value = os.getenv(name, "")
+        return value.lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _as_bool(value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.lower() in {"1", "true", "yes", "on"}
+        return False
+
+    def _config_value(self, key: str) -> object:
+        extra = self.layout_hints.get("lmcache_extra_config")
+        if isinstance(extra, dict) and key in extra:
+            return extra[key]
+        extra = self.metadata.kv_connector_extra_config
+        if isinstance(extra, dict):
+            if key in extra:
+                return extra[key]
+            lmcache_key = f"lmcache.extra_config.{key}"
+            if lmcache_key in extra:
+                return extra[lmcache_key]
+        return None
+
+    def _read_config_flag(self, key: str, env_name: str) -> bool:
+        value = self._config_value(key)
+        if value is not None:
+            return self._as_bool(value)
+        return self._read_env_flag(env_name)
+
+    @staticmethod
+    def _read_env_int(name: str, default: int, minimum: int) -> int:
+        value = os.getenv(name)
+        if value is None:
+            return default
+        return VLLMPagedMemGPUConnectorV3._parse_int_value(
+            value,
+            name,
+            default,
+            minimum,
+        )
+
+    def _read_config_int(
+        self,
+        key: str,
+        env_name: str,
+        default: int,
+        minimum: int,
+    ) -> int:
+        value = self._config_value(key)
+        if value is not None:
+            return self._parse_int_value(value, key, default, minimum)
+        return self._read_env_int(env_name, default, minimum)
+
+    @staticmethod
+    def _parse_int_value(
+        value: object,
+        name: str,
+        default: int,
+        minimum: int,
+    ) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            logger.warning(
+                "%s=%r is not an integer; using default %d",
+                name,
+                value,
+                default,
+            )
+            return default
+        if parsed < minimum:
+            logger.warning(
+                "%s=%d is below minimum %d; using %d",
+                name,
+                parsed,
+                minimum,
+                minimum,
+            )
+            return minimum
+        return parsed
+
+    @staticmethod
+    def _dsv4_group_role(group: KVLayerGroupInfo) -> str:
+        """Classify DeepSeek V4 heterogeneous KV groups by transfer semantics."""
+        hidden_dim = group.hidden_dim_size
+        num_layers = group.num_layers
+        compress_ratio = group.compress_ratio
+
+        if group.dtype == torch.float32:
+            return "compressor_state"
+
+        if group.dtype != torch.uint8:
+            return "unknown"
+
+        if hidden_dim == 132:
+            return "csa_indexer_cache"
+
+        if hidden_dim != 584:
+            return "unknown"
+
+        if hidden_dim == 584 and compress_ratio == 1:
+            return "swa_cache"
+        if compress_ratio >= 64 or group.shape_desc.bs <= 2:
+            return "hca_attention_kv"
+        if compress_ratio == 4 or num_layers == 30:
+            return "csa_attention_kv"
+        return "unknown"
+
+    def _dsv4_optimized_layout_is_valid(self) -> bool:
+        if not self.dsv4_optimized_kv:
+            return False
+        if self._dsv4_layout_valid is not None:
+            return self._dsv4_layout_valid
+        klg_manager = self.metadata.kv_layer_groups_manager
+        if klg_manager is None:
+            self._dsv4_layout_valid = False
+            return False
+        roles = {
+            self._dsv4_group_role(group)
+            for group in klg_manager.kv_layer_groups
+        }
+        required = {
+            "swa_cache",
+            "hca_attention_kv",
+            "csa_attention_kv",
+            "csa_indexer_cache",
+            "compressor_state",
+        }
+        self._dsv4_layout_valid = required.issubset(roles)
+        if not self._dsv4_layout_valid:
+            logger.warning(
+                "LMCACHE_DSV4_OPTIMIZED_KV=1 but KV groups do not look like "
+                "DeepSeek V4; falling back to full H2D transfer. roles=%s",
+                sorted(roles),
+            )
+        return self._dsv4_layout_valid
+
+    def _log_dsv4_optimized_policy_once(self) -> None:
+        if self._dsv4_policy_logged or not self._dsv4_optimized_layout_is_valid():
+            return
+        assert self.metadata.kv_layer_groups_manager is not None
+        group_summaries = []
+        for idx, group in enumerate(
+            self.metadata.kv_layer_groups_manager.kv_layer_groups
+        ):
+            role = self._dsv4_group_role(group)
+            action = (
+                "tail-only"
+                if role in {"swa_cache", "compressor_state"}
+                else "defer-to-moe"
+                if self._should_defer_hca_group(role)
+                else "full"
+            )
+            group_summaries.append(
+                f"{idx}:{role}:{action}:layers={group.num_layers}:"
+                f"hidden={group.hidden_dim_size}:cr={group.compress_ratio}:"
+                f"dtype={group.dtype}"
+            )
+        logger.info(
+            "LMCACHE_DSV4_OPTIMIZED_KV active: H2D transfer uses DSv4 "
+            "role-aware policy; tail_tokens=%d; groups=[%s]",
+            self.dsv4_optimized_tail_tokens,
+            ", ".join(group_summaries),
+        )
+        self._dsv4_policy_logged = True
+
+    def _dsv4_is_tail_transfer(
+        self,
+        start: int,
+        end: int,
+        **kwargs: object,
+    ) -> bool:
+        slot_mapping = kwargs.get("slot_mapping")
+        if isinstance(slot_mapping, torch.Tensor):
+            load_end = int(slot_mapping.numel())
+        else:
+            load_end = end
+        tail_start = max(0, load_end - self.dsv4_optimized_tail_tokens)
+        return end > tail_start
+
+    def _should_transfer_group_to_gpu(
+        self,
+        group_idx: int,
+        start: int,
+        end: int,
+        **kwargs: object,
+    ) -> bool:
+        if not self._dsv4_optimized_layout_is_valid():
+            return True
+        assert self.metadata.kv_layer_groups_manager is not None
+        group = self.metadata.kv_layer_groups_manager.kv_layer_groups[group_idx]
+        role = self._dsv4_group_role(group)
+        if role in {"swa_cache", "compressor_state"}:
+            return self._dsv4_is_tail_transfer(start, end, **kwargs)
+        return True
+
+    def _should_defer_hca_group(self, role: str) -> bool:
+        return role == "hca_attention_kv" and self.dsv4_defer_hca_to_moe
+
+    @staticmethod
+    def _dsv4_layer_id_from_name(layer_name: str) -> Optional[int]:
+        """Extract the transformer layer id from a vLLM KV cache layer name."""
+        match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", layer_name)
+        if match is None:
+            return None
+        return int(match.group(1))
+
+    def _dsv4_hca_layer_ids_for_group(self, group: KVLayerGroupInfo) -> list[int]:
+        """Return transformer layer ids covered by one LMCache HCA group."""
+        layer_ids: list[int] = []
+        for layer_idx in group.layer_indices:
+            if layer_idx >= len(self._kv_cache_layer_names):
+                continue
+            layer_id = self._dsv4_layer_id_from_name(
+                self._kv_cache_layer_names[layer_idx]
+            )
+            if layer_id is not None:
+                layer_ids.append(layer_id)
+        return layer_ids
+
+    def _prepare_hca_defer_for_group(
+        self,
+        group_idx: int,
+        group: KVLayerGroupInfo,
+        memory_tensor: torch.Tensor,
+        start: int,
+        end: int,
+        role: str,
+        **kwargs: object,
+    ) -> bool:
+        """Seed HCA flat store from this retrieve chunk and skip normal H2D."""
+        if not self._should_defer_hca_group(role):
+            return False
+        self._update_hma_metadata(**kwargs)
+        layer_ids = self._dsv4_hca_layer_ids_for_group(group)
+        if not layer_ids:
+            if not self._dsv4_hca_defer_fallback_logged:
+                logger.info(
+                    "LMCACHE_DSV4_DEFER_HCA_TO_MOE=1 but HCA layer ids could "
+                    "not be resolved for LMCache group %d; keeping normal H2D",
+                    group_idx,
+                )
+                self._dsv4_hca_defer_fallback_logged = True
+            return False
+        try:
+            from lmcache.v1.hca_prefetch_manager import get_hca_prefetch_manager
+        except ImportError:
+            return False
+        manager = get_hca_prefetch_manager()
+        if manager is None:
+            if not self._dsv4_hca_defer_fallback_logged:
+                logger.info(
+                    "LMCACHE_DSV4_DEFER_HCA_TO_MOE=1 but no HCA prefetch "
+                    "manager is attached; keeping normal H2D"
+                )
+                self._dsv4_hca_defer_fallback_logged = True
+            return False
+        seed = getattr(manager, "seed_range_from_lmcache_group", None)
+        if not callable(seed):
+            return False
+        seeded = seed(layer_ids, memory_tensor, start, end)
+        if seeded <= 0:
+            if not self._dsv4_hca_defer_fallback_logged:
+                logger.info(
+                    "LMCACHE_DSV4_DEFER_HCA_TO_MOE=1 but HCA LMCache chunk "
+                    "could not seed the flat store; keeping normal H2D"
+                )
+                self._dsv4_hca_defer_fallback_logged = True
+            return False
+        if not self._dsv4_hca_defer_logged:
+            logger.info(
+                "LMCACHE_DSV4_DEFER_HCA_TO_MOE=1: seeded HCA flat store "
+                "directly from LMCache retrieve and deferred normal HCA H2D"
+            )
+            self._dsv4_hca_defer_logged = True
+        return True
+
+    def _group_shape_for_tokens(
+        self, group: KVLayerGroupInfo, num_tokens: int
+    ) -> torch.Size:
+        """Return this KV group's LMCache memory shape for logical tokens."""
+        compress_ratio = group.compress_ratio
+        if num_tokens % compress_ratio != 0:
+            raise ValueError(
+                f"num_tokens ({num_tokens}) is not a multiple of "
+                f"compress_ratio ({compress_ratio})"
+            )
+        return torch.Size(
+            [
+                group.shape_desc.kv_size,
+                group.num_layers,
+                num_tokens // compress_ratio,
+                group.hidden_dim_size,
+            ]
+        )
+
+    def _group_tmp_view(
+        self, group_idx: int, shape: Optional[torch.Size] = None
+    ) -> torch.Tensor:
+        """Return a typed view into the temporary flat GPU buffer."""
+        assert self.group_tmp_buffer_flat is not None
+        assert self.metadata.kv_layer_groups_manager is not None
+        group = self.metadata.kv_layer_groups_manager.kv_layer_groups[group_idx]
+        start = self.group_tmp_buffer_offsets[group_idx]
+        group_capacity = self.group_tmp_buffer_offsets[group_idx + 1] - start
+        if shape is None:
+            shape = self._group_shape_for_tokens(group, self.chunk_size)
+        byte_size = shape.numel() * group.dtype.itemsize
+        if byte_size > group_capacity:
+            raise ValueError(
+                f"temporary buffer for KV group {group_idx} is too small: "
+                f"need {byte_size} bytes, capacity {group_capacity} bytes"
+            )
+        end = start + byte_size
+        return self.group_tmp_buffer_flat[start:end].view(group.dtype).view(shape)
+
+    @staticmethod
+    def _normalize_hma_block_ids(block_ids: Any) -> tuple[list[int], ...]:
+        """Normalize vLLM HMA block ids into ``tuple[group][block]`` form."""
+        if block_ids is None:
+            return ()
+        if isinstance(block_ids, tuple):
+            return tuple(list(group) for group in block_ids)
+        if isinstance(block_ids, list):
+            if block_ids and all(isinstance(group, list) for group in block_ids):
+                return tuple(list(group) for group in block_ids)
+            return (list(block_ids),)
+        return ()
+
+    @staticmethod
+    def _normalize_name_groups(names: Any) -> tuple[tuple[str, ...], ...]:
+        if not isinstance(names, Sequence) or isinstance(names, (str, bytes)):
+            return ()
+        normalized: list[tuple[str, ...]] = []
+        for group in names:
+            if not isinstance(group, Sequence) or isinstance(group, (str, bytes)):
+                return ()
+            normalized.append(tuple(str(name) for name in group))
+        return tuple(normalized)
+
+    @staticmethod
+    def _normalize_int_tuple(values: Any) -> tuple[int, ...]:
+        if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+            return ()
+        try:
+            return tuple(int(value) for value in values)
+        except (TypeError, ValueError):
+            return ()
+
+    def _update_hma_metadata(self, **kwargs: object) -> None:
+        """Refresh vLLM HMA group metadata passed by the adapter."""
+        layer_names = kwargs.get("kv_cache_layer_names")
+        if isinstance(layer_names, Sequence) and not isinstance(
+            layer_names, (str, bytes)
+        ):
+            self._kv_cache_layer_names = tuple(str(name) for name in layer_names)
+
+        group_names = self._normalize_name_groups(
+            kwargs.get("vllm_kv_cache_group_layer_names")
+        )
+        if group_names:
+            self._layer_name_to_vllm_group = {
+                name: group_idx
+                for group_idx, names in enumerate(group_names)
+                for name in names
+            }
+
+        group_block_sizes = self._normalize_int_tuple(
+            kwargs.get("vllm_kv_cache_group_block_sizes")
+        )
+        if group_block_sizes:
+            self._vllm_group_block_sizes = group_block_sizes
+
+        if (
+            not self._hma_layout_logged
+            and self._kv_cache_layer_names
+            and self._layer_name_to_vllm_group
+            and self._vllm_group_block_sizes
+        ):
+            logger.info(
+                "VLLMPagedMemGPUConnectorV3 captured HMA transfer metadata: "
+                "kv_cache_layers=%d, vllm_groups=%d, block_sizes=%s",
+                len(self._kv_cache_layer_names),
+                len(self._vllm_group_block_sizes),
+                list(self._vllm_group_block_sizes),
+            )
+            self._hma_layout_logged = True
+
+    def _vllm_group_for_lmcache_group(self, group_idx: int) -> Optional[int]:
+        """Map an LMCache transfer group to its vLLM HMA kv_cache_group."""
+        if not self._kv_cache_layer_names or not self._layer_name_to_vllm_group:
+            return None
+        assert self.metadata.kv_layer_groups_manager is not None
+        group = self.metadata.kv_layer_groups_manager.kv_layer_groups[group_idx]
+        for layer_idx in group.layer_indices:
+            if layer_idx >= len(self._kv_cache_layer_names):
+                continue
+            layer_name = self._kv_cache_layer_names[layer_idx]
+            if layer_name in self._layer_name_to_vllm_group:
+                return self._layer_name_to_vllm_group[layer_name]
+        return None
+
+    def _hma_block_ids_for_group(
+        self,
+        group_idx: int,
+        start: int,
+        end: int,
+        **kwargs: object,
+    ) -> Optional[tuple[torch.Tensor, int]]:
+        """Return engine-logical block ids from vLLM HMA metadata.
+
+        LMCache stores one logical chunk per object. For DSv4 HMA, each
+        transfer group must use the vLLM block table and block size that owns
+        that layer group. Same-shaped tensors can have different HMA semantics,
+        so using group 0 for every group corrupts full-hit restore.
+        """
+        self._update_hma_metadata(**kwargs)
+        block_ids_by_group = self._normalize_hma_block_ids(
+            kwargs.get("block_ids_by_group")
+        )
+        if not block_ids_by_group:
+            return None
+
+        vllm_group_idx = self._vllm_group_for_lmcache_group(group_idx)
+        if vllm_group_idx is None:
+            vllm_group_idx = 0
+        if vllm_group_idx >= len(block_ids_by_group):
+            raise ValueError(
+                f"LMCache KV group {group_idx} maps to vLLM HMA group "
+                f"{vllm_group_idx}, but only {len(block_ids_by_group)} block-id "
+                "groups were provided"
+            )
+        if not block_ids_by_group[vllm_group_idx]:
+            return None
+        logical_block_size = int(
+            self.layout_hints.get(
+                "inference_engine_logical_block_size",
+                self.block_size,
+            )
+        )
+        if self._vllm_group_block_sizes:
+            logical_block_size = self._vllm_group_block_sizes[vllm_group_idx]
+        if logical_block_size <= 0:
+            raise ValueError(
+                f"Invalid vLLM HMA logical block size {logical_block_size}"
+            )
+        if start % logical_block_size != 0 or end % logical_block_size != 0:
+            raise ValueError(
+                f"LMCache transfer [{start}, {end}) is not aligned to vLLM "
+                f"HMA logical block_size {logical_block_size}"
+            )
+
+        block_start = start // logical_block_size
+        block_end = end // logical_block_size
+        selected = block_ids_by_group[vllm_group_idx][block_start:block_end]
+        expected = block_end - block_start
+        if len(selected) != expected:
+            raise ValueError(
+                f"Insufficient vLLM HMA block ids for LMCache group {group_idx}: "
+                f"vllm_group={vllm_group_idx}, range=[{start}, {end}), "
+                f"block_size={logical_block_size}, need={expected}, "
+                f"available={len(block_ids_by_group[vllm_group_idx])}"
+            )
+        return (
+            torch.tensor(selected, dtype=torch.long, device=self.device),
+            logical_block_size,
+        )
+
+    def _slot_mapping_to_block_ids(
+        self,
+        slot_mapping: torch.Tensor,
+        start: int,
+        end: int,
+    ) -> torch.Tensor:
+        token_slots = slot_mapping[start:end]
+        if token_slots.numel() == 0:
+            return torch.empty(0, dtype=torch.long, device=self.device)
+        valid = token_slots >= 0
+        if not bool(valid.all().item()):
+            raise ValueError(
+                "VLLMPagedMemGPUConnectorV3 block transfer does not support "
+                "negative slot_mapping entries inside a transferred chunk"
+            )
+        logical_block_size = int(
+            self.layout_hints.get(
+                "inference_engine_logical_block_size",
+                self.block_size,
+            )
+        )
+        if token_slots.numel() % logical_block_size != 0:
+            raise ValueError(
+                f"transfer token count {token_slots.numel()} is not aligned to "
+                f"inference_engine_logical_block_size {logical_block_size}"
+            )
+        block_slots = token_slots.view(-1, logical_block_size)
+        slot_offsets = block_slots % logical_block_size
+        expected_offsets = torch.arange(
+            logical_block_size,
+            dtype=token_slots.dtype,
+            device=token_slots.device,
+        )
+        if not bool(torch.equal(slot_offsets, expected_offsets.expand_as(slot_offsets))):
+            raise ValueError(
+                "VLLMPagedMemGPUConnectorV3 block transfer requires contiguous "
+                "slot offsets within each inference-engine block"
+            )
+        block_starts = block_slots[:, 0]
+        block_ids = block_starts // logical_block_size
+        return block_ids.to(device=self.device, dtype=torch.long, non_blocking=True)
+
+    def _transfer_group(
+        self,
+        group_idx: int,
+        memory_tensor: torch.Tensor,
+        block_ids: torch.Tensor,
+        direction: "lmc_ops.TransferDirection",
+        skip_prefix_n_blocks: int = 0,
+    ) -> None:
+        assert self.group_kv_cache_pointers_on_gpu is not None
+        assert self.metadata.kv_layer_groups_manager is not None
+        group = self.metadata.kv_layer_groups_manager.kv_layer_groups[group_idx]
+        lmc_ops.multi_layer_block_kv_transfer(
+            self.group_kv_cache_pointers_on_gpu[group_idx],
+            [memory_tensor.data_ptr()],
+            block_ids,
+            self.device,
+            direction,
+            group.shape_desc,
+            group.physical_chunk_size,
+            self.gpu_kv_format,
+            skip_prefix_n_blocks,
+        )
+
     @_lmcache_nvtx_annotate
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         assert memory_obj.raw_tensor is not None
@@ -539,6 +1094,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         assert self.kvcaches[0].device == self.device
         self._initialize_kv_cache_pointers()
         assert self.group_kv_cache_pointers_on_gpu is not None
+        assert self.metadata.kv_layer_groups_manager is not None
 
         # avoid read/write stream race condition for shared block
         # this will only be potentially non-zero for the first
@@ -546,21 +1102,86 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         vllm_cached = kwargs.get("vllm_cached_tokens", 0)
         skip_prefix_n_tokens = min(end - start, max(0, vllm_cached - start))
 
-        for i, kv_cache_pointer in enumerate(self.group_kv_cache_pointers_on_gpu):
-            memory_obj_tensor = memory_obj.get_tensor(i)
-            assert memory_obj_tensor is not None
-            lmc_ops.multi_layer_kv_transfer(
-                memory_obj_tensor,
-                kv_cache_pointer,
-                slot_mapping[start:end],
-                self.device,
-                self.page_buffer_size,
-                lmc_ops.TransferDirection.H2D,
-                self.gpu_kv_format,
-                block_size=self.block_size,
-                head_size=self.head_size,
-                skip_prefix_n_tokens=skip_prefix_n_tokens,
-            )
+        with torch.cuda.stream(self.load_stream):
+            legacy_block_ids: Optional[torch.Tensor] = None
+            legacy_skip_prefix_n_blocks: Optional[int] = None
+            self._update_hma_metadata(**kwargs)
+            self._log_dsv4_optimized_policy_once()
+            for i in range(self.metadata.kv_layer_groups_manager.num_groups):
+                group = self.metadata.kv_layer_groups_manager.kv_layer_groups[i]
+                role = self._dsv4_group_role(group)
+                memory_obj_tensor = memory_obj.get_tensor(i)
+                assert memory_obj_tensor is not None
+                if memory_obj_tensor.numel() == 0:
+                    continue
+                if self._prepare_hca_defer_for_group(
+                    i,
+                    group,
+                    memory_obj_tensor,
+                    start,
+                    end,
+                    role,
+                    **kwargs,
+                ):
+                    continue
+                if not self._should_transfer_group_to_gpu(
+                    i,
+                    start,
+                    end,
+                    **kwargs,
+                ):
+                    continue
+                if self.use_gpu:
+                    tmp_tensor = self._group_tmp_view(i, memory_obj_tensor.shape)
+                    tmp_tensor.copy_(memory_obj_tensor, non_blocking=True)
+                    memory_obj_tensor = tmp_tensor
+                hma_block_ids = self._hma_block_ids_for_group(
+                    i,
+                    start,
+                    end,
+                    **kwargs,
+                )
+                if hma_block_ids is None:
+                    if legacy_block_ids is None:
+                        logical_block_size = int(
+                            self.layout_hints.get(
+                                "inference_engine_logical_block_size",
+                                self.block_size,
+                            )
+                        )
+                        if skip_prefix_n_tokens % logical_block_size != 0:
+                            raise ValueError(
+                                f"skip_prefix_n_tokens {skip_prefix_n_tokens} "
+                                "is not aligned to "
+                                "inference_engine_logical_block_size "
+                                f"{logical_block_size}"
+                            )
+                        legacy_block_ids = self._slot_mapping_to_block_ids(
+                            slot_mapping,
+                            start,
+                            end,
+                        )
+                        legacy_skip_prefix_n_blocks = (
+                            skip_prefix_n_tokens // logical_block_size
+                        )
+                    block_ids = legacy_block_ids
+                    skip_prefix_n_blocks = legacy_skip_prefix_n_blocks
+                else:
+                    block_ids, group_block_size = hma_block_ids
+                    if skip_prefix_n_tokens % group_block_size != 0:
+                        raise ValueError(
+                            f"skip_prefix_n_tokens {skip_prefix_n_tokens} is not "
+                            f"aligned to HMA group block_size {group_block_size}"
+                        )
+                    skip_prefix_n_blocks = skip_prefix_n_tokens // group_block_size
+                assert skip_prefix_n_blocks is not None
+                self._transfer_group(
+                    i,
+                    memory_obj_tensor,
+                    block_ids,
+                    lmc_ops.TransferDirection.H2D,
+                    skip_prefix_n_blocks,
+                )
 
     @_lmcache_nvtx_annotate
     def from_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
@@ -573,45 +1194,41 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         assert self.kvcaches[0].device == self.device
         self._initialize_kv_cache_pointers()
         assert self.group_kv_cache_pointers_on_gpu is not None
+        assert self.metadata.kv_layer_groups_manager is not None
         with torch.cuda.stream(self.store_stream):
-            if not self.use_gpu or end - start != self.chunk_size:
-                for i, kv_cache_pointer in enumerate(
-                    self.group_kv_cache_pointers_on_gpu
-                ):
-                    memory_obj_tensor = memory_obj.get_tensor(i)
-                    assert memory_obj_tensor is not None
-                    lmc_ops.multi_layer_kv_transfer(
-                        memory_obj_tensor,
-                        kv_cache_pointer,
-                        slot_mapping[start:end],
-                        self.device,
-                        self.page_buffer_size,
-                        lmc_ops.TransferDirection.D2H,
-                        self.gpu_kv_format,
-                        block_size=self.block_size,
-                        head_size=self.head_size,
-                    )
-            else:
-                # kvcaches -> gpu_buffer -> memobj
-                assert self.group_tmp_buffer is not None
-                for i, kv_cache_pointer in enumerate(
-                    self.group_kv_cache_pointers_on_gpu
-                ):
-                    tmp_gpu_buffer = self.group_tmp_buffer[i][:, :, : end - start, :]
-                    lmc_ops.multi_layer_kv_transfer(
-                        tmp_gpu_buffer,
-                        kv_cache_pointer,
-                        slot_mapping[start:end],
-                        self.device,
-                        self.page_buffer_size,
-                        lmc_ops.TransferDirection.D2H,
-                        self.gpu_kv_format,
-                        block_size=self.block_size,
-                        head_size=self.head_size,
-                    )
-                    memory_obj_tensor = memory_obj.get_tensor(i)
-                    assert memory_obj_tensor is not None
-                    memory_obj_tensor.copy_(tmp_gpu_buffer, non_blocking=True)
+            legacy_block_ids: Optional[torch.Tensor] = None
+            for i in range(self.metadata.kv_layer_groups_manager.num_groups):
+                dst_tensor = memory_obj.get_tensor(i)
+                assert dst_tensor is not None
+                if dst_tensor.numel() == 0:
+                    continue
+                memory_obj_tensor = dst_tensor
+                if self.use_gpu:
+                    memory_obj_tensor = self._group_tmp_view(i, dst_tensor.shape)
+                hma_block_ids = self._hma_block_ids_for_group(
+                    i,
+                    start,
+                    end,
+                    **kwargs,
+                )
+                if hma_block_ids is None:
+                    if legacy_block_ids is None:
+                        legacy_block_ids = self._slot_mapping_to_block_ids(
+                            slot_mapping,
+                            start,
+                            end,
+                        )
+                    block_ids = legacy_block_ids
+                else:
+                    block_ids, _ = hma_block_ids
+                self._transfer_group(
+                    i,
+                    memory_obj_tensor,
+                    block_ids,
+                    lmc_ops.TransferDirection.D2H,
+                )
+                if self.use_gpu:
+                    dst_tensor.copy_(memory_obj_tensor, non_blocking=True)
 
         if not memory_obj.raw_tensor.is_cuda:
             # Force a synchronize if the target buffer is NOT CUDA device

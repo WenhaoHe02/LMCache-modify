@@ -36,6 +36,20 @@ from lmcache.v1.plugin.runtime_plugin_launcher import RuntimePluginLauncher
 logger = init_logger(__name__)
 
 
+def _engine_logical_block_size(vllm_config: "VllmConfig") -> int:
+    """Return the token-addressed block size used by vLLM HMA scheduling."""
+    kv_cache_config = getattr(vllm_config, "_kv_cache_config", None)
+    groups = getattr(kv_cache_config, "kv_cache_groups", ()) or ()
+    if groups:
+        spec = getattr(groups[0], "kv_cache_spec", None)
+        block_size = int(
+            getattr(spec, "block_size", vllm_config.cache_config.block_size)
+        )
+        if block_size > 0:
+            return block_size
+    return int(vllm_config.cache_config.block_size)
+
+
 class VllmServiceFactory(BaseServiceFactory):
     """Creates LMCache service components for vLLM integration.
 
@@ -200,11 +214,19 @@ class VllmServiceFactory(BaseServiceFactory):
             # First Party
             from lmcache.integration.vllm.utils import vllm_layout_hints
 
+            layout_hints = vllm_layout_hints()
+            layout_hints["inference_engine_logical_block_size"] = (
+                _engine_logical_block_size(self.vllm_config)
+            )
+            if self.lmcache_config.extra_config is not None:
+                layout_hints["lmcache_extra_config"] = dict(
+                    self.lmcache_config.extra_config
+                )
             vllm_gpu_connector = CreateGPUConnector(
                 self.lmcache_config,
                 self.metadata,
                 EngineType.VLLM,
-                layout_hints=vllm_layout_hints(),
+                layout_hints=layout_hints,
             )
 
         engine = LMCacheEngineBuilder.get_or_create(

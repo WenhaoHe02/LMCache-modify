@@ -89,17 +89,25 @@ class LMCacheMetadata:
         if klg_manager is not None and klg_manager.kv_layer_groups:
             # Read kv_size from each group's shape_desc rather than self.use_mla
             # so heterogeneous groups (should any ever co-exist) are handled.
-            return [
-                torch.Size(
-                    [
-                        group.shape_desc.kv_size,
-                        group.num_layers,
-                        num_tokens,
-                        group.hidden_dim_size,
-                    ]
+            shapes = []
+            for idx, group in enumerate(klg_manager.kv_layer_groups):
+                compress_ratio = group.compress_ratio
+                if num_tokens % compress_ratio != 0:
+                    raise ValueError(
+                        f"num_tokens ({num_tokens}) is not a multiple of "
+                        f"compress_ratio ({compress_ratio}) for KV group {idx}"
+                    )
+                shapes.append(
+                    torch.Size(
+                        [
+                            group.shape_desc.kv_size,
+                            group.num_layers,
+                            num_tokens // compress_ratio,
+                            group.hidden_dim_size,
+                        ]
+                    )
                 )
-                for group in klg_manager.kv_layer_groups
-            ]
+            return shapes
         return [
             torch.Size(
                 [

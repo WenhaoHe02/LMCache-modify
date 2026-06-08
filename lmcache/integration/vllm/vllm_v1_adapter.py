@@ -59,6 +59,487 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+_INDEXER_PREFETCH_MANAGER: Any = None
+_HCA_PREFETCH_MANAGER: Any = None
+
+
+def _normalize_block_ids_by_group(
+    block_ids: Optional[Union[tuple[list[int], ...], list[int], list[list[int]]]],
+) -> tuple[list[int], ...]:
+    """Normalize vLLM block ids into ``tuple[group][block]`` form."""
+    if block_ids is None:
+        return ()
+    if len(block_ids) == 0:
+        return ()
+    if isinstance(block_ids, tuple):
+        return tuple(list(group) for group in block_ids)
+    if isinstance(block_ids, list):
+        if block_ids and all(isinstance(group, list) for group in block_ids):
+            return tuple(list(group) for group in block_ids)
+        return (list(block_ids),)
+    raise ValueError(f"Unsupported block_ids type {type(block_ids)}")
+
+
+def _select_primary_block_ids(
+    block_ids_by_group: tuple[list[int], ...],
+    num_tokens: int,
+    block_size: Optional[int],
+) -> list[int]:
+    """Pick the KV group that can represent the original token sequence.
+
+    Under vLLM HMA, DSv4 exposes several KV cache groups. The first vLLM
+    group is the canonical full-MLA group and carries the engine-logical token
+    block size. LMCache's legacy ``slot_mapping`` is still token-addressed
+    with that block size, so using ``vllm_config.cache_config.block_size``
+    directly can be wrong when the global config reports the smallest
+    compressed-group block size.
+    """
+    if not block_ids_by_group:
+        return []
+    if block_size is not None:
+        for group in block_ids_by_group:
+            if len(group) * block_size >= num_tokens:
+                return list(group)
+    return list(block_ids_by_group[0])
+
+
+def _engine_logical_block_size(vllm_config: Any, parent: Any) -> int:
+    """Return the token-addressed vLLM block size used by LMCache metadata."""
+    override = os.environ.get("LMCACHE_ENGINE_LOGICAL_BLOCK_SIZE")
+    if override:
+        try:
+            value = int(override)
+        except ValueError:
+            logger.warning(
+                "Invalid LMCACHE_ENGINE_LOGICAL_BLOCK_SIZE=%r; ignoring",
+                override,
+            )
+        else:
+            if value > 0:
+                return value
+
+    cache_config = getattr(vllm_config, "cache_config", None)
+    fallback = int(getattr(cache_config, "block_size", 0) or 0)
+
+    kv_cache_config = getattr(parent, "_kv_cache_config", None)
+    groups = getattr(kv_cache_config, "kv_cache_groups", ()) or ()
+    if not groups:
+        groups = getattr(cache_config, "kv_cache_groups", ()) or ()
+
+    group_block_sizes: list[int] = []
+    for group in groups:
+        spec = getattr(group, "kv_cache_spec", None)
+        block_size = int(getattr(spec, "block_size", 0) or 0)
+        if block_size > 0:
+            group_block_sizes.append(block_size)
+
+    if group_block_sizes:
+        logical_block_size = group_block_sizes[0]
+        if fallback > 0 and logical_block_size != fallback:
+            logger.info(
+                "LMCache using vLLM HMA group0 block_size=%d as the "
+                "engine-logical block size; cache_config.block_size=%d",
+                logical_block_size,
+                fallback,
+            )
+        return logical_block_size
+
+    if fallback <= 0:
+        raise ValueError("vLLM cache_config.block_size must be a positive integer")
+    return fallback
+
+
+def _indexer_prefetch_enabled() -> bool:
+    """Return whether SSD-backed indexer prefetch is explicitly enabled."""
+    value = os.environ.get("LMCACHE_INDEXER_ENABLE_PREFETCH", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _hca_prefetch_enabled() -> bool:
+    """Return whether deterministic HCA prefetch is explicitly enabled."""
+    value = os.environ.get("LMCACHE_HCA_ENABLE_PREFETCH", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _hca_decode_hook_enabled() -> bool:
+    """Return whether the legacy HCA decode hook is explicitly enabled."""
+    value = os.environ.get("LMCACHE_HCA_ENABLE_DECODE_HOOK", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _hca_pinned_bounce_enabled() -> bool:
+    """Return whether transient pinned-bounce HCA I/O may run.
+
+    CPU pinned memory is allowed only as a temporary I/O buffer. It is not an
+    LMCache tier, resident set, or cache-hit source.
+    """
+    value = os.environ.get("LMCACHE_HCA_ENABLE_PINNED_BOUNCE", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    """Parse an integer environment variable with a safe fallback."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("Invalid integer for %s=%r; using %d", name, value, default)
+        return default
+
+
+def _deepseek_decoder_registries() -> list[Any]:
+    """Return vLLM DeepSeek decoder registries that are present in-process."""
+    registry_specs = (
+        (
+            "vllm.models.deepseek_v4.nvidia.model",
+            "_DEEPSEEK_V4_DECODER_LAYER_REGISTRY",
+        ),
+        (
+            "vllm.models.deepseek_v4.amd.model",
+            "_DEEPSEEK_V4_DECODER_LAYER_REGISTRY",
+        ),
+        (
+            "vllm.model_executor.models.deepseek_v4",
+            "_DEEPSEEK_V4_DECODER_LAYER_REGISTRY",
+        ),
+    )
+    registries: list[Any] = []
+    for module_name, registry_name in registry_specs:
+        try:
+            module = __import__(module_name, fromlist=[registry_name])
+        except ImportError:
+            continue
+        registry = getattr(module, registry_name, None)
+        if registry is not None:
+            registries.append(registry)
+    return registries
+
+
+def _decoder_csa_indexer(decoder_layer: Any) -> Any:
+    """Return the SparseAttnIndexer op owned by a DeepSeek decoder layer."""
+    attn = getattr(decoder_layer, "self_attn", None)
+    if attn is None:
+        attn = getattr(decoder_layer, "attn", None)
+    indexer = getattr(attn, "indexer", None)
+    return getattr(indexer, "indexer_op", None)
+
+
+def _decoder_hca_attention(decoder_layer: Any) -> Any:
+    """Return the HCA MLA attention object owned by a DeepSeek decoder layer."""
+    attn = getattr(decoder_layer, "self_attn", None)
+    if attn is None:
+        attn = getattr(decoder_layer, "attn", None)
+    if attn is None:
+        return None
+    wrapper = getattr(attn, "mla_attn", None)
+    candidates = [
+        getattr(wrapper, "mla_attn", None),
+        wrapper,
+        attn,
+    ]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        compress_ratio = int(getattr(candidate, "compress_ratio", 1))
+        kv_cache = getattr(candidate, "kv_cache", None)
+        if compress_ratio == 128 and isinstance(kv_cache, torch.Tensor):
+            return candidate
+    return None
+
+
+def _compressed_slot_mapping(
+    slot_mapping: torch.Tensor,
+    seq_len: int,
+    compress_ratio: int,
+    compressed_block_size: int,
+) -> torch.Tensor:
+    """Map logical token slots to compressed IndexerCache slots."""
+    compressed_len = seq_len // compress_ratio
+    if compressed_len <= 0:
+        return torch.empty(0, dtype=torch.long)
+    token_positions = torch.arange(
+        compress_ratio - 1,
+        seq_len,
+        compress_ratio,
+        dtype=torch.long,
+    )
+    if token_positions.numel() > compressed_len:
+        token_positions = token_positions[:compressed_len]
+    token_slots = slot_mapping[:seq_len].to(device="cpu", dtype=torch.long)
+    token_slots = token_slots[token_positions]
+    valid = token_slots >= 0
+    compressed_slots = torch.full_like(token_slots, -1)
+    if bool(valid.any().item()):
+        logical_block_size = compressed_block_size * compress_ratio
+        block_numbers = token_slots[valid] // logical_block_size
+        block_offsets = token_slots[valid] % logical_block_size
+        compressed_slots[valid] = (
+            block_numbers * compressed_block_size
+            + block_offsets // compress_ratio
+        )
+    return compressed_slots
+
+
+def _attach_indexer_prefetch() -> None:
+    """Attach SSD-backed CSA indexer prefetch when enabled by environment."""
+    global _INDEXER_PREFETCH_MANAGER
+
+    if not _indexer_prefetch_enabled():
+        return
+
+    base_store_dir = os.environ.get("LMCACHE_INDEXER_SSD_DIR", "")
+    if not base_store_dir:
+        logger.warning(
+            "LMCACHE_INDEXER_ENABLE_PREFETCH is set, but "
+            "LMCACHE_INDEXER_SSD_DIR is empty; skipping CSA prefetch"
+        )
+        return
+
+    rank_suffix = os.environ.get("LOCAL_RANK") or os.environ.get("RANK") or "0"
+    store_dir = os.path.join(base_store_dir, f"rank_{rank_suffix}")
+
+    try:
+        from lmcache.v1.indexer_ssd_manager import IndexerSSDManager
+    except ImportError as exc:
+        logger.warning("IndexerSSDManager is unavailable: %s", exc)
+        return
+
+    decoder_layers: list[Any] = []
+    seen: set[int] = set()
+    for registry in _deepseek_decoder_registries():
+        for decoder_layer in list(registry):
+            obj_id = id(decoder_layer)
+            if obj_id in seen:
+                continue
+            seen.add(obj_id)
+            decoder_layers.append(decoder_layer)
+
+    if not decoder_layers:
+        logger.warning(
+            "CSA prefetch requested, but no registered DeepSeek decoder "
+            "layers were found"
+        )
+        return
+
+    csa_info: list[tuple[int, Any]] = []
+    for decoder_layer in decoder_layers:
+        layer_id = getattr(decoder_layer, "layer_idx", -1)
+        indexer_op = _decoder_csa_indexer(decoder_layer)
+        if isinstance(layer_id, int) and layer_id >= 0 and indexer_op is not None:
+            csa_info.append((layer_id, indexer_op))
+
+    if not csa_info:
+        logger.warning(
+            "CSA prefetch requested, but registered DeepSeek decoder layers "
+            "have no CSA indexers"
+        )
+        return
+
+    csa_info.sort(key=lambda item: item[0])
+    csa_layer_ids = [layer_id for layer_id, _ in csa_info]
+
+    token_bytes = 144
+    device = torch.device("cuda")
+    for _, indexer_op in csa_info:
+        kv_cache = getattr(getattr(indexer_op, "k_cache", None), "kv_cache", None)
+        if isinstance(kv_cache, torch.Tensor) and kv_cache.numel() > 0:
+            token_bytes = int(kv_cache.shape[-1])
+            device = kv_cache.device
+            break
+
+    pool_size = int(os.environ.get("LMCACHE_INDEXER_POOL_SIZE", "2048"))
+    io_workers = int(os.environ.get("LMCACHE_INDEXER_IO_WORKERS", "8"))
+    max_seq_len = int(os.environ.get("LMCACHE_INDEXER_MAX_SEQ_LEN", "131072"))
+
+    manager = IndexerSSDManager(
+        csa_layer_ids=csa_layer_ids,
+        store_dir=store_dir,
+        pool_size=pool_size,
+        token_bytes=token_bytes,
+        max_seq_len=max_seq_len,
+        io_workers=io_workers,
+        device=device,
+    )
+
+    for layer_id, indexer_op in csa_info:
+        indexer_op.ssd_manager = manager
+        indexer_op.csa_layer_id = layer_id
+
+    _INDEXER_PREFETCH_MANAGER = manager
+
+    for decoder_layer in decoder_layers:
+        layer_id = getattr(decoder_layer, "layer_idx", -1)
+        if isinstance(layer_id, int) and layer_id >= 0:
+            register = getattr(manager, "register_decoder_layer", None)
+            if callable(register):
+                register(layer_id, decoder_layer)
+
+    attached_decoders = 0
+    for decoder_layer in decoder_layers:
+        decoder_layer_id = getattr(decoder_layer, "layer_idx", -1)
+        next_csa = next(
+            (
+                csa_layer_id
+                for csa_layer_id in csa_layer_ids
+                if csa_layer_id > decoder_layer_id
+            ),
+            -1,
+        )
+        attach = getattr(decoder_layer, "attach_indexer_prefetch", None)
+        if callable(attach):
+            attach(manager, next_csa)
+            attached_decoders += 1
+
+    if attached_decoders != len(decoder_layers):
+        logger.warning(
+            "CSA prefetch requested, but only %d/%d DeepSeek decoder layers "
+            "expose attach_indexer_prefetch(); FFN-window prefetch may be "
+            "disabled for the remaining layers",
+            attached_decoders,
+            len(decoder_layers),
+        )
+
+    logger.info(
+        "IndexerSSDManager: enabled CSA prefetch on %d decoder layers and "
+        "attached %d CSA indexers, pool_size=%d, store=%s",
+        attached_decoders,
+        len(csa_layer_ids),
+        pool_size,
+        store_dir,
+    )
+
+
+def _attach_hca_prefetch() -> None:
+    """Attach transient pinned-bounce HCA prefetch when enabled.
+
+    HCA rows are deterministic for a reused prefix, so the request may submit
+    their SSD/NVMe reads as soon as the current request's compressed slot
+    mapping is known. vLLM drains the read before the target HCA attention.
+    This path may use CPU pinned memory only as a transient bounce buffer;
+    pinned payloads must not be treated as cache residency or hit state.
+    """
+    global _HCA_PREFETCH_MANAGER
+
+    if not _hca_prefetch_enabled():
+        return
+    if not _hca_pinned_bounce_enabled():
+        logger.info(
+            "LMCACHE_HCA_ENABLE_PREFETCH=1 but no GPU-direct path is wired in "
+            "this build. Set LMCACHE_HCA_ENABLE_PINNED_BOUNCE=1 to use a "
+            "transient pinned I/O buffer; it is not a CPU KV cache."
+        )
+        return
+
+    base_store_dir = os.environ.get("LMCACHE_HCA_SSD_DIR", "")
+    if not base_store_dir:
+        indexer_dir = os.environ.get("LMCACHE_INDEXER_SSD_DIR", "")
+        if indexer_dir:
+            base_store_dir = os.path.join(indexer_dir, "hca")
+    if not base_store_dir:
+        logger.warning(
+            "LMCACHE_HCA_ENABLE_PREFETCH is set, but neither "
+            "LMCACHE_HCA_SSD_DIR nor LMCACHE_INDEXER_SSD_DIR is set; "
+            "skipping HCA prefetch"
+        )
+        return
+
+    try:
+        from lmcache.v1.hca_prefetch_manager import HCAPrefetchManager
+    except ImportError as exc:
+        logger.warning("HCAPrefetchManager is unavailable: %s", exc)
+        return
+
+    decoder_layers: list[Any] = []
+    seen: set[int] = set()
+    for registry in _deepseek_decoder_registries():
+        for decoder_layer in list(registry):
+            obj_id = id(decoder_layer)
+            if obj_id in seen:
+                continue
+            seen.add(obj_id)
+            decoder_layers.append(decoder_layer)
+
+    if not decoder_layers:
+        logger.warning(
+            "HCA prefetch requested, but no registered DeepSeek decoder "
+            "layers were found"
+        )
+        return
+
+    hca_info: list[tuple[int, Any]] = []
+    for decoder_layer in decoder_layers:
+        layer_id = getattr(decoder_layer, "layer_idx", -1)
+        hca_layer = _decoder_hca_attention(decoder_layer)
+        if isinstance(layer_id, int) and layer_id >= 0 and hca_layer is not None:
+            hca_info.append((layer_id, hca_layer))
+
+    if not hca_info:
+        logger.warning(
+            "HCA prefetch requested, but registered DeepSeek decoder layers "
+            "have no compress_ratio=128 HCA attention caches"
+        )
+        return
+
+    hca_info.sort(key=lambda item: item[0])
+    hca_layer_ids = [layer_id for layer_id, _ in hca_info]
+    rank_suffix = os.environ.get("LOCAL_RANK") or os.environ.get("RANK") or "0"
+    store_dir = os.path.join(base_store_dir, f"rank_{rank_suffix}")
+
+    manager = HCAPrefetchManager(
+        store_dir=store_dir,
+        max_seq_len=_env_int(
+            "LMCACHE_HCA_MAX_SEQ_LEN",
+            _env_int("LMCACHE_INDEXER_MAX_SEQ_LEN", 131072),
+        ),
+        io_workers=_env_int(
+            "LMCACHE_HCA_IO_WORKERS",
+            _env_int("LMCACHE_INDEXER_IO_WORKERS", 8),
+        ),
+        resident_budget_blocks=_env_int("LMCACHE_HCA_RESIDENT_BUDGET_BLOCKS", 0),
+        prefetch_window_tokens=_env_int("LMCACHE_HCA_PREFETCH_WINDOW_TOKENS", 0),
+    )
+    for layer_id, hca_layer in hca_info:
+        manager.register_hca_layer(layer_id, hca_layer)
+
+    attached_decoders = 0
+    hca_set = set(hca_layer_ids)
+    for decoder_layer in decoder_layers:
+        decoder_layer_id = getattr(decoder_layer, "layer_idx", -1)
+        if not isinstance(decoder_layer_id, int) or decoder_layer_id < 0:
+            continue
+        current_hca = decoder_layer_id if decoder_layer_id in hca_set else -1
+        next_hca = next(
+            (
+                hca_layer_id
+                for hca_layer_id in hca_layer_ids
+                if hca_layer_id > decoder_layer_id
+            ),
+            -1,
+        )
+        attach = getattr(decoder_layer, "attach_hca_prefetch", None)
+        if callable(attach):
+            attach(manager, current_hca, next_hca)
+            attached_decoders += 1
+
+    if attached_decoders == 0:
+        logger.warning(
+            "HCA prefetch requested, but DeepSeek decoder layers do not expose "
+            "attach_hca_prefetch(); attention-drain HCA overlap is disabled"
+        )
+        return
+
+    _HCA_PREFETCH_MANAGER = manager
+    logger.info(
+        "HCAPrefetchManager: enabled pinned-transient HCA state; "
+        "decoder_hooks=%d HCA caches=%d store=%s",
+        attached_decoders,
+        len(hca_layer_ids),
+        store_dir,
+    )
+
+
 @dataclass
 class LoadSpec:
     # Number of tokens cached in vLLM
@@ -119,6 +600,9 @@ class RequestTracker:
     # The block ids that has been allocated so far
     # NOTE: allocated blocks could be more than the number of tokens
     allocated_block_ids: list[int]
+    allocated_block_ids_by_group: tuple[list[int], ...] = field(
+        default_factory=tuple
+    )
 
     # The number of tokens that has been saved
     num_saved_tokens: int = 0
@@ -150,6 +634,7 @@ class RequestTracker:
         num_tokens_to_compute: int,
         lmcache_cached_tokens: int,
         skip_save: bool,
+        block_size: Optional[int] = None,
     ) -> "RequestTracker":
         """Create the request tracker from a new request.
 
@@ -168,20 +653,12 @@ class RequestTracker:
         # tuple[list[int]]
         # Need to check the type of request.block_ids
 
-        unfolded_block_ids = []
-
-        if not isinstance(new_request.block_ids[0], list):
-            unfolded_block_ids = new_request.block_ids.copy()
-        else:
-            # According to the vLLM code
-            # (https://github.com/vllm-project/vllm/blob/main/vllm/v1/core/
-            # sched/scheduler.py#L943),
-            # only one KVCacheGroup is supported in connector for now.
-
-            # TODO: Please support multiple KVCacheGroup in connector.
-            # NOTE: Also, `update` method in RequestTracker should be
-            # updated accordingly.
-            unfolded_block_ids = new_request.block_ids[0].copy()
+        block_ids_by_group = _normalize_block_ids_by_group(new_request.block_ids)
+        unfolded_block_ids = _select_primary_block_ids(
+            block_ids_by_group,
+            num_tokens_to_compute,
+            block_size,
+        )
 
         # NOTE: Initialized in `update_state_after_alloc`
         disagg_spec = tmp_disagg_tracker.pop(new_request.req_id, None)
@@ -195,6 +672,7 @@ class RequestTracker:
             prompt_len=len(new_request.prompt_token_ids),
             token_ids=new_request.prompt_token_ids[:num_tokens_to_compute].copy(),
             allocated_block_ids=unfolded_block_ids,
+            allocated_block_ids_by_group=block_ids_by_group,
             num_saved_tokens=lmcache_cached_tokens,
             disagg_spec=disagg_spec,
             mm_hashes=mm_hashes,
@@ -212,6 +690,7 @@ class RequestTracker:
         lmcache_cached_tokens: int = 0,
         vllm_cached_tokens: int = 0,
         all_token_ids: Optional[list[int]] = None,
+        block_size: Optional[int] = None,
     ) -> None:
         """Update the request tracker when a running request is
         scheduled again
@@ -220,27 +699,16 @@ class RequestTracker:
         is only used for preempted requests
         all_token_ids: the full token list from the vLLM request, used to
         restore token_ids for preempted requests to ensure chunk keys match
+        block_size: the logical vLLM block size used to select the primary HMA
+        KV group for legacy slot_mapping metadata
         """
 
-        if new_block_ids is None:
-            # https://github.com/vllm-project/vllm/commit/
-            # b029de9902aa3ac58806c8c17776c7074175b6db#
-            # diff-cafd89ce8a698a56acb24ada62831cbc7a980782f78a52d1742ba238031f296cL94
-            new_block_ids = []
-        elif len(new_block_ids) == 0:
-            new_block_ids = []
-        elif isinstance(new_block_ids, tuple):
-            new_block_ids = new_block_ids[0]
-        elif isinstance(new_block_ids, list):
-            # If input is a list, flatten it to handle potential nesting.
-            # This also correctly processes already-flat lists.
-            new_block_ids = [
-                i
-                for elem in new_block_ids
-                for i in (elem if isinstance(elem, list) else [elem])
-            ]
-        else:
-            raise ValueError(f"Unsupported new_block_ids type {type(new_block_ids)}")
+        new_block_ids_by_group = _normalize_block_ids_by_group(new_block_ids)
+        new_block_ids = _select_primary_block_ids(
+            new_block_ids_by_group,
+            len(new_token_ids),
+            block_size=block_size,
+        )
 
         if preempted:
             assert all_token_ids is not None, (
@@ -248,6 +716,7 @@ class RequestTracker:
             )
             # the block ids will change after preemption
             self.allocated_block_ids = new_block_ids
+            self.allocated_block_ids_by_group = new_block_ids_by_group
             # reset the number of saved tokens
             self.num_saved_tokens = lmcache_cached_tokens
             num_computed_tokens = max(lmcache_cached_tokens, vllm_cached_tokens)
@@ -263,6 +732,31 @@ class RequestTracker:
             self.token_ids = all_token_ids[:num_tokens_needed]
         else:
             self.allocated_block_ids.extend(new_block_ids)
+            if new_block_ids_by_group:
+                if not self.allocated_block_ids_by_group:
+                    self.allocated_block_ids_by_group = tuple(
+                        [] for _ in new_block_ids_by_group
+                    )
+                if len(new_block_ids_by_group) != len(
+                    self.allocated_block_ids_by_group
+                ):
+                    logger.warning(
+                        "Request %s KV group count changed from %d to %d; "
+                        "using current scheduler block ids",
+                        self.req_id,
+                        len(self.allocated_block_ids_by_group),
+                        len(new_block_ids_by_group),
+                    )
+                    self.allocated_block_ids_by_group = new_block_ids_by_group
+                else:
+                    self.allocated_block_ids_by_group = tuple(
+                        list(old) + list(new)
+                        for old, new in zip(
+                            self.allocated_block_ids_by_group,
+                            new_block_ids_by_group,
+                            strict=True,
+                        )
+                    )
             self.token_ids.extend(new_token_ids)
 
         # When a request is scheduled again, and the number of new tokens
@@ -280,6 +774,10 @@ class ReqMeta:
     token_ids: list[int]  # torch.Tensor
     # Slot mapping
     slot_mapping: torch.Tensor
+    # vLLM HMA block ids in kv_cache_group order. The legacy slot_mapping above
+    # is built from the full-MLA group; GPU transfer can use this richer form
+    # to address non-full groups with their own block tables.
+    block_ids_by_group: tuple[list[int], ...] = field(default_factory=tuple)
 
     # Whether is last prefill or not
     is_last_prefill: bool = False
@@ -383,15 +881,16 @@ class ReqMeta:
         num_blocks = len(tracker.allocated_block_ids)
 
         if len(token_ids) > num_blocks * block_size:
-            logger.error(
-                "The number of tokens is more than the number of blocks"
-                " for request %s. "
-                "Something might be wrong in scheduling logic!",
+            max_capacity = num_blocks * block_size
+            raise ValueError(
+                "Request %s: num_tokens=%d exceeds primary-group capacity=%d "
+                "(num_blocks=%d, block_size=%d). This means LMCache is using "
+                "the wrong vLLM HMA block-id group or block size; refusing to "
+                "truncate token_ids because that would create a false partial "
+                "SSD hit.",
                 tracker.req_id,
-            )
-            logger.error(
-                "Num tokens: %d, num blocks: %d, block size: %d",
                 len(token_ids),
+                max_capacity,
                 num_blocks,
                 block_size,
             )
@@ -426,6 +925,7 @@ class ReqMeta:
             req_id=tracker.req_id,
             token_ids=token_ids,
             slot_mapping=slot_mapping,
+            block_ids_by_group=tracker.allocated_block_ids_by_group,
             is_last_prefill=is_last_prefill,
             save_spec=save_spec,
             load_spec=load_spec,
@@ -517,7 +1017,7 @@ class LMCacheConnectorV1Impl:
         """Initialize connector-specific state variables."""
         self.async_loading = config.enable_async_loading
         self.layerwise_retrievers: list[
-            Generator[Optional[torch.Tensor], None, None]
+            tuple[Generator[Optional[torch.Tensor], None, None], ReqMeta]
         ] = []
         self._layerwise_save_storers: dict[
             str, Generator[Optional[torch.Tensor], None, None]
@@ -547,7 +1047,7 @@ class LMCacheConnectorV1Impl:
         self._check_legacy_register_kv_caches()
 
         self.kv_caches: dict[str, torch.Tensor] = {}
-        self._block_size = vllm_config.cache_config.block_size
+        self._block_size = _engine_logical_block_size(vllm_config, self._parent)
         self.load_specs: dict[str, LoadSpec] = {}
         self.kv_cache_manager: Optional["KVCacheManager"] = None
         self._request_trackers: dict[str, RequestTracker] = {}
@@ -573,6 +1073,10 @@ class LMCacheConnectorV1Impl:
         self.force_skip_save = bool(os.environ.get("LMCACHE_FORCE_SKIP_SAVE", False))
         self._requests_priority: dict[str, int] = {}
         self._invalid_block_ids: set[int] = set()
+        self._reuse_prefetch_seen: set[tuple[Any, ...]] = set()
+        self._kv_cache_layer_names: tuple[str, ...] = ()
+        self._vllm_kv_cache_group_layer_names: tuple[tuple[str, ...], ...] = ()
+        self._vllm_kv_cache_group_block_sizes: tuple[int, ...] = ()
 
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""
@@ -732,7 +1236,74 @@ class LMCacheConnectorV1Impl:
         #  not called, we should consider removing it.
         assert len(self.kv_caches) == 0 and len(kv_caches) > 0
         self.kv_caches = kv_caches
+        self._kv_cache_layer_names = tuple(kv_caches.keys())
+        self._capture_vllm_hma_layout()
         self._manager.post_init()
+        _attach_indexer_prefetch()
+        _attach_hca_prefetch()
+
+    def _capture_vllm_hma_layout(self) -> None:
+        """Capture vLLM HMA group metadata for LMCache GPU transfers."""
+        kv_cache_config = getattr(self._parent, "_kv_cache_config", None)
+        groups = getattr(kv_cache_config, "kv_cache_groups", ()) or ()
+
+        group_layer_names: list[tuple[str, ...]] = []
+        group_block_sizes: list[int] = []
+        layer_name_to_group: dict[str, int] = {}
+        layer_name_to_block_size: dict[str, int] = {}
+        for group in groups:
+            names = tuple(getattr(group, "layer_names", ()))
+            group_layer_names.append(names)
+            group_idx = len(group_layer_names) - 1
+            layer_name_to_group.update((name, group_idx) for name in names)
+            spec = getattr(group, "kv_cache_spec", None)
+            block_size = int(getattr(spec, "block_size", self._block_size))
+            group_block_sizes.append(block_size)
+            layer_name_to_block_size.update((name, block_size) for name in names)
+
+        self._vllm_kv_cache_group_layer_names = tuple(group_layer_names)
+        self._vllm_kv_cache_group_block_sizes = tuple(group_block_sizes)
+        if self.lmcache_engine is not None:
+            gpu_connector = getattr(self.lmcache_engine, "gpu_connector", None)
+            layout_hints = getattr(gpu_connector, "layout_hints", None)
+            if isinstance(layout_hints, dict) and layer_name_to_group:
+                layout_hints["vllm_kv_cache_group_ids"] = [
+                    layer_name_to_group.get(name, -1)
+                    for name in self._kv_cache_layer_names
+                ]
+                layout_hints["vllm_kv_cache_layer_block_sizes"] = [
+                    layer_name_to_block_size.get(name, self._block_size)
+                    for name in self._kv_cache_layer_names
+                ]
+        if group_layer_names:
+            logger.info(
+                "LMCache captured vLLM HMA layout: kv_cache_layers=%d, "
+                "groups=%s",
+                len(self._kv_cache_layer_names),
+                [
+                    {
+                        "group": idx,
+                        "layers": len(names),
+                        "block_size": group_block_sizes[idx],
+                    }
+                    for idx, names in enumerate(group_layer_names)
+                ],
+            )
+
+    def _hma_transfer_kwargs(self, request: ReqMeta) -> dict[str, Any]:
+        """Return HMA metadata consumed by VLLMPagedMemGPUConnectorV3."""
+        if not request.block_ids_by_group:
+            return {}
+        return {
+            "block_ids_by_group": request.block_ids_by_group,
+            "kv_cache_layer_names": self._kv_cache_layer_names,
+            "vllm_kv_cache_group_layer_names": (
+                self._vllm_kv_cache_group_layer_names
+            ),
+            "vllm_kv_cache_group_block_sizes": (
+                self._vllm_kv_cache_group_block_sizes
+            ),
+        }
 
     @_lmcache_nvtx_annotate
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
@@ -799,6 +1370,7 @@ class LMCacheConnectorV1Impl:
             token_mask[:masked_token_count] = False
 
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
+            hma_kwargs = self._hma_transfer_kwargs(request)
             if self.use_layerwise:
                 if idx == last_idx:
                     sync = True
@@ -822,11 +1394,12 @@ class LMCacheConnectorV1Impl:
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                         sync=sync,
+                        **hma_kwargs,
                     )
                     # NOTE: retrieve for two layers at the first layer
                     next(layerwise_retriever)
                     next(layerwise_retriever)
-                    self.layerwise_retrievers.append(layerwise_retriever)
+                    self.layerwise_retrievers.append((layerwise_retriever, request))
             else:
                 ret_token_mask = self.lmcache_engine.retrieve(
                     tokens[:lmcache_cached_tokens],
@@ -836,6 +1409,7 @@ class LMCacheConnectorV1Impl:
                     vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
                     request_configs=request.request_configs,
                     req_id=request.req_id,
+                    **hma_kwargs,
                 )
 
                 # Check the result
@@ -865,6 +1439,17 @@ class LMCacheConnectorV1Impl:
                         slot_mapping[:lmcache_cached_tokens],
                     )
                     self._invalid_block_ids.update(missing_blocks)
+                else:
+                    self._maybe_seed_indexer_reuse_prefetch(
+                        request,
+                        lmcache_cached_tokens,
+                        slot_mapping,
+                    )
+                    self._maybe_seed_hca_reuse_prefetch(
+                        request,
+                        lmcache_cached_tokens,
+                        slot_mapping,
+                    )
 
     def record_failed_blocks(
         self,
@@ -940,6 +1525,216 @@ class LMCacheConnectorV1Impl:
         )
         return missing_blocks
 
+    def _maybe_seed_indexer_reuse_prefetch(
+        self,
+        request: ReqMeta,
+        lmcache_cached_tokens: int,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Seed CSA prefetch state after LMCache loads a reused prefill prefix."""
+        manager = _INDEXER_PREFETCH_MANAGER
+        if manager is None:
+            return
+        reuse_prefetch_enabled = getattr(manager, "reuse_prefetch_enabled", None)
+        if (
+            not callable(reuse_prefetch_enabled)
+            or not reuse_prefetch_enabled()
+        ):
+            return
+        if lmcache_cached_tokens <= request.load_spec.vllm_cached_tokens:
+            return
+
+        min_hit_tokens = max(
+            0, _env_int("LMCACHE_INDEXER_REUSE_PREFETCH_MIN_HIT_TOKENS", 1024)
+        )
+        if lmcache_cached_tokens < min_hit_tokens:
+            return
+
+        csa_entries: list[tuple[int, Any]] = []
+        for registry in _deepseek_decoder_registries():
+            for decoder_layer in list(registry):
+                layer_id = getattr(decoder_layer, "layer_idx", -1)
+                indexer_op = _decoder_csa_indexer(decoder_layer)
+                if isinstance(layer_id, int) and layer_id >= 0 and indexer_op is not None:
+                    csa_entries.append((layer_id, indexer_op))
+
+        if not csa_entries:
+            return
+
+        csa_entries.sort(key=lambda item: item[0])
+        submitted = 0
+        for layer_id, indexer_op in csa_entries:
+            key = (request.req_id, layer_id)
+            if key in self._reuse_prefetch_seen:
+                continue
+            k_cache = getattr(getattr(indexer_op, "k_cache", None), "kv_cache", None)
+            if not isinstance(k_cache, torch.Tensor) or k_cache.numel() == 0:
+                continue
+            compress_ratio = int(
+                getattr(getattr(indexer_op, "k_cache", None), "compress_ratio", 1)
+            )
+            if compress_ratio <= 1:
+                continue
+            compressed_seq_len = lmcache_cached_tokens // compress_ratio
+            if compressed_seq_len <= 0:
+                continue
+            compressed_block_size = int(k_cache.shape[1])
+            compressed_slots = _compressed_slot_mapping(
+                slot_mapping,
+                lmcache_cached_tokens,
+                compress_ratio,
+                compressed_block_size,
+            )
+            if compressed_slots.numel() < compressed_seq_len:
+                continue
+            if bool((compressed_slots[:compressed_seq_len] < 0).any().item()):
+                logger.info(
+                    "IndexerSSDManager: skip reuse prefetch layer %d request %s "
+                    "because compressed slot mapping has gaps",
+                    layer_id,
+                    request.req_id,
+                )
+                continue
+            max_seed_tokens = max(
+                0,
+                _env_int("LMCACHE_INDEXER_REUSE_PREFETCH_MAX_TAIL_TOKENS", 4096),
+            )
+            pool_size = max(1, _env_int("LMCACHE_INDEXER_POOL_SIZE", 2048))
+            if max_seed_tokens > 0:
+                pool_size = min(pool_size, max_seed_tokens)
+            tail = min(compressed_seq_len, pool_size)
+            start = max(0, compressed_seq_len - tail)
+            seed_token_ids = list(range(start, compressed_seq_len))
+
+            self._reuse_prefetch_seen.add(key)
+            submit_seed = getattr(manager, "submit_seed_after_reuse", None)
+            if not callable(submit_seed):
+                submit_seed = manager.submit_evict_after_prefill
+            submit_seed(
+                layer_id,
+                k_cache.detach().cpu(),
+                compressed_seq_len,
+                seed_token_ids,
+                slot_mapping_cpu=compressed_slots[:compressed_seq_len],
+            )
+            submitted += 1
+
+        if submitted > 0:
+            logger.info(
+                "IndexerSSDManager: reuse prefetch seeded %d CSA layers for "
+                "request %s lmcache_tokens=%d compressed_tokens~=%d",
+                submitted,
+                request.req_id,
+                lmcache_cached_tokens,
+                lmcache_cached_tokens // 4,
+            )
+
+    def _maybe_seed_hca_reuse_prefetch(
+        self,
+        request: ReqMeta,
+        lmcache_cached_tokens: int,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Seed HCA deterministic prefetch state after an LMCache prefix hit."""
+        manager = _HCA_PREFETCH_MANAGER
+        if manager is None:
+            return
+        if lmcache_cached_tokens <= request.load_spec.vllm_cached_tokens:
+            return
+        min_hit_tokens = max(
+            0,
+            _env_int(
+                "LMCACHE_HCA_REUSE_PREFETCH_MIN_HIT_TOKENS",
+                _env_int("LMCACHE_INDEXER_REUSE_PREFETCH_MIN_HIT_TOKENS", 1024),
+            ),
+        )
+        if lmcache_cached_tokens < min_hit_tokens:
+            return
+
+        hca_entries: list[tuple[int, Any]] = []
+        for registry in _deepseek_decoder_registries():
+            for decoder_layer in list(registry):
+                layer_id = getattr(decoder_layer, "layer_idx", -1)
+                hca_layer = _decoder_hca_attention(decoder_layer)
+                if isinstance(layer_id, int) and layer_id >= 0 and hca_layer is not None:
+                    hca_entries.append((layer_id, hca_layer))
+
+        if not hca_entries:
+            return
+
+        submitted = 0
+        hca_entries.sort(key=lambda item: item[0])
+        for layer_id, hca_layer in hca_entries:
+            key = (request.req_id, "hca", layer_id)
+            if key in self._reuse_prefetch_seen:
+                continue
+            kv_cache = getattr(hca_layer, "kv_cache", None)
+            if not isinstance(kv_cache, torch.Tensor) or kv_cache.numel() == 0:
+                continue
+            compress_ratio = int(getattr(hca_layer, "compress_ratio", 1))
+            if compress_ratio != 128:
+                continue
+            compressed_seq_len = lmcache_cached_tokens // compress_ratio
+            if compressed_seq_len <= 0:
+                continue
+            compressed_block_size = int(kv_cache.shape[1])
+            compressed_slots = _compressed_slot_mapping(
+                slot_mapping,
+                lmcache_cached_tokens,
+                compress_ratio,
+                compressed_block_size,
+            )
+            if compressed_slots.numel() < compressed_seq_len:
+                continue
+            if bool((compressed_slots[:compressed_seq_len] < 0).any().item()):
+                logger.info(
+                    "HCAPrefetchManager: skip reuse seed layer %d request %s "
+                    "because compressed slot mapping has gaps",
+                    layer_id,
+                    request.req_id,
+                )
+                continue
+            self._reuse_prefetch_seen.add(key)
+            set_slots = getattr(manager, "set_active_request_slots", None)
+            if callable(set_slots):
+                set_slots(
+                    layer_id,
+                    compressed_seq_len,
+                    compressed_slots[:compressed_seq_len],
+                )
+            has_seeded_rows = getattr(manager, "has_seeded_rows", None)
+            already_seeded = (
+                callable(has_seeded_rows)
+                and has_seeded_rows(layer_id, compressed_seq_len)
+            )
+            if already_seeded:
+                submitted += 1
+            else:
+                seed = getattr(manager, "submit_seed_after_reuse", None)
+                if not callable(seed):
+                    continue
+                seed(
+                    layer_id,
+                    kv_cache.detach().cpu(),
+                    compressed_seq_len,
+                    compressed_slots[:compressed_seq_len],
+                    fire_seq_len=lmcache_cached_tokens,
+                )
+                submitted += 1
+            fire_for_seq_len = getattr(manager, "fire_for_seq_len", None)
+            if already_seeded and callable(fire_for_seq_len):
+                fire_for_seq_len(layer_id, lmcache_cached_tokens)
+
+        if submitted > 0:
+            logger.info(
+                "HCAPrefetchManager: reuse prefetch prepared %d HCA "
+                "layers for request %s lmcache_tokens=%d compressed_tokens~=%d",
+                submitted,
+                request.req_id,
+                lmcache_cached_tokens,
+                lmcache_cached_tokens // 128,
+            )
+
     @_lmcache_nvtx_annotate
     def wait_for_layer_load(self, layer_name: str) -> None:
         """Blocking until the KV for a specific layer is loaded into vLLM's
@@ -954,7 +1749,7 @@ class LMCacheConnectorV1Impl:
             logger.debug(f"Waiting for layer {self.current_layer} to be loaded")
 
         # Wait for the layer to be loaded
-        for layerwise_retriever in self.layerwise_retrievers:
+        for layerwise_retriever, request in self.layerwise_retrievers:
             ret_token_mask = next(layerwise_retriever)
 
             if self.current_layer == self.num_layers - 1:
@@ -1062,6 +1857,7 @@ class LMCacheConnectorV1Impl:
                     offset=skip_leading_tokens,
                     sync=is_first,
                     req_id=request.req_id,
+                    **self._hma_transfer_kwargs(request),
                 )
                 self._layerwise_save_storers[request.req_id] = layerwise_storer
                 if is_first:
@@ -1188,6 +1984,7 @@ class LMCacheConnectorV1Impl:
                 transfer_spec=request.disagg_spec,
                 request_configs=request.request_configs,
                 req_id=request.req_id,
+                **self._hma_transfer_kwargs(request),
             )
 
             # Probe decoder cache after store
@@ -1574,6 +2371,7 @@ class LMCacheConnectorV1Impl:
                 num_tokens_to_compute,
                 lmcache_cached_tokens,
                 skip_save,
+                block_size=self._block_size,
             )
             self._request_trackers[request.req_id] = request_tracker
 
@@ -1621,6 +2419,7 @@ class LMCacheConnectorV1Impl:
                     lmcache_cached_tokens=lmcache_cached_tokens,
                     vllm_cached_tokens=vllm_cached_tokens,
                     all_token_ids=all_token_ids,
+                    block_size=self._block_size,
                 )
 
                 req_meta = ReqMeta.from_request_tracker(
@@ -1744,6 +2543,7 @@ class LMCacheConnectorV1Impl:
                 lmcache_cached_tokens=lmcache_cached_tokens,
                 vllm_cached_tokens=vllm_cached_tokens,
                 all_token_ids=all_token_ids,
+                block_size=self._block_size,
             )
 
             req_meta = ReqMeta.from_request_tracker(
@@ -1775,17 +2575,19 @@ class LMCacheConnectorV1Impl:
 
         # Cleanup if request was aborted
         if request.status == RequestStatus.FINISHED_ABORTED:
-            # Notify storage backends of aborted requests
-            assert self.lmcache_engine is not None
-            sm = self.lmcache_engine.storage_manager
-            if sm is not None:
-                sm.cancel_request(request.request_id)
+            # Abort notifications can run on scheduler-side connector objects
+            # that do not own an LMCache engine. Treat cleanup as best-effort so
+            # an interrupted benchmark does not crash the serving process.
+            if self.lmcache_engine is not None:
+                sm = self.lmcache_engine.storage_manager
+                if sm is not None:
+                    sm.cancel_request(request.request_id)
 
             if self.async_loading:
                 # Cancel any ongoing async lookup and prefetch tasks on workers
                 lookup_id = request.request_id
-                assert self.lookup_client is not None
-                self.lookup_client.cancel_lookup(lookup_id)  # type: ignore[attr-defined]
+                if self.lookup_client is not None:
+                    self.lookup_client.cancel_lookup(lookup_id)  # type: ignore[attr-defined]
 
         params = (
             request.kv_transfer_params

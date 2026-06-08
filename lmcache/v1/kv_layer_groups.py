@@ -39,7 +39,11 @@ DTYPE_MAP: dict[str, torch.dtype] = {
 # ``(kv_size, num_heads, head_size, block_size, dtype)``. Two layers share a transfer-
 # kernel launch iff they share this identity — see the grouping loop in
 # :meth:`KVLayerGroupsManager.__init__` for the derivation.
-LayerGroupIdentity = tuple[int, int, int, int, torch.dtype]
+# Identity layout:
+# (vllm_hma_group_id_or_minus_one, kv_size, num_heads, head_size, block_size,
+# dtype). DSv4 can expose same-shaped tensors with different block tables, so
+# HMA group identity must be part of transfer grouping.
+LayerGroupIdentity = tuple[int, int, int, int, int, torch.dtype]
 
 
 @dataclass
@@ -209,6 +213,19 @@ class KVLayerGroupsManager:
             if layout_hints
             else None
         )
+        vllm_logical_block_sizes_by_layer: tuple[int, ...] = ()
+        if layout_hints:
+            values = layout_hints.get("vllm_kv_cache_layer_block_sizes")
+            if isinstance(values, (list, tuple)):
+                try:
+                    vllm_logical_block_sizes_by_layer = tuple(
+                        int(value) for value in values
+                    )
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "Ignoring invalid vllm_kv_cache_layer_block_sizes layout hint"
+                    )
+                    vllm_logical_block_sizes_by_layer = ()
         self.kv_layer_groups: list[KVLayerGroupInfo] = []
 
         num_layers = get_num_layers(kv_caches, gpu_kv_format)
@@ -217,12 +234,12 @@ class KVLayerGroupsManager:
             return
 
         groups_dict = self._group_layers_by_identity(
-            kv_caches, gpu_kv_format, num_layers
+            kv_caches, gpu_kv_format, num_layers, layout_hints
         )
 
         # Emit groups in order of their first-appearing layer so that group
         # indices remain deterministic across runs.
-        for group_idx, ((_, _, _, bs, dt), indices) in enumerate(
+        for group_idx, ((_, _, _, _, bs, dt), indices) in enumerate(
             sorted(groups_dict.items(), key=lambda kv: kv[1][0])
         ):
             block_stride_elems = resolve_block_stride_and_log_layout(
@@ -241,10 +258,19 @@ class KVLayerGroupsManager:
                 block_stride_elems=block_stride_elems,
             )
 
+            group_logical_block_size = self.inference_engine_logical_block_size_
+            if (
+                vllm_logical_block_sizes_by_layer
+                and indices[0] < len(vllm_logical_block_sizes_by_layer)
+            ):
+                group_logical_block_size = vllm_logical_block_sizes_by_layer[
+                    indices[0]
+                ]
+
             compress_ratio, physical_chunk_size = self._derive_compression_metadata(
                 group_idx=group_idx,
                 bs=bs,
-                ie_logical_block_size=self.inference_engine_logical_block_size_,
+                ie_logical_block_size=group_logical_block_size,
                 lmcache_logical_chunk_size=lmcache_logical_chunk_size,
             )
 
@@ -317,15 +343,17 @@ class KVLayerGroupsManager:
         kv_caches: "DiscoverableKVCache",
         gpu_kv_format: "lmc_ops.GPUKVFormat",
         num_layers: int,
+        layout_hints: "LayoutHints | None" = None,
     ) -> dict[LayerGroupIdentity, list[int]]:
         """Partition layer indices by :data:`LayerGroupIdentity`.
 
         Linear single pass over ``kv_caches``; layers sharing the same
-        ``(kv_size, num_heads, head_size, block_size, dtype)`` signature
-        land in the same bucket. The returned dict's value lists are
-        later passed by reference into :class:`KVLayerGroupInfo`
-        instances, so the dict itself is garbage-collected after
-        ``__init__`` returns while the lists stay alive on each group.
+        ``(vLLM group, kv_size, num_heads, head_size, block_size, dtype)``
+        signature land in the same bucket. The vLLM group component is -1
+        when unavailable. The returned dict's value lists are later passed by
+        reference into :class:`KVLayerGroupInfo` instances, so the dict itself
+        is garbage-collected after ``__init__`` returns while the lists stay
+        alive on each group.
         """
         # First Party
         from lmcache.v1.gpu_connector.utils import (
@@ -338,13 +366,25 @@ class KVLayerGroupsManager:
 
         mla = is_mla(gpu_kv_format)
         kv_size = 1 if mla else 2
+        vllm_group_by_layer: tuple[int, ...] = ()
+        if layout_hints is not None:
+            values = layout_hints.get("vllm_kv_cache_group_ids")
+            if isinstance(values, (list, tuple)) and len(values) == num_layers:
+                try:
+                    vllm_group_by_layer = tuple(int(value) for value in values)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "Ignoring invalid vllm_kv_cache_group_ids layout hint"
+                    )
+                    vllm_group_by_layer = ()
         groups_dict: dict[LayerGroupIdentity, list[int]] = defaultdict(list)
         for idx in range(num_layers):
             nh = 1 if mla else get_num_heads(kv_caches, gpu_kv_format, idx)
             hs = get_head_size(kv_caches, gpu_kv_format, idx)
             dt = get_dtype(kv_caches, gpu_kv_format, idx)
             bs = get_block_size(kv_caches, gpu_kv_format, idx)
-            groups_dict[(kv_size, nh, hs, bs, dt)].append(idx)
+            vllm_group = vllm_group_by_layer[idx] if vllm_group_by_layer else -1
+            groups_dict[(vllm_group, kv_size, nh, hs, bs, dt)].append(idx)
         return groups_dict
 
     @property
