@@ -786,6 +786,9 @@ class LocalDiskBackend(StorageBackendInterface):
         if has_kv_groups:
             canonical_shapes = metadata.get_shapes(metadata.chunk_size)
             canonical_dtypes = metadata.get_dtypes()
+        recovered_fmt = (
+            MemoryFormat.KV_MLA_FMT if metadata.use_mla else MemoryFormat.KV_2LTD
+        )
 
         with self.disk_lock:
             for fname in filenames:
@@ -810,7 +813,7 @@ class LocalDiskBackend(StorageBackendInterface):
                     size=fsize,
                     shape=torch.Size(metadata.kv_shape),
                     dtype=metadata.kv_dtype,
-                    fmt=MemoryFormat.KV_2LTD,
+                    fmt=recovered_fmt,
                     shapes=canonical_shapes,
                     dtypes=canonical_dtypes,
                 )

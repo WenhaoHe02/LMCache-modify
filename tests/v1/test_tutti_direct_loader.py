@@ -94,6 +94,7 @@ class TestLbaRecord:
         rec = LbaRecord(slba=512, n_sectors=32)
         assert rec.slba == 512
         assert rec.n_sectors == 32
+        assert rec.file_offset == 0
 
 
 # ── FiemapHelper ─────────────────────────────────────────────────────────────
@@ -147,6 +148,7 @@ class TestFiemapHelper:
             assert len(records) == 1
             assert records[0].slba == 100
             assert records[0].n_sectors == 8
+            assert records[0].file_offset == 0
         finally:
             os.unlink(tmp)
 
@@ -171,7 +173,9 @@ class TestFiemapHelper:
 
             assert len(records) == 2
             assert records[0].slba == 10
+            assert records[0].file_offset == 0
             assert records[1].slba == 20
+            assert records[1].file_offset == 512 * 5
         finally:
             os.unlink(tmp)
 
@@ -298,7 +302,7 @@ def _make_mock_session(q_depth: int = 32) -> MagicMock:
     return session
 
 
-def _make_loader(n_slots: int = 4, slot_mb: int = 32):
+def _make_loader(n_slots: int = 4, slot_mb: int = 32, q_depth: Optional[int] = None):
     """Build a (loader, ctrl_arrays) tuple — keep ctrl_arrays alive!
 
     Returns (TuttiDirectLoader, dict[str, ctypes array]) so callers can read
@@ -310,7 +314,7 @@ def _make_loader(n_slots: int = 4, slot_mb: int = 32):
     total_bytes = n_slots * slot_bytes
 
     staging = torch.zeros(total_bytes, dtype=torch.uint8)
-    session = _make_mock_session(q_depth=n_slots)
+    session = _make_mock_session(q_depth=q_depth or n_slots)
 
     # Keep ctypes arrays alive by storing them in a dict returned to the caller.
     sq_tail_arr = (ctypes.c_uint16 * 1)(0)
@@ -333,7 +337,7 @@ def _make_loader(n_slots: int = 4, slot_mb: int = 32):
         cq_head_ptr=ctypes.addressof(cq_head_arr),
         cq_phase_ptr=ctypes.addressof(cq_phase_arr),
         timed_out_ptr=ctypes.addressof(timed_out_arr),
-        status_buf=torch.zeros(n_slots, dtype=torch.int32),
+        status_buf=torch.zeros(q_depth or n_slots, dtype=torch.int32),
     )
     return loader, ctrl
 
@@ -382,11 +386,11 @@ class TestTuttiDirectLoaderLoadBatch:
 
         def fake_fiemap(path):
             n_sectors = metas[0].size // 512 if metas[0] else 1
-            return LbaRecord(slba=fiemap_lba, n_sectors=n_sectors)
+            return [LbaRecord(slba=fiemap_lba, n_sectors=n_sectors)]
 
         # Patch FIEMAP so no real ioctl is issued.
         with patch.object(
-            _tdl.FiemapHelper, "single_contiguous", side_effect=fake_fiemap
+            _tdl.FiemapHelper, "query_extents", side_effect=fake_fiemap
         ):
             # Patch c_ops submit/poll to be no-ops but set status_buf correctly.
             with patch.object(_tdl, "_c_ops") as mock_c:
@@ -433,33 +437,31 @@ class TestTuttiDirectLoaderLoadBatch:
         keys = [_fake_key(i) for i in range(3)]
         metas = [None, None, None]
 
-        with patch.object(_tdl.FiemapHelper, "single_contiguous"):
+        with patch.object(_tdl.FiemapHelper, "query_extents"):
             results = loader._load_batch(keys, metas)
 
         assert all(r is None for r in results)
 
-    def test_chunk_too_large_skipped(self) -> None:
+    def test_chunk_too_large_raises(self) -> None:
         loader, _ctrl = _make_loader(n_slots=2, slot_mb=1)  # 1 MiB slots
         # 2 MiB chunk > 1 MiB slot → should be skipped
         size = 2 * 1024 * 1024
         keys = [_fake_key(0)]
         metas = [_disk_meta_for(size)]
 
-        with patch.object(_tdl.FiemapHelper, "single_contiguous"):
-            results = loader._load_batch(keys, metas)
+        with patch.object(_tdl.FiemapHelper, "query_extents"):
+            with pytest.raises(RuntimeError, match="no readable KV extents"):
+                loader._load_batch(keys, metas)
 
-        assert results[0] is None
-
-    def test_non_sector_aligned_size_skipped(self) -> None:
+    def test_non_sector_aligned_size_raises(self) -> None:
         loader, _ctrl = _make_loader(n_slots=2)
         size = 1000  # not a multiple of 512
         keys = [_fake_key(0)]
         metas = [_disk_meta_for(size)]
 
-        with patch.object(_tdl.FiemapHelper, "single_contiguous"):
-            results = loader._load_batch(keys, metas)
-
-        assert results[0] is None
+        with patch.object(_tdl.FiemapHelper, "query_extents"):
+            with pytest.raises(RuntimeError, match="no readable KV extents"):
+                loader._load_batch(keys, metas)
 
     def test_nvme_error_raises(self) -> None:
         loader, _ctrl = _make_loader(n_slots=2)
@@ -471,6 +473,40 @@ class TestTuttiDirectLoaderLoadBatch:
         with pytest.raises(RuntimeError, match="NVMe READ failed"):
             self._run_load(loader, keys, metas, nvme_status=1)
 
+    def test_multi_extent_file_submits_multiple_reads(self) -> None:
+        loader, _ctrl = _make_loader(n_slots=2, q_depth=8)
+        size = 64 * 1024
+        keys = [_fake_key(0)]
+        metas = [_disk_meta_for(size)]
+        extents = [
+            LbaRecord(slba=100, n_sectors=(32 * 1024) // 512, file_offset=0),
+            LbaRecord(
+                slba=200,
+                n_sectors=(32 * 1024) // 512,
+                file_offset=32 * 1024,
+            ),
+        ]
+
+        with patch.object(
+            _tdl.FiemapHelper, "query_extents", return_value=extents
+        ):
+            with patch.object(_tdl, "_c_ops") as mock_c:
+                mock_c.tutti_submit_batch_sgl_read = MagicMock()
+
+                def fake_poll(**kwargs):
+                    n_ios = kwargs.get("n_ios", 0)
+                    loader._status_buf[:n_ios] = 0
+
+                mock_c.tutti_poll_batch.side_effect = fake_poll
+
+                with patch("torch.cuda.synchronize"):
+                    results = loader._load_batch(keys, metas)
+
+        assert results[0] is not None
+        submit_kwargs = mock_c.tutti_submit_batch_sgl_read.call_args.kwargs
+        assert submit_kwargs["byte_lens"].cpu().tolist() == [32 * 1024, 32 * 1024]
+        assert submit_kwargs["slbas"].cpu().tolist() == [100, 200]
+
     def test_timeout_raises(self) -> None:
         loader, _ctrl = _make_loader(n_slots=2)
         size = 512 * 4
@@ -478,10 +514,10 @@ class TestTuttiDirectLoaderLoadBatch:
         metas = [_disk_meta_for(size)]
 
         def fake_fiemap(path):
-            return LbaRecord(slba=0, n_sectors=size // 512)
+            return [LbaRecord(slba=0, n_sectors=size // 512)]
 
         with patch.object(
-            _tdl.FiemapHelper, "single_contiguous", side_effect=fake_fiemap
+            _tdl.FiemapHelper, "query_extents", side_effect=fake_fiemap
         ):
             with patch.object(_tdl, "_c_ops") as mock_c:
                 mock_c.tutti_submit_batch_sgl_read = MagicMock()
@@ -512,10 +548,10 @@ class TestTuttiDirectLoaderLoadChunksToHbm:
         metas = [_disk_meta_for(size) for _ in range(n_keys)]
 
         def fake_fiemap(path):
-            return LbaRecord(slba=0, n_sectors=size // 512)
+            return [LbaRecord(slba=0, n_sectors=size // 512)]
 
         with patch.object(
-            _tdl.FiemapHelper, "single_contiguous", side_effect=fake_fiemap
+            _tdl.FiemapHelper, "query_extents", side_effect=fake_fiemap
         ):
             with patch.object(_tdl, "_c_ops") as mock_c:
                 mock_c.tutti_submit_batch_sgl_read = MagicMock()
@@ -542,10 +578,10 @@ class TestTuttiDirectLoaderLoadChunksToHbm:
         metas = [_disk_meta_for(size), None, _disk_meta_for(size)]
 
         def fake_fiemap(path):
-            return LbaRecord(slba=0, n_sectors=size // 512)
+            return [LbaRecord(slba=0, n_sectors=size // 512)]
 
         with patch.object(
-            _tdl.FiemapHelper, "single_contiguous", side_effect=fake_fiemap
+            _tdl.FiemapHelper, "query_extents", side_effect=fake_fiemap
         ):
             with patch.object(_tdl, "_c_ops") as mock_c:
                 mock_c.tutti_submit_batch_sgl_read = MagicMock()

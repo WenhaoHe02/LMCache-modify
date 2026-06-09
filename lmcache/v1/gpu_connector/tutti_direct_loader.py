@@ -380,6 +380,20 @@ def _ioctl(fd: int, request: int, arg: ctypes.Structure) -> None:
     ctypes.memmove(ctypes.addressof(arg), buf, size)
 
 
+def _clear_driver_override(pci_bdf: str) -> None:
+    """Clear Linux PCI driver_override before snvme attaches a controller."""
+    override_path = f"/sys/bus/pci/devices/{pci_bdf}/driver_override"
+    try:
+        with open(override_path, "w", encoding="utf-8") as override_file:
+            override_file.write("\n")
+    except OSError as exc:
+        logger.warning(
+            "Could not clear driver_override for %s before snvme bind: %s",
+            pci_bdf,
+            exc,
+        )
+
+
 # ── FIEMAP helper ─────────────────────────────────────────────────────────────
 
 
@@ -389,6 +403,7 @@ class LbaRecord:
 
     slba: int       # starting logical block address (512-byte sectors)
     n_sectors: int  # number of 512-byte sectors
+    file_offset: int = 0  # logical byte offset inside the file
 
 
 class FiemapHelper:
@@ -399,7 +414,7 @@ class FiemapHelper:
     physical offsets to be usable for direct NVMe I/O.
     """
 
-    _MAX_EXTENTS: int = 32
+    _MAX_EXTENTS: int = 256
 
     @staticmethod
     def query_extents(file_path: str) -> list[LbaRecord]:
@@ -439,9 +454,10 @@ class FiemapHelper:
                 LbaRecord(
                     slba=ext.fe_physical // _NVME_LBS,
                     n_sectors=ext.fe_length // _NVME_LBS,
+                    file_offset=ext.fe_logical,
                 )
             )
-        return records
+        return sorted(records, key=lambda record: record.file_offset)
 
     @staticmethod
     def single_contiguous(file_path: str) -> LbaRecord:
@@ -470,15 +486,16 @@ class FiemapHelper:
     @staticmethod
     def scan_paths(
         file_paths: list[str],
-    ) -> dict[str, LbaRecord]:
+    ) -> dict[str, list[LbaRecord]]:
         """Pre-compute LBA records for a list of files.
 
         Must be called BEFORE snvme DEVICE_BIND (while the filesystem is
         still accessible).  Returns a dict suitable for passing as
         ``initial_lba_cache`` to ``TuttiDirectLoader.create()``.
 
-        Files that are fragmented (>1 extent) or inaccessible are silently
-        skipped and will not appear in the returned dict.
+        Inaccessible files are skipped and will not appear in the returned
+        dict. Fragmented files are kept as multiple records so the loader can
+        issue multiple NVMe reads into one HBM staging slot.
 
         Args:
             file_paths: List of absolute paths to scan.
@@ -486,12 +503,17 @@ class FiemapHelper:
         Returns:
             Dict mapping file path → LbaRecord for successfully scanned files.
         """
-        result: dict[str, LbaRecord] = {}
+        result: dict[str, list[LbaRecord]] = {}
         for path in file_paths:
             try:
-                result[path] = FiemapHelper.single_contiguous(path)
-            except Exception:
-                pass
+                extents = FiemapHelper.query_extents(path)
+            except Exception as exc:
+                logger.warning("Tutti FIEMAP pre-scan failed for %s: %s", path, exc)
+                continue
+            if extents:
+                result[path] = extents
+            else:
+                logger.warning("Tutti FIEMAP pre-scan found no extents for %s", path)
         return result
 
 
@@ -671,6 +693,7 @@ class SnvmeSession:
         self._fd_dev = os.open(self._device_path, os.O_RDWR)
         cap_buf = _struct.pack("I", kernel_ioq_cap)
         fcntl.ioctl(self._fd_dev, _NVM_SET_KERNEL_IOQ_CAP, cap_buf)
+        _clear_driver_override(pci_bdf)
         _ioctl(self._fd_ctrl, _SNVM_DEVICE_BIND, bdf)
 
         # 3. Query device info.
@@ -906,7 +929,7 @@ class TuttiDirectLoader:
         timed_out_ptr: int,
         status_buf: torch.Tensor,
         cuda_device: int = 0,
-        initial_lba_cache: Optional[dict[str, LbaRecord]] = None,
+        initial_lba_cache: Optional[dict[str, list[LbaRecord]]] = None,
     ) -> None:
         self._session = session
         self._staging = staging_tensor
@@ -925,11 +948,11 @@ class TuttiDirectLoader:
         # Reusable GPU tensor for per-CQE status codes.
         self._status_buf = status_buf
 
-        # LBA cache: file path → LbaRecord.  Seeded from initial_lba_cache
+        # LBA cache: file path to LbaRecords.  Seeded from initial_lba_cache
         # (pre-computed before SNVM_DEVICE_BIND while the filesystem is still
         # accessible); additional entries are added lazily via FIEMAP if the
         # filesystem remains accessible (i.e. drive not yet bound).
-        self._lba_cache: dict[str, LbaRecord] = dict(initial_lba_cache or {})
+        self._lba_cache: dict[str, list[LbaRecord]] = dict(initial_lba_cache or {})
 
     @staticmethod
     def create(
@@ -941,7 +964,7 @@ class TuttiDirectLoader:
         nsid: int = 1,
         kernel_ioq_cap: int = 36,
         cuda_device: int = 0,
-        initial_lba_cache: Optional[dict[str, LbaRecord]] = None,
+        initial_lba_cache: Optional[dict[str, list[LbaRecord]]] = None,
     ) -> "TuttiDirectLoader":
         """Create and initialise a TuttiDirectLoader.
 
@@ -1058,10 +1081,10 @@ class TuttiDirectLoader:
 
     # ── internal helpers ────────────────────────────────────────────────────
 
-    def _get_lba(self, file_path: str) -> LbaRecord:
-        """Look up or populate the LBA record for file_path (FIEMAP cache)."""
+    def _get_extents(self, file_path: str) -> list[LbaRecord]:
+        """Look up or populate the LBA records for file_path."""
         if file_path not in self._lba_cache:
-            self._lba_cache[file_path] = FiemapHelper.single_contiguous(file_path)
+            self._lba_cache[file_path] = FiemapHelper.query_extents(file_path)
         return self._lba_cache[file_path]
 
     def _staging_slice(self, slot_idx: int, nbytes: int) -> torch.Tensor:
@@ -1073,6 +1096,11 @@ class TuttiDirectLoader:
         """IOVA of the first GPU page in staging slot slot_idx."""
         page_offset = slot_idx * self._slot_gpu_pages
         return self._session.staging_iovas[page_offset]
+
+    def _slot_iova_with_offset(self, slot_idx: int, offset: int) -> int:
+        """IOVA inside a staging slot at an arbitrary byte offset."""
+        page_offset = slot_idx * self._slot_gpu_pages + offset // _GPU_PAGE_SIZE
+        return self._session.staging_iovas[page_offset] + offset % _GPU_PAGE_SIZE
 
     def _q_depth(self) -> int:
         return int(self._session.info.q_depth)
@@ -1150,19 +1178,21 @@ class TuttiDirectLoader:
                 "split into smaller batches before calling _load_batch"
             )
 
-        # Build per-I/O parameters.
-        valid_indices: list[int] = []
+        # Build per-I/O parameters. A single KV file can occupy multiple
+        # filesystem extents, so one logical chunk may expand to multiple NVMe
+        # READs into different offsets of the same staging slot.
+        completed_indices: list[int] = []
+        io_to_key_index: list[int] = []
         staging_iovas_list: list[int] = []
         slbas_list: list[int] = []
         byte_lens_list: list[int] = []
-        lba_records: list[LbaRecord] = []
 
         for i, (key, meta) in enumerate(zip(keys, metas)):
             if meta is None:
                 logger.debug("Tutti: no metadata for key %s, skipping", key)
                 continue
             try:
-                lba = self._get_lba(meta.path)
+                extents = self._get_extents(meta.path)
             except (FileNotFoundError, ValueError, OSError) as exc:
                 logger.warning("Tutti FIEMAP failed for %s: %s", meta.path, exc)
                 continue
@@ -1177,14 +1207,6 @@ class TuttiDirectLoader:
                 )
                 continue
             max_io = self._session.info.max_data_size
-            if max_io > 0 and nbytes > max_io:
-                logger.warning(
-                    "Chunk %s (%d bytes) exceeds drive MDTS (%d bytes); skipping",
-                    key,
-                    nbytes,
-                    max_io,
-                )
-                continue
             if nbytes % _NVME_LBS != 0:
                 logger.warning(
                     "Chunk %s size %d is not a multiple of 512; skipping",
@@ -1193,15 +1215,108 @@ class TuttiDirectLoader:
                 )
                 continue
 
-            slot_idx = len(valid_indices)  # slot assigned in submission order
-            valid_indices.append(i)
-            staging_iovas_list.append(self._slot_iova(slot_idx))
-            slbas_list.append(lba.slba)
-            byte_lens_list.append(nbytes)
-            lba_records.append(lba)
+            slot_idx = len(completed_indices)
+            io_start = len(io_to_key_index)
+            file_ios = 0
+            skip_file = False
+            for extent in extents:
+                extent_start = extent.file_offset
+                extent_end = extent_start + extent.n_sectors * _NVME_LBS
+                read_start = max(0, extent_start)
+                read_end = min(nbytes, extent_end)
+                if read_start >= read_end:
+                    continue
+                read_nbytes = read_end - read_start
+                extent_skip = read_start - extent_start
+                if read_start % _GPU_PAGE_SIZE != 0:
+                    logger.debug(
+                        "Chunk %s extent offset %d is not 64 KiB aligned",
+                        key,
+                        read_start,
+                    )
+                if len(io_to_key_index) >= self._q_depth():
+                    logger.warning(
+                        "Tutti batch for %s would exceed queue depth %d; skipping",
+                        key,
+                        self._q_depth(),
+                    )
+                    skip_file = True
+                    break
+                if read_nbytes % _NVME_LBS != 0:
+                    logger.warning(
+                        "Chunk %s extent read size %d is not 512B aligned; skipping",
+                        key,
+                        read_nbytes,
+                    )
+                    skip_file = True
+                    break
+                cursor = 0
+                while cursor < read_nbytes:
+                    chunk_nbytes = read_nbytes - cursor
+                    if max_io > 0:
+                        chunk_nbytes = min(chunk_nbytes, max_io)
+                    chunk_nbytes = (chunk_nbytes // _NVME_LBS) * _NVME_LBS
+                    if chunk_nbytes == 0:
+                        logger.warning(
+                            "Chunk %s extent tail is smaller than 512B; skipping",
+                            key,
+                        )
+                        skip_file = True
+                        break
+                    if len(io_to_key_index) >= self._q_depth():
+                        logger.warning(
+                            "Tutti batch for %s would exceed queue depth %d; "
+                            "skipping",
+                            key,
+                            self._q_depth(),
+                        )
+                        skip_file = True
+                        break
+                    io_offset = read_start + cursor
+                    lba_slba = (
+                        extent.slba + (extent_skip + cursor) // _NVME_LBS
+                    )
+                    staging_iovas_list.append(
+                        self._slot_iova_with_offset(slot_idx, io_offset)
+                    )
+                    slbas_list.append(lba_slba)
+                    byte_lens_list.append(chunk_nbytes)
+                    io_to_key_index.append(i)
+                    file_ios += 1
+                    logger.debug(
+                        "Tutti extent read: key=%s slot=%d slba=%d "
+                        "offset=%d bytes=%d",
+                        key,
+                        slot_idx,
+                        lba_slba,
+                        io_offset,
+                        chunk_nbytes,
+                    )
+                    cursor += chunk_nbytes
+                if skip_file:
+                    break
 
-        n_ios = len(valid_indices)
+            total_file_bytes = sum(
+                byte_lens_list[io_start:]
+            ) if file_ios else 0
+            if skip_file or total_file_bytes != nbytes:
+                del staging_iovas_list[io_start:]
+                del slbas_list[io_start:]
+                del byte_lens_list[io_start:]
+                del io_to_key_index[io_start:]
+                logger.warning(
+                    "Tutti extents for %s cover %d/%d bytes; skipping",
+                    meta.path,
+                    total_file_bytes,
+                    nbytes,
+                )
+                continue
+            completed_indices.append(i)
+
+        n_ios = len(io_to_key_index)
         if n_ios == 0:
+            if any(meta is not None for meta in metas):
+                raise RuntimeError("Tutti direct load found no readable KV extents")
             return [None] * len(keys)
 
         # Build GPU tensors for kernel arguments (same device as staging).
@@ -1271,10 +1386,10 @@ class TuttiDirectLoader:
             # NVMe status field: bit 0 = phase, bits[15:1] = SC/SCT/DNR/More.
             nvme_status = (raw >> 1) & 0x7FFF
             if nvme_status != 0:
-                i_orig = valid_indices[j]
+                i_orig = io_to_key_index[j]
                 path = metas[i_orig].path if metas[i_orig] else "<unknown>"
                 raise RuntimeError(
-                    f"NVMe READ failed for slot {j} (key index {i_orig}, "
+                    f"NVMe READ failed for io {j} (key index {i_orig}, "
                     f"path {path}): raw status 0x{raw:04x} "
                     f"(SC=0x{nvme_status & 0xFF:02x} "
                     f"SCT=0x{(nvme_status >> 8) & 0x7:x})"
@@ -1282,15 +1397,15 @@ class TuttiDirectLoader:
 
         # Build GPU-resident MemoryObj for each completed I/O.
         results: list[Optional[MemoryObj]] = [None] * len(keys)
-        for j, i_orig in enumerate(valid_indices):
+        for slot_idx, i_orig in enumerate(completed_indices):
             meta = metas[i_orig]
             if meta is None:
                 raise RuntimeError(
-                    f"Internal error: valid_indices[{j}] = {i_orig} but "
+                    f"Internal error: completed_indices[{slot_idx}] = {i_orig} but "
                     "metas[i_orig] is None; this should never happen"
                 )
-            nbytes = byte_lens_list[j]
-            gpu_raw = self._staging_slice(j, nbytes)
+            nbytes = meta.size
+            gpu_raw = self._staging_slice(slot_idx, nbytes)
 
             # Apply per-key shape override when provided (DSV4 optimised KV:
             # non-tail chunks carry only prefix groups, so their shapes differ
@@ -1309,6 +1424,13 @@ class TuttiDirectLoader:
                 raw_data=gpu_raw,
                 parent_allocator=None,
             )
+
+        for i, (meta, result) in enumerate(zip(metas, results)):
+            if meta is not None and result is None:
+                raise RuntimeError(
+                    "Tutti direct load incomplete for key index "
+                    f"{i}, path {meta.path}"
+                )
 
         return results
 

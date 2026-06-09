@@ -23,6 +23,7 @@ import asyncio
 import gc
 import multiprocessing
 import os
+import subprocess
 import time
 
 # Third Party
@@ -77,6 +78,44 @@ ProcessTokensInternalResult = Tuple[List[ProcessedChunk], int]
 def _env_flag(name: str) -> bool:
     value = os.getenv(name, "")
     return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _maybe_unmount_for_tutti(cache_path: str) -> None:
+    """Unmount a local cache filesystem before snvme binds its NVMe device.
+
+    Tutti's SNVM_DEVICE_BIND detaches the in-tree nvme driver. Keeping ext4
+    mounted while doing that causes EIO and failed snvme attach. This helper is
+    called after FIEMAP has captured LBAs and before creating TuttiDirectLoader.
+
+    Args:
+        cache_path: LocalDiskBackend cache directory.
+    """
+    try:
+        mount_result = subprocess.run(
+            ["findmnt", "-nr", "-T", cache_path, "-o", "TARGET"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        mount_point = mount_result.stdout.strip().splitlines()[0]
+    except (IndexError, OSError) as exc:
+        logger.warning("Tutti could not resolve mount for %s: %s", cache_path, exc)
+        return
+
+    if not mount_point.startswith("/mnt/nvme"):
+        logger.info(
+            "Tutti leaves non-local cache mount active: path=%s mount=%s",
+            cache_path,
+            mount_point,
+        )
+        return
+
+    logger.info(
+        "Tutti unmounting cache filesystem before snvme bind: path=%s mount=%s",
+        cache_path,
+        mount_point,
+    )
+    subprocess.run(["umount", mount_point], check=True)
 
 
 def _as_bool(value: object) -> bool:
@@ -258,6 +297,9 @@ class LMCacheEngine:
 
         # Optional GPU-direct NVMe loader (Tutti fast path for LocalDiskBackend)
         self._tutti_loader: Optional[TuttiDirectLoader] = None
+        self._tutti_config: Optional[dict[str, Any]] = None
+        self._tutti_init_failed = False
+        self._tutti_can_cpu_fallback = True
 
     def set_health_monitor(self, health_monitor: "HealthMonitor") -> None:
         """
@@ -411,8 +453,45 @@ class LMCacheEngine:
         nsid: int = int(self.config.get_extra_config_value("tutti_nsid", 1))
         cuda_device: int = worker_idx
 
-        # ── Pre-scan: compute LBAs before SNVM_DEVICE_BIND (filesystem EIO
-        # after bind makes FIEMAP impossible for subsequent requests) ──────────
+        self._tutti_config = {
+            "device_path": device_path,
+            "ctrl_path": ctrl_path,
+            "pci_bdf": pci_bdf,
+            "n_slots": n_slots,
+            "slot_mb": slot_mb,
+            "nsid": nsid,
+            "cuda_device": cuda_device,
+        }
+        logger.info(
+            "TuttiDirectLoader configured lazily: worker=%d device=%s pci=%s "
+            "cuda:%d slots=%dx%dMiB",
+            worker_idx,
+            device_path,
+            pci_bdf,
+            cuda_device,
+            n_slots,
+            slot_mb,
+        )
+
+    def _ensure_tutti_loader(
+        self,
+        keys: Optional[List[CacheEngineKey]] = None,
+    ) -> bool:
+        """Initialise TuttiDirectLoader on the first LocalDiskBackend hit.
+
+        DSv4 long-context cold prefill has narrow HBM headroom. Deferring
+        Tutti staging allocation keeps cold/store requests on the same memory
+        path as the proven non-Tutti baseline; the loader is created only when
+        a disk hit can actually use it.
+
+        Returns:
+            True if the loader is available, False otherwise.
+        """
+        if self._tutti_loader is not None:
+            return True
+        if self._tutti_config is None or self._tutti_init_failed:
+            return False
+
         from lmcache.v1.gpu_connector.tutti_direct_loader import FiemapHelper
         from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
 
@@ -424,51 +503,79 @@ class LMCacheEngine:
         )
         if isinstance(disk_backend, LocalDiskBackend):
             n_recovered = disk_backend.scan_existing_entries(self.metadata)
-            if n_recovered > 0:
-                with disk_backend.disk_lock:
+            with disk_backend.disk_lock:
+                required_paths = [
+                    disk_backend.dict[key].path
+                    for key in keys or []
+                    if key in disk_backend.dict
+                    and disk_backend.dict[key] is not None
+                ]
+                if required_paths:
+                    paths = list(dict.fromkeys(required_paths))
+                else:
                     paths = [
                         meta.path
                         for meta in disk_backend.dict.values()
                         if meta is not None
                     ]
-                initial_lba_cache = FiemapHelper.scan_paths(paths)
-                logger.info(
-                    "Tutti pre-scan: %d files scanned, %d LBAs cached",
-                    len(paths),
-                    len(initial_lba_cache),
+            initial_lba_cache = FiemapHelper.scan_paths(paths)
+            missing_required_paths = [
+                path for path in required_paths if path not in initial_lba_cache
+            ]
+            if missing_required_paths:
+                logger.warning(
+                    "Tutti LBA pre-scan missed %d/%d requested files before "
+                    "snvme bind; using CPU filesystem path for this request. "
+                    "first_missing=%s",
+                    len(missing_required_paths),
+                    len(required_paths),
+                    missing_required_paths[0],
                 )
+                return False
+            logger.info(
+                "Tutti lazy pre-scan: %d recovered, %d files scanned, "
+                "%d LBAs cached",
+                n_recovered,
+                len(paths),
+                len(initial_lba_cache),
+            )
+            _maybe_unmount_for_tutti(disk_backend.path)
+            self._tutti_can_cpu_fallback = False
 
+        cfg = self._tutti_config
         try:
             self._tutti_loader = TuttiDirectLoader.create(
-                device_path=device_path,
-                ctrl_path=ctrl_path,
-                pci_bdf=pci_bdf,
-                n_slots=n_slots,
-                slot_bytes=slot_mb * 1024 * 1024,
-                nsid=nsid,
-                cuda_device=cuda_device,
+                device_path=cfg["device_path"],
+                ctrl_path=cfg["ctrl_path"],
+                pci_bdf=cfg["pci_bdf"],
+                n_slots=cfg["n_slots"],
+                slot_bytes=cfg["slot_mb"] * 1024 * 1024,
+                nsid=cfg["nsid"],
+                cuda_device=cfg["cuda_device"],
                 initial_lba_cache=initial_lba_cache,
             )
             logger.info(
                 "TuttiDirectLoader initialised: worker=%d device=%s pci=%s "
-                "cuda:%d slots=%d×%dMiB lba_cache=%d",
-                worker_idx,
-                device_path,
-                pci_bdf,
-                cuda_device,
-                n_slots,
-                slot_mb,
+                "cuda:%d slots=%dx%dMiB lba_cache=%d",
+                self.metadata.local_worker_id,
+                cfg["device_path"],
+                cfg["pci_bdf"],
+                cfg["cuda_device"],
+                cfg["n_slots"],
+                cfg["slot_mb"],
                 len(initial_lba_cache),
             )
+            return True
         except Exception as exc:
             logger.warning(
                 "TuttiDirectLoader init failed (worker=%d, %s); "
                 "falling back to CPU path",
-                worker_idx,
+                self.metadata.local_worker_id,
                 exc,
             )
             self._tutti_loader = None
-
+            self._tutti_init_failed = True
+            return False
     def _tutti_batched_get(
         self,
         keys: List[CacheEngineKey],
@@ -521,15 +628,24 @@ class LMCacheEngine:
         if any(m is None for m in disk_metas):
             return [None] * len(keys)
 
-        try:
-            return self._tutti_loader.load_chunks_to_hbm(
-                keys,
-                disk_metas,  # type: ignore[arg-type]
-                shapes_per_key=shapes_per_key,
-            )
-        except Exception as exc:
-            logger.warning("Tutti load failed (%s); falling back to CPU path", exc)
-            return [None] * len(keys)
+        # Recovered on-disk entries only have filename-level metadata.  Keep
+        # their format aligned with the engine so the downstream GPU connector
+        # accepts the GPU-resident TensorMemoryObj produced by Tutti.
+        for disk_meta in disk_metas:
+            if disk_meta is not None and disk_meta.fmt != self.fmt:
+                logger.debug(
+                    "Normalising Tutti disk metadata fmt from %s to %s for %s",
+                    disk_meta.fmt,
+                    self.fmt,
+                    disk_meta.path,
+                )
+                disk_meta.fmt = self.fmt
+
+        return self._tutti_loader.load_chunks_to_hbm(
+            keys,
+            disk_metas,  # type: ignore[arg-type]
+            shapes_per_key=shapes_per_key,
+        )
 
     def freeze(self, enabled: bool) -> None:
         """
@@ -1971,19 +2087,26 @@ class LMCacheEngine:
             else:
                 shapes_per_key = None
 
-            if location == "LocalDiskBackend" and self._tutti_loader is not None:
-                memory_objs = self._tutti_batched_get(keys, shapes_per_key=shapes_per_key)
-                if any(m is None for m in memory_objs):
-                    # Tutti returned a (partial) miss; release any refs it
-                    # already acquired before falling back to the CPU path.
-                    for _mo in memory_objs:
-                        if _mo is not None:
-                            _mo.ref_count_down()
+            if location == "LocalDiskBackend" and self._tutti_config is not None:
+                if self._ensure_tutti_loader(keys):
+                    memory_objs = self._tutti_batched_get(
+                        keys,
+                        shapes_per_key=shapes_per_key,
+                    )
+                elif self._tutti_can_cpu_fallback:
                     memory_objs = self.storage_manager.batched_get(
                         keys=keys,
                         location=location,
                         shapes_per_key=shapes_per_key,
                     )
+                else:
+                    logger.warning(
+                        "Tutti is configured for LocalDiskBackend but unavailable; "
+                        "treating %d disk blocks as misses to avoid CPU filesystem "
+                        "fallback after snvme bind",
+                        len(keys),
+                    )
+                    memory_objs = [None] * len(keys)
             else:
                 memory_objs = self.storage_manager.batched_get(
                     keys=keys,
