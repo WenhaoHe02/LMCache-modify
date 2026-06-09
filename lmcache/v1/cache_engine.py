@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 import asyncio
 import gc
 import multiprocessing
+import os
 import time
 
 # Third Party
@@ -42,6 +43,7 @@ from lmcache.utils import (
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventManager, EventStatus, EventType
 from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
+from lmcache.v1.gpu_connector.tutti_direct_loader import TuttiDirectLoader
 from lmcache.v1.gpu_connector.utils import assert_layerwise_gpu_connector
 from lmcache.v1.memory_management import CuFileMemoryAllocator  # noqa: E501
 from lmcache.v1.memory_management import (  # noqa: E501
@@ -70,6 +72,21 @@ logger = init_logger(__name__)
 ProcessedChunk = Tuple[CacheEngineKey, MemoryObj, int, int]
 # (list of processed chunks, total kv size)
 ProcessTokensInternalResult = Tuple[List[ProcessedChunk], int]
+
+
+def _env_flag(name: str) -> bool:
+    value = os.getenv(name, "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _as_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.lower() in {"1", "true", "yes", "on"}
+    return False
 
 
 class CacheEngineEndSignal:
@@ -109,6 +126,19 @@ class LMCacheEngine:
         self.gpu_connector = gpu_connector
         self.broadcast_fn = broadcast_fn
         self.broadcast_object_fn = broadcast_object_fn
+        self.dsv4_optimized_kv = (
+            _as_bool(config.get_extra_config_value("dsv4_optimized_kv", False))
+            or _env_flag("LMCACHE_DSV4_OPTIMIZED_KV")
+        )
+        self.dsv4_optimized_tail_tokens = max(
+            int(
+                config.get_extra_config_value(
+                    "dsv4_optimized_tail_tokens",
+                    os.getenv("LMCACHE_DSV4_OPTIMIZED_TAIL_TOKENS", config.chunk_size),
+                )
+            ),
+            config.chunk_size,
+        )
         # save_only_first_rank only works when use mla
         self.save_only_first_rank = (
             self.config.get_extra_config_value("save_only_first_rank", metadata.use_mla)
@@ -226,6 +256,9 @@ class LMCacheEngine:
         # Flag to indicate if initialization failed (irrecoverable error)
         self._init_failed = False
 
+        # Optional GPU-direct NVMe loader (Tutti fast path for LocalDiskBackend)
+        self._tutti_loader: Optional[TuttiDirectLoader] = None
+
     def set_health_monitor(self, health_monitor: "HealthMonitor") -> None:
         """
         Set the health monitor reference.
@@ -261,6 +294,14 @@ class LMCacheEngine:
     def _get_req_id(self, kwargs: dict) -> str:
         """Extracts request ID from kwargs for logging."""
         return kwargs.get("req_id", "unspecified")
+
+    def _prepare_gpu_connector_layout(self, **kwargs: Any) -> None:
+        """Let the GPU connector discover KV layout before memory allocation."""
+        if self.gpu_connector is None:
+            return
+        register = getattr(self.gpu_connector, "register_kv_caches", None)
+        if callable(register) and "kvcaches" in kwargs:
+            register(kwargs["kvcaches"])
 
     def mark_init_failed(self, reason: str = "") -> None:
         """
@@ -306,7 +347,189 @@ class LMCacheEngine:
                     lmcache_worker=self.lmcache_worker,
                     async_lookup_server=async_lookup_server,
                 )
+                self._maybe_init_tutti_loader()
             self.post_inited = True
+
+    def _maybe_init_tutti_loader(self) -> None:
+        """Initialise TuttiDirectLoader if tutti_device_path is configured.
+
+        Reads extra_config keys:
+          - ``tutti_device_path``  (required, e.g. "/dev/ssnvme0")
+          - ``tutti_ctrl_path``    (default "/dev/snvm_control")
+          - ``tutti_pci_bdfs``     CSV of BDFs ordered by worker rank, e.g.
+                                   "0000:6f:00.0,0000:10:00.0,..."
+                                   Worker N uses bdfs[local_worker_id % len(bdfs)].
+                                   Use "skip" for workers whose disk is not a
+                                   local PCIe NVMe (e.g. NVMe-oF fabric devices).
+                                   Alias ``tutti_pci_bdf`` (singular) accepted for
+                                   single-drive / TP=1 setups.
+          - ``tutti_n_slots``      (default 16)
+          - ``tutti_slot_mb``      (default 32, per-slot MiB)
+          - ``tutti_nsid``         (default 1)
+        """
+        device_path: Optional[str] = self.config.get_extra_config_value(
+            "tutti_device_path", None
+        )
+        if device_path is None:
+            return
+
+        ctrl_path: str = self.config.get_extra_config_value(
+            "tutti_ctrl_path", "/dev/snvm_control"
+        )
+
+        # Support both tutti_pci_bdfs (CSV for TP>1) and tutti_pci_bdf (singular).
+        bdfs_csv: Optional[str] = self.config.get_extra_config_value(
+            "tutti_pci_bdfs", None
+        )
+        if bdfs_csv is None:
+            bdfs_csv = self.config.get_extra_config_value("tutti_pci_bdf", None)
+        if bdfs_csv is None:
+            logger.warning(
+                "tutti_device_path set but tutti_pci_bdfs missing; "
+                "Tutti fast path disabled"
+            )
+            return
+
+        bdf_list = [b.strip() for b in bdfs_csv.split(",")]
+        worker_idx: int = self.metadata.local_worker_id
+        pci_bdf: str = bdf_list[worker_idx % len(bdf_list)]
+
+        if pci_bdf.lower() in ("skip", "none", ""):
+            logger.info(
+                "Worker %d: Tutti disabled (BDF='%s' in tutti_pci_bdfs list)",
+                worker_idx,
+                pci_bdf,
+            )
+            return
+
+        n_slots: int = int(
+            self.config.get_extra_config_value("tutti_n_slots", 16)
+        )
+        slot_mb: int = int(
+            self.config.get_extra_config_value("tutti_slot_mb", 32)
+        )
+        nsid: int = int(self.config.get_extra_config_value("tutti_nsid", 1))
+        cuda_device: int = worker_idx
+
+        # ── Pre-scan: compute LBAs before SNVM_DEVICE_BIND (filesystem EIO
+        # after bind makes FIEMAP impossible for subsequent requests) ──────────
+        from lmcache.v1.gpu_connector.tutti_direct_loader import FiemapHelper
+        from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
+
+        initial_lba_cache: dict = {}
+        disk_backend = (
+            self.storage_manager.storage_backends.get("LocalDiskBackend")
+            if self.storage_manager is not None
+            else None
+        )
+        if isinstance(disk_backend, LocalDiskBackend):
+            n_recovered = disk_backend.scan_existing_entries(self.metadata)
+            if n_recovered > 0:
+                with disk_backend.disk_lock:
+                    paths = [
+                        meta.path
+                        for meta in disk_backend.dict.values()
+                        if meta is not None
+                    ]
+                initial_lba_cache = FiemapHelper.scan_paths(paths)
+                logger.info(
+                    "Tutti pre-scan: %d files scanned, %d LBAs cached",
+                    len(paths),
+                    len(initial_lba_cache),
+                )
+
+        try:
+            self._tutti_loader = TuttiDirectLoader.create(
+                device_path=device_path,
+                ctrl_path=ctrl_path,
+                pci_bdf=pci_bdf,
+                n_slots=n_slots,
+                slot_bytes=slot_mb * 1024 * 1024,
+                nsid=nsid,
+                cuda_device=cuda_device,
+                initial_lba_cache=initial_lba_cache,
+            )
+            logger.info(
+                "TuttiDirectLoader initialised: worker=%d device=%s pci=%s "
+                "cuda:%d slots=%d×%dMiB lba_cache=%d",
+                worker_idx,
+                device_path,
+                pci_bdf,
+                cuda_device,
+                n_slots,
+                slot_mb,
+                len(initial_lba_cache),
+            )
+        except Exception as exc:
+            logger.warning(
+                "TuttiDirectLoader init failed (worker=%d, %s); "
+                "falling back to CPU path",
+                worker_idx,
+                exc,
+            )
+            self._tutti_loader = None
+
+    def _tutti_batched_get(
+        self,
+        keys: List[CacheEngineKey],
+        shapes_per_key: Optional[List[Optional[List[torch.Size]]]] = None,
+    ) -> List[Optional[MemoryObj]]:
+        """Fast-path disk load via GPU-direct NVMe (Tutti).
+
+        Fetches DiskCacheMetadata from LocalDiskBackend without loading the
+        tensor, then delegates to TuttiDirectLoader which DMAs directly from
+        NVMe into HBM staging buffers and wraps them as TensorMemoryObj.
+
+        Falls back to returning all-None (triggering the standard CPU path)
+        on any error.
+
+        Args:
+            keys: Cache keys to load.
+            shapes_per_key: Optional per-key shape overrides for DSV4
+                optimised KV.  When provided, ``shapes_per_key[i]`` overrides
+                the shapes used to build the MemoryObjMetadata for
+                ``keys[i]``.  A ``None`` entry means "use shapes stored in
+                disk metadata for that key".
+
+        Returns:
+            List of MemoryObj (GPU-resident TensorMemoryObj) or None per key.
+        """
+        if self.storage_manager is None:
+            raise RuntimeError(
+                "_tutti_batched_get called but storage_manager is None"
+            )
+        if self._tutti_loader is None:
+            raise RuntimeError(
+                "_tutti_batched_get called but _tutti_loader is None"
+            )
+
+        # Retrieve DiskCacheMetadata from LocalDiskBackend without loading.
+        from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
+        from lmcache.utils import DiskCacheMetadata
+
+        disk_backend = self.storage_manager.storage_backends.get(
+            "LocalDiskBackend"
+        )
+        if not isinstance(disk_backend, LocalDiskBackend):
+            return [None] * len(keys)
+
+        disk_metas: List[Optional[DiskCacheMetadata]] = []
+        with disk_backend.disk_lock:
+            for key in keys:
+                disk_metas.append(disk_backend.dict.get(key, None))
+
+        if any(m is None for m in disk_metas):
+            return [None] * len(keys)
+
+        try:
+            return self._tutti_loader.load_chunks_to_hbm(
+                keys,
+                disk_metas,  # type: ignore[arg-type]
+                shapes_per_key=shapes_per_key,
+            )
+        except Exception as exc:
+            logger.warning("Tutti load failed (%s); falling back to CPU path", exc)
+            return [None] * len(keys)
 
     def freeze(self, enabled: bool) -> None:
         """
@@ -396,6 +619,7 @@ class LMCacheEngine:
         assert self.gpu_connector is not None, (
             "gpu_connector is required for store operation"
         )
+        self._prepare_gpu_connector_layout(**kwargs)
 
         if self._is_passive():
             logger.debug(f"rank={self.metadata.worker_id} ignore store")
@@ -470,6 +694,13 @@ class LMCacheEngine:
                 num_tokens = end - start
                 kv_shapes = self.metadata.get_shapes(num_tokens)
                 kv_dtypes = self.metadata.get_dtypes()
+                kv_shapes = self._dsv4_store_shapes_for_range(
+                    kv_shapes,
+                    kv_dtypes,
+                    start,
+                    end,
+                    len(tokens),
+                )
 
                 # TODO (Jiayi): should be batched in the future
                 memory_obj = self.storage_manager.allocate(
@@ -563,6 +794,56 @@ class LMCacheEngine:
             (store_stats.process_tokens_time + store_stats.from_gpu_time) * 1000,
             store_stats.put_time * 1000,
         )
+
+    def _dsv4_store_shapes_for_range(
+        self,
+        shapes: list[torch.Size],
+        dtypes: list[torch.dtype],
+        start: int,
+        end: int,
+        total_tokens: int,
+    ) -> list[torch.Size]:
+        if not self.dsv4_optimized_kv:
+            return shapes
+        klg_manager = self.metadata.kv_layer_groups_manager
+        if klg_manager is None or not klg_manager.kv_layer_groups:
+            return shapes
+        tail_start = max(0, total_tokens - self.dsv4_optimized_tail_tokens)
+        keep_tail_groups = end > tail_start
+        optimized: list[torch.Size] = []
+        for shape, dtype, group in zip(
+            shapes,
+            dtypes,
+            klg_manager.kv_layer_groups,
+            strict=True,
+        ):
+            role = self._dsv4_group_role(group, dtype)
+            if role in {"swa_cache", "compressor_state"} and not keep_tail_groups:
+                optimized.append(torch.Size([*shape[:2], 0, *shape[3:]]))
+            else:
+                optimized.append(shape)
+        return optimized
+
+    @staticmethod
+    def _dsv4_group_role(group: Any, dtype: torch.dtype) -> str:
+        hidden_dim = group.hidden_dim_size
+        compress_ratio = group.compress_ratio
+        num_layers = group.num_layers
+        if dtype == torch.float32:
+            return "compressor_state"
+        if dtype != torch.uint8:
+            return "unknown"
+        if hidden_dim == 132:
+            return "csa_indexer_cache"
+        if hidden_dim != 584:
+            return "unknown"
+        if compress_ratio == 1:
+            return "swa_cache"
+        if compress_ratio >= 64 or group.shape_desc.bs <= 2:
+            return "hca_attention_kv"
+        if compress_ratio == 4 or num_layers == 30:
+            return "csa_attention_kv"
+        return "unknown"
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -787,6 +1068,7 @@ class LMCacheEngine:
         assert self.gpu_connector is not None, (
             "gpu_connector is required for retrieve operation"
         )
+        self._prepare_gpu_connector_layout(**kwargs)
 
         # Get req_id for logging
         req_id = self._get_req_id(kwargs)
@@ -1544,6 +1826,13 @@ class LMCacheEngine:
         except Exception as e:
             logger.error(f"Error closing storage_manager: {e}")
 
+        if self._tutti_loader is not None:
+            try:
+                self._tutti_loader.close()
+            except Exception as exc:
+                logger.error("Error closing TuttiDirectLoader: %s", exc)
+            self._tutti_loader = None
+
         logger.info("LMCacheEngine closed.")
 
     def _async_process_tokens_internal(
@@ -1656,13 +1945,51 @@ class LMCacheEngine:
         else:
             block_mapping = self.storage_manager.get_block_mapping(chunk_infos)
 
+        total_tokens = len(tokens)
+
         last_failed_block_start = None
         for location, blocks in block_mapping.items():
             keys = [key for key, _, _ in blocks]
-            memory_objs = self.storage_manager.batched_get(
-                keys=keys,
-                location=location,
-            )
+
+            # For DSv4-optimised KV layouts, compute per-chunk shape overrides
+            # so that non-tail chunks only read prefix groups (groups 0-2,
+            # ~1.4 MB) instead of all 8 groups (~116 MB).  This mirrors the
+            # shape masking already applied in the store path and prevents
+            # vLLM RPC timeouts caused by reading ~110 GB sequentially for
+            # large prompts.
+            if self.dsv4_optimized_kv:
+                shapes_per_key: Optional[List[Optional[List[torch.Size]]]] = [
+                    self._dsv4_store_shapes_for_range(
+                        self.metadata.get_shapes(end - start),
+                        self.metadata.get_dtypes(),
+                        start,
+                        end,
+                        total_tokens,
+                    )
+                    for _, start, end in blocks
+                ]
+            else:
+                shapes_per_key = None
+
+            if location == "LocalDiskBackend" and self._tutti_loader is not None:
+                memory_objs = self._tutti_batched_get(keys, shapes_per_key=shapes_per_key)
+                if any(m is None for m in memory_objs):
+                    # Tutti returned a (partial) miss; release any refs it
+                    # already acquired before falling back to the CPU path.
+                    for _mo in memory_objs:
+                        if _mo is not None:
+                            _mo.ref_count_down()
+                    memory_objs = self.storage_manager.batched_get(
+                        keys=keys,
+                        location=location,
+                        shapes_per_key=shapes_per_key,
+                    )
+            else:
+                memory_objs = self.storage_manager.batched_get(
+                    keys=keys,
+                    location=location,
+                    shapes_per_key=shapes_per_key,
+                )
 
             used_keys: set[CacheEngineKey] = set()
             for (key, start, end), memory_obj in zip(blocks, memory_objs, strict=False):

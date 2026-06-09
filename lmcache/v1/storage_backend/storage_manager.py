@@ -483,13 +483,31 @@ class StorageManager:
         self,
         keys: List[CacheEngineKey],
         location: Optional[str] = None,
+        shapes_per_key: Optional[List[Optional[List[torch.Size]]]] = None,
     ) -> List[Optional[MemoryObj]]:
-        """
-        Blocking function to get the memory objects from the storages.
+        """Blocking function to get the memory objects from the storages.
+
+        Args:
+            keys: Cache keys to retrieve.
+            location: If provided, restrict the search to the backend with
+                this name.
+            shapes_per_key: Optional per-key allocation shape overrides
+                forwarded to :meth:`StorageBackendInterface.batched_get_blocking`.
+                ``shapes_per_key[i]`` overrides the shapes used to allocate
+                the read buffer for ``keys[i]``.  Pass ``None`` for an entry
+                to use the shapes stored in metadata for that key.  Backends
+                that do not support partial reads silently ignore this
+                parameter.
+
+        Returns:
+            A list of ``MemoryObj`` instances, one per key.  Entries are
+            ``None`` for keys not found in any backend.
         """
         # TODO (ApostaC): remove the nested optional here
         for backend_name, storage_backend in self.get_active_storage_backends(location):
-            memory_objs = storage_backend.batched_get_blocking(keys)
+            memory_objs = storage_backend.batched_get_blocking(
+                keys, shapes_per_key=shapes_per_key
+            )
             if memory_objs:
                 # Align with single-key `get()` logic:
                 # auto-write remote data to local CPU cache

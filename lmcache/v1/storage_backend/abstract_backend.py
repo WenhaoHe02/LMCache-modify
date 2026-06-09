@@ -178,11 +178,18 @@ class StorageBackendInterface(metaclass=abc.ABCMeta):
     def batched_get_blocking(
         self,
         keys: List[CacheEngineKey],
+        shapes_per_key: Optional[List[Optional[List[torch.Size]]]] = None,
     ) -> List[Optional[MemoryObj]]:
         """
         A blocking function to get the kv cache from the storage backend.
 
         :param List[CacheEngineKey] keys: The keys of the MemoryObjs.
+        :param Optional[List[Optional[List[torch.Size]]]] shapes_per_key:
+            Per-key allocation shape overrides for multi-group KV caches.
+            When provided, ``shapes_per_key[i]`` overrides the shapes used
+            to allocate the read buffer for ``keys[i]``.  A ``None`` entry
+            means "use shapes stored in metadata for that key".  Backends
+            that do not support partial reads may ignore this parameter.
 
         :return: a list of memory objects.
         """

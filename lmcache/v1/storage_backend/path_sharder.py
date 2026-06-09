@@ -95,7 +95,19 @@ class PathSharder:
 
         if create_dirs:
             for p in paths:
-                os.makedirs(p, exist_ok=True)
+                try:
+                    os.makedirs(p, exist_ok=True)
+                except OSError as exc:
+                    # Non-fatal: another worker may have already bound this
+                    # device to snvme (GPU-direct NVMe), putting the
+                    # filesystem in EIO state.  The directory was created
+                    # before the bind; skip silently.
+                    logger.warning(
+                        "Cannot create cache dir %s: %s "
+                        "(non-fatal; likely bound to snvme by another worker)",
+                        p,
+                        exc,
+                    )
 
     # -- public read-only properties -----------------------------------------
 

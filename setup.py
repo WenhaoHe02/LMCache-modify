@@ -138,6 +138,7 @@ def cuda_extension() -> tuple[list, dict]:
         "csrc/mem_alloc.cpp",
         "csrc/utils.cpp",
         "csrc/event_recorder.cpp",
+        "csrc/tutti_kv_ops.cu",
     ]
     storage_manager_sources = [
         "csrc/storage_manager/bitmap.cpp",

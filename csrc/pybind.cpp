@@ -9,6 +9,7 @@
 #include "mem_alloc.h"
 #include "utils.h"
 #include "event_recorder.h"
+#include "tutti_kv_ops.cuh"
 #include <torch/torch.h>
 #include <torch/extension.h>
 #include <iostream>
@@ -96,4 +97,21 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("session_id"), py::arg("str_metadata"), py::arg("int_metadata"),
         py::call_guard<py::gil_scoped_release>());
   m.def("drain_recorded_events", &drain_recorded_events);
+  // Tutti GPU-direct NVMe batch I/O (Linux + snvme kernel module required)
+  m.def("tutti_submit_batch_sgl_read", &tutti_submit_batch_sgl_read,
+        py::arg("sq_dev_ptr"), py::arg("cq_dev_ptr"),
+        py::arg("sq_db_ptr"), py::arg("cq_db_ptr"),
+        py::arg("sq_tail_ptr"),
+        py::arg("q_depth"), py::arg("qid"), py::arg("nsid"),
+        py::arg("staging_iovas"), py::arg("slbas"), py::arg("byte_lens"),
+        py::arg("stream_ptr") = int64_t(0),
+        py::call_guard<py::gil_scoped_release>());
+  m.def("tutti_poll_batch", &tutti_poll_batch,
+        py::arg("sq_dev_ptr"), py::arg("cq_dev_ptr"),
+        py::arg("sq_db_ptr"), py::arg("cq_db_ptr"),
+        py::arg("cq_head_ptr"), py::arg("cq_phase_ptr"),
+        py::arg("q_depth"), py::arg("n_ios"),
+        py::arg("status_out"), py::arg("timed_out_ptr"),
+        py::arg("max_iters"), py::arg("stream_ptr") = int64_t(0),
+        py::call_guard<py::gil_scoped_release>());
 }
