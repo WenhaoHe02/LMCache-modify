@@ -84,6 +84,11 @@ _DEFAULT_MAX_ITERS: int = 500_000_000
 _CUDA_HOST_REGISTER_IO_MEMORY: int = 0x04
 
 
+def _align_up(x: int, align: int) -> int:
+    """Round x up to the next multiple of align."""
+    return ((x + align - 1) // align) * align
+
+
 # ── ctypes helpers ───────────────────────────────────────────────────────────
 
 _libcudart: Optional[ctypes.CDLL] = None
@@ -1092,10 +1097,19 @@ class TuttiDirectLoader:
         start = slot_idx * self._slot_bytes
         return self._staging[start : start + nbytes]
 
+    def _staging_slice_at(self, offset: int, nbytes: int) -> torch.Tensor:
+        """Return the uint8 view into staging at an arbitrary byte offset."""
+        return self._staging[offset : offset + nbytes]
+
     def _slot_iova(self, slot_idx: int) -> int:
         """IOVA of the first GPU page in staging slot slot_idx."""
         page_offset = slot_idx * self._slot_gpu_pages
         return self._session.staging_iovas[page_offset]
+
+    def _staging_iova_at(self, offset: int) -> int:
+        """IOVA inside the staging pool at an arbitrary byte offset."""
+        page_offset = offset // _GPU_PAGE_SIZE
+        return self._session.staging_iovas[page_offset] + offset % _GPU_PAGE_SIZE
 
     def _slot_iova_with_offset(self, slot_idx: int, offset: int) -> int:
         """IOVA inside a staging slot at an arbitrary byte offset."""
@@ -1104,6 +1118,33 @@ class TuttiDirectLoader:
 
     def _q_depth(self) -> int:
         return int(self._session.info.q_depth)
+
+    def _staging_capacity_bytes(self) -> int:
+        """Total bytes available in the HBM staging pool."""
+        return self._n_slots * self._slot_bytes
+
+    def _estimate_chunk_ios(self, meta: DiskCacheMetadata) -> int:
+        """Estimate how many NVMe READ commands are needed for one chunk."""
+        max_io = self._session.info.max_data_size
+        nbytes = meta.size
+        n_ios = 0
+        covered = 0
+        for extent in self._get_extents(meta.path):
+            extent_start = extent.file_offset
+            extent_end = extent_start + extent.n_sectors * _NVME_LBS
+            read_start = max(0, extent_start)
+            read_end = min(nbytes, extent_end)
+            if read_start >= read_end:
+                continue
+            read_nbytes = read_end - read_start
+            covered += read_nbytes
+            if max_io > 0:
+                n_ios += (read_nbytes + max_io - 1) // max_io
+            else:
+                n_ios += 1
+        if covered != nbytes:
+            return self._q_depth() + 1
+        return n_ios
 
     # ── public API ──────────────────────────────────────────────────────────
 
@@ -1119,7 +1160,9 @@ class TuttiDirectLoader:
         READ into an HBM staging slot and returns a GPU-resident TensorMemoryObj.
         Keys with missing metadata (None) yield None in the output list.
 
-        Large batches (len > n_slots) are processed in sub-batches of n_slots.
+        Large batches are processed in sub-batches bounded by NVMe queue depth
+        and total staging pool capacity.  The staging pool is packed by actual
+        chunk size, so small chunks do not waste a full ``slot_bytes`` region.
 
         Args:
             keys:           Cache engine keys identifying the chunks.
@@ -1145,10 +1188,45 @@ class TuttiDirectLoader:
 
         results: list[Optional[MemoryObj]] = [None] * n
 
-        # Process in sub-batches bounded by n_slots (= queue depth capacity).
-        batch_size = self._n_slots
-        for batch_start in range(0, n, batch_size):
-            batch_end = min(batch_start + batch_size, n)
+        q_depth = self._q_depth()
+        staging_capacity = self._staging_capacity_bytes()
+        batch_start = 0
+        while batch_start < n:
+            batch_end = batch_start
+            batch_ios = 0
+            batch_bytes = 0
+            while batch_end < n:
+                meta = disk_metadatas[batch_end]
+                if meta is None:
+                    if batch_end == batch_start or (batch_end - batch_start) < q_depth:
+                        batch_end += 1
+                        continue
+                    break
+
+                chunk_bytes = _align_up(meta.size, _GPU_PAGE_SIZE)
+                try:
+                    chunk_ios = self._estimate_chunk_ios(meta)
+                except (FileNotFoundError, ValueError, OSError):
+                    chunk_ios = 1
+
+                if (
+                    batch_end > batch_start
+                    and (
+                        batch_ios + chunk_ios > q_depth
+                        or batch_bytes + chunk_bytes > staging_capacity
+                    )
+                ):
+                    break
+
+                batch_ios += chunk_ios
+                batch_bytes += chunk_bytes
+                batch_end += 1
+
+                # A single oversized chunk still needs to reach _load_batch so
+                # it follows the existing loud failure path.
+                if batch_ios > q_depth or batch_bytes > staging_capacity:
+                    break
+
             batch_keys = keys[batch_start:batch_end]
             batch_metas = disk_metadatas[batch_start:batch_end]
             batch_shapes = (
@@ -1162,6 +1240,7 @@ class TuttiDirectLoader:
             )
             for i, res in enumerate(batch_results):
                 results[batch_start + i] = res
+            batch_start = batch_end
 
         return results
 
@@ -1171,21 +1250,18 @@ class TuttiDirectLoader:
         metas: list[Optional[DiskCacheMetadata]],
         shapes_per_key: Optional[list[Optional[list[torch.Size]]]] = None,
     ) -> list[Optional[MemoryObj]]:
-        """Load one batch (len ≤ n_slots) into HBM staging."""
-        if len(keys) > self._n_slots:
-            raise ValueError(
-                f"batch size {len(keys)} exceeds n_slots {self._n_slots}; "
-                "split into smaller batches before calling _load_batch"
-            )
+        """Load one queue/staging-capacity-bounded batch into HBM staging."""
 
         # Build per-I/O parameters. A single KV file can occupy multiple
         # filesystem extents, so one logical chunk may expand to multiple NVMe
         # READs into different offsets of the same staging slot.
         completed_indices: list[int] = []
+        completed_offsets: list[int] = []
         io_to_key_index: list[int] = []
         staging_iovas_list: list[int] = []
         slbas_list: list[int] = []
         byte_lens_list: list[int] = []
+        next_staging_offset = 0
 
         for i, (key, meta) in enumerate(zip(keys, metas)):
             if meta is None:
@@ -1206,6 +1282,16 @@ class TuttiDirectLoader:
                     self._slot_bytes,
                 )
                 continue
+            aligned_nbytes = _align_up(nbytes, _GPU_PAGE_SIZE)
+            if next_staging_offset + aligned_nbytes > self._staging_capacity_bytes():
+                logger.warning(
+                    "Tutti batch staging capacity exceeded for %s: need %d bytes, "
+                    "remaining %d bytes; skipping",
+                    key,
+                    aligned_nbytes,
+                    self._staging_capacity_bytes() - next_staging_offset,
+                )
+                continue
             max_io = self._session.info.max_data_size
             if nbytes % _NVME_LBS != 0:
                 logger.warning(
@@ -1215,7 +1301,7 @@ class TuttiDirectLoader:
                 )
                 continue
 
-            slot_idx = len(completed_indices)
+            chunk_offset = next_staging_offset
             io_start = len(io_to_key_index)
             file_ios = 0
             skip_file = False
@@ -1277,17 +1363,17 @@ class TuttiDirectLoader:
                         extent.slba + (extent_skip + cursor) // _NVME_LBS
                     )
                     staging_iovas_list.append(
-                        self._slot_iova_with_offset(slot_idx, io_offset)
+                        self._staging_iova_at(chunk_offset + io_offset)
                     )
                     slbas_list.append(lba_slba)
                     byte_lens_list.append(chunk_nbytes)
                     io_to_key_index.append(i)
                     file_ios += 1
                     logger.debug(
-                        "Tutti extent read: key=%s slot=%d slba=%d "
+                        "Tutti extent read: key=%s staging_offset=%d slba=%d "
                         "offset=%d bytes=%d",
                         key,
-                        slot_idx,
+                        chunk_offset,
                         lba_slba,
                         io_offset,
                         chunk_nbytes,
@@ -1312,6 +1398,8 @@ class TuttiDirectLoader:
                 )
                 continue
             completed_indices.append(i)
+            completed_offsets.append(chunk_offset)
+            next_staging_offset += aligned_nbytes
 
         n_ios = len(io_to_key_index)
         if n_ios == 0:
@@ -1397,15 +1485,15 @@ class TuttiDirectLoader:
 
         # Build GPU-resident MemoryObj for each completed I/O.
         results: list[Optional[MemoryObj]] = [None] * len(keys)
-        for slot_idx, i_orig in enumerate(completed_indices):
+        for chunk_offset, i_orig in zip(completed_offsets, completed_indices):
             meta = metas[i_orig]
             if meta is None:
                 raise RuntimeError(
-                    f"Internal error: completed_indices[{slot_idx}] = {i_orig} but "
+                    f"Internal error: completed_indices contains {i_orig} but "
                     "metas[i_orig] is None; this should never happen"
                 )
             nbytes = meta.size
-            gpu_raw = self._staging_slice(slot_idx, nbytes)
+            gpu_raw = self._staging_slice_at(chunk_offset, nbytes)
 
             # Apply per-key shape override when provided (DSV4 optimised KV:
             # non-tail chunks carry only prefix groups, so their shapes differ

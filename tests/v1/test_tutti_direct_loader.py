@@ -283,6 +283,7 @@ def _make_mock_session(q_depth: int = 32) -> MagicMock:
     # info.q_depth
     info = MagicMock()
     info.q_depth = q_depth
+    info.max_data_size = 4 * 1024 * 1024
     session.info = info
 
     # queue resources
@@ -384,8 +385,11 @@ class TestTuttiDirectLoaderLoadBatch:
         """
         _GPU_PAGE_SIZE = 1 << 16
 
+        meta_by_path = {meta.path: meta for meta in metas if meta is not None}
+
         def fake_fiemap(path):
-            n_sectors = metas[0].size // 512 if metas[0] else 1
+            meta = meta_by_path.get(path)
+            n_sectors = meta.size // 512 if meta is not None else 1
             return [LbaRecord(slba=fiemap_lba, n_sectors=n_sectors)]
 
         # Patch FIEMAP so no real ioctl is issued.
@@ -396,7 +400,7 @@ class TestTuttiDirectLoaderLoadBatch:
             with patch.object(_tdl, "_c_ops") as mock_c:
 
                 def fake_poll(**kwargs):
-                    n = len(keys)
+                    n = kwargs.get("n_ios", len(keys))
                     loader._status_buf[:n] = nvme_status * 2  # phase=0 → raw=status<<1
 
                 mock_c.tutti_submit_batch_sgl_read = MagicMock()
@@ -569,6 +573,37 @@ class TestTuttiDirectLoaderLoadChunksToHbm:
         # All five should succeed
         for r in results:
             assert r is not None
+
+    def test_small_chunks_pack_beyond_slot_count(self) -> None:
+        """Small chunks use queue/staging capacity instead of fixed slot count."""
+        loader, _ctrl = _make_loader(n_slots=2, slot_mb=1, q_depth=8)
+        size = 512 * 4
+        n_keys = 4
+        keys = [_fake_key(i) for i in range(n_keys)]
+        metas = [_disk_meta_for(size, path=f"/tmp/fake_{i}.kv") for i in range(n_keys)]
+
+        def fake_fiemap(path):
+            return [LbaRecord(slba=0, n_sectors=size // 512)]
+
+        with patch.object(
+            _tdl.FiemapHelper, "query_extents", side_effect=fake_fiemap
+        ):
+            with patch.object(_tdl, "_c_ops") as mock_c:
+                mock_c.tutti_submit_batch_sgl_read = MagicMock()
+
+                def fake_poll(**kwargs):
+                    n_ios = kwargs.get("n_ios", 0)
+                    loader._status_buf[:n_ios] = 0
+
+                mock_c.tutti_poll_batch.side_effect = fake_poll
+
+                with patch("torch.cuda.synchronize"):
+                    results = loader.load_chunks_to_hbm(keys, metas)
+
+        assert all(r is not None for r in results)
+        assert mock_c.tutti_submit_batch_sgl_read.call_count == 1
+        submit_kwargs = mock_c.tutti_submit_batch_sgl_read.call_args.kwargs
+        assert submit_kwargs["staging_iovas"].numel() == n_keys
 
     def test_partial_none_in_batch(self) -> None:
         """Mix of valid and None metas within a single batch."""

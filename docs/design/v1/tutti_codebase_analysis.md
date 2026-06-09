@@ -933,13 +933,29 @@ dict[str, list[LbaRecord]]
 
 #### staging slot 和多 IO 映射
 
-`TuttiDirectLoader` 仍然要求一个逻辑 chunk 放进一个 staging slot：
+`TuttiDirectLoader` 仍然要求一个逻辑 chunk 不超过 `tutti_slot_mb`：
 
 ```text
 meta.size <= tutti_slot_mb * 1024 * 1024
 ```
 
-但一个逻辑 chunk 可以拆成多个 NVMe READ：
+但 staging pool 不再按固定 slot 浪费空间。批处理时按实际 chunk 大小做 64 KiB 对齐后紧凑 packing：
+
+```text
+staging pool = tutti_n_slots * tutti_slot_mb
+
+small chunk 0 -> offset 0
+small chunk 1 -> offset align_up(size0, 64KiB)
+small chunk 2 -> offset align_up(size0, 64KiB) + align_up(size1, 64KiB)
+...
+```
+
+这样 `tutti_slot_mb=128` 仍可容纳 DSv4 大 chunk，但 42K 这类小 chunk 不会每个都浪费一个 128 MiB slot。批大小由两个条件共同限制：
+
+1. NVMe queue depth：本批展开后的 READ 数不能超过 `q_depth`。
+2. staging pool 总容量：本批实际 packed bytes 不能超过 `tutti_n_slots * tutti_slot_mb`。
+
+一个逻辑 chunk 可以拆成多个 NVMe READ：
 
 ```text
 chunk file
@@ -947,10 +963,10 @@ chunk file
   extent 1: file_offset=A,        length=B
   extent 2: file_offset=A+B,      length=C
 
-staging slot
-  [0:A)       <- READ extent 0
-  [A:A+B)     <- READ extent 1
-  [A+B:A+B+C) <- READ extent 2
+staging region at chunk_offset
+  [chunk_offset + 0 : chunk_offset + A)       <- READ extent 0
+  [chunk_offset + A : chunk_offset + A+B)     <- READ extent 1
+  [chunk_offset + A+B : chunk_offset + A+B+C) <- READ extent 2
 ```
 
 每个 READ 的 HBM 目标地址由 `_slot_iova_with_offset(slot_idx, io_offset)` 计算。这里同时处理：
