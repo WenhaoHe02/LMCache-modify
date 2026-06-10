@@ -4,8 +4,9 @@ This module defines the lower storage namespace for KV objects. The current
 implementation has a real framework integration in `LocalDiskBackend`: when
 `LMCACHE_KV_OBJECT_STORE_ENABLE=1` or `extra_config.kv_object_store_enable` is
 set, disk store writes both the legacy `.pt` file and a chunk-level KV object
-pool entry; disk retrieve tries the object pool first and falls back to the
-legacy file when the object is absent or incompatible.
+pool entry. The intended fast retrieve path is Tutti: `CacheEngine` selects
+READY object records and passes the pool file plus per-object byte offset to
+`TuttiDirectLoader`, which issues NVMe reads directly into HBM staging.
 
 CSA/HCA overlap managers still own fire/drain timing. The object store is the
 lower read/write substrate that those managers can target.
@@ -20,20 +21,19 @@ The object store owns:
   `pool_id`, byte `offset`, `length`, tensor `shape`, `dtype`, and lifecycle
   state.
 - Pool file layout:
-  the MVP uses fixed-size aligned slots in a sparse file.
+  the current Tutti path uses dense aligned objects in a pool file so FIEMAP
+  can cover the written byte ranges without sparse holes.
 - Batch lookup:
   callers can ask for many objects and get request-ordered records or misses.
 - Optional LocalDiskBackend integration:
-  chunk-level `role=full` object writes and reads, with
-  `KV_OBJECT_STORE_PROFILE` logs proving whether the framework path used the
-  object store.
+  chunk-level `role=full` object writes, plus READY record lookup for Tutti.
 
 The object store does not own:
 
 - CSA/HCA prediction.
 - Prefill/forward overlap windows.
 - HBM residency policy.
-- Tutti vs normal LMCache read selection.
+- CSA/HCA/Tutti read scheduling.
 
 ## Current Framework Integration
 
@@ -42,22 +42,20 @@ LocalDiskBackend.async_save_bytes_to_disk()
   -> write legacy <CacheEngineKey>.pt
   -> if object store enabled:
        allocate or reuse KVObjectRecord(role="full", block_id=chunk_hash_hex)
-       pwritev() the chunk bytes into the fixed-slot pool
+       pwritev() the chunk bytes into the dense aligned object pool
        mark record READY
 
-LocalDiskBackend.load_bytes_from_disk()
-  -> allocate the normal MemoryObj
-  -> if object store has a READY record with matching byte length:
-       preadv() directly into MemoryObj.byte_array
-       log KV_OBJECT_STORE_PROFILE op=read status=hit
-  -> else:
-       fall back to read_file() from legacy .pt
+CacheEngine._tutti_batched_get()
+  -> lookup READY KVObjectRecord values for requested keys
+  -> build DiskCacheMetadata(path=<pool file>) and file_offsets=<record.offset>
+  -> TuttiDirectLoader.load_chunks_to_hbm(..., file_offsets=...)
+  -> snvme reads pool extents directly into HBM staging
+  -> GPU-resident TensorMemoryObj goes to the existing vLLM connector
 ```
 
-This is intentionally chunk-level first. It proves that the vLLM/LMCache
-framework path can really store and retrieve through the object namespace. The
-next step is to split the object identity from `role=full` chunks into native
-`layer_id x role x block_id` objects for CSA/HCA/SWA.
+There is no framework CPU read path for the object pool. If Tutti is not
+available, `LocalDiskBackend` falls back to the legacy `.pt` files rather than
+reading object-pool bytes through CPU staging.
 
 ## MVP Flow
 
@@ -70,9 +68,29 @@ DSv4 overlap manager selects layer/block objects
   -> connector copies or aliases results into vLLM KV slots
 ```
 
-## Why Fixed Slots First
+## Why Dense Pool First
 
-Fixed slots make the first integration deterministic: object offsets do not move,
-pool size is known up front, and FIEMAP/Tutti batching can be reasoned about
-without a free-list allocator. A future allocator can replace the layout while
-keeping the `KVObjectId` and `KVObjectRecord` contract stable.
+Dense aligned objects keep the pool compact and make FIEMAP useful for Tutti:
+each stored chunk has real extents around `record.offset` instead of a 128 MiB
+sparse hole per object. Fixed slots are still available as a layout option for
+tests and future allocator experiments, but the framework fast path uses dense
+pool files.
+
+## Validation
+
+gpu002, 2026-06-10, DSv4 128K, TP=8, `--no-enable-prefix-caching`,
+`LMCACHE_KV_OBJECT_STORE_ENABLE=1`, Tutti enabled:
+
+- Prompt: 121,800 tokens, `max_tokens=1`.
+- Cold/store: 17.091 s.
+- First full-hit after cold: 30.711 s. This includes first-time Tutti
+  bind/session setup; rank 0 spent 29.47 s in `session_bind_map_ms`.
+- Second full-hit: 1.020 s end-to-end.
+- LMCache logs reported full hit on all ranks:
+  `Retrieved 121600 out of 121600 required tokens`.
+- Tutti object-store path was used on all ranks:
+  `TUTTI_OBJECT_STORE_PROFILE op=select keys=475 pools=1`.
+- Steady Tutti direct read per rank loaded 475 chunks, about 753.8 MiB/rank,
+  with `TUTTI_PROFILE batched_get` around 79-84 ms.
+- Framework CPU object-pool reads were absent:
+  `KV_OBJECT_STORE_PROFILE op=read` count was 0.

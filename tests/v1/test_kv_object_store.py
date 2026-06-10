@@ -75,6 +75,50 @@ def test_pool_layout_allocates_aligned_sparse_slots(tmp_path: Path) -> None:
     assert layout.pool_path.stat().st_size == layout.pool_size_bytes()
 
 
+def test_pool_layout_dense_allocates_by_object_length(tmp_path: Path) -> None:
+    layout = KVObjectPoolLayout(
+        pool_id="rank3-full",
+        pool_path=tmp_path / "rank3_full.pool",
+        slot_bytes=8192,
+        capacity=2,
+        alignment=4096,
+        dense=True,
+    )
+    first = layout.allocate(
+        KVObjectId(
+            model_id="model",
+            parallel_config_id="tp8",
+            rank=3,
+            layer_id=-1,
+            role="full",
+            block_id="7",
+        ),
+        length=1024,
+        shape=(512, 2),
+        dtype="torch.uint8",
+    )
+    second = layout.allocate(
+        KVObjectId(
+            model_id="model",
+            parallel_config_id="tp8",
+            rank=3,
+            layer_id=-1,
+            role="full",
+            block_id="8",
+        ),
+        length=5000,
+        shape=(2500, 2),
+        dtype="torch.uint8",
+    )
+
+    assert first.offset == 0
+    assert first.aligned_length == 4096
+    assert second.offset == 4096
+    assert second.aligned_length == 8192
+    assert layout.pool_size_bytes() == 12288
+    assert layout.pool_path.stat().st_size == layout.pool_size_bytes()
+
+
 def test_pool_layout_rejects_full_and_oversized_objects(tmp_path: Path) -> None:
     layout = KVObjectPoolLayout(
         pool_id="rank0-hca",

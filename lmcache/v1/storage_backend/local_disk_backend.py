@@ -23,6 +23,7 @@ from lmcache.v1.kv_object_store import (
     KVObjectMetadataStore,
     KVObjectPoolIO,
     KVObjectPoolLayout,
+    KVObjectRecord,
 )
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
@@ -185,13 +186,17 @@ class LocalDiskBackend(StorageBackendInterface):
                 capacity = int(
                     config.extra_config.get("kv_object_store_capacity", capacity)
                 )
-            pool_id = f"rank{dst_device}-full"
+            rank_id = str(dst_device).removeprefix("cuda:")
+            pool_id = f"rank{rank_id}-full"
             pool_path = Path(self.path) / "_kv_object_store" / f"{pool_id}.pool"
+            if pool_path.exists():
+                pool_path.unlink()
             self.kv_object_pool_layout = KVObjectPoolLayout(
                 pool_id=pool_id,
                 pool_path=pool_path,
                 slot_bytes=slot_mb * 1024 * 1024,
                 capacity=capacity,
+                dense=True,
             )
             self.kv_object_metadata_store = KVObjectMetadataStore()
             self.kv_object_pool_io = KVObjectPoolIO({pool_id: pool_path})
@@ -253,6 +258,24 @@ class LocalDiskBackend(StorageBackendInterface):
             role="full",
             block_id=key.chunk_hash_hex,
         )
+
+    def get_kv_object_records(
+        self,
+        keys: Sequence[CacheEngineKey],
+    ) -> list[Optional[KVObjectRecord]]:
+        """Return READY KV object records for cache keys in request order."""
+        if not self.kv_object_store_enabled or self.kv_object_metadata_store is None:
+            return [None] * len(keys)
+        object_ids = [self._key_to_object_id(key) for key in keys]
+        return self.kv_object_metadata_store.get_many(object_ids, ready_only=True)
+
+    def get_kv_object_pool_paths(self) -> dict[str, Path]:
+        """Return object pool paths keyed by pool id."""
+        if self.kv_object_pool_layout is None:
+            return {}
+        return {
+            self.kv_object_pool_layout.pool_id: self.kv_object_pool_layout.pool_path
+        }
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         with self.disk_lock:
@@ -800,8 +823,7 @@ class LocalDiskBackend(StorageBackendInterface):
         assert memory_obj is not None, "Memory allocation failed during disk load."
 
         buffer = memory_obj.byte_array
-        if not self._read_kv_object_store(key, buffer):
-            self.read_file(key, buffer, path)
+        self.read_file(key, buffer, path)
 
         # TODO(Jiayi): Please recover the metadata in a more
         # elegant way in the future.
@@ -860,47 +882,6 @@ class LocalDiskBackend(StorageBackendInterface):
                 key.to_string(),
                 exc,
             )
-
-    def _read_kv_object_store(self, key: CacheEngineKey, buffer: memoryview) -> bool:
-        """Read a chunk-level object-store copy into ``buffer`` when present."""
-        if (
-            not self.kv_object_store_enabled
-            or self.kv_object_metadata_store is None
-            or self.kv_object_pool_io is None
-        ):
-            return False
-
-        object_id = self._key_to_object_id(key)
-        record = self.kv_object_metadata_store.get(object_id)
-        if record is None:
-            return False
-        if record.length != len(buffer):
-            logger.info(
-                "KV_OBJECT_STORE_PROFILE op=read key=%s status=miss "
-                "reason=length_mismatch record_bytes=%d buffer_bytes=%d",
-                key.to_string(),
-                record.length,
-                len(buffer),
-            )
-            return False
-
-        try:
-            batch = self.kv_object_pool_io.read_into_many([record], [buffer])
-            logger.info(
-                "KV_OBJECT_STORE_PROFILE op=read key=%s status=hit bytes=%d "
-                "read_ms=%.3f",
-                key.to_string(),
-                batch.bytes_read,
-                batch.elapsed_ms,
-            )
-            return True
-        except Exception as exc:
-            logger.warning(
-                "KV_OBJECT_STORE_PROFILE op=read key=%s status=failed error=%s",
-                key.to_string(),
-                exc,
-            )
-            return False
 
     def scan_existing_entries(self, metadata: LMCacheMetadata) -> int:
         """Scan the disk cache directory and register pre-existing ``.pt`` files.

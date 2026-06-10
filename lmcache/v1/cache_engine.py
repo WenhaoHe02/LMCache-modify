@@ -532,7 +532,9 @@ class LMCacheEngine:
         if self._tutti_loader is not None:
             return True
         if os.getenv("LMCACHE_TUTTI_FORCE_CPU_FALLBACK", "0") == "1":
-            logger.info("Tutti direct load disabled by LMCACHE_TUTTI_FORCE_CPU_FALLBACK")
+            logger.info(
+                "Tutti direct load disabled by LMCACHE_TUTTI_FORCE_CPU_FALLBACK"
+            )
             return False
         if self._tutti_config is None or self._tutti_init_failed:
             return False
@@ -598,6 +600,12 @@ class LMCacheEngine:
                         for meta in disk_backend.dict.values()
                         if meta is not None
                     ]
+                object_pool_paths = [
+                    str(path)
+                    for path in disk_backend.get_kv_object_pool_paths().values()
+                ]
+                paths.extend(object_pool_paths)
+                paths = list(dict.fromkeys(paths))
             collect_paths_ms = (time.perf_counter() - collect_start) * 1000.0
             fiemap_start = time.perf_counter()
             initial_lba_cache = FiemapHelper.scan_paths(paths)
@@ -769,6 +777,7 @@ class LMCacheEngine:
             return [None] * len(keys)
 
         disk_metas: List[Optional[DiskCacheMetadata]] = []
+        tutti_file_offsets: Optional[List[int]] = None
         metadata_start = time.perf_counter()
         with disk_backend.disk_lock:
             for key in keys:
@@ -777,6 +786,45 @@ class LMCacheEngine:
 
         if any(m is None for m in disk_metas):
             return [None] * len(keys)
+
+        kv_object_records = disk_backend.get_kv_object_records(keys)
+        if all(record is not None for record in kv_object_records):
+            pool_paths = disk_backend.get_kv_object_pool_paths()
+            object_metas: List[Optional[DiskCacheMetadata]] = []
+            object_offsets: List[int] = []
+            for original_meta, record in zip(
+                disk_metas,
+                kv_object_records,
+                strict=True,
+            ):
+                assert original_meta is not None
+                assert record is not None
+                pool_path = pool_paths.get(record.pool_id)
+                if pool_path is None:
+                    object_metas = []
+                    break
+                object_metas.append(
+                    DiskCacheMetadata(
+                        path=str(pool_path),
+                        size=record.length,
+                        shape=original_meta.shape,
+                        dtype=original_meta.dtype,
+                        cached_positions=original_meta.cached_positions,
+                        fmt=original_meta.fmt,
+                        pin_count=original_meta.pin_count,
+                        shapes=original_meta.shapes,
+                        dtypes=original_meta.dtypes,
+                    )
+                )
+                object_offsets.append(record.offset)
+            if object_metas:
+                disk_metas = object_metas
+                tutti_file_offsets = object_offsets
+                logger.info(
+                    "TUTTI_OBJECT_STORE_PROFILE op=select keys=%d pools=%d",
+                    len(keys),
+                    len({meta.path for meta in object_metas if meta is not None}),
+                )
 
         # Recovered on-disk entries only have filename-level metadata.  Keep
         # their format aligned with the engine so the downstream GPU connector
@@ -797,6 +845,7 @@ class LMCacheEngine:
                 keys,
                 disk_metas,  # type: ignore[arg-type]
                 shapes_per_key=shapes_per_key,
+                file_offsets=tutti_file_offsets,
             )
         except Exception:
             logger.exception(

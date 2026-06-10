@@ -1207,7 +1207,12 @@ class TuttiDirectLoader:
         """Total bytes available in the HBM staging pool."""
         return self._n_slots * self._slot_bytes
 
-    def _estimate_chunk_ios(self, meta: DiskCacheMetadata, nbytes: int) -> int:
+    def _estimate_chunk_ios(
+        self,
+        meta: DiskCacheMetadata,
+        nbytes: int,
+        file_offset: int = 0,
+    ) -> int:
         """Estimate how many NVMe READ commands are needed for one chunk."""
         max_io = self._session.info.max_data_size
         n_ios = 0
@@ -1215,8 +1220,8 @@ class TuttiDirectLoader:
         for extent in self._get_extents(meta.path):
             extent_start = extent.file_offset
             extent_end = extent_start + extent.n_sectors * _NVME_LBS
-            read_start = max(0, extent_start)
-            read_end = min(nbytes, extent_end)
+            read_start = max(file_offset, extent_start)
+            read_end = min(file_offset + nbytes, extent_end)
             if read_start >= read_end:
                 continue
             read_nbytes = read_end - read_start
@@ -1273,6 +1278,7 @@ class TuttiDirectLoader:
         keys: list[CacheEngineKey],
         disk_metadatas: list[Optional[DiskCacheMetadata]],
         shapes_per_key: Optional[list[Optional[list[torch.Size]]]] = None,
+        file_offsets: Optional[list[int]] = None,
     ) -> list[Optional[MemoryObj]]:
         """Load KV chunks directly from NVMe into HBM staging.
 
@@ -1294,6 +1300,9 @@ class TuttiDirectLoader:
                             overrides the shapes used for building the
                             MemoryObjMetadata for ``keys[i]``.  A ``None``
                             entry means "use shapes from disk metadata".
+            file_offsets: Optional per-key byte offset inside the metadata
+                          path. This is used by the KV object-store path,
+                          where many objects live inside one pool file.
 
         Returns:
             List parallel to keys.  Each element is either a GPU-resident
@@ -1335,8 +1344,15 @@ class TuttiDirectLoader:
                 chunk_nbytes = _effective_nbytes(meta, key_shapes_override)
                 chunk_dma_nbytes = _align_up(chunk_nbytes, _NVME_LBS)
                 chunk_bytes = _align_up(chunk_dma_nbytes, _GPU_PAGE_SIZE)
+                chunk_file_offset = (
+                    file_offsets[batch_end] if file_offsets is not None else 0
+                )
                 try:
-                    chunk_ios = self._estimate_chunk_ios(meta, chunk_dma_nbytes)
+                    chunk_ios = self._estimate_chunk_ios(
+                        meta,
+                        chunk_dma_nbytes,
+                        file_offset=chunk_file_offset,
+                    )
                 except (FileNotFoundError, ValueError, OSError):
                     chunk_ios = 1
 
@@ -1369,7 +1385,14 @@ class TuttiDirectLoader:
             pack_ms = _elapsed_ms(pack_start)
             batch_profile_start = time.perf_counter()
             batch_results = self._load_batch(
-                batch_keys, batch_metas, shapes_per_key=batch_shapes
+                batch_keys,
+                batch_metas,
+                shapes_per_key=batch_shapes,
+                file_offsets=(
+                    file_offsets[batch_start:batch_end]
+                    if file_offsets is not None
+                    else None
+                ),
             )
             n_batches += 1
             batch_loaded = sum(1 for res in batch_results if res is not None)
@@ -1406,6 +1429,7 @@ class TuttiDirectLoader:
         keys: list[CacheEngineKey],
         metas: list[Optional[DiskCacheMetadata]],
         shapes_per_key: Optional[list[Optional[list[torch.Size]]]] = None,
+        file_offsets: Optional[list[int]] = None,
     ) -> list[Optional[MemoryObj]]:
         """Load one queue/staging-capacity-bounded batch into HBM staging."""
 
@@ -1440,6 +1464,7 @@ class TuttiDirectLoader:
                 else None
             )
             nbytes = _effective_nbytes(meta, key_shapes_override)
+            base_file_offset = file_offsets[i] if file_offsets is not None else 0
             dma_nbytes = _align_up(nbytes, _NVME_LBS)
             if dma_nbytes > self._slot_bytes:
                 logger.warning(
@@ -1467,12 +1492,13 @@ class TuttiDirectLoader:
             for extent in extents:
                 extent_start = extent.file_offset
                 extent_end = extent_start + extent.n_sectors * _NVME_LBS
-                read_start = max(0, extent_start)
-                read_end = min(dma_nbytes, extent_end)
+                read_start = max(base_file_offset, extent_start)
+                read_end = min(base_file_offset + dma_nbytes, extent_end)
                 if read_start >= read_end:
                     continue
                 read_nbytes = read_end - read_start
                 extent_skip = read_start - extent_start
+                object_skip = read_start - base_file_offset
                 if read_start % _GPU_PAGE_SIZE != 0:
                     logger.debug(
                         "Chunk %s extent offset %d is not 64 KiB aligned",
@@ -1517,12 +1543,12 @@ class TuttiDirectLoader:
                         )
                         skip_file = True
                         break
-                    io_offset = read_start + cursor
+                    io_object_offset = object_skip + cursor
                     lba_slba = (
                         extent.slba + (extent_skip + cursor) // _NVME_LBS
                     )
                     staging_iovas_list.append(
-                        self._staging_iova_at(chunk_offset + io_offset)
+                        self._staging_iova_at(chunk_offset + io_object_offset)
                     )
                     slbas_list.append(lba_slba)
                     byte_lens_list.append(chunk_nbytes)
@@ -1534,7 +1560,7 @@ class TuttiDirectLoader:
                         key,
                         chunk_offset,
                         lba_slba,
-                        io_offset,
+                        io_object_offset,
                         chunk_nbytes,
                     )
                     cursor += chunk_nbytes
@@ -1570,7 +1596,11 @@ class TuttiDirectLoader:
         # Build GPU tensors for kernel arguments (same device as staging).
         arg_start = time.perf_counter()
         _dev = f"cuda:{self._cuda_device}"
-        staging_iovas_t = torch.tensor(staging_iovas_list, dtype=torch.int64, device=_dev)
+        staging_iovas_t = torch.tensor(
+            staging_iovas_list,
+            dtype=torch.int64,
+            device=_dev,
+        )
         slbas_t = torch.tensor(slbas_list, dtype=torch.int64, device=_dev)
         byte_lens_t = torch.tensor(byte_lens_list, dtype=torch.int32, device=_dev)
         arg_ms = _elapsed_ms(arg_start)
@@ -1679,7 +1709,10 @@ class TuttiDirectLoader:
 
             # Wrap the staging slice as a TensorMemoryObj with GPU raw_data.
             # parent_allocator=None means Python GC manages the tensor lifetime.
-            obj_meta = _make_memory_obj_metadata(meta, shapes_override=key_shapes_override)
+            obj_meta = _make_memory_obj_metadata(
+                meta,
+                shapes_override=key_shapes_override,
+            )
             results[i_orig] = TensorMemoryObj(
                 metadata=obj_meta,
                 raw_data=owned_raw,

@@ -115,15 +115,19 @@ class KVObjectPoolIO:
         try:
             for record, payload in zip(records, payloads, strict=True):
                 payload_view = memoryview(payload).cast("B")
+                pad_len = record.aligned_length - len(payload_view)
+                write_buffers = [payload_view]
+                if pad_len > 0:
+                    write_buffers.append(memoryview(bytes(pad_len)))
                 written = os.pwritev(
                     fds[record.pool_id],
-                    [payload_view],
+                    write_buffers,
                     record.offset,
                 )
-                if written != len(payload_view):
+                if written != record.aligned_length:
                     raise OSError(
                         f"short write for {record.object_id.to_key()}: "
-                        f"{written} of {len(payload_view)} bytes"
+                        f"{written} of {record.aligned_length} bytes"
                     )
         finally:
             self._close_pool_fds(fds)

@@ -33,6 +33,7 @@ class KVObjectPoolLayout:
         slot_bytes: int,
         capacity: int,
         alignment: int = 4096,
+        dense: bool = False,
     ) -> None:
         """Create a fixed-slot pool layout.
 
@@ -42,6 +43,9 @@ class KVObjectPoolLayout:
             slot_bytes: Maximum bytes per slot before alignment.
             capacity: Number of object slots in the pool.
             alignment: Byte alignment for each slot.
+            dense: When true, allocate objects back-to-back by aligned object
+                length instead of fixed slot stride. This is the preferred mode
+                for Tutti FIEMAP because it avoids sparse holes.
 
         Raises:
             ValueError: If sizing arguments are invalid.
@@ -61,15 +65,19 @@ class KVObjectPoolLayout:
         self.capacity = capacity
         self.alignment = alignment
         self.aligned_slot_bytes = self.align_length(slot_bytes)
+        self.dense = dense
         self._next_slot = 0
+        self._next_offset = 0
         self._lock = threading.Lock()
 
     def ensure_file(self) -> None:
         """Create or resize the sparse pool file to the required capacity."""
         self.pool_path.parent.mkdir(parents=True, exist_ok=True)
-        required_bytes = self.aligned_slot_bytes * self.capacity
         with self.pool_path.open("ab"):
             pass
+        if self.dense:
+            return
+        required_bytes = self.aligned_slot_bytes * self.capacity
         current_bytes = os.path.getsize(self.pool_path)
         if current_bytes < required_bytes:
             with self.pool_path.open("r+b") as pool_file:
@@ -103,6 +111,7 @@ class KVObjectPoolLayout:
         if length > self.slot_bytes:
             raise ValueError("length exceeds fixed slot size")
         self.ensure_file()
+        aligned_length = self.align_length(length)
         with self._lock:
             if self._next_slot >= self.capacity:
                 raise KVObjectPoolFullError(
@@ -110,18 +119,30 @@ class KVObjectPoolLayout:
                 )
             slot = self._next_slot
             self._next_slot += 1
+            if self.dense:
+                offset = self._next_offset
+                self._next_offset += aligned_length
+            else:
+                offset = slot * self.aligned_slot_bytes
+        if self.dense:
+            with self.pool_path.open("r+b") as pool_file:
+                pool_file.truncate(self._next_offset)
+        else:
+            offset = slot * self.aligned_slot_bytes
         return KVObjectRecord(
             object_id=object_id,
             pool_id=self.pool_id,
-            offset=slot * self.aligned_slot_bytes,
+            offset=offset,
             length=length,
-            aligned_length=self.align_length(length),
+            aligned_length=aligned_length,
             shape=shape,
             dtype=dtype,
         )
 
     def pool_size_bytes(self) -> int:
         """Return the required pool file size in bytes."""
+        if self.dense:
+            return self._next_offset
         return self.aligned_slot_bytes * self.capacity
 
     def align_length(self, length: int) -> int:
