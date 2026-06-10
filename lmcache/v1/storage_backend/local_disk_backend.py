@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from concurrent.futures import Future
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 import asyncio
 import os
@@ -17,6 +18,12 @@ from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import CacheEngineKey, DiskCacheMetadata, _lmcache_nvtx_annotate
 from lmcache.v1.cache_controller.message import OpType
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.kv_object_store import (
+    KVObjectId,
+    KVObjectMetadataStore,
+    KVObjectPoolIO,
+    KVObjectPoolLayout,
+)
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
@@ -33,6 +40,11 @@ if TYPE_CHECKING:
     from lmcache.v1.cache_controller.worker import LMCacheWorker
 
 logger = init_logger(__name__)
+
+
+def _env_flag(name: str) -> bool:
+    value = os.getenv(name, "")
+    return value.lower() in {"1", "true", "yes", "on"}
 
 
 # TODO(Jiayi): handle cases where cache is repetitvely prefetched.
@@ -150,6 +162,48 @@ class LocalDiskBackend(StorageBackendInterface):
             self.use_odirect = config.extra_config.get("use_odirect", False)
         logger.info("Using O_DIRECT for disk I/O: %s", self.use_odirect)
 
+        enable_object_store = _env_flag("LMCACHE_KV_OBJECT_STORE_ENABLE")
+        if config.extra_config is not None:
+            enable_object_store = bool(
+                config.extra_config.get(
+                    "kv_object_store_enable",
+                    enable_object_store,
+                )
+            )
+        self.kv_object_store_enabled = enable_object_store
+        self.kv_object_pool_layout: Optional[KVObjectPoolLayout] = None
+        self.kv_object_metadata_store: Optional[KVObjectMetadataStore] = None
+        self.kv_object_pool_io: Optional[KVObjectPoolIO] = None
+        self.kv_object_store_lock = threading.Lock()
+        if self.kv_object_store_enabled:
+            slot_mb = int(os.getenv("LMCACHE_KV_OBJECT_STORE_SLOT_MB", "128"))
+            capacity = int(os.getenv("LMCACHE_KV_OBJECT_STORE_CAPACITY", "2048"))
+            if config.extra_config is not None:
+                slot_mb = int(
+                    config.extra_config.get("kv_object_store_slot_mb", slot_mb)
+                )
+                capacity = int(
+                    config.extra_config.get("kv_object_store_capacity", capacity)
+                )
+            pool_id = f"rank{dst_device}-full"
+            pool_path = Path(self.path) / "_kv_object_store" / f"{pool_id}.pool"
+            self.kv_object_pool_layout = KVObjectPoolLayout(
+                pool_id=pool_id,
+                pool_path=pool_path,
+                slot_bytes=slot_mb * 1024 * 1024,
+                capacity=capacity,
+            )
+            self.kv_object_metadata_store = KVObjectMetadataStore()
+            self.kv_object_pool_io = KVObjectPoolIO({pool_id: pool_path})
+            logger.info(
+                "KV object store enabled: pool_id=%s path=%s slot_mb=%d "
+                "capacity=%d",
+                pool_id,
+                pool_path,
+                slot_mb,
+                capacity,
+            )
+
         self.disk_worker = LocalDiskWorker(loop)
 
         # TODO(Jiayi): We need a disk space allocator to avoid fragmentation
@@ -189,6 +243,16 @@ class LocalDiskBackend(StorageBackendInterface):
         key: CacheEngineKey,
     ) -> str:
         return os.path.join(self.path, key.to_string().replace("/", "-") + ".pt")
+
+    def _key_to_object_id(self, key: CacheEngineKey) -> KVObjectId:
+        return KVObjectId(
+            model_id=key.model_name,
+            parallel_config_id=f"world{key.world_size}",
+            rank=key.worker_id,
+            layer_id=0,
+            role="full",
+            block_id=key.chunk_hash_hex,
+        )
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         with self.disk_lock:
@@ -516,7 +580,9 @@ class LocalDiskBackend(StorageBackendInterface):
         mem_objs: List[Optional[MemoryObj]] = []
         for i, key in enumerate(keys):
             override = shapes_per_key[i] if shapes_per_key is not None else None
-            mem_objs.append(self._get_blocking_with_shapes(key, shapes_override=override))
+            mem_objs.append(
+                self._get_blocking_with_shapes(key, shapes_override=override)
+            )
         return mem_objs
 
     async def batched_get_non_blocking(
@@ -623,6 +689,7 @@ class LocalDiskBackend(StorageBackendInterface):
 
         # TODO(Jiayi): need to add ref count in disk memory object
         self.write_file(buffer, path)
+        self._write_kv_object_store(key, buffer)
 
         # ref count down here because there's a ref_count_up in
         # `submit_put_task` above.
@@ -733,7 +800,8 @@ class LocalDiskBackend(StorageBackendInterface):
         assert memory_obj is not None, "Memory allocation failed during disk load."
 
         buffer = memory_obj.byte_array
-        self.read_file(key, buffer, path)
+        if not self._read_kv_object_store(key, buffer):
+            self.read_file(key, buffer, path)
 
         # TODO(Jiayi): Please recover the metadata in a more
         # elegant way in the future.
@@ -741,6 +809,98 @@ class LocalDiskBackend(StorageBackendInterface):
         memory_obj.metadata.cached_positions = cached_positions
 
         return memory_obj
+
+    def _write_kv_object_store(self, key: CacheEngineKey, buffer: memoryview) -> None:
+        """Write a chunk-level object-store copy when enabled."""
+        if (
+            not self.kv_object_store_enabled
+            or self.kv_object_pool_layout is None
+            or self.kv_object_metadata_store is None
+            or self.kv_object_pool_io is None
+        ):
+            return
+
+        start = time.perf_counter()
+        object_id = self._key_to_object_id(key)
+        try:
+            with self.kv_object_store_lock:
+                existing = self.kv_object_metadata_store.get(object_id)
+                if existing is None:
+                    record = self.kv_object_pool_layout.allocate(
+                        object_id,
+                        length=len(buffer),
+                        shape=(len(buffer),),
+                        dtype="torch.uint8",
+                    )
+                else:
+                    record = existing
+                    if record.length != len(buffer):
+                        logger.warning(
+                            "KV_OBJECT_STORE_PROFILE op=write key=%s "
+                            "status=skip reason=length_changed old=%d new=%d",
+                            key.to_string(),
+                            record.length,
+                            len(buffer),
+                        )
+                        return
+                write_ms = self.kv_object_pool_io.write_object(record, buffer)
+                self.kv_object_metadata_store.put(record.mark_ready())
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            logger.info(
+                "KV_OBJECT_STORE_PROFILE op=write key=%s bytes=%d "
+                "write_ms=%.3f total_ms=%.3f",
+                key.to_string(),
+                len(buffer),
+                write_ms,
+                elapsed_ms,
+            )
+        except Exception as exc:
+            logger.warning(
+                "KV_OBJECT_STORE_PROFILE op=write key=%s status=failed error=%s",
+                key.to_string(),
+                exc,
+            )
+
+    def _read_kv_object_store(self, key: CacheEngineKey, buffer: memoryview) -> bool:
+        """Read a chunk-level object-store copy into ``buffer`` when present."""
+        if (
+            not self.kv_object_store_enabled
+            or self.kv_object_metadata_store is None
+            or self.kv_object_pool_io is None
+        ):
+            return False
+
+        object_id = self._key_to_object_id(key)
+        record = self.kv_object_metadata_store.get(object_id)
+        if record is None:
+            return False
+        if record.length != len(buffer):
+            logger.info(
+                "KV_OBJECT_STORE_PROFILE op=read key=%s status=miss "
+                "reason=length_mismatch record_bytes=%d buffer_bytes=%d",
+                key.to_string(),
+                record.length,
+                len(buffer),
+            )
+            return False
+
+        try:
+            batch = self.kv_object_pool_io.read_into_many([record], [buffer])
+            logger.info(
+                "KV_OBJECT_STORE_PROFILE op=read key=%s status=hit bytes=%d "
+                "read_ms=%.3f",
+                key.to_string(),
+                batch.bytes_read,
+                batch.elapsed_ms,
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "KV_OBJECT_STORE_PROFILE op=read key=%s status=failed error=%s",
+                key.to_string(),
+                exc,
+            )
+            return False
 
     def scan_existing_entries(self, metadata: LMCacheMetadata) -> int:
         """Scan the disk cache directory and register pre-existing ``.pt`` files.

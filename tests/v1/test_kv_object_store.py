@@ -9,6 +9,7 @@ import pytest
 from lmcache.v1.kv_object_store import (
     KVObjectId,
     KVObjectMetadataStore,
+    KVObjectPoolIO,
     KVObjectPoolFullError,
     KVObjectPoolLayout,
     KVObjectState,
@@ -157,3 +158,66 @@ def test_metadata_store_ready_lookup_and_jsonl_roundtrip(tmp_path: Path) -> None
     restored = KVObjectMetadataStore.load_jsonl(metadata_path)
 
     assert restored.get(object_id) == ready
+
+
+def test_pool_io_reads_and_writes_many_records_in_order(tmp_path: Path) -> None:
+    layout = KVObjectPoolLayout(
+        pool_id="rank0-csa",
+        pool_path=tmp_path / "rank0_csa.pool",
+        slot_bytes=4096,
+        capacity=3,
+    )
+    records = [
+        layout.allocate(
+            KVObjectId(
+                model_id="model",
+                parallel_config_id="tp8",
+                rank=0,
+                layer_id=layer_id,
+                role="csa",
+                block_id=str(layer_id),
+            ),
+            length=16,
+            shape=(8, 2),
+            dtype="torch.uint8",
+        ).mark_ready()
+        for layer_id in range(3)
+    ]
+    payloads = [
+        bytes([index]) * records[index].length for index in range(len(records))
+    ]
+    pool_io = KVObjectPoolIO({"rank0-csa": layout.pool_path})
+
+    write_ms = pool_io.write_many(records, payloads)
+    read_batch = pool_io.read_many([records[2], records[0], records[1]])
+
+    assert write_ms >= 0.0
+    assert read_batch.elapsed_ms >= 0.0
+    assert read_batch.bytes_read == 48
+    assert read_batch.payloads == [payloads[2], payloads[0], payloads[1]]
+
+
+def test_pool_io_rejects_payload_length_mismatch(tmp_path: Path) -> None:
+    layout = KVObjectPoolLayout(
+        pool_id="rank0-full",
+        pool_path=tmp_path / "rank0_full.pool",
+        slot_bytes=4096,
+        capacity=1,
+    )
+    record = layout.allocate(
+        KVObjectId(
+            model_id="model",
+            parallel_config_id="tp8",
+            rank=0,
+            layer_id=0,
+            role="full",
+            block_id="0",
+        ),
+        length=16,
+        shape=(8, 2),
+        dtype="torch.uint8",
+    )
+    pool_io = KVObjectPoolIO({"rank0-full": layout.pool_path})
+
+    with pytest.raises(ValueError, match="payload length"):
+        pool_io.write_object(record, b"short")
