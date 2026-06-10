@@ -43,9 +43,11 @@ Usage
 
 import ctypes
 import fcntl
+import hashlib
 import mmap
 import os
 import struct as _struct
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -87,6 +89,59 @@ _CUDA_HOST_REGISTER_IO_MEMORY: int = 0x04
 def _align_up(x: int, align: int) -> int:
     """Round x up to the next multiple of align."""
     return ((x + align - 1) // align) * align
+
+
+def _elapsed_ms(start: float) -> float:
+    """Return elapsed wall-clock milliseconds since start."""
+    return (time.perf_counter() - start) * 1000.0
+
+
+def _effective_shapes(
+    disk_meta: DiskCacheMetadata,
+    shapes_override: Optional[list[torch.Size]],
+) -> Optional[list[torch.Size]]:
+    """Return the logical group shapes to expose for one cached chunk."""
+    return shapes_override if shapes_override is not None else disk_meta.shapes
+
+
+def _effective_dtypes(
+    disk_meta: DiskCacheMetadata,
+    effective_shapes: Optional[list[torch.Size]],
+) -> Optional[list[torch.dtype]]:
+    """Return per-group dtypes matching ``effective_shapes``."""
+    if effective_shapes is None:
+        return disk_meta.dtypes
+    if disk_meta.dtypes is not None:
+        if len(disk_meta.dtypes) != len(effective_shapes):
+            raise ValueError(
+                f"DiskCacheMetadata for {disk_meta.path} has "
+                f"{len(disk_meta.dtypes)} dtypes but {len(effective_shapes)} shapes"
+            )
+        return disk_meta.dtypes
+    if disk_meta.dtype is None:
+        raise ValueError(
+            f"DiskCacheMetadata for {disk_meta.path} is missing dtype information"
+        )
+    return [disk_meta.dtype] * len(effective_shapes)
+
+
+def _effective_nbytes(
+    disk_meta: DiskCacheMetadata,
+    shapes_override: Optional[list[torch.Size]],
+) -> int:
+    """Return the byte length Tutti must read for one cached chunk."""
+    effective_shapes = _effective_shapes(disk_meta, shapes_override)
+    if effective_shapes is None:
+        return int(disk_meta.size)
+    effective_dtypes = _effective_dtypes(disk_meta, effective_shapes)
+    if effective_dtypes is None:
+        return int(disk_meta.size)
+    return int(
+        sum(
+            shape.numel() * dtype.itemsize
+            for shape, dtype in zip(effective_shapes, effective_dtypes, strict=True)
+        )
+    )
 
 
 # ── ctypes helpers ───────────────────────────────────────────────────────────
@@ -880,13 +935,15 @@ def _make_memory_obj_metadata(
         ValueError: If neither disk_meta nor the override can supply a valid
             shape/dtype.
     """
-    effective_shapes = shapes_override if shapes_override is not None else disk_meta.shapes
+    effective_shapes = _effective_shapes(disk_meta, shapes_override)
+    effective_dtypes = _effective_dtypes(disk_meta, effective_shapes)
+    effective_size = _effective_nbytes(disk_meta, shapes_override)
     shape = disk_meta.shape
     dtype = disk_meta.dtype
     if shape is None and effective_shapes:
         shape = effective_shapes[0]
-    if dtype is None and disk_meta.dtypes:
-        dtype = disk_meta.dtypes[0]
+    if dtype is None and effective_dtypes:
+        dtype = effective_dtypes[0]
     if shape is None or dtype is None:
         raise ValueError(
             f"DiskCacheMetadata for {disk_meta.path} is missing shape/dtype"
@@ -895,12 +952,12 @@ def _make_memory_obj_metadata(
         shape=shape,
         dtype=dtype,
         address=0,
-        phy_size=disk_meta.size,
+        phy_size=effective_size,
         ref_count=1,
         pin_count=0,
         fmt=disk_meta.fmt or MemoryFormat.KV_2LTD,
         shapes=effective_shapes,
-        dtypes=disk_meta.dtypes,
+        dtypes=effective_dtypes,
     )
 
 
@@ -935,6 +992,7 @@ class TuttiDirectLoader:
         status_buf: torch.Tensor,
         cuda_device: int = 0,
         initial_lba_cache: Optional[dict[str, list[LbaRecord]]] = None,
+        debug_expected_checksums: Optional[dict[str, tuple[int, str]]] = None,
     ) -> None:
         self._session = session
         self._staging = staging_tensor
@@ -958,6 +1016,7 @@ class TuttiDirectLoader:
         # accessible); additional entries are added lazily via FIEMAP if the
         # filesystem remains accessible (i.e. drive not yet bound).
         self._lba_cache: dict[str, list[LbaRecord]] = dict(initial_lba_cache or {})
+        self._debug_expected_checksums = debug_expected_checksums or {}
 
     @staticmethod
     def create(
@@ -970,6 +1029,7 @@ class TuttiDirectLoader:
         kernel_ioq_cap: int = 36,
         cuda_device: int = 0,
         initial_lba_cache: Optional[dict[str, list[LbaRecord]]] = None,
+        debug_expected_checksums: Optional[dict[str, tuple[int, str]]] = None,
     ) -> "TuttiDirectLoader":
         """Create and initialise a TuttiDirectLoader.
 
@@ -1007,6 +1067,7 @@ class TuttiDirectLoader:
         cuda_dev_str = f"cuda:{cuda_device}"
         slot_gpu_pages = slot_bytes // _GPU_PAGE_SIZE
         total_bytes = n_slots * slot_bytes
+        profile_start = time.perf_counter()
 
         # Allocate the staging pool via raw cudaMalloc (not PyTorch's caching
         # allocator) so that nvidia_p2p_get_pages_persistent can find the VA
@@ -1014,6 +1075,7 @@ class TuttiDirectLoader:
         # expandable_segments (cuMemCreate / cuMemMap), which is invisible to
         # the legacy P2P RM lookup and causes EINVAL.
         alloc_bytes = total_bytes + _GPU_PAGE_SIZE  # headroom for 64 KiB alignment
+        cuda_malloc_start = time.perf_counter()
         staging_raw_ptr = _cuda_malloc_device(alloc_bytes, cuda_device)
         _get_cudart().cudaMemset(
             ctypes.c_void_p(staging_raw_ptr),
@@ -1021,6 +1083,7 @@ class TuttiDirectLoader:
             ctypes.c_size_t(alloc_bytes),
         )
         torch.cuda.synchronize(device=cuda_dev_str)
+        cuda_malloc_ms = _elapsed_ms(cuda_malloc_start)
         align_offset = (-staging_raw_ptr) % _GPU_PAGE_SIZE
         # Wrap cudaMalloc pointer as a non-owning PyTorch tensor via CAI.
         _buf_obj = _ExternalCudaBuffer(staging_raw_ptr, alloc_bytes)
@@ -1038,6 +1101,7 @@ class TuttiDirectLoader:
             staging.data_ptr(), cuda_dev_str, total_bytes,
         )
 
+        session_start = time.perf_counter()
         session = SnvmeSession(
             device_path=device_path,
             ctrl_path=ctrl_path,
@@ -1047,8 +1111,10 @@ class TuttiDirectLoader:
             kernel_ioq_cap=kernel_ioq_cap,
             cuda_device=cuda_device,
         )
+        session_ms = _elapsed_ms(session_start)
 
         # Allocate managed-memory scalars for SQ/CQ state.
+        aux_alloc_start = time.perf_counter()
         sq_tail_ptr = _cuda_malloc_managed(ctypes.sizeof(ctypes.c_uint16))
         cq_head_ptr = _cuda_malloc_managed(ctypes.sizeof(ctypes.c_uint16))
         cq_phase_ptr = _cuda_malloc_managed(ctypes.sizeof(ctypes.c_uint8))
@@ -1062,12 +1128,29 @@ class TuttiDirectLoader:
 
         q_depth = int(session.info.q_depth)
         status_buf = torch.zeros(q_depth, dtype=torch.int32, device=cuda_dev_str)
+        aux_alloc_ms = _elapsed_ms(aux_alloc_start)
 
         if n_slots > q_depth:
             raise RuntimeError(
                 f"n_slots ({n_slots}) > q_depth ({q_depth}); "
                 "reduce n_slots or increase the NVMe queue depth"
             )
+
+        logger.info(
+            "TUTTI_PROFILE create cuda_device=%d pci=%s slots=%d slot_mb=%.1f "
+            "total_mb=%.1f cuda_malloc_ms=%.3f session_bind_map_ms=%.3f "
+            "aux_alloc_ms=%.3f total_ms=%.3f q_depth=%d",
+            cuda_device,
+            pci_bdf,
+            n_slots,
+            slot_bytes / 1024**2,
+            total_bytes / 1024**2,
+            cuda_malloc_ms,
+            session_ms,
+            aux_alloc_ms,
+            _elapsed_ms(profile_start),
+            q_depth,
+        )
 
         return TuttiDirectLoader(
             session=session,
@@ -1082,6 +1165,7 @@ class TuttiDirectLoader:
             status_buf=status_buf,
             cuda_device=cuda_device,
             initial_lba_cache=initial_lba_cache,
+            debug_expected_checksums=debug_expected_checksums,
         )
 
     # ── internal helpers ────────────────────────────────────────────────────
@@ -1123,10 +1207,9 @@ class TuttiDirectLoader:
         """Total bytes available in the HBM staging pool."""
         return self._n_slots * self._slot_bytes
 
-    def _estimate_chunk_ios(self, meta: DiskCacheMetadata) -> int:
+    def _estimate_chunk_ios(self, meta: DiskCacheMetadata, nbytes: int) -> int:
         """Estimate how many NVMe READ commands are needed for one chunk."""
         max_io = self._session.info.max_data_size
-        nbytes = meta.size
         n_ios = 0
         covered = 0
         for extent in self._get_extents(meta.path):
@@ -1145,6 +1228,43 @@ class TuttiDirectLoader:
         if covered != nbytes:
             return self._q_depth() + 1
         return n_ios
+
+    def _debug_verify_direct_read(
+        self,
+        meta: DiskCacheMetadata,
+        gpu_raw: torch.Tensor,
+    ) -> None:
+        """Compare one direct-read HBM slice with a CPU pread checksum."""
+        expected = self._debug_expected_checksums.get(meta.path)
+        if expected is None:
+            return
+        expected_nbytes, expected_sha = expected
+        if gpu_raw.numel() != expected_nbytes:
+            logger.error(
+                "TUTTI_DEBUG_CHECKSUM size_mismatch path=%s expected=%d actual=%d",
+                meta.path,
+                expected_nbytes,
+                gpu_raw.numel(),
+            )
+            return
+        actual = bytes(gpu_raw.cpu().numpy().tobytes())
+        actual_sha = hashlib.sha256(actual).hexdigest()
+        if actual_sha == expected_sha:
+            logger.info(
+                "TUTTI_DEBUG_CHECKSUM ok path=%s bytes=%d sha=%s",
+                meta.path,
+                expected_nbytes,
+                actual_sha[:16],
+            )
+        else:
+            logger.error(
+                "TUTTI_DEBUG_CHECKSUM mismatch path=%s bytes=%d expected=%s "
+                "actual=%s",
+                meta.path,
+                expected_nbytes,
+                expected_sha[:16],
+                actual_sha[:16],
+            )
 
     # ── public API ──────────────────────────────────────────────────────────
 
@@ -1186,12 +1306,16 @@ class TuttiDirectLoader:
         if n == 0:
             return []
 
+        profile_start = time.perf_counter()
         results: list[Optional[MemoryObj]] = [None] * n
 
         q_depth = self._q_depth()
         staging_capacity = self._staging_capacity_bytes()
         batch_start = 0
+        n_batches = 0
+        n_loaded = 0
         while batch_start < n:
+            pack_start = time.perf_counter()
             batch_end = batch_start
             batch_ios = 0
             batch_bytes = 0
@@ -1203,9 +1327,16 @@ class TuttiDirectLoader:
                         continue
                     break
 
-                chunk_bytes = _align_up(meta.size, _GPU_PAGE_SIZE)
+                key_shapes_override = (
+                    shapes_per_key[batch_end]
+                    if shapes_per_key is not None
+                    else None
+                )
+                chunk_nbytes = _effective_nbytes(meta, key_shapes_override)
+                chunk_dma_nbytes = _align_up(chunk_nbytes, _NVME_LBS)
+                chunk_bytes = _align_up(chunk_dma_nbytes, _GPU_PAGE_SIZE)
                 try:
-                    chunk_ios = self._estimate_chunk_ios(meta)
+                    chunk_ios = self._estimate_chunk_ios(meta, chunk_dma_nbytes)
                 except (FileNotFoundError, ValueError, OSError):
                     chunk_ios = 1
 
@@ -1235,13 +1366,39 @@ class TuttiDirectLoader:
                 else None
             )
 
+            pack_ms = _elapsed_ms(pack_start)
+            batch_profile_start = time.perf_counter()
             batch_results = self._load_batch(
                 batch_keys, batch_metas, shapes_per_key=batch_shapes
+            )
+            n_batches += 1
+            batch_loaded = sum(1 for res in batch_results if res is not None)
+            n_loaded += batch_loaded
+            logger.info(
+                "TUTTI_PROFILE load_batch batch=%d key_start=%d keys=%d "
+                "loaded=%d estimated_ios=%d estimated_mb=%.3f pack_ms=%.3f "
+                "batch_total_ms=%.3f",
+                n_batches,
+                batch_start,
+                len(batch_keys),
+                batch_loaded,
+                batch_ios,
+                batch_bytes / 1024**2,
+                pack_ms,
+                _elapsed_ms(batch_profile_start),
             )
             for i, res in enumerate(batch_results):
                 results[batch_start + i] = res
             batch_start = batch_end
 
+        logger.info(
+            "TUTTI_PROFILE load_total keys=%d loaded=%d batches=%d "
+            "total_ms=%.3f",
+            n,
+            n_loaded,
+            n_batches,
+            _elapsed_ms(profile_start),
+        )
         return results
 
     def _load_batch(
@@ -1252,6 +1409,7 @@ class TuttiDirectLoader:
     ) -> list[Optional[MemoryObj]]:
         """Load one queue/staging-capacity-bounded batch into HBM staging."""
 
+        profile_start = time.perf_counter()
         # Build per-I/O parameters. A single KV file can occupy multiple
         # filesystem extents, so one logical chunk may expand to multiple NVMe
         # READs into different offsets of the same staging slot.
@@ -1262,27 +1420,36 @@ class TuttiDirectLoader:
         slbas_list: list[int] = []
         byte_lens_list: list[int] = []
         next_staging_offset = 0
+        extents_ms = 0.0
 
         for i, (key, meta) in enumerate(zip(keys, metas)):
             if meta is None:
                 logger.debug("Tutti: no metadata for key %s, skipping", key)
                 continue
             try:
+                extents_start = time.perf_counter()
                 extents = self._get_extents(meta.path)
+                extents_ms += _elapsed_ms(extents_start)
             except (FileNotFoundError, ValueError, OSError) as exc:
                 logger.warning("Tutti FIEMAP failed for %s: %s", meta.path, exc)
                 continue
 
-            nbytes = meta.size
-            if nbytes > self._slot_bytes:
+            key_shapes_override = (
+                shapes_per_key[i]
+                if shapes_per_key is not None
+                else None
+            )
+            nbytes = _effective_nbytes(meta, key_shapes_override)
+            dma_nbytes = _align_up(nbytes, _NVME_LBS)
+            if dma_nbytes > self._slot_bytes:
                 logger.warning(
                     "Chunk %s (%d bytes) exceeds slot size (%d bytes); skipping",
                     key,
-                    nbytes,
+                    dma_nbytes,
                     self._slot_bytes,
                 )
                 continue
-            aligned_nbytes = _align_up(nbytes, _GPU_PAGE_SIZE)
+            aligned_nbytes = _align_up(dma_nbytes, _GPU_PAGE_SIZE)
             if next_staging_offset + aligned_nbytes > self._staging_capacity_bytes():
                 logger.warning(
                     "Tutti batch staging capacity exceeded for %s: need %d bytes, "
@@ -1293,14 +1460,6 @@ class TuttiDirectLoader:
                 )
                 continue
             max_io = self._session.info.max_data_size
-            if nbytes % _NVME_LBS != 0:
-                logger.warning(
-                    "Chunk %s size %d is not a multiple of 512; skipping",
-                    key,
-                    nbytes,
-                )
-                continue
-
             chunk_offset = next_staging_offset
             io_start = len(io_to_key_index)
             file_ios = 0
@@ -1309,7 +1468,7 @@ class TuttiDirectLoader:
                 extent_start = extent.file_offset
                 extent_end = extent_start + extent.n_sectors * _NVME_LBS
                 read_start = max(0, extent_start)
-                read_end = min(nbytes, extent_end)
+                read_end = min(dma_nbytes, extent_end)
                 if read_start >= read_end:
                     continue
                 read_nbytes = read_end - read_start
@@ -1385,7 +1544,7 @@ class TuttiDirectLoader:
             total_file_bytes = sum(
                 byte_lens_list[io_start:]
             ) if file_ios else 0
-            if skip_file or total_file_bytes != nbytes:
+            if skip_file or total_file_bytes != dma_nbytes:
                 del staging_iovas_list[io_start:]
                 del slbas_list[io_start:]
                 del byte_lens_list[io_start:]
@@ -1394,7 +1553,7 @@ class TuttiDirectLoader:
                     "Tutti extents for %s cover %d/%d bytes; skipping",
                     meta.path,
                     total_file_bytes,
-                    nbytes,
+                    dma_nbytes,
                 )
                 continue
             completed_indices.append(i)
@@ -1402,16 +1561,19 @@ class TuttiDirectLoader:
             next_staging_offset += aligned_nbytes
 
         n_ios = len(io_to_key_index)
+        build_ms = _elapsed_ms(profile_start)
         if n_ios == 0:
             if any(meta is not None for meta in metas):
                 raise RuntimeError("Tutti direct load found no readable KV extents")
             return [None] * len(keys)
 
         # Build GPU tensors for kernel arguments (same device as staging).
+        arg_start = time.perf_counter()
         _dev = f"cuda:{self._cuda_device}"
         staging_iovas_t = torch.tensor(staging_iovas_list, dtype=torch.int64, device=_dev)
         slbas_t = torch.tensor(slbas_list, dtype=torch.int64, device=_dev)
         byte_lens_t = torch.tensor(byte_lens_list, dtype=torch.int32, device=_dev)
+        arg_ms = _elapsed_ms(arg_start)
 
         q = self._session.queue
         sq_dev_ptr = q.sq_tensor.data_ptr()
@@ -1426,6 +1588,7 @@ class TuttiDirectLoader:
         # that live on a different GPU.
         with torch.cuda.device(self._cuda_device):
             # Submit all reads in one kernel launch.
+            submit_start = time.perf_counter()
             _c_ops.tutti_submit_batch_sgl_read(
                 sq_dev_ptr=sq_dev_ptr,
                 cq_dev_ptr=cq_dev_ptr,
@@ -1440,9 +1603,11 @@ class TuttiDirectLoader:
                 byte_lens=byte_lens_t,
                 stream_ptr=0,
             )
+            submit_launch_ms = _elapsed_ms(submit_start)
 
             # Poll completions synchronously (default CUDA stream, so submit
             # happens-before poll without an explicit sync).
+            poll_start = time.perf_counter()
             _c_ops.tutti_poll_batch(
                 sq_dev_ptr=sq_dev_ptr,
                 cq_dev_ptr=cq_dev_ptr,
@@ -1460,6 +1625,7 @@ class TuttiDirectLoader:
 
             # Sync before reading back status / building MemoryObjs.
             torch.cuda.synchronize(device=self._cuda_device)
+            poll_sync_ms = _elapsed_ms(poll_start)
 
         if ctypes.c_int32.from_address(self._timed_out_ptr).value != 0:
             raise RuntimeError(
@@ -1468,6 +1634,7 @@ class TuttiDirectLoader:
             )
 
         # Check per-CQE status.
+        status_start = time.perf_counter()
         status_cpu = self._status_buf[:n_ios].cpu()
         for j in range(n_ios):
             raw = int(status_cpu[j])
@@ -1482,8 +1649,11 @@ class TuttiDirectLoader:
                     f"(SC=0x{nvme_status & 0xFF:02x} "
                     f"SCT=0x{(nvme_status >> 8) & 0x7:x})"
                 )
+        status_ms = _elapsed_ms(status_start)
 
         # Build GPU-resident MemoryObj for each completed I/O.
+        wrap_start = time.perf_counter()
+        persist_ms = 0.0
         results: list[Optional[MemoryObj]] = [None] * len(keys)
         for chunk_offset, i_orig in zip(completed_offsets, completed_indices):
             meta = metas[i_orig]
@@ -1492,9 +1662,6 @@ class TuttiDirectLoader:
                     f"Internal error: completed_indices contains {i_orig} but "
                     "metas[i_orig] is None; this should never happen"
                 )
-            nbytes = meta.size
-            gpu_raw = self._staging_slice_at(chunk_offset, nbytes)
-
             # Apply per-key shape override when provided (DSV4 optimised KV:
             # non-tail chunks carry only prefix groups, so their shapes differ
             # from the canonical multi-group shapes stored in disk metadata).
@@ -1503,15 +1670,22 @@ class TuttiDirectLoader:
                 if shapes_per_key is not None
                 else None
             )
+            nbytes = _effective_nbytes(meta, key_shapes_override)
+            gpu_raw = self._staging_slice_at(chunk_offset, nbytes)
+            self._debug_verify_direct_read(meta, gpu_raw)
+            persist_start = time.perf_counter()
+            owned_raw = gpu_raw.clone()
+            persist_ms += _elapsed_ms(persist_start)
 
             # Wrap the staging slice as a TensorMemoryObj with GPU raw_data.
             # parent_allocator=None means Python GC manages the tensor lifetime.
             obj_meta = _make_memory_obj_metadata(meta, shapes_override=key_shapes_override)
             results[i_orig] = TensorMemoryObj(
                 metadata=obj_meta,
-                raw_data=gpu_raw,
+                raw_data=owned_raw,
                 parent_allocator=None,
             )
+        wrap_ms = _elapsed_ms(wrap_start)
 
         for i, (meta, result) in enumerate(zip(metas, results)):
             if meta is not None and result is None:
@@ -1520,6 +1694,25 @@ class TuttiDirectLoader:
                     f"{i}, path {meta.path}"
                 )
 
+        logger.info(
+            "TUTTI_PROFILE batch_detail keys=%d completed=%d ios=%d bytes_mb=%.3f "
+            "build_ms=%.3f extents_ms=%.3f arg_ms=%.3f submit_launch_ms=%.3f "
+            "poll_sync_ms=%.3f status_ms=%.3f persist_ms=%.3f wrap_ms=%.3f "
+            "total_ms=%.3f",
+            len(keys),
+            len(completed_indices),
+            n_ios,
+            sum(byte_lens_list) / 1024**2,
+            build_ms,
+            extents_ms,
+            arg_ms,
+            submit_launch_ms,
+            poll_sync_ms,
+            status_ms,
+            persist_ms,
+            wrap_ms,
+            _elapsed_ms(profile_start),
+        )
         return results
 
     def close(self) -> None:

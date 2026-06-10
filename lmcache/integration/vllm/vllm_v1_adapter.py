@@ -1984,6 +1984,7 @@ class LMCacheConnectorV1Impl:
                 transfer_spec=request.disagg_spec,
                 request_configs=request.request_configs,
                 req_id=request.req_id,
+                is_last_prefill=is_last_prefill,
                 **self._hma_transfer_kwargs(request),
             )
 

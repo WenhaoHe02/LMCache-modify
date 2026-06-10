@@ -5,6 +5,7 @@ from concurrent.futures import Future
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Coroutine,
     Dict,
     Generator,
@@ -389,6 +390,7 @@ class StorageManager:
         memory_objs: List[MemoryObj],
         transfer_spec=None,
         location: Optional[str] = None,
+        on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> None:
         """
         Non-blocking function to batched put the memory objects into the
@@ -428,7 +430,17 @@ class StorageManager:
             # NOTE: the handling of exists_in_put_tasks
             # is done in the backend
             ks, objs = obj_dict[cname]
-            backend.batched_submit_put_task(ks, objs, transfer_spec=transfer_spec)
+            backend_callback = (
+                on_complete_callback
+                if backend_name == "LocalDiskBackend"
+                else None
+            )
+            backend.batched_submit_put_task(
+                ks,
+                objs,
+                transfer_spec=transfer_spec,
+                on_complete_callback=backend_callback,
+            )
 
         for cname, (ks, objs) in obj_dict.items():
             for memory_obj in objs:

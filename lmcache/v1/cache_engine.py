@@ -24,6 +24,7 @@ import gc
 import multiprocessing
 import os
 import subprocess
+import threading
 import time
 
 # Third Party
@@ -80,7 +81,7 @@ def _env_flag(name: str) -> bool:
     return value.lower() in {"1", "true", "yes", "on"}
 
 
-def _maybe_unmount_for_tutti(cache_path: str) -> None:
+def _maybe_unmount_for_tutti(cache_path: str) -> Optional[Tuple[str, str]]:
     """Unmount a local cache filesystem before snvme binds its NVMe device.
 
     Tutti's SNVM_DEVICE_BIND detaches the in-tree nvme driver. Keeping ext4
@@ -89,18 +90,22 @@ def _maybe_unmount_for_tutti(cache_path: str) -> None:
 
     Args:
         cache_path: LocalDiskBackend cache directory.
+
+    Returns:
+        ``(source, mount_point)`` if a local NVMe filesystem was unmounted,
+        otherwise ``None``.
     """
     try:
         mount_result = subprocess.run(
-            ["findmnt", "-nr", "-T", cache_path, "-o", "TARGET"],
+            ["findmnt", "-nr", "-T", cache_path, "-o", "SOURCE,TARGET"],
             check=False,
             capture_output=True,
             text=True,
         )
-        mount_point = mount_result.stdout.strip().splitlines()[0]
+        source, mount_point = mount_result.stdout.strip().splitlines()[0].split()
     except (IndexError, OSError) as exc:
         logger.warning("Tutti could not resolve mount for %s: %s", cache_path, exc)
-        return
+        return None
 
     if not mount_point.startswith("/mnt/nvme"):
         logger.info(
@@ -108,14 +113,44 @@ def _maybe_unmount_for_tutti(cache_path: str) -> None:
             cache_path,
             mount_point,
         )
-        return
+        return None
 
     logger.info(
-        "Tutti unmounting cache filesystem before snvme bind: path=%s mount=%s",
+        "Tutti unmounting cache filesystem before snvme bind: path=%s source=%s "
+        "mount=%s",
         cache_path,
+        source,
         mount_point,
     )
     subprocess.run(["umount", mount_point], check=True)
+    return source, mount_point
+
+
+def _maybe_remount_after_tutti_failure(
+    mount_info: Optional[Tuple[str, str]],
+) -> bool:
+    """Remount a filesystem that was unmounted before a failed Tutti bind."""
+    if mount_info is None:
+        return False
+    source, mount_point = mount_info
+    try:
+        subprocess.run(["mount", source, mount_point], check=True)
+        logger.info(
+            "Tutti remounted cache filesystem after init failure: source=%s "
+            "mount=%s",
+            source,
+            mount_point,
+        )
+        return True
+    except (OSError, subprocess.CalledProcessError) as exc:
+        logger.warning(
+            "Tutti could not remount cache filesystem after init failure: "
+            "source=%s mount=%s error=%s",
+            source,
+            mount_point,
+            exc,
+        )
+        return False
 
 
 def _as_bool(value: object) -> bool:
@@ -300,6 +335,12 @@ class LMCacheEngine:
         self._tutti_config: Optional[dict[str, Any]] = None
         self._tutti_init_failed = False
         self._tutti_can_cpu_fallback = True
+        self._tutti_warmup_lock = threading.Lock()
+        self._tutti_warmup_started = False
+        self._tutti_warmup_done: Optional[threading.Event] = None
+        self._tutti_store_warmup_keys: dict[str, set[CacheEngineKey]] = {}
+        self._tutti_store_warmup_pending: dict[str, set[CacheEngineKey]] = {}
+        self._tutti_store_warmup_last_seen: set[str] = set()
 
     def set_health_monitor(self, health_monitor: "HealthMonitor") -> None:
         """
@@ -476,6 +517,7 @@ class LMCacheEngine:
     def _ensure_tutti_loader(
         self,
         keys: Optional[List[CacheEngineKey]] = None,
+        wait_for_warmup: bool = True,
     ) -> bool:
         """Initialise TuttiDirectLoader on the first LocalDiskBackend hit.
 
@@ -489,20 +531,58 @@ class LMCacheEngine:
         """
         if self._tutti_loader is not None:
             return True
+        if os.getenv("LMCACHE_TUTTI_FORCE_CPU_FALLBACK", "0") == "1":
+            logger.info("Tutti direct load disabled by LMCACHE_TUTTI_FORCE_CPU_FALLBACK")
+            return False
         if self._tutti_config is None or self._tutti_init_failed:
             return False
 
+        warmup_done: Optional[threading.Event] = None
+        with self._tutti_warmup_lock:
+            if self._tutti_loader is not None:
+                return True
+            if self._tutti_config is None or self._tutti_init_failed:
+                return False
+            if (
+                wait_for_warmup
+                and self._tutti_warmup_started
+                and self._tutti_warmup_done is not None
+                and not self._tutti_warmup_done.is_set()
+            ):
+                warmup_done = self._tutti_warmup_done
+            else:
+                return self._ensure_tutti_loader_locked(keys)
+
+        logger.info("Waiting for in-flight Tutti warmup to finish")
+        warmup_done.wait()
+        return self._tutti_loader is not None
+
+    def _ensure_tutti_loader_locked(
+        self,
+        keys: Optional[List[CacheEngineKey]] = None,
+    ) -> bool:
+        """Initialise TuttiDirectLoader while holding _tutti_warmup_lock."""
         from lmcache.v1.gpu_connector.tutti_direct_loader import FiemapHelper
         from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
 
+        profile_start = time.perf_counter()
         initial_lba_cache: dict = {}
+        debug_expected_checksums: dict[str, tuple[int, str]] = {}
+        mount_info: Optional[Tuple[str, str]] = None
+        recover_ms = 0.0
+        collect_paths_ms = 0.0
+        fiemap_ms = 0.0
+        unmount_ms = 0.0
         disk_backend = (
             self.storage_manager.storage_backends.get("LocalDiskBackend")
             if self.storage_manager is not None
             else None
         )
         if isinstance(disk_backend, LocalDiskBackend):
+            recover_start = time.perf_counter()
             n_recovered = disk_backend.scan_existing_entries(self.metadata)
+            recover_ms = (time.perf_counter() - recover_start) * 1000.0
+            collect_start = time.perf_counter()
             with disk_backend.disk_lock:
                 required_paths = [
                     disk_backend.dict[key].path
@@ -518,7 +598,10 @@ class LMCacheEngine:
                         for meta in disk_backend.dict.values()
                         if meta is not None
                     ]
+            collect_paths_ms = (time.perf_counter() - collect_start) * 1000.0
+            fiemap_start = time.perf_counter()
             initial_lba_cache = FiemapHelper.scan_paths(paths)
+            fiemap_ms = (time.perf_counter() - fiemap_start) * 1000.0
             missing_required_paths = [
                 path for path in required_paths if path not in initial_lba_cache
             ]
@@ -532,6 +615,41 @@ class LMCacheEngine:
                     missing_required_paths[0],
                 )
                 return False
+            if os.getenv("LMCACHE_TUTTI_DEBUG_CHECKSUM", "0") == "1":
+                import hashlib
+
+                checksum_limit = int(
+                    os.getenv("LMCACHE_TUTTI_DEBUG_CHECKSUM_LIMIT", "4")
+                )
+                debug_start = time.perf_counter()
+                for key in (keys or [])[:checksum_limit]:
+                    disk_meta = disk_backend.dict.get(key)
+                    if disk_meta is None:
+                        continue
+                    shapes = self.metadata.get_shapes(self.metadata.chunk_size)
+                    dtypes = self.metadata.get_dtypes()
+                    shapes_override = self._dsv4_store_shapes_for_range(
+                        shapes,
+                        dtypes,
+                        0,
+                        self.metadata.chunk_size,
+                        self.metadata.chunk_size * len(keys or []),
+                    )
+                    nbytes = sum(
+                        shape.numel() * dtype.itemsize
+                        for shape, dtype in zip(shapes_override, dtypes, strict=True)
+                    )
+                    with open(disk_meta.path, "rb") as handle:
+                        data = handle.read(nbytes)
+                    debug_expected_checksums[disk_meta.path] = (
+                        nbytes,
+                        hashlib.sha256(data).hexdigest(),
+                    )
+                logger.info(
+                    "TUTTI_DEBUG_CHECKSUM prepared count=%d ms=%.3f",
+                    len(debug_expected_checksums),
+                    (time.perf_counter() - debug_start) * 1000.0,
+                )
             logger.info(
                 "Tutti lazy pre-scan: %d recovered, %d files scanned, "
                 "%d LBAs cached",
@@ -539,11 +657,13 @@ class LMCacheEngine:
                 len(paths),
                 len(initial_lba_cache),
             )
-            _maybe_unmount_for_tutti(disk_backend.path)
-            self._tutti_can_cpu_fallback = False
+            unmount_start = time.perf_counter()
+            mount_info = _maybe_unmount_for_tutti(disk_backend.path)
+            unmount_ms = (time.perf_counter() - unmount_start) * 1000.0
 
         cfg = self._tutti_config
         try:
+            create_start = time.perf_counter()
             self._tutti_loader = TuttiDirectLoader.create(
                 device_path=cfg["device_path"],
                 ctrl_path=cfg["ctrl_path"],
@@ -553,7 +673,9 @@ class LMCacheEngine:
                 nsid=cfg["nsid"],
                 cuda_device=cfg["cuda_device"],
                 initial_lba_cache=initial_lba_cache,
+                debug_expected_checksums=debug_expected_checksums,
             )
+            create_ms = (time.perf_counter() - create_start) * 1000.0
             logger.info(
                 "TuttiDirectLoader initialised: worker=%d device=%s pci=%s "
                 "cuda:%d slots=%dx%dMiB lba_cache=%d",
@@ -565,6 +687,24 @@ class LMCacheEngine:
                 cfg["slot_mb"],
                 len(initial_lba_cache),
             )
+            logger.info(
+                "TUTTI_PROFILE ensure_loader worker=%d keys=%d recovered=%d "
+                "paths=%d lba_cache=%d recover_ms=%.3f collect_paths_ms=%.3f "
+                "fiemap_ms=%.3f unmount_ms=%.3f create_ms=%.3f total_ms=%.3f",
+                self.metadata.local_worker_id,
+                len(keys or []),
+                n_recovered if isinstance(disk_backend, LocalDiskBackend) else 0,
+                len(paths) if isinstance(disk_backend, LocalDiskBackend) else 0,
+                len(initial_lba_cache),
+                recover_ms,
+                collect_paths_ms,
+                fiemap_ms,
+                unmount_ms,
+                create_ms,
+                (time.perf_counter() - profile_start) * 1000.0,
+            )
+            if mount_info is not None:
+                self._tutti_can_cpu_fallback = False
             return True
         except Exception as exc:
             logger.warning(
@@ -574,8 +714,15 @@ class LMCacheEngine:
                 exc,
             )
             self._tutti_loader = None
-            self._tutti_init_failed = True
+            if mount_info is not None:
+                remounted = _maybe_remount_after_tutti_failure(mount_info)
+                self._tutti_can_cpu_fallback = remounted
+            # cudaMalloc can fail transiently if the cold prefill request has
+            # not released KV blocks yet.  Keep the loader retryable in that
+            # case; permanent configuration errors will simply fail again.
+            self._tutti_init_failed = not self._tutti_can_cpu_fallback
             return False
+
     def _tutti_batched_get(
         self,
         keys: List[CacheEngineKey],
@@ -610,6 +757,7 @@ class LMCacheEngine:
                 "_tutti_batched_get called but _tutti_loader is None"
             )
 
+        profile_start = time.perf_counter()
         # Retrieve DiskCacheMetadata from LocalDiskBackend without loading.
         from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
         from lmcache.utils import DiskCacheMetadata
@@ -621,9 +769,11 @@ class LMCacheEngine:
             return [None] * len(keys)
 
         disk_metas: List[Optional[DiskCacheMetadata]] = []
+        metadata_start = time.perf_counter()
         with disk_backend.disk_lock:
             for key in keys:
                 disk_metas.append(disk_backend.dict.get(key, None))
+        metadata_ms = (time.perf_counter() - metadata_start) * 1000.0
 
         if any(m is None for m in disk_metas):
             return [None] * len(keys)
@@ -641,11 +791,169 @@ class LMCacheEngine:
                 )
                 disk_meta.fmt = self.fmt
 
-        return self._tutti_loader.load_chunks_to_hbm(
-            keys,
-            disk_metas,  # type: ignore[arg-type]
-            shapes_per_key=shapes_per_key,
+        load_start = time.perf_counter()
+        try:
+            results = self._tutti_loader.load_chunks_to_hbm(
+                keys,
+                disk_metas,  # type: ignore[arg-type]
+                shapes_per_key=shapes_per_key,
+            )
+        except Exception:
+            logger.exception(
+                "Tutti direct load failed for %d LocalDiskBackend keys; "
+                "falling back to %s",
+                len(keys),
+                "CPU filesystem path"
+                if self._tutti_can_cpu_fallback
+                else "cache miss",
+            )
+            if self._tutti_can_cpu_fallback:
+                return self.storage_manager.batched_get(
+                    keys=keys,
+                    location="LocalDiskBackend",
+                    shapes_per_key=shapes_per_key,
+                )
+            return [None] * len(keys)
+        load_ms = (time.perf_counter() - load_start) * 1000.0
+        loaded = sum(1 for result in results if result is not None)
+        total_bytes = sum(
+            result.get_size() for result in results if result is not None
         )
+        logger.info(
+            "TUTTI_PROFILE batched_get keys=%d loaded=%d size_mb=%.3f "
+            "metadata_ms=%.3f load_hbm_ms=%.3f total_ms=%.3f",
+            len(keys),
+            loaded,
+            total_bytes / 1024**2,
+            metadata_ms,
+            load_ms,
+            (time.perf_counter() - profile_start) * 1000.0,
+        )
+        return results
+
+    def _make_tutti_store_warmup_callback(
+        self,
+        keys: List[CacheEngineKey],
+        req_id: str,
+        is_last_prefill: bool,
+    ) -> Optional[Callable[[CacheEngineKey], None]]:
+        """Create a callback that warms Tutti after a cold LocalDisk store.
+
+        The callback is invoked once per key after LocalDiskBackend has written
+        that key to ext4 and inserted its metadata.  Store can be called
+        multiple times for one chunked-prefill request, so the callback
+        aggregates keys by request and warms Tutti only after the last prefill
+        store batch has completed.  That avoids unmounting the filesystem while
+        earlier cold-store chunks are still being written.
+        """
+        if (
+            self._tutti_config is None
+            or self._tutti_loader is not None
+            or self._tutti_init_failed
+            or not (
+                _env_flag("LMCACHE_TUTTI_WARMUP_AFTER_STORE")
+                or _as_bool(
+                    self.config.get_extra_config_value(
+                        "tutti_warmup_after_store",
+                        False,
+                    )
+                )
+            )
+            or (
+                self.store_location is not None
+                and self.store_location != "LocalDiskBackend"
+            )
+        ):
+            return None
+
+        req_key = req_id or "unspecified"
+        with self._tutti_warmup_lock:
+            known_keys = self._tutti_store_warmup_keys.setdefault(req_key, set())
+            known_keys.update(keys)
+            pending = self._tutti_store_warmup_pending.setdefault(req_key, set())
+            pending.update(keys)
+            if is_last_prefill:
+                self._tutti_store_warmup_last_seen.add(req_key)
+
+        def _warm_after_store(req_keys: List[CacheEngineKey]) -> None:
+            with self._tutti_warmup_lock:
+                if self._tutti_loader is not None or self._tutti_warmup_started:
+                    self._clear_tutti_store_warmup_state(req_key)
+                    return
+                self._tutti_warmup_started = True
+                self._tutti_warmup_done = threading.Event()
+            logger.info(
+                "Tutti warmup after final cold store started: req_id=%s chunks=%d",
+                req_id,
+                len(req_keys),
+            )
+            try:
+                delay_s = float(
+                    self.config.get_extra_config_value(
+                        "tutti_warmup_after_store_delay_sec",
+                        os.getenv("LMCACHE_TUTTI_WARMUP_AFTER_STORE_DELAY_SEC", 0),
+                    )
+                )
+                if delay_s > 0:
+                    logger.info(
+                        "Tutti warmup waiting %.3f sec for request cleanup: "
+                        "req_id=%s",
+                        delay_s,
+                        req_id,
+                    )
+                    time.sleep(delay_s)
+                if self._ensure_tutti_loader(req_keys, wait_for_warmup=False):
+                    logger.info(
+                        "Tutti warmup after final cold store finished: req_id=%s "
+                        "chunks=%d",
+                        req_id,
+                        len(req_keys),
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Tutti warmup after final cold store failed: req_id=%s error=%s",
+                    req_id,
+                    exc,
+                )
+            finally:
+                if self._tutti_warmup_done is not None:
+                    self._tutti_warmup_done.set()
+                with self._tutti_warmup_lock:
+                    self._clear_tutti_store_warmup_state(req_key)
+                    self._tutti_warmup_started = False
+
+        def _on_store_complete(key: CacheEngineKey) -> None:
+            req_keys: List[CacheEngineKey] = []
+            should_start = False
+            with self._tutti_warmup_lock:
+                req_pending = self._tutti_store_warmup_pending.get(req_key)
+                if req_pending is None:
+                    return
+                req_pending.discard(key)
+                should_start = (
+                    req_key in self._tutti_store_warmup_last_seen
+                    and not req_pending
+                    and not self._tutti_warmup_started
+                )
+                if should_start:
+                    req_keys = list(
+                        self._tutti_store_warmup_keys.get(req_key, set())
+                    )
+            if should_start and req_keys:
+                thread = threading.Thread(
+                    target=_warm_after_store,
+                    args=(req_keys,),
+                    name="tutti-store-warmup",
+                    daemon=True,
+                )
+                thread.start()
+
+        return _on_store_complete
+
+    def _clear_tutti_store_warmup_state(self, req_id: str) -> None:
+        self._tutti_store_warmup_keys.pop(req_id, None)
+        self._tutti_store_warmup_pending.pop(req_id, None)
+        self._tutti_store_warmup_last_seen.discard(req_id)
 
     def freeze(self, enabled: bool) -> None:
         """
@@ -882,6 +1190,17 @@ class LMCacheEngine:
 
         with store_stats.profile_put():
             transfer_spec = kwargs.get("transfer_spec", None)
+            is_last_prefill = bool(
+                kwargs.get(
+                    "is_last_prefill",
+                    getattr(transfer_spec, "is_last_prefill", False),
+                )
+            )
+            tutti_warmup_callback = self._make_tutti_store_warmup_callback(
+                list(keys),
+                req_id,
+                is_last_prefill,
+            )
             # TODO: we implicitly rely on batched_put to call ref_count_down
             # this management should be done in a cleaner way
             self.storage_manager.batched_put(
@@ -889,6 +1208,7 @@ class LMCacheEngine:
                 memory_objs,
                 transfer_spec=transfer_spec,
                 location=self.store_location,
+                on_complete_callback=tutti_warmup_callback,
             )
 
         self.stats_monitor.on_store_finished(
@@ -1209,7 +1529,13 @@ class LMCacheEngine:
         ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
 
         reordered_chunks: List[ProcessedChunk] = []
+        retrieve_profile_start = time.perf_counter()
+        process_tokens_ms = 0.0
+        broadcast_ms = 0.0
+        to_gpu_ms = 0.0
+        cleanup_ms = 0.0
         if not self._is_passive():
+            process_tokens_start = time.perf_counter()
             with retrieve_stats.profile_process_tokens():
                 if self.async_loading:
                     reordered_chunks, tot_kv_size = self._async_process_tokens_internal(  # noqa: E501
@@ -1225,8 +1551,12 @@ class LMCacheEngine:
                         ret_mask,
                         **kwargs,
                     )
+            process_tokens_ms = (
+                time.perf_counter() - process_tokens_start
+            ) * 1000.0
 
         if self.save_only_first_rank:
+            broadcast_start = time.perf_counter()
             with retrieve_stats.profile_broadcast():
                 with torch_dev.stream(self.broadcast_stream):
                     self._broadcast_or_receive_memory_objs(
@@ -1242,20 +1572,24 @@ class LMCacheEngine:
                 # operation, and then process to_cpu operation.
                 if not hasattr(self.gpu_connector, "load_stream"):
                     self.broadcast_stream.synchronize()
+            broadcast_ms = (time.perf_counter() - broadcast_start) * 1000.0
 
         # NOTE(Jiayi): memory_obj doesn't have to be a pinned
         # cpu tensor for the sake of performance.
         # For example, disk->gpu is faster than disk->cpu->gpu.
         # RDMA is another example.
         if len(reordered_chunks) > 0:
+            to_gpu_start = time.perf_counter()
             with retrieve_stats.profile_to_gpu():
                 _, memory_objs, starts, ends = zip(*reordered_chunks, strict=False)
                 self.gpu_connector.batched_to_gpu(
                     list(memory_objs), list(starts), list(ends), **kwargs
                 )
+            to_gpu_ms = (time.perf_counter() - to_gpu_start) * 1000.0
 
         # TODO(Jiayi): Remove the following for loop with batched operations
         # TODO(Jiayi): Need to refactor the `remove_after_retrieve` logic.
+        cleanup_start = time.perf_counter()
         for key, memory_obj, _, _ in reordered_chunks:
             if self.remove_after_retrieve and not self._is_passive():
                 assert self.storage_manager is not None
@@ -1267,6 +1601,7 @@ class LMCacheEngine:
                     memory_obj.ref_count_down()
             elif not self.async_loading:
                 memory_obj.ref_count_down()
+        cleanup_ms = (time.perf_counter() - cleanup_start) * 1000.0
 
         retrieved_tokens = torch.sum(ret_mask)
         self.stats_monitor.on_retrieve_finished(
@@ -1287,6 +1622,9 @@ class LMCacheEngine:
         # need_to_load: 512 - 288 = 224 tokens
         # retrieved: 256 tokens
         if not self._is_passive():
+            profile_total_ms = (
+                time.perf_counter() - retrieve_profile_start
+            ) * 1000.0
             logger.info(
                 "[req_id=%s] Retrieved %d out of %d required tokens "
                 "(from %d total tokens). size: %.4f gb, "
@@ -1298,6 +1636,23 @@ class LMCacheEngine:
                 tot_kv_size / 1024**3,
                 onload_time * 1000,
                 tot_kv_size / onload_time / 1024**3 if onload_time > 0 else 0,
+            )
+            logger.info(
+                "LMCACHE_RETRIEVE_PROFILE req_id=%s chunks=%d retrieved=%d "
+                "required=%d size_mb=%.3f process_tokens_ms=%.3f "
+                "broadcast_ms=%.3f to_gpu_ms=%.3f cleanup_ms=%.3f "
+                "total_ms=%.3f stats_total_ms=%.3f",
+                req_id,
+                len(reordered_chunks),
+                int(retrieved_tokens),
+                int(num_required_tokens),
+                tot_kv_size / 1024**2,
+                process_tokens_ms,
+                broadcast_ms,
+                to_gpu_ms,
+                cleanup_ms,
+                profile_total_ms,
+                onload_time * 1000,
             )
         return ret_mask
 

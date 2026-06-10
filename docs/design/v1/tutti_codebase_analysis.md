@@ -289,6 +289,61 @@ GPU kernel 轮询 CQ ring
 完成，GPU 可直接使用 HBM 中的数据
 ```
 
+**测试配置**：128K max len，实测 120,017 prompt tokens（tokenizer 后）。
+
+---
+
+## 九、性能 Profile 结果（120K token 长上下文，TP=8 DSV4）
+
+### 端到端 TTFT 各阶段
+
+| 阶段 | 端到端 TTFT | 命中情况 |
+|------|------------|---------|
+| cold store | 17.438s | 0 hit |
+| hit1 lazy（首次命中） | 25.301s | 119,808 / 119,808 full hit |
+| hit2 steady（稳态） | 1.023s | 119,808 / 119,808 full hit |
+
+每 rank 实际 load 大小：**744.422 MB / rank，468 chunks**，确认 full hit。
+
+---
+
+### 稳态 hit2 breakdown（per rank）
+
+| 部分 | 时间 |
+|------|------|
+| Tutti metadata 查询 | mean 0.20ms |
+| SSD → HBM direct load | mean 211.6ms，max 219.9ms |
+| process_tokens 总段 | mean 231.2ms |
+| to_gpu / KV 放置（scatter） | mean 432.2ms，**max 439.9ms** |
+| cleanup | mean 0.09ms |
+| LMCache retrieve 总时间 | mean 663.7ms，max 669.9ms |
+| 端到端 TTFT | **1.023s** |
+
+**关键结论**：稳态下瓶颈不是 SSD 读，而是 to_gpu/KV scatter 放置：
+- to_gpu/KV 放置：~432ms，占 LMCache retrieve 的 **65%**
+- SSD → HBM direct load：~212ms，占 **32%**
+- metadata + cleanup：< 1ms，可忽略
+
+优化优先级：① 消掉/减少 KV scatter 的 430ms → ② 继续抠 SSD direct load 的 212ms。
+
+---
+
+### hit1 lazy init breakdown（首次命中的 25s 来自哪里）
+
+稳态 hit2 只需 1s，首次 hit1 需要 25s，差距完全来自 Tutti loader 的懒初始化：
+
+| lazy init 阶段 | 时间 |
+|---------------|------|
+| recover metadata（scan_existing_entries） | mean 105ms |
+| FIEMAP 预扫描 | mean 4ms |
+| unmount cache filesystem | mean 4ms |
+| create / session_bind_map | mean 3.57s，**max 24.14s** |
+| ensure_loader total | mean 3.69s，**max 24.26s** |
+
+`session_bind_map` 有严重长尾（mean 3.57s vs max 24.14s），是 hit1 TTFT 的决定性因素。稳态不受影响，但第一次命中会因此拖到 25s，需要单独处理。
+
+---
+
 **我们（LMCache）对应的生产代码**：
 - `csrc/tutti_kv_ops.cu`：`k_submit_batch_sgl_read`（批量提交 N 个 SQE）和 `k_poll_batch`（批量轮询 N 个 CQE）
 - `lmcache/v1/gpu_connector/tutti_direct_loader.py`：Python 层，管理 staging buffer、调用上述 CUDA kernel、把结果装进 `TensorMemoryObj`
@@ -1068,4 +1123,675 @@ lmcache.c_ops.tutti_poll_batch(...)
 FIEMAP multi-extent pre-scan must happen before snvme bind.
 After bind, direct load must be complete or fail loudly.
 Do not silently mix partial Tutti with CPU filesystem fallback.
+```
+
+---
+
+## 十、Tutti 官方仓库 v0.1.0 架构解析
+
+### 背景
+
+v0.1.0（2026-06 发布，commit 872b035）是 Tutti 第一次把完整 C++ 库栈开源。之前仓库只有内核模块（snvme.ko）和测试代码；现在新增约 **2 万行**，覆盖从设备管理到内存注册到 IO 引擎的完整软件栈。
+
+---
+
+### 目标分层架构（v0.1 Roadmap 定义）
+
+Roadmap 定义了 9 层目标架构，当前实现进度参差不齐：
+
+```
+1. API Layer          ← ❌ api/ 目录不存在
+2. Adapter Layer      ← ❌ adapters/ 目录不存在（LMCache/Mooncake 适配未实现）
+3. Core Runtime       ← ⚠️ 混在旧的 GeminiFS 单体里
+4. Memory Layer       ← ⚠️ 部分实现（memory/ 目录存在但未完全从单体中剥离）
+5. Device Manager     ← ⚠️ 部分实现（device_manager/ 目录存在但与 IO 引擎仍耦合）
+6. Filesystem Layer   ← ⚠️ 散落在 nvme_storage/ 和 block_storage/ 里
+7. IO Engine Layer    ← ⚠️ 接口已定义，但 local_nvme 后端还直接调 libnvm
+8. Backend SPI Layer  ← ⚠️ IBackendProvider 接口已定义，未完全实现
+9. Backend Impls      ← ✅ local_nvme（libnvm + snvme）可用；RDMA/GDS 是 future
+```
+
+Roadmap 自己承认："The current codebase does not yet match the v0.1 target architecture."  
+v0.1.0 本质是"发布了架构蓝图 + 骨架代码"，真正跑 GPU-direct IO 的仍然是旧的单体 `libgeminifs`（`GeminiFS` 类）。
+
+---
+
+### 新增模块详解
+
+#### `nvme_storage/` — NVMe 文件层
+
+**定位**：把 NVMe 裸 LBA 抽象成"命名文件"，是最靠近硬件的 C++ 层。
+
+关键组件：
+
+| 文件 | 作用 |
+|------|------|
+| `include/nvme_storage.h` | `INvmeStorage` 接口：`bootstrap(devices)`、`shutdown()`、`acquire_device_handle()` |
+| `include/nvme_file.h` | `NvmeFile`：单个命名文件的描述符，管理它在 NVMe 上的 LBA 范围 |
+| `include/nvme_file_device_handle.h` | `NvmeFileDeviceHandle`：GPU 侧句柄，kernel 直接消费 |
+| `include/fiemap_helper.h` | FIEMAP 查询接口（C++ 版，对应我们 Python 里手写的那个） |
+| `include/lba_extent.h` | `LbaExtent`：一段连续 LBA 的描述符（slba + n_sectors） |
+| `src/fiemap_helper.cpp` | FIEMAP 实现：`query_extents(path)`、`single_contiguous(path)` |
+| `src/host_fs_backed_nvme_storage.cpp` | 基于 host 文件系统的 NvmeStorage 实现（ext4/xfs + FIEMAP） |
+| `include/persistent_file_log.h` | 持久化文件日志（generation-number 仲裁的镜像日志） |
+
+`INvmeStorage` 工作流：
+```
+bootstrap(devices)           → 挂载文件系统、扫描已有文件的 LBA
+acquire_device_handle(name)  → 返回 NvmeFileDeviceHandle（GPU 侧可直接用）
+shutdown()                   → flush + unmount
+```
+
+---
+
+#### `device_manager/` — 设备注册与队列管理
+
+**定位**：跨进程的设备发现、拓扑管理和队列租约，替代各进程自己 bind 设备的混乱局面。
+
+关键组件：
+
+| 文件 | 作用 |
+|------|------|
+| `include/device_registry.h` | `IDeviceRegistry`：设备注册表，`device_at(i)`、`find_by_id()`、`list()` |
+| `include/local_nvme_device.h` | `LocalNvmeDevice`：一个本地 PCIe NVMe 设备的描述符 |
+| `include/local_nvme_direct_registry.h` | 进程内直接 bind 模式的注册表实现 |
+| `include/nvmeservice_backed_registry.h` | 通过 NVMeService daemon 管理设备的注册表实现 |
+| `include/nvme_queue_group.h` | `NvmeQueueGroup`：SQ/CQ 队列组生命周期（对应我们 SnvmeSession 里那套 ioctl） |
+| `include/lease_manager.h` | `ILeaseManager`：队列租约的发放、心跳、回收 |
+| `src/nvme_queue_group.cu` | CUDA 侧队列组实现：分配 GPU 内存 ring、注册 IOVA、创建用户队列 |
+
+两种 bootstrap 模式（Roadmap 明确支持）：
+```
+GPU-owned（进程直接 bind）     → LocalNvmeDirectRegistry
+Service-owned（daemon 管理）   → NvmeServiceBackedRegistry → NVMeService gRPC
+```
+
+---
+
+#### `memory/` — 内存子系统
+
+**定位**：GPU tensor 注册给 NVMe 控制器的统一入口，替代散落在各处的 `NVM_MAP_DEVICE_MEMORY` 调用。
+
+关键组件：
+
+| 文件 | 作用 |
+|------|------|
+| `include/memory_subsystem.h` | `IMemorySubsystem`：`register_tensor()`、`allocate_device()`、`free()` |
+| `include/memory_region.h` | `MemoryRegion`：已注册内存的描述符（地址、大小、对齐、ownership、注册状态） |
+| `include/memory_kind.h` | `MemoryKind` 枚举：HOST / PINNED_HOST / DEVICE / MANAGED / EXTERNAL |
+| `include/cuda_helpers.cuh` | CUDA 工具：`cuda_check()`、对齐计算 |
+| `src/host_device_memory_subsystem.cu` | 完整实现：管理 HBM 分配池、调用 P2P API 注册给 NVMe |
+
+`IMemorySubsystem` 核心操作：
+```
+register_tensor(tensor, devices)  → 对每个 device 调 NVM_MAP_DEVICE_MEMORY，返回 MemoryRegion
+allocate_device(size, device_id)  → cudaMalloc + 自动注册
+free(region)                      → unregister + cudaFree
+```
+
+---
+
+#### `block_storage/` — 块存储层
+
+**定位**：在 `nvme_storage` 之上加了多设备分片和持久化元数据，是 GPU 文件系统的抽象层。
+
+关键组件：
+
+| 文件 | 作用 |
+|------|------|
+| `include/block_storage.h` | `IBlockStorage`：`create_gpu_file()`、`open_gpu_file()`、`acquire_device_handle()` |
+| `include/gpu_file_resolve.h` | `GpuFileId`（uint32）和 name → id 的映射 |
+| `include/host_fs_backed_block_storage.h` | host 文件系统支撑的实现 |
+| `include/persistent_gpu_file_log.h` | 持久化日志：generation-number 仲裁，所有 shard 镜像，防止部分写导致元数据不一致 |
+| `src/host_fs_backed_block_storage.cpp` | 完整实现（726 行） |
+
+`GpuFile` 概念：一个逻辑文件横跨 N 块 NVMe（每块一个 shard），`GpuFileHandle` 是 GPU 侧句柄，直接被 io_engine kernel 消费：
+```
+GpuFileSpec { name, tensor_shape, shard_placement: [device_0, device_1, ...] }
+  → create_gpu_file(spec)
+  → GpuFileId
+  → acquire_device_handle(file_id)
+  → GpuFileHandle { shard_handles[N] }  ← GPU kernel 直接读这个
+```
+
+**已知问题**（Roadmap Known Bugs）：GPU file persistence 有 correctness/stability 问题，暂不可作为生产持久化合同。
+
+---
+
+#### `io_engine/` — IO 引擎 SPI
+
+**定位**：定义后端插件接口，让 local_nvme / RDMA / GDS 三种后端都能接入同一个上层 API，不改上层代码就能换后端。
+
+关键组件：
+
+| 文件 | 作用 |
+|------|------|
+| `include/backend_provider.h` | `IBackendProvider`：所有后端必须实现的接口 |
+| `include/backend_type.h` | `BackendType` 枚举：LOCAL_NVME=0, RDMA=1, GDS=2 |
+| `include/buffer_descriptor.h` | `BufferDescriptor` tagged union：NVMe PRP/SGL 描述符 + RDMA 占位 |
+| `include/io_request.h` | `IORequest`：一次 IO 操作的描述（StorageTarget、MemoryRegion、方向、大小） |
+| `include/io_submit_mode.h` | `IOSubmitMode` 枚举：CPU_SUBMIT / GPU_SUBMIT |
+| `include/queue_provider.h` | `IQueueProvider`：队列获取/释放接口 |
+| `include/io_future.h` | `IOFuture`：异步 IO 完成句柄 |
+| `include/coop_channel.h` | 协作通道（v0.1 中保留为接口，不实现 COOPERATIVE_SUBMIT） |
+
+`IBackendProvider` 的三类职责：
+```
+# 内存侧
+prepare_descriptors(memory_region)  → BufferDescriptorBatch（供 kernel 直接用）
+
+# 队列侧
+acquire_queue(device)               → QueueHandle
+release_queue(handle)
+
+# IO 侧（两种模式）
+launch_batch_gpu_stream(batch, stream)  → GPU_SUBMIT：GPU kernel 直接发 IO
+submit_batch_cpu(batch)                 → CPU_SUBMIT：CPU 代劳提交
+```
+
+**v0.1 明确不支持的**：`COOPERATIVE_SUBMIT`（CPU 和 GPU 同时操作同一数据区域）——Roadmap 原文："v0.1 explicitly does **not** define cooperative submit."
+
+---
+
+#### `backends/local/NVMeService/` — gRPC 会话守护进程
+
+**定位**：多进程共享同一块 NVMe 设备的协调者。之前每个进程都得自己 bind 设备，互相干扰；NVMeService 作为守护进程持有独占 bind，其他进程通过 gRPC 连上来"借"队列。
+
+架构：
+```
+┌─────────────────────────────────────┐
+│  LMCache worker 0  ─── gRPC ──┐    │
+│  LMCache worker 1  ─── gRPC ──┼──► NVMeService daemon
+│  LMCache worker 2  ─── gRPC ──┘    │  （持有 snvme bind + chrdev）
+└─────────────────────────────────────┘
+```
+
+关键 gRPC 接口（`nvmeservice.proto`）：
+
+| RPC | 方向 | 作用 |
+|-----|------|------|
+| `ListDevices` | unary | 枚举所有 NVMe：PCI BDF、namespace、BAR0 地址、队列深度 |
+| `Connect` | unary | 建立会话：返回 ssnvme 设备路径 + 分配的队列数 |
+| `Disconnect` | unary | 释放会话和队列 |
+| `Heartbeat` | 双向流 | 保活：daemon 靠 PID 存活检测 + heartbeat 超时自动回收泄露的队列 |
+
+关键设计：daemon **不**托管 SQ/CQ ring 本身，只做会话元数据 broker。客户端拿到 `ssnvme_dev_path` 后自己打开、自己分配 GPU ring、自己写 SQE——IO 数据路径完全在客户端进程内，daemon 不在关键路径上。
+
+配置文件（`sys_config.yaml` 关键字段）：
+```yaml
+nvmes:
+  - pci: "0000:6f:00.0"
+    allowed_gpus: ["0000:3e:00.0"]   # PCIe 亲和性 ACL
+    kernel_ioq_cap: 36
+queue_pool:
+  default_per_client: 4
+  max_per_client: 16
+lease:
+  heartbeat_interval_sec: 5
+  timeout_sec: 30
+```
+
+---
+
+### 论文承诺 vs v0.1.0 实际状态
+
+| 论文/架构描述 | v0.1.0 实际状态 |
+|-------------|----------------|
+| 8 层干净架构 | 仍以 `GeminiFS` 单体为核心，新模块是从中剥离的过程 |
+| Adapter Layer（LMCache/Mooncake） | ❌ `adapters/` 目录不存在 |
+| GPU file persistence | ⚠️ Known Bug：correctness/stability 问题，不可作为生产合同 |
+| Cooperative submit | ❌ v0.1 明确不实现 |
+| Backend SPI（RDMA, GDS） | ⚠️ 接口定义了，实现只有 local_nvme，其余是 future |
+| 稳定上层 API | ❌ `api/` 目录不存在 |
+| NVMeService 多进程共享 | ✅ 完整实现，gRPC + heartbeat + lease |
+| local_nvme GPU 提交 | ✅ 内核模块 + libnvm + CUDA kernel 完整可用 |
+
+---
+
+### 对 LMCache 的影响
+
+| 我们现在手写的 | Tutti v0.1.0 对应实现 | 是否可迁移 |
+|--------------|----------------------|-----------|
+| Python `FiemapHelper` | `nvme_storage/src/fiemap_helper.cpp` | 可，但需要 C++ binding |
+| Python `SnvmeSession`（ioctl 序列） | `device_manager/NvmeQueueGroup` | 可，接口更稳定 |
+| Python `_map_device_memory()` | `memory/IMemorySubsystem::register_tensor()` | 可 |
+| 各 worker 自己 bind 设备 | `NVMeService` daemon | 可，解决多进程冲突 |
+
+当前建议：API 仍未稳定（`api/` 目录不存在，适配层不存在），**暂不迁移**。继续使用现有 Python 实现，等 v0.2 适配层稳定后再考虑。
+
+---
+
+## 十一、新版本 LMCache Tutti 实现详解（生产可运行版本）
+
+本节解析基于 LMCache 的最新 Tutti GPU-direct 集成实现（branch `codex/tutti-lazy-multiextent`），该版本在 120K token、TP=8 DSV4 环境中实测可运行。涉及的主要文件：
+
+- [lmcache/v1/cache_engine.py](lmcache/v1/cache_engine.py)
+- [lmcache/v1/gpu_connector/tutti_direct_loader.py](lmcache/v1/gpu_connector/tutti_direct_loader.py)
+- [lmcache/integration/vllm/vllm_v1_adapter.py](lmcache/integration/vllm/vllm_v1_adapter.py)
+
+---
+
+### 11.1 整体架构概览
+
+新版本解决了前一版本存在的三个核心问题：
+
+| 问题 | 根因 | 新版本的解决方案 |
+|------|------|----------------|
+| hit1 lazy 初始化 25s（max 24s session_bind_map 长尾） | Tutti init 在首次 retrieve 时触发，与 HBM 内存紧张的 cold prefill 并行 | **warmup-after-store**：cold store 完成后在后台线程立即初始化 |
+| DSV4 非尾块 nbytes 计算错误 | 用 `disk_meta.size`（全尺寸）而非实际存储的 shapes 计算需读取的字节数 | `_effective_nbytes()` 根据 `shapes_override` 精确计算 |
+| staging tensor 生命周期不安全 | `_staging_slice_at()` 返回的 view 在 staging pool 复用后失效 | 每个 completed chunk 调用 `.clone()` 生成独立 tensor |
+
+附带改进：
+- 全链路 `TUTTI_PROFILE` 日志（create / load_batch / batch_detail）
+- `LMCACHE_RETRIEVE_PROFILE` 日志（retrieve 各阶段分解）
+- `LMCACHE_TUTTI_DEBUG_CHECKSUM` SHA256 正确性校验模式
+- `_maybe_remount_after_tutti_failure`：init 失败后恢复 ext4 挂载
+- `LMCACHE_TUTTI_FORCE_CPU_FALLBACK` 逃生舱环境变量
+
+---
+
+### 11.2 Warmup-After-Store：解决 hit1 25s 问题
+
+#### 11.2.1 问题背景
+
+profile 数据（见九节）显示 hit1 TTFT 为 25.3s，远高于稳态的 1.0s。根因是 `_ensure_tutti_loader()` 在首次 retrieve 时被调用，但此时 cold prefill 刚完成，HBM 仍被 KV blocks 占满，`cudaMalloc` 大概率 OOM；同时 session_bind_map（SNVM_DEVICE_BIND + NVM_MAP_DEVICE_MEMORY）在某些 PCIe 拓扑下耗时最长达 24s。
+
+#### 11.2.2 设计思路
+
+cold store 完成后 HBM 有空余，且此时文件已落盘、FIEMAP 能正确查到 LBA。因此：
+1. cold store 最后一个 chunk 写盘后，立即在 **daemon 线程**里异步完成 Tutti 初始化
+2. 后续 retrieve 到来时，若 warmup 已完成 → 直接使用；若仍在 warmup → **等待其完成**再使用
+3. 用 `threading.Lock` + `threading.Event` 保证线程安全，杜绝双重初始化
+
+#### 11.2.3 代码实现
+
+**新增实例变量**（`__init__` 中）：
+
+```python
+self._tutti_warmup_lock    = threading.Lock()
+self._tutti_warmup_started = False                    # 是否已启动过 warmup 线程
+self._tutti_warmup_done    : Optional[threading.Event] = None  # warmup 完成信号
+
+# 按 req_id 跟踪每个请求的 store keys
+self._tutti_store_warmup_keys    : dict[str, set[CacheEngineKey]] = {}
+self._tutti_store_warmup_pending : dict[str, set[CacheEngineKey]] = {}
+self._tutti_store_warmup_last_seen: set[str] = set()
+```
+
+**`_make_tutti_store_warmup_callback()`** 的职责：
+
+1. **guard 检查**：如果 Tutti 未配置 / 已初始化 / 初始化已永久失败 / 未开启 `tutti_warmup_after_store` 选项，返回 `None`
+2. 在 `_tutti_warmup_lock` 下，把本次 store 的所有 keys 注册到 `_tutti_store_warmup_keys[req_id]` 和 `pending[req_id]`；若 `is_last_prefill=True` 则把 req_id 加入 `_tutti_store_warmup_last_seen`
+3. 返回闭包 `_on_store_complete(key)`，由 `StorageManager.batched_put()` 的 `on_complete_callback` 在每个 key 写盘后调用
+
+**`_on_store_complete(key)` 闭包**（每 key 写盘后触发）：
+
+```
+从 pending 集合中移除 key
+若满足：req_id in last_seen AND pending 已空 AND warmup 未启动
+    收集 all keys for req_id
+    设置 _tutti_warmup_started = True, 创建 _tutti_warmup_done Event
+    启动 daemon thread: target=_warm_after_store, name="tutti-store-warmup"
+```
+
+**`_warm_after_store(req_keys)` 后台线程**：
+
+```
+可选 sleep（tutti_warmup_after_store_delay_sec，等 prefill request 释放 HBM）
+调用 _ensure_tutti_loader(req_keys, wait_for_warmup=False)
+    → 内部调用 _ensure_tutti_loader_locked(req_keys)
+finally:
+    _tutti_warmup_done.set()       # 通知等待中的 retrieve
+    _clear_tutti_store_warmup_state(req_id)
+    _tutti_warmup_started = False   # 允许下次重试（cudaMalloc transient OOM 时）
+```
+
+#### 11.2.4 `_ensure_tutti_loader()` 的等待逻辑
+
+```
+def _ensure_tutti_loader(keys, wait_for_warmup=True):
+    if _tutti_loader is not None: return True         # 快路径
+
+    with _tutti_warmup_lock:
+        if _tutti_loader is not None: return True     # DCL
+        if warmup 正在进行中 AND wait_for_warmup:
+            warmup_done = _tutti_warmup_done          # 取出 Event
+        else:
+            return _ensure_tutti_loader_locked(keys)  # 直接初始化
+
+    warmup_done.wait()                                # 等待后台完成
+    return _tutti_loader is not None                  # 看结果
+```
+
+#### 11.2.5 时序图
+
+```
+cold store 期间                        cold store 完成后              retrieve 时
+─────────────────────────────────────────────────────────────────────────────────
+vllm_v1_adapter.store(is_last_prefill=True)
+    → CacheEngine.store()
+        → _make_tutti_store_warmup_callback(keys, req_id, is_last_prefill=True)
+              注册 keys；last_seen.add(req_id)
+        → storage_manager.batched_put(on_complete_callback=callback)
+              [写盘，每 key 调用 callback]
+              callback(key) → pending.discard(key)
+              pending 空 → 启动 "tutti-store-warmup" daemon 线程
+
+                                      [daemon 线程]
+                                      _warm_after_store(req_keys):
+                                        sleep(delay_sec)  # 等 HBM 释放
+                                        _ensure_tutti_loader_locked(req_keys)
+                                          ├─ scan_existing_entries()
+                                          ├─ FiemapHelper.scan_paths()
+                                          ├─ _maybe_unmount_for_tutti()
+                                          └─ TuttiDirectLoader.create()
+                                        _tutti_warmup_done.set()
+
+                                                                   retrieve() 到来
+                                                                   _ensure_tutti_loader()
+                                                                   ├─ warmup 已完成：
+                                                                   │    return True
+                                                                   └─ warmup 进行中：
+                                                                        warmup_done.wait()
+                                                                        return True
+```
+
+---
+
+### 11.3 `_effective_nbytes()` 和 DSV4 非尾块尺寸修正
+
+#### 11.3.1 问题
+
+DSV4 优化模式下，非尾部 chunk（不含 SWA cache 和 compressor state 的两个 group）仅有 3 个 group，实际存储约 1.41 MB；但旧代码用 `disk_meta.size`（按 8 group 全量大小）计算 DMA nbytes，导致：
+1. NVMe READ 命令请求过多字节（越过文件末尾）→ 读出垃圾数据
+2. MemoryObjMetadata 的 `phy_size` 和实际 tensor shape 不匹配
+
+#### 11.3.2 三个辅助函数
+
+**`_effective_shapes(disk_meta, shapes_override)`**：
+```python
+return shapes_override if shapes_override is not None else disk_meta.shapes
+```
+优先使用调用方传入的 `shapes_override`（由 `_dsv4_store_shapes_for_range` 生成），回退到盘上 metadata 中的 shapes。
+
+**`_effective_dtypes(disk_meta, effective_shapes)`**：
+从 `disk_meta.dtypes`（优先）或 `disk_meta.dtype`（单类型广播）得到每 group 的 dtype，长度必须与 `effective_shapes` 一致。
+
+**`_effective_nbytes(disk_meta, shapes_override)`**：
+```python
+return sum(
+    shape.numel() * dtype.itemsize
+    for shape, dtype in zip(effective_shapes, effective_dtypes, strict=True)
+)
+```
+这是 DMA 实际应读取的字节数（有别于文件的总字节数）。
+
+#### 11.3.3 影响范围
+
+| 调用位置 | 改动 |
+|---------|------|
+| `_make_memory_obj_metadata()` | `phy_size = _effective_nbytes(...)` 而非 `disk_meta.size` |
+| `_estimate_chunk_ios(meta, nbytes)` | `nbytes` 参数由调用方传入（不再在内部重算） |
+| `load_chunks_to_hbm()` batch 打包 | `chunk_nbytes = _effective_nbytes(meta, key_shapes_override)` |
+| `_load_batch()` | `nbytes = _effective_nbytes(...)`；`dma_nbytes = _align_up(nbytes, _NVME_LBS)` |
+
+#### 11.3.4 NVMe 对齐
+
+```
+nbytes     ← _effective_nbytes()          # 逻辑字节数（精确）
+dma_nbytes ← _align_up(nbytes, 512)       # NVMe 必须按 512-byte sector 对齐
+chunk_bytes← _align_up(dma_nbytes, 64KiB) # staging 分配按 GPU_PAGE 对齐
+```
+旧版本直接用 `meta.size`（已是 512 对齐），因为全量尺寸恰好对齐所以没有暴露 bug；新版本非尾块有 0-padding group（shape dim=0），总尺寸不一定是 512 的倍数，必须显式 align_up。
+
+---
+
+### 11.4 `gpu_raw.clone()`：staging 内存所有权修正
+
+**旧版本问题**：`_load_batch` 返回的 `TensorMemoryObj.raw_data` 是 staging pool 的 **view**（非拷贝）。staging pool 是共享的环形缓冲区；下一个 batch 的 DMA 写入会覆盖当前 batch 尚未消费的数据，导致 KV cache 内容被静默破坏。
+
+**新版本修正**：
+
+```python
+gpu_raw = self._staging_slice_at(chunk_offset, nbytes)
+self._debug_verify_direct_read(meta, gpu_raw)   # checksum 在 clone 前验证
+persist_start = time.perf_counter()
+owned_raw = gpu_raw.clone()                      # G2G copy：staging → 独立 HBM tensor
+persist_ms += _elapsed_ms(persist_start)
+
+results[i_orig] = TensorMemoryObj(
+    metadata=obj_meta,
+    raw_data=owned_raw,    # ← 独立 tensor，不受 staging 复用影响
+    parent_allocator=None, # Python GC 管理
+)
+```
+
+`clone()` 是 G2G（HBM → HBM）copy，带宽 ~2 TB/s，延迟对应 profile 中的 `persist_ms`。在 120K profile 中未单独测量，但 468 chunk × ~1.5 MB = ~700 MB 的 clone 在稳态 batch 里分摊，不构成瓶颈。
+
+---
+
+### 11.5 挂载恢复：`_maybe_remount_after_tutti_failure()`
+
+Tutti 初始化序列在 FIEMAP 之后必须 unmount ext4，否则 SNVM_DEVICE_BIND 报 EIO。若 bind 或后续步骤失败，文件系统处于 unmounted 状态，CPU fallback 路径无法读文件。
+
+**新增 `_maybe_remount_after_tutti_failure()`**：
+
+```python
+def _maybe_remount_after_tutti_failure(
+    mount_info: Optional[Tuple[str, str]],
+) -> bool:
+    if mount_info is None: return False
+    source, mount_point = mount_info
+    subprocess.run(["mount", source, mount_point], check=True)
+    return True
+```
+
+`_ensure_tutti_loader_locked()` 的 except 块：
+
+```python
+except Exception as exc:
+    logger.warning("TuttiDirectLoader init failed: %s", exc)
+    self._tutti_loader = None
+    if mount_info is not None:
+        remounted = _maybe_remount_after_tutti_failure(mount_info)
+        self._tutti_can_cpu_fallback = remounted
+    # cudaMalloc transient OOM → 可重试（_tutti_init_failed 不设为 True）
+    # 挂载恢复失败 → _tutti_init_failed = True，永久禁用
+    self._tutti_init_failed = not self._tutti_can_cpu_fallback
+    return False
+```
+
+这里的可重试逻辑很重要：若 cold prefill 占满 HBM 导致 `cudaMalloc` 失败，下次 warmup 线程重启后可以再次尝试（`_tutti_warmup_started` 在 `finally` 里被重置为 False）。只有在挂载无法恢复的情况下才永久禁用 Tutti。
+
+---
+
+### 11.6 全链路 Profiling 基础设施
+
+#### 11.6.1 `TUTTI_PROFILE` 日志（tutti_direct_loader.py）
+
+**`create` 阶段**（`TuttiDirectLoader.create()`）：
+
+```
+TUTTI_PROFILE create cuda_device=N pci=... slots=16 slot_mb=32 total_mb=512
+  cuda_malloc_ms=Xms  session_bind_map_ms=Xms  aux_alloc_ms=Xms
+  total_ms=Xms  q_depth=N
+```
+- `cuda_malloc_ms`：`cudaMalloc` 分配 staging pool 的时间（通常 <5ms）
+- `session_bind_map_ms`：`SnvmeSession.__init__` 的总时间，含 `SNVM_DEVICE_BIND`（主要耗时）+ FIEMAP + BAR0 mmap + `NVM_MAP_DEVICE_MEMORY`（P2P 注册）
+- `aux_alloc_ms`：分配 4 个 managed-memory 标量（sq_tail / cq_head / cq_phase / timed_out）
+
+**`ensure_loader` 阶段**（`_ensure_tutti_loader_locked()`）：
+
+```
+TUTTI_PROFILE ensure_loader worker=N keys=N recovered=N paths=N lba_cache=N
+  recover_ms=Xms  collect_paths_ms=Xms  fiemap_ms=Xms
+  unmount_ms=Xms  create_ms=Xms  total_ms=Xms
+```
+- `recover_ms`：`disk_backend.scan_existing_entries()`（热重启后恢复磁盘 metadata）
+- `fiemap_ms`：`FiemapHelper.scan_paths(paths)`（批量 FIEMAP，filesystem 还挂载时）
+- `unmount_ms`：`umount` 系统调用
+- `create_ms`：`TuttiDirectLoader.create()`（含上面的 session_bind_map）
+
+**`load_batch` 阶段**（`load_chunks_to_hbm()` 的每个子批次）：
+
+```
+TUTTI_PROFILE load_batch batch=N key_start=N keys=N loaded=N
+  estimated_ios=N estimated_mb=X pack_ms=Xms batch_total_ms=Xms
+```
+
+**`batch_detail` 阶段**（`_load_batch()` 的内部分解）：
+
+```
+TUTTI_PROFILE batch_detail keys=N completed=N ios=N bytes_mb=X
+  build_ms=Xms    ← 构建 per-IO 参数（FIEMAP 查询、IOVA 计算）
+  extents_ms=Xms  ← FiemapHelper.query_extents() 调用（未缓存时）
+  arg_ms=Xms      ← torch.tensor() 构建 GPU 参数张量
+  submit_launch_ms=Xms  ← k_submit_batch_sgl_read CUDA kernel 启动
+  poll_sync_ms=Xms      ← k_poll_batch + cudaDeviceSynchronize（=实际 SSD 读带宽）
+  status_ms=Xms   ← NVMe CQE 状态检查（CPU）
+  persist_ms=Xms  ← gpu_raw.clone()（G2G copy，staging → 独立 HBM tensor）
+  wrap_ms=Xms     ← TensorMemoryObj 包装
+  total_ms=Xms
+```
+
+**`load_total` 汇总**：
+
+```
+TUTTI_PROFILE load_total keys=N loaded=N batches=N total_ms=Xms
+```
+
+#### 11.6.2 `LMCACHE_RETRIEVE_PROFILE` 日志（cache_engine.py）
+
+在 retrieve 结束时输出：
+
+```
+LMCACHE_RETRIEVE_PROFILE req_id=X chunks=N retrieved=N required=N size_mb=X
+  process_tokens_ms=Xms   ← 包含 _ensure_tutti_loader + _tutti_batched_get
+  broadcast_ms=Xms        ← save_only_first_rank 广播（TP=8 非 first_rank 时）
+  to_gpu_ms=Xms           ← gpu_connector.batched_to_gpu（KV scatter）
+  cleanup_ms=Xms          ← ref_count_down
+  total_ms=Xms
+  stats_total_ms=Xms      ← stats_monitor 的时间（含 profile 开销）
+```
+
+对应 120K profile（稳态，468 chunks）：
+
+| 字段 | 典型值 |
+|------|--------|
+| `process_tokens_ms` | ~231ms（含 SSD→HBM 212ms） |
+| `to_gpu_ms` | ~432ms（KV scatter，65% 总时间） |
+| `total_ms` | ~664ms |
+
+---
+
+### 11.7 `LMCACHE_TUTTI_DEBUG_CHECKSUM`：正确性验证模式
+
+在 `_ensure_tutti_loader_locked()` 里，若 `LMCACHE_TUTTI_DEBUG_CHECKSUM=1`：
+
+1. 对前 N 个 key（`LMCACHE_TUTTI_DEBUG_CHECKSUM_LIMIT`，默认 4），用 Python `open()` 读取文件前 `nbytes` 字节，计算 SHA256
+2. 将 `(nbytes, sha256)` 存入 `debug_expected_checksums` dict，传入 `TuttiDirectLoader.create()`
+
+在 `_load_batch()` 的 wrap 阶段：
+
+```python
+gpu_raw = self._staging_slice_at(chunk_offset, nbytes)
+self._debug_verify_direct_read(meta, gpu_raw)
+```
+
+`_debug_verify_direct_read()` 把 `gpu_raw` 搬到 CPU（`.cpu().numpy().tobytes()`），计算 SHA256 并与预期值对比，日志输出 `TUTTI_DEBUG_CHECKSUM ok` 或 `mismatch`。
+
+用途：验证 SGL descriptor 参数、SLBA 计算、MDTS 分片是否正确，无需运行完整推理。
+
+---
+
+### 11.8 环境变量和配置键汇总
+
+#### 环境变量
+
+| 变量名 | 默认值 | 作用 |
+|--------|--------|------|
+| `LMCACHE_TUTTI_FORCE_CPU_FALLBACK` | `0` | 强制 CPU fallback，完全禁用 Tutti 快路径 |
+| `LMCACHE_TUTTI_WARMUP_AFTER_STORE` | `0` | 启用 cold store 后 warmup（配置键的环境变量等价） |
+| `LMCACHE_TUTTI_WARMUP_AFTER_STORE_DELAY_SEC` | `0` | warmup 线程启动后先 sleep 指定秒数，等待 HBM 释放 |
+| `LMCACHE_TUTTI_DEBUG_CHECKSUM` | `0` | 启用 SHA256 正确性校验 |
+| `LMCACHE_TUTTI_DEBUG_CHECKSUM_LIMIT` | `4` | 校验的 key 数上限 |
+
+#### `extra_config` 配置键
+
+| 键名 | 默认值 | 作用 |
+|------|--------|------|
+| `tutti_device_path` | （必填） | snvme char-dev 路径，如 `/dev/ssnvme0` |
+| `tutti_ctrl_path` | `/dev/snvm_control` | snvme 控制设备路径 |
+| `tutti_pci_bdfs` | （必填） | 各 rank 对应的 PCIe BDF，CSV，用 `skip` 跳过 NVMe-oF |
+| `tutti_pci_bdf` | — | 单驱动器别名（等价于 `tutti_pci_bdfs` 含单元素） |
+| `tutti_n_slots` | `16` | staging pool 的 slot 数（并发 IO 数上限） |
+| `tutti_slot_mb` | `32` | 每 slot 大小（MiB） |
+| `tutti_nsid` | `1` | NVMe namespace ID |
+| `tutti_warmup_after_store` | `false` | 同 `LMCACHE_TUTTI_WARMUP_AFTER_STORE` |
+| `tutti_warmup_after_store_delay_sec` | `0` | 同 `LMCACHE_TUTTI_WARMUP_AFTER_STORE_DELAY_SEC` |
+
+---
+
+### 11.9 vllm_v1_adapter.py 的修改
+
+只有一行改动：在调用 `engine.store()` 时传入 `is_last_prefill` 标志：
+
+```python
+engine.store(
+    ...,
+    is_last_prefill=is_last_prefill,   # ← 新增
+)
+```
+
+`is_last_prefill` 来自 vLLM v1 的 `transfer_spec`，标识当前 prefill batch 是否是该请求的最后一个。CacheEngine 利用它判断"所有 chunk 已全部 store"，从而触发 warmup。
+
+---
+
+### 11.10 模块间调用关系总结
+
+```
+vllm_v1_adapter.py
+  └─ CacheEngine.store(is_last_prefill=True)
+        └─ _make_tutti_store_warmup_callback(keys, req_id, is_last_prefill)
+              注册 keys → 返回 _on_store_complete 闭包
+        └─ storage_manager.batched_put(on_complete_callback=_on_store_complete)
+              每 key 写盘后调用 → _on_store_complete(key)
+                    pending 空 → 启动 daemon "tutti-store-warmup"
+                                    → _ensure_tutti_loader_locked(req_keys)
+                                         scan_existing_entries()         [recover_ms]
+                                         FiemapHelper.scan_paths(paths) [fiemap_ms]
+                                         _maybe_unmount_for_tutti()     [unmount_ms]
+                                         TuttiDirectLoader.create(      [create_ms]
+                                           initial_lba_cache=...,
+                                           debug_expected_checksums=...,
+                                         )
+                                         → SnvmeSession._setup()
+                                              SNVM_CHRDEV_CREATE
+                                              NVM_SET_KERNEL_IOQ_CAP
+                                              SNVM_DEVICE_BIND
+                                              NVM_GET_DEV_INFO
+                                              mmap(BAR0)
+                                              cudaHostRegister + GetDevicePointer
+                                              NVM_MAP_DEVICE_MEMORY(DATA)
+                                              NVM_CREATE_QUEUE_GROUP
+                                              NVM_MAP_DEVICE_MEMORY(SQ ring)
+                                              NVM_MAP_DEVICE_MEMORY(CQ ring)
+                                              NVM_ADD_USER_QUEUE
+
+CacheEngine.retrieve()
+  └─ _process_tokens_internal()
+        └─ _ensure_tutti_loader(wait_for_warmup=True)
+              │ warmup 已完成 → return True
+              └─ warmup 进行中 → warmup_done.wait()
+        └─ _tutti_batched_get(keys, shapes_per_key)
+              └─ TuttiDirectLoader.load_chunks_to_hbm(keys, disk_metas, shapes_per_key)
+                    批次打包：_effective_nbytes + _estimate_chunk_ios
+                    └─ _load_batch(batch_keys, batch_metas, batch_shapes)
+                          构建 per-IO 参数（IOVA/SLBA/byte_len）
+                          k_submit_batch_sgl_read<<<1,1>>>()  [GPU kernel]
+                          k_poll_batch<<<1,1>>>()             [GPU kernel]
+                          cudaDeviceSynchronize()
+                          CQE status 检查
+                          gpu_raw.clone() → TensorMemoryObj (GPU resident)
+  └─ gpu_connector.batched_to_gpu()   # G2G scatter → vLLM KV slots
 ```

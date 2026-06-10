@@ -245,17 +245,25 @@ class IndexerBlockStore:
         Path(store_dir).mkdir(parents=True, exist_ok=True)
         self._path = Path(store_dir) / f"indexer_layer_{layer_id:03d}.bin"
         self._token_bytes = token_bytes
+        self._max_seq_len = max_seq_len
         self._fd: Optional[int] = None
         # Pre-create sparse file
-        if not self._path.exists():
-            with open(self._path, "wb") as f:
-                f.seek(max_seq_len * token_bytes - 1)
-                f.write(b"\x00")
+        self._ensure_file()
 
     def _open(self) -> int:
         if self._fd is None:
+            self._ensure_file()
             self._fd = os.open(str(self._path), os.O_RDWR | os.O_CREAT)
         return self._fd
+
+    def _ensure_file(self) -> None:
+        """Ensure the backing directory and sparse file exist."""
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        if self._path.exists():
+            return
+        with open(self._path, "wb") as f:
+            f.seek(self._max_seq_len * self._token_bytes - 1)
+            f.write(b"\x00")
 
     def read_token(self, token_id: int) -> bytes:
         """Synchronously read one token's K vector from SSD."""
