@@ -26,6 +26,7 @@
 // NVMe protocol constants (NVMe Base Spec 1.4)
 // ---------------------------------------------------------------------------
 
+#define NVME_OPC_WRITE       0x01u
 #define NVME_OPC_READ        0x02u
 #define NVME_SQE_SIZE        64u
 #define NVME_CQE_SIZE        16u
@@ -88,13 +89,14 @@ struct tutti_queue_dev {
 // GPU kernels
 // ---------------------------------------------------------------------------
 
-// Submit n_ios NVMe SGL READ commands from a single GPU thread.
+// Submit n_ios NVMe SGL READ/WRITE commands from a single GPU thread.
 // Rings the SQ doorbell after every SQE so the controller can begin DMA
 // for earlier I/Os while the kernel is still building later SQEs.
-__global__ void k_submit_batch_sgl_read(
+__global__ void k_submit_batch_sgl_rw(
     tutti_queue_dev   qd,
     uint16_t*         sq_tail_io,
     uint32_t          nsid,
+    uint8_t           opcode,
     const uint64_t*   staging_iovas,
     const uint64_t*   slbas,
     const uint32_t*   byte_lens,
@@ -121,7 +123,7 @@ __global__ void k_submit_batch_sgl_read(
             static_cast<uint64_t>(byte_lens[i] & 0xffffffffu) |
             (static_cast<uint64_t>(NVME_SGL_BYTE15) << 56);
 
-        slot->opcode = NVME_OPC_READ;
+        slot->opcode = opcode;
         slot->flags  = NVME_FLAG_PSDT_SGL;
         slot->cid    = static_cast<uint16_t>(i);  // 0-based within this batch
         slot->nsid   = nsid;
@@ -215,7 +217,7 @@ static tutti_queue_dev make_qd(
 // Public host wrappers (called from Python via pybind11)
 // ---------------------------------------------------------------------------
 
-void tutti_submit_batch_sgl_read(
+static void tutti_submit_batch_sgl_rw(
     int64_t   sq_dev_ptr,
     int64_t   cq_dev_ptr,
     int64_t   sq_db_ptr,
@@ -227,6 +229,7 @@ void tutti_submit_batch_sgl_read(
     at::Tensor staging_iovas,
     at::Tensor slbas,
     at::Tensor byte_lens,
+    uint8_t    opcode,
     int64_t   stream_ptr)
 {
     TORCH_CHECK(staging_iovas.dtype() == at::kLong,
@@ -249,14 +252,55 @@ void tutti_submit_batch_sgl_read(
         sq_dev_ptr, cq_dev_ptr, sq_db_ptr, cq_db_ptr, q_depth, qid);
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
-    k_submit_batch_sgl_read<<<1, 1, 0, stream>>>(
+    k_submit_batch_sgl_rw<<<1, 1, 0, stream>>>(
         qd,
         reinterpret_cast<uint16_t*>(sq_tail_ptr),
         static_cast<uint32_t>(nsid),
+        opcode,
         reinterpret_cast<const uint64_t*>(staging_iovas.data_ptr<int64_t>()),
         reinterpret_cast<const uint64_t*>(slbas.data_ptr<int64_t>()),
         reinterpret_cast<const uint32_t*>(byte_lens.data_ptr<int32_t>()),
         n_ios);
+}
+
+void tutti_submit_batch_sgl_read(
+    int64_t   sq_dev_ptr,
+    int64_t   cq_dev_ptr,
+    int64_t   sq_db_ptr,
+    int64_t   cq_db_ptr,
+    int64_t   sq_tail_ptr,
+    int       q_depth,
+    int       qid,
+    int64_t   nsid,
+    at::Tensor staging_iovas,
+    at::Tensor slbas,
+    at::Tensor byte_lens,
+    int64_t   stream_ptr)
+{
+    tutti_submit_batch_sgl_rw(
+        sq_dev_ptr, cq_dev_ptr, sq_db_ptr, cq_db_ptr, sq_tail_ptr,
+        q_depth, qid, nsid, staging_iovas, slbas, byte_lens,
+        NVME_OPC_READ, stream_ptr);
+}
+
+void tutti_submit_batch_sgl_write(
+    int64_t   sq_dev_ptr,
+    int64_t   cq_dev_ptr,
+    int64_t   sq_db_ptr,
+    int64_t   cq_db_ptr,
+    int64_t   sq_tail_ptr,
+    int       q_depth,
+    int       qid,
+    int64_t   nsid,
+    at::Tensor staging_iovas,
+    at::Tensor slbas,
+    at::Tensor byte_lens,
+    int64_t   stream_ptr)
+{
+    tutti_submit_batch_sgl_rw(
+        sq_dev_ptr, cq_dev_ptr, sq_db_ptr, cq_db_ptr, sq_tail_ptr,
+        q_depth, qid, nsid, staging_iovas, slbas, byte_lens,
+        NVME_OPC_WRITE, stream_ptr);
 }
 
 void tutti_poll_batch(

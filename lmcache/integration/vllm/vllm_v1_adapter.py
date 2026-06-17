@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import math
@@ -61,6 +62,11 @@ logger = init_logger(__name__)
 
 _INDEXER_PREFETCH_MANAGER: Any = None
 _HCA_PREFETCH_MANAGER: Any = None
+
+
+def _env_flag(name: str) -> bool:
+    """Return True when an environment variable is set to a truthy value."""
+    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
 
 
 def _normalize_block_ids_by_group(
@@ -301,7 +307,10 @@ def _attach_indexer_prefetch() -> None:
     store_dir = os.path.join(base_store_dir, f"rank_{rank_suffix}")
 
     try:
-        from lmcache.v1.indexer_ssd_manager import IndexerSSDManager
+        from lmcache.v1.indexer_ssd_manager import (
+            IndexerSSDManager,
+            set_indexer_ssd_manager,
+        )
     except ImportError as exc:
         logger.warning("IndexerSSDManager is unavailable: %s", exc)
         return
@@ -368,6 +377,7 @@ def _attach_indexer_prefetch() -> None:
         indexer_op.csa_layer_id = layer_id
 
     _INDEXER_PREFETCH_MANAGER = manager
+    set_indexer_ssd_manager(manager)
 
     for decoder_layer in decoder_layers:
         layer_id = getattr(decoder_layer, "layer_idx", -1)
@@ -1074,6 +1084,20 @@ class LMCacheConnectorV1Impl:
         self._requests_priority: dict[str, int] = {}
         self._invalid_block_ids: set[int] = set()
         self._reuse_prefetch_seen: set[tuple[Any, ...]] = set()
+        self._reuse_prefetch_executor: Optional[ThreadPoolExecutor] = None
+        self._reuse_prefetch_async = _env_flag(
+            "LMCACHE_REUSE_PREFETCH_ASYNC"
+        ) or _env_flag("LMCACHE_INDEXER_REUSE_PREFETCH_ASYNC")
+        if self._reuse_prefetch_async:
+            workers = max(1, _env_int("LMCACHE_REUSE_PREFETCH_ASYNC_WORKERS", 1))
+            self._reuse_prefetch_executor = ThreadPoolExecutor(
+                max_workers=workers,
+                thread_name_prefix="lmcache-reuse-prefetch",
+            )
+            logger.info(
+                "LMCache async reuse prefetch seed enabled with %d worker(s)",
+                workers,
+            )
         self._kv_cache_layer_names: tuple[str, ...] = ()
         self._vllm_kv_cache_group_layer_names: tuple[tuple[str, ...], ...] = ()
         self._vllm_kv_cache_group_block_sizes: tuple[int, ...] = ()
@@ -1440,12 +1464,12 @@ class LMCacheConnectorV1Impl:
                     )
                     self._invalid_block_ids.update(missing_blocks)
                 else:
-                    self._maybe_seed_indexer_reuse_prefetch(
+                    self._maybe_seed_hca_reuse_prefetch(
                         request,
                         lmcache_cached_tokens,
                         slot_mapping,
                     )
-                    self._maybe_seed_hca_reuse_prefetch(
+                    self._maybe_seed_indexer_reuse_prefetch(
                         request,
                         lmcache_cached_tokens,
                         slot_mapping,
@@ -1525,6 +1549,40 @@ class LMCacheConnectorV1Impl:
         )
         return missing_blocks
 
+    def _submit_reuse_prefetch_task(
+        self,
+        label: str,
+        request_id: str,
+        task: Callable[[], None],
+    ) -> bool:
+        """Submit a reuse-prefetch seed task to the optional background worker."""
+        executor = self._reuse_prefetch_executor
+        if executor is None:
+            return False
+
+        try:
+            future: Future[None] = executor.submit(task)
+        except RuntimeError:
+            logger.exception(
+                "LMCache async reuse prefetch submit failed for %s request %s",
+                label,
+                request_id,
+            )
+            return False
+
+        def _log_done(done_future: Future[None]) -> None:
+            try:
+                done_future.result()
+            except Exception:
+                logger.exception(
+                    "LMCache async reuse prefetch task failed for %s request %s",
+                    label,
+                    request_id,
+                )
+
+        future.add_done_callback(_log_done)
+        return True
+
     def _maybe_seed_indexer_reuse_prefetch(
         self,
         request: ReqMeta,
@@ -1532,6 +1590,60 @@ class LMCacheConnectorV1Impl:
         slot_mapping: torch.Tensor,
     ) -> None:
         """Seed CSA prefetch state after LMCache loads a reused prefill prefix."""
+        manager = _INDEXER_PREFETCH_MANAGER
+        if manager is None:
+            return
+        reuse_prefetch_enabled = getattr(manager, "reuse_prefetch_enabled", None)
+        if (
+            not callable(reuse_prefetch_enabled)
+            or not reuse_prefetch_enabled()
+        ):
+            return
+        if lmcache_cached_tokens <= request.load_spec.vllm_cached_tokens:
+            return
+
+        min_hit_tokens = max(
+            0, _env_int("LMCACHE_INDEXER_REUSE_PREFETCH_MIN_HIT_TOKENS", 1024)
+        )
+        if lmcache_cached_tokens < min_hit_tokens:
+            return
+
+        if self._reuse_prefetch_executor is not None:
+            slot_mapping_cpu = slot_mapping.detach().to(device="cpu", dtype=torch.long)
+
+            def _seed_indexer_async() -> None:
+                self._maybe_seed_indexer_reuse_prefetch_sync(
+                    request,
+                    lmcache_cached_tokens,
+                    slot_mapping_cpu,
+                )
+
+            if self._submit_reuse_prefetch_task(
+                "CSA",
+                request.req_id,
+                _seed_indexer_async,
+            ):
+                logger.info(
+                    "IndexerSSDManager: submitted async reuse prefetch seed "
+                    "for request %s lmcache_tokens=%d",
+                    request.req_id,
+                    lmcache_cached_tokens,
+                )
+                return
+
+        self._maybe_seed_indexer_reuse_prefetch_sync(
+            request,
+            lmcache_cached_tokens,
+            slot_mapping,
+        )
+
+    def _maybe_seed_indexer_reuse_prefetch_sync(
+        self,
+        request: ReqMeta,
+        lmcache_cached_tokens: int,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Synchronously seed CSA prefetch state after an LMCache prefix hit."""
         manager = _INDEXER_PREFETCH_MANAGER
         if manager is None:
             return
@@ -1577,6 +1689,14 @@ class LMCacheConnectorV1Impl:
                 continue
             compressed_seq_len = lmcache_cached_tokens // compress_ratio
             if compressed_seq_len <= 0:
+                continue
+            has_layer_rows = getattr(manager, "has_layer_rows", None)
+            if callable(has_layer_rows) and has_layer_rows(
+                layer_id,
+                compressed_seq_len,
+            ):
+                self._reuse_prefetch_seen.add(key)
+                submitted += 1
                 continue
             compressed_block_size = int(k_cache.shape[1])
             compressed_slots = _compressed_slot_mapping(
@@ -2103,6 +2223,12 @@ class LMCacheConnectorV1Impl:
     def shutdown(self):
         """Shutdown the connector by delegating to LMCacheManager."""
         logger.info("Starting LMCacheConnector shutdown...")
+        if self._reuse_prefetch_executor is not None:
+            self._reuse_prefetch_executor.shutdown(
+                wait=False,
+                cancel_futures=True,
+            )
+            self._reuse_prefetch_executor = None
         self._manager.stop_services()
 
     ###################

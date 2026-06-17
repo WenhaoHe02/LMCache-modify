@@ -106,6 +106,14 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("staging_iovas"), py::arg("slbas"), py::arg("byte_lens"),
         py::arg("stream_ptr") = int64_t(0),
         py::call_guard<py::gil_scoped_release>());
+  m.def("tutti_submit_batch_sgl_write", &tutti_submit_batch_sgl_write,
+        py::arg("sq_dev_ptr"), py::arg("cq_dev_ptr"),
+        py::arg("sq_db_ptr"), py::arg("cq_db_ptr"),
+        py::arg("sq_tail_ptr"),
+        py::arg("q_depth"), py::arg("qid"), py::arg("nsid"),
+        py::arg("staging_iovas"), py::arg("slbas"), py::arg("byte_lens"),
+        py::arg("stream_ptr") = int64_t(0),
+        py::call_guard<py::gil_scoped_release>());
   m.def("tutti_poll_batch", &tutti_poll_batch,
         py::arg("sq_dev_ptr"), py::arg("cq_dev_ptr"),
         py::arg("sq_db_ptr"), py::arg("cq_db_ptr"),

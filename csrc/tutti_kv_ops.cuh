@@ -40,6 +40,24 @@ void tutti_submit_batch_sgl_read(
     at::Tensor byte_lens,
     int64_t stream_ptr);
 
+// Batch-submit N NVMe SGL WRITE commands from a single GPU thread.
+//
+// The arguments match tutti_submit_batch_sgl_read(); data is transferred from
+// HBM staging buffers to the NVMe namespace.
+void tutti_submit_batch_sgl_write(
+    int64_t sq_dev_ptr,
+    int64_t cq_dev_ptr,
+    int64_t sq_db_ptr,
+    int64_t cq_db_ptr,
+    int64_t sq_tail_ptr,
+    int q_depth,
+    int qid,
+    int64_t nsid,
+    at::Tensor staging_iovas,
+    at::Tensor slbas,
+    at::Tensor byte_lens,
+    int64_t stream_ptr);
+
 // Poll for n_ios NVMe CQE completions in submission order.
 //
 // Spins on the CQE phase bit for each slot in sequence.  On timeout

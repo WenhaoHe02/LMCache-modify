@@ -1,0 +1,5 @@
+{"event": "start", "mode": "all_off_profile_extra", "prompt_chars": 1171259, "out": "/tmp/dsv4_alloff_profile_extra_248k_20260603.jsonl", "ts": 1780416775.869987}
+{"label": "alloff_profile_extra_248k_hit_1", "elapsed_s": 3.5655372500186786, "usage": {"prompt_tokens": 248462, "total_tokens": 248463, "completion_tokens": 1, "prompt_tokens_details": null}, "text": "What", "ts": 1780416779.438069}
+{"label": "alloff_profile_extra_248k_hit_2", "elapsed_s": 2.1758587589720264, "usage": {"prompt_tokens": 248462, "total_tokens": 248463, "completion_tokens": 1, "prompt_tokens_details": null}, "text": "What", "ts": 1780416801.6380885}
+{"label": "alloff_profile_extra_248k_hit_3", "elapsed_s": 2.1180196549976245, "usage": {"prompt_tokens": 248462, "total_tokens": 248463, "completion_tokens": 1, "prompt_tokens_details": null}, "text": "</", "ts": 1780416823.7795982}
+{"event": "done", "out": "/tmp/dsv4_alloff_profile_extra_248k_20260603.jsonl", "ts": 1780416823.7797468}

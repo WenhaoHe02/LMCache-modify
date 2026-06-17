@@ -47,7 +47,7 @@ import time
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 
@@ -55,6 +55,18 @@ from lmcache.logging import init_logger
 
 logger = init_logger(__name__)
 DEEPGEMM_PAGED_BLOCK_SIZE = 64
+_INDEXER_SSD_MANAGER: Optional["IndexerSSDManager"] = None
+
+
+def get_indexer_ssd_manager() -> Optional["IndexerSSDManager"]:
+    """Return the process-local CSA indexer SSD manager, if one is attached."""
+    return _INDEXER_SSD_MANAGER
+
+
+def set_indexer_ssd_manager(manager: Optional["IndexerSSDManager"]) -> None:
+    """Set the process-local CSA indexer SSD manager used by GPU connectors."""
+    global _INDEXER_SSD_MANAGER
+    _INDEXER_SSD_MANAGER = manager
 
 
 def _proxy_num_rows(proxy_state: Optional[torch.Tensor]) -> int:
@@ -157,6 +169,9 @@ _RESIDENT_ENABLED: bool = os.environ.get("LMCACHE_DISABLE_RESIDENT_INDEXER", "0"
 _RESIDUAL_PROXY_ENABLED: bool = _env_flag("LMCACHE_INDEXER_ENABLE_RESIDUAL_PROXY")
 _DECODE_PREFETCH_ENABLED: bool = _env_flag(
     "LMCACHE_INDEXER_ENABLE_DECODE_PREFETCH"
+)
+_PREFILL_RESIDUAL_PROXY_ENABLED: bool = _env_flag(
+    "LMCACHE_INDEXER_ENABLE_PREFILL_RESIDUAL_PROXY"
 )
 _PREFILL_PROXY_ROWS: int = max(
     0, _env_int("LMCACHE_INDEXER_PREFETCH_PREFILL_ROWS", 0)
@@ -664,6 +679,9 @@ class IndexerSSDManager:
         self._ready_futures: Dict[int, Optional[Future[None]]] = {
             lid: None for lid in csa_layer_ids
         }
+        self._direct_seed_tail_buffers: Dict[int, List[Tuple[int, torch.Tensor]]] = {
+            lid: [] for lid in csa_layer_ids
+        }
 
         # Next sequential token ID for new decode-step tokens, per layer.
         # Set to seq_len by evict_after_prefill; incremented on each decode step.
@@ -682,6 +700,7 @@ class IndexerSSDManager:
         self._debug_residual_proxy_skip_logged: set[Tuple[int, str]] = set()
         self._debug_residual_proxy_logged: set[int] = set()
         self._debug_attention_topk_logged: set[int] = set()
+        self._debug_lmcache_seed_logged = False
         self._proxy_profile_limit = _env_int(
             "LMCACHE_INDEXER_RESIDUAL_PROFILE_LIMIT", 128
         )
@@ -743,11 +762,220 @@ class IndexerSSDManager:
 
     def prefill_proxy_enabled(self) -> bool:
         """Return True when prefill-stage CSA residual proxy is enabled."""
-        return _PREFILL_PROXY_ROWS > 0
+        return _PREFILL_RESIDUAL_PROXY_ENABLED and _PREFILL_PROXY_ROWS > 0
 
     def layer_initialized(self, layer_id: int) -> bool:
         """Return True when *layer_id* has an initialized SSD/pool cursor."""
         return self._decode_cursor.get(layer_id, 0) > 0
+
+    def has_layer_rows(self, layer_id: int, seq_len: int) -> bool:
+        """Return True when *layer_id* has direct-seeded rows through seq_len.
+
+        Args:
+            layer_id: CSA layer index.
+            seq_len: Required compressed sequence length.
+
+        Returns:
+            True if the layer's SSD/pool cursor covers at least seq_len rows.
+        """
+        return self._decode_cursor.get(layer_id, 0) >= seq_len
+
+    def seed_range_from_lmcache_group(
+        self,
+        layer_ids: Sequence[int],
+        memory_tensor: torch.Tensor,
+        start: int,
+        end: int,
+        total_logical_tokens: Optional[int] = None,
+    ) -> int:
+        """Seed CSA SSD/HBM pools directly from one LMCache retrieve chunk.
+
+        Args:
+            layer_ids: Transformer CSA layer ids in the same order as the
+                LMCache CSA-indexer group layer axis.
+            memory_tensor: LMCache CSA group tensor with shape
+                ``[kv_size, num_layers, rows, hidden_dim]``.
+            start: Logical token start offset of this LMCache chunk.
+            end: Logical token end offset of this LMCache chunk.
+            total_logical_tokens: Total logical tokens being restored for the
+                request. When provided, only the final tail window needed to
+                seed the HBM pool is initialized synchronously.
+
+        Returns:
+            Number of CSA layers whose SSD/HBM state was updated.
+
+        Raises:
+            ValueError: If the tensor shape or token range is incompatible
+                with the registered CSA layers.
+        """
+        if not layer_ids or memory_tensor.numel() == 0 or end <= start:
+            return 0
+        if memory_tensor.ndim != 4:
+            raise ValueError(
+                "CSA LMCache group tensor must have shape "
+                "[kv_size, num_layers, rows, hidden_dim], got "
+                f"{tuple(memory_tensor.shape)}"
+            )
+        if start % 4 != 0 or end % 4 != 0:
+            raise ValueError(
+                f"CSA LMCache range [{start}, {end}) is not aligned to "
+                "compress_ratio 4"
+            )
+        if len(layer_ids) > int(memory_tensor.shape[1]):
+            raise ValueError(
+                f"CSA LMCache group has {memory_tensor.shape[1]} layers but "
+                f"{len(layer_ids)} layer ids were provided"
+            )
+
+        seq_start = start // 4
+        expected_rows = (end - start) // 4
+        rows_to_seed = min(expected_rows, int(memory_tensor.shape[2]))
+        if rows_to_seed <= 0:
+            return 0
+        total_rows = (total_logical_tokens or end) // 4
+        if total_rows <= 0:
+            return 0
+        tail_rows = max(
+            1,
+            _env_int("LMCACHE_INDEXER_DIRECT_SEED_TAIL_ROWS", self._pool_size),
+        )
+        tail_rows = min(tail_rows, total_rows)
+        tail_start = total_rows - tail_rows
+        seq_end = seq_start + rows_to_seed
+        overlap_start = max(seq_start, tail_start)
+        overlap_end = min(seq_end, total_rows)
+        if overlap_start >= overlap_end:
+            return 0
+        local_start = overlap_start - seq_start
+        local_rows = overlap_end - overlap_start
+
+        timing = _timing_enabled()
+        t0 = time.perf_counter() if timing else 0.0
+        t_cpu0 = time.perf_counter() if timing else 0.0
+        tensor_cpu = memory_tensor.detach()
+        if tensor_cpu.device.type != "cpu":
+            tensor_cpu = tensor_cpu.to(device="cpu", non_blocking=False)
+        cpu_ms = (time.perf_counter() - t_cpu0) * 1000.0 if timing else 0.0
+        t_contig0 = time.perf_counter() if timing else 0.0
+        tensor_cpu = tensor_cpu.contiguous()
+        contiguous_ms = (
+            (time.perf_counter() - t_contig0) * 1000.0 if timing else 0.0
+        )
+
+        seeded = 0
+        reshape_ms = 0.0
+        write_ms = 0.0
+        load_ms = 0.0
+        state_ms = 0.0
+        for group_layer_idx, layer_id in enumerate(layer_ids):
+            layer_id = int(layer_id)
+            if layer_id not in self._pools or layer_id not in self._stores:
+                continue
+            t_reshape0 = time.perf_counter() if timing else 0.0
+            layer_rows = tensor_cpu[
+                :,
+                group_layer_idx,
+                :rows_to_seed,
+                :,
+            ].permute(1, 0, 2)
+            token_bytes = (
+                layer_rows[local_start : local_start + local_rows]
+                .contiguous()
+                .view(local_rows, -1)
+            )
+            if timing:
+                reshape_ms += (time.perf_counter() - t_reshape0) * 1000.0
+            if int(token_bytes.shape[1]) != self._token_bytes:
+                raise ValueError(
+                    f"CSA layer {layer_id} row size mismatch: LMCache row has "
+                    f"{int(token_bytes.shape[1])} bytes, manager expects "
+                    f"{self._token_bytes} bytes"
+                )
+
+            store = self._stores[layer_id]
+            t_write0 = time.perf_counter() if timing else 0.0
+            store.write_tokens_contiguous(
+                overlap_start,
+                token_bytes.contiguous().numpy().tobytes(),
+            )
+            if timing:
+                write_ms += (time.perf_counter() - t_write0) * 1000.0
+
+            t_load0 = time.perf_counter() if timing else 0.0
+            load_ids: List[int] = []
+            finished_tail = overlap_end >= total_rows
+            with self._lock:
+                if overlap_start == tail_start:
+                    self._direct_seed_tail_buffers[layer_id] = []
+                self._direct_seed_tail_buffers[layer_id].append(
+                    (overlap_start, token_bytes.clone())
+                )
+                tail_chunks = list(self._direct_seed_tail_buffers[layer_id])
+                if finished_tail:
+                    self._direct_seed_tail_buffers[layer_id] = []
+
+            if finished_tail and tail_chunks:
+                tail_chunks.sort(key=lambda item: item[0])
+                chunks = []
+                expected_start = tail_start
+                for chunk_start, chunk_bytes in tail_chunks:
+                    if chunk_start > expected_start:
+                        break
+                    skip = max(0, expected_start - chunk_start)
+                    if skip < int(chunk_bytes.shape[0]):
+                        chunks.append(chunk_bytes[skip:])
+                        expected_start = chunk_start + int(chunk_bytes.shape[0])
+                    if expected_start >= total_rows:
+                        break
+                if chunks and expected_start >= total_rows:
+                    pool = self._pools[layer_id]
+                    pool.reset()
+                    load_ids = list(range(tail_start, total_rows))
+                    tail_bytes = torch.cat(chunks, dim=0)[: len(load_ids)]
+                    pool.load_tokens(load_ids, tail_bytes.contiguous())
+                    pool.protect_only(load_ids)
+            if timing:
+                load_ms += (time.perf_counter() - t_load0) * 1000.0
+
+            t_state0 = time.perf_counter() if timing else 0.0
+            if finished_tail:
+                with self._lock:
+                    self._decode_cursor[layer_id] = max(
+                        self._decode_cursor.get(layer_id, 0),
+                        total_rows,
+                    )
+                    self._prev_topk[layer_id] = list(load_ids[:1024])
+                    self._ready_futures[layer_id] = None
+            if timing:
+                state_ms += (time.perf_counter() - t_state0) * 1000.0
+            seeded += 1
+
+        if seeded > 0 and not self._debug_lmcache_seed_logged:
+            self._debug_lmcache_seed_logged = True
+            logger.info(
+                "IndexerSSDManager: direct LMCache seed enabled for %d CSA "
+                "layers; first tail rows=[%d,%d) total_rows=%d",
+                seeded,
+                overlap_start,
+                overlap_end,
+                total_rows,
+            )
+        if seeded and timing:
+            self._log_timing(
+                "seed_lmcache",
+                -1,
+                total_ms=f"{(time.perf_counter() - t0) * 1000.0:.3f}",
+                cpu_ms=f"{cpu_ms:.3f}",
+                contiguous_ms=f"{contiguous_ms:.3f}",
+                reshape_ms=f"{reshape_ms:.3f}",
+                write_ms=f"{write_ms:.3f}",
+                load_ms=f"{load_ms:.3f}",
+                state_ms=f"{state_ms:.3f}",
+                layers=seeded,
+                start_row=seq_start,
+                rows=rows_to_seed,
+            )
+        return seeded
 
     # ------------------------------------------------------------------
     # Called from DeepseekV4DecoderLayer.forward, before self.ffn()
@@ -783,8 +1011,13 @@ class IndexerSSDManager:
         proxy_rows = _proxy_num_rows(proxy_state)
         is_prefill_proxy = proxy_rows > 1
         if is_prefill_proxy:
-            if _PREFILL_PROXY_ROWS <= 0:
-                self._log_residual_proxy_skip(layer_id, "prefill_proxy_disabled")
+            if not _PREFILL_RESIDUAL_PROXY_ENABLED or _PREFILL_PROXY_ROWS <= 0:
+                reason = (
+                    "prefill_proxy_experimental_disabled"
+                    if _PREFILL_PROXY_ROWS > 0
+                    else "prefill_proxy_disabled"
+                )
+                self._log_residual_proxy_skip(layer_id, reason)
                 return
         elif not _DECODE_PREFETCH_ENABLED:
             return
@@ -818,18 +1051,18 @@ class IndexerSSDManager:
                 proxy_state = proxy_state[-min_rows:]
                 positions = positions[-min_rows:]
             if is_prefill_proxy:
-                if _PREFILL_PROXY_ROWS != 1:
-                    self._log_residual_proxy_skip(
-                        layer_id,
-                        f"prefill_rows_capped_to_one={_PREFILL_PROXY_ROWS}",
-                    )
                 original_shape = tuple(proxy_state.shape)
-                topk_tail_rows = 1
+                topk_tail_rows = min(
+                    max(1, _PREFILL_PROXY_ROWS),
+                    int(proxy_state.shape[0]),
+                    int(positions.shape[0]),
+                )
                 if layer_id not in self._debug_residual_proxy_attempt_logged:
                     logger.info(
                         "IndexerSSDManager: residual_proxy prefill layer %d "
-                        "using_tail_rows=1 original_shape=%s compute_shape=%s",
+                        "using_tail_rows=%d original_shape=%s compute_shape=%s",
                         layer_id,
+                        topk_tail_rows,
                         original_shape,
                         tuple(proxy_state.shape),
                     )
@@ -919,6 +1152,35 @@ class IndexerSSDManager:
             prev=len(prev),
             missing=len(missing),
         )
+
+    def prepare_layer_async(self, layer_id: int) -> None:
+        """Submit CSA ready/drain work before the target layer consumes it.
+
+        This lets the caller place the wait and HBM-pool insertion in the MoE
+        window instead of paying it at ``SparseAttnIndexer.prepare_pool()``.
+
+        Args:
+            layer_id: CSA layer whose ready future and pending reads should be
+                progressed in the background.
+        """
+        if layer_id not in self._pools:
+            return
+        with self._lock:
+            ready_fut = self._ready_futures.get(layer_id)
+
+        def _prepare() -> None:
+            if ready_fut is not None:
+                ready_fut.result(timeout=self._prefill_ready_timeout_s)
+                if self._device.type == "cuda":
+                    torch.cuda.synchronize(self._device)
+                with self._lock:
+                    if self._ready_futures.get(layer_id) is ready_fut:
+                        self._ready_futures[layer_id] = None
+            self._drain(layer_id)
+            if self._device.type == "cuda":
+                torch.cuda.synchronize(self._device)
+
+        self._executor.submit(_prepare)
 
     def _prefill_overlap_profile_fire(
         self,
@@ -2060,6 +2322,12 @@ class IndexerSSDManager:
         values = flat_blocks[block_ids.unsqueeze(1), value_offsets]
         scales = flat_blocks[block_ids.unsqueeze(1), scale_offsets]
         return torch.cat((values, scales), dim=1)
+
+    def _tail_seed_token_ids(self, start: int, rows: int) -> List[int]:
+        pool_size = max(1, self._pool_size)
+        tail = min(rows, pool_size)
+        tail_start = start + max(0, rows - tail)
+        return list(range(tail_start, start + rows))
 
     def _drain(self, layer_id: int) -> None:
         """Wait for all pending async reads for *layer_id* and insert into pool."""

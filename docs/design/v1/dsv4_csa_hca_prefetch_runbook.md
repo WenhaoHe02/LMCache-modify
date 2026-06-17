@@ -63,6 +63,8 @@ ssh -o StrictHostKeyChecking=no master "sshpass -p '<gpu002-password>' ssh -o St
 ```text
 name:     dsv4-256k                      # 256K 上下文验证（2026-05-29）
 image:    lmcache/vllm-openai:indexer-ssd-hca-prefetch-decodegate-20260528_0630
+          # vLLM: 0.20.2+cu129  LMCache: 0.4.4  (confirmed 2026-06-13)
+          # 镜像在 gpu002 /var/lib/docker/ 完好，无需重建；删 tar 不影响本体
 entrypoint: /bin/bash（需显式 --entrypoint /bin/bash）
 model id: /mnt/nvme0/models/DeepSeek-V4-Pro
 endpoint: http://127.0.0.1:8000

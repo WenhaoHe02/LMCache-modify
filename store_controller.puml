@@ -1,0 +1,57 @@
+@startuml StoreController Thread Interaction
+
+participant "serving thread" as ST
+participant "L1Manager" as L1
+participant "StoreListener" as SL
+participant "_store_loop\n(background)" as BG
+participant "L2 Adapter" as L2
+
+== finish_write triggered ==
+
+ST -> L1 : finish_write(keys)
+activate L1
+L1 -> L1 : acquire _lock
+
+L1 -> SL : on_l1_keys_write_finished(keys)
+activate SL
+note over SL : inside L1Manager lock\nmust be non-blocking
+SL -> SL : append to _pending_keys
+SL -> BG : os.write(listener_efd, 1)
+deactivate SL
+
+L1 -> L1 : release _lock
+L1 --> ST : return
+deactivate L1
+
+== background loop processes new keys ==
+
+activate BG
+BG -> SL : pop_pending_keys()
+BG -> BG : _process_new_keys()\n_group_keys_by_shape()
+
+BG -> L1 : reserve_read(keys)
+L1 --> BG : ok
+
+BG -> L2 : submit_store_task(keys, memory_objs)
+L2 --> BG : task_id
+deactivate BG
+
+BG -> BG : select.poll() blocks
+
+== L2 store completes ==
+
+L2 -> BG : os.write(store_efd, 1)
+activate BG
+BG -> BG : _finalize_store()
+BG -> L1 : finish_read(read_locked_keys)
+L1 --> BG : ok
+
+alt policy selects L1 deletions
+    BG -> L1 : delete(keys)
+    L1 --> BG : ok
+end
+
+BG -> BG : select.poll() blocks
+deactivate BG
+
+@enduml

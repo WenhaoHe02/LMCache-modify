@@ -122,35 +122,61 @@ def _maybe_unmount_for_tutti(cache_path: str) -> Optional[Tuple[str, str]]:
         source,
         mount_point,
     )
-    subprocess.run(["umount", mount_point], check=True)
+    try:
+        # Use lazy umount (-l) so that open file descriptors (e.g. async pool
+        # writers still holding the file) do not cause EBUSY.  The mount point
+        # is detached from the namespace immediately; the underlying block
+        # device is released once all open fds to that filesystem are closed,
+        # which is sufficient for snvme DEVICE_BIND to proceed.
+        subprocess.run(["umount", "-l", mount_point], check=True)
+    except subprocess.CalledProcessError as exc:
+        logger.warning(
+            "Tutti umount -l failed for %s (errno %s); "
+            "snvme bind may fail or fall back to CPU path",
+            mount_point,
+            exc.returncode,
+        )
+        return None
     return source, mount_point
 
 
 def _maybe_remount_after_tutti_failure(
     mount_info: Optional[Tuple[str, str]],
 ) -> bool:
-    """Remount a filesystem that was unmounted before a failed Tutti bind."""
+    """Remount a filesystem that was unmounted before a failed Tutti bind.
+
+    Tries 'mount -t auto source mount_point' first, then falls back to
+    'mount source mount_point'.  Containers running without a full fstab
+    need the device path and filesystem type supplied explicitly.
+    """
     if mount_info is None:
         return False
     source, mount_point = mount_info
-    try:
-        subprocess.run(["mount", source, mount_point], check=True)
-        logger.info(
-            "Tutti remounted cache filesystem after init failure: source=%s "
-            "mount=%s",
-            source,
-            mount_point,
-        )
-        return True
-    except (OSError, subprocess.CalledProcessError) as exc:
-        logger.warning(
-            "Tutti could not remount cache filesystem after init failure: "
-            "source=%s mount=%s error=%s",
-            source,
-            mount_point,
-            exc,
-        )
-        return False
+    cmds = [
+        ["mount", "-t", "auto", source, mount_point],
+        ["mount", source, mount_point],
+    ]
+    for cmd in cmds:
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+            logger.info(
+                "Tutti remounted cache filesystem after init failure: "
+                "source=%s mount=%s cmd=%s",
+                source,
+                mount_point,
+                cmd,
+            )
+            return True
+        except (OSError, subprocess.CalledProcessError) as exc:
+            logger.warning(
+                "Tutti remount attempt failed: source=%s mount=%s "
+                "cmd=%s error=%s",
+                source,
+                mount_point,
+                cmd,
+                exc,
+            )
+    return False
 
 
 def _as_bool(value: object) -> bool:
@@ -503,16 +529,109 @@ class LMCacheEngine:
             "nsid": nsid,
             "cuda_device": cuda_device,
         }
+        delay_s = float(
+            self.config.get_extra_config_value(
+                "tutti_startup_warmup_delay_sec",
+                os.getenv("LMCACHE_TUTTI_STARTUP_WARMUP_DELAY_SEC", 0),
+            )
+        )
         logger.info(
-            "TuttiDirectLoader configured lazily: worker=%d device=%s pci=%s "
-            "cuda:%d slots=%dx%dMiB",
+            "TuttiDirectLoader configured: worker=%d device=%s pci=%s "
+            "cuda:%d slots=%dx%dMiB startup_warmup_delay_s=%.0f",
             worker_idx,
             device_path,
             pci_bdf,
             cuda_device,
             n_slots,
             slot_mb,
+            delay_s,
         )
+        health_port = int(
+            self.config.get_extra_config_value(
+                "tutti_startup_health_port",
+                os.getenv("LMCACHE_TUTTI_STARTUP_HEALTH_PORT", 8000),
+            )
+        )
+        health_poll_interval_s = float(
+            self.config.get_extra_config_value(
+                "tutti_startup_health_poll_interval_sec",
+                os.getenv("LMCACHE_TUTTI_STARTUP_HEALTH_POLL_INTERVAL_SEC", 10),
+            )
+        )
+        health_poll_timeout_s = float(
+            self.config.get_extra_config_value(
+                "tutti_startup_health_poll_timeout_sec",
+                os.getenv("LMCACHE_TUTTI_STARTUP_HEALTH_POLL_TIMEOUT_SEC", 1200),
+            )
+        )
+        if delay_s > 0:
+            # Spawn a background daemon thread that sleeps for delay_s seconds
+            # before initializing Tutti.  This defers the NVMe FS unmount until
+            # after the vLLM API server has finished loading the tokenizer from
+            # the NVMe-backed model directory.  Without the delay, the worker
+            # process would unmount /mnt/nvme0 while the API server process
+            # (sharing the same Docker mount namespace) is still reading from it.
+            #
+            # After the fixed delay, the thread additionally polls the vLLM
+            # /health endpoint (if health_poll_timeout_s > 0) so that the unmount
+            # does not happen until the server is fully ready even when the warmup
+            # compilation takes longer than expected.
+            def _startup_warmup() -> None:
+                logger.info(
+                    "Tutti startup warmup thread sleeping %.1f s (worker=%d)",
+                    delay_s,
+                    worker_idx,
+                )
+                time.sleep(delay_s)
+                logger.info(
+                    "Tutti startup warmup thread woke up after sleep (worker=%d)",
+                    worker_idx,
+                )
+                if health_poll_timeout_s > 0 and health_port > 0:
+                    import urllib.request
+                    url = f"http://127.0.0.1:{health_port}/health"
+                    deadline = time.monotonic() + health_poll_timeout_s
+                    ready = False
+                    while time.monotonic() < deadline:
+                        try:
+                            urllib.request.urlopen(url, timeout=3)
+                            ready = True
+                            break
+                        except Exception:
+                            remaining = deadline - time.monotonic()
+                            logger.info(
+                                "Tutti startup warmup: server not ready yet, "
+                                "retrying in %.0f s (%.0f s remaining, worker=%d)",
+                                health_poll_interval_s,
+                                remaining,
+                                worker_idx,
+                            )
+                            time.sleep(health_poll_interval_s)
+                    if ready:
+                        logger.info(
+                            "Tutti startup warmup: server ready, initializing (worker=%d)",
+                            worker_idx,
+                        )
+                    else:
+                        logger.warning(
+                            "Tutti startup warmup: server health poll timed out "
+                            "after %.0f s, proceeding anyway (worker=%d)",
+                            health_poll_timeout_s,
+                            worker_idx,
+                        )
+                else:
+                    logger.info(
+                        "Tutti startup warmup thread woke up, initializing (worker=%d)",
+                        worker_idx,
+                    )
+                self._ensure_tutti_loader(wait_for_warmup=False)
+
+            thread = threading.Thread(
+                target=_startup_warmup,
+                daemon=True,
+                name=f"tutti-startup-warmup-{worker_idx}",
+            )
+            thread.start()
 
     def _ensure_tutti_loader(
         self,
@@ -564,7 +683,10 @@ class LMCacheEngine:
         keys: Optional[List[CacheEngineKey]] = None,
     ) -> bool:
         """Initialise TuttiDirectLoader while holding _tutti_warmup_lock."""
-        from lmcache.v1.gpu_connector.tutti_direct_loader import FiemapHelper
+        from lmcache.v1.gpu_connector.tutti_direct_loader import (
+            FiemapHelper,
+            LbaRecord,
+        )
         from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
 
         profile_start = time.perf_counter()
@@ -610,6 +732,36 @@ class LMCacheEngine:
             fiemap_start = time.perf_counter()
             initial_lba_cache = FiemapHelper.scan_paths(paths)
             fiemap_ms = (time.perf_counter() - fiemap_start) * 1000.0
+            if (
+                disk_backend.kv_object_tutti_raw_enabled
+                and disk_backend.kv_object_tutti_raw_region_path
+            ):
+                raw_region_start = time.perf_counter()
+                raw_region_extents = FiemapHelper.query_extents(
+                    disk_backend.kv_object_tutti_raw_region_path
+                )
+                disk_backend.set_kv_object_tutti_raw_region_extents(
+                    [
+                        (
+                            extent.file_offset,
+                            extent.slba,
+                            extent.n_sectors,
+                        )
+                        for extent in raw_region_extents
+                    ]
+                )
+                logger.info(
+                    "TUTTI_PROFILE raw_region path=%s extents=%d size_mb=%.3f "
+                    "scan_ms=%.3f",
+                    disk_backend.kv_object_tutti_raw_region_path,
+                    len(raw_region_extents),
+                    sum(
+                        extent.n_sectors * 512
+                        for extent in raw_region_extents
+                    )
+                    / 1024**2,
+                    (time.perf_counter() - raw_region_start) * 1000.0,
+                )
             missing_required_paths = [
                 path for path in required_paths if path not in initial_lba_cache
             ]
@@ -665,12 +817,15 @@ class LMCacheEngine:
                 len(paths),
                 len(initial_lba_cache),
             )
-            unmount_start = time.perf_counter()
-            mount_info = _maybe_unmount_for_tutti(disk_backend.path)
-            unmount_ms = (time.perf_counter() - unmount_start) * 1000.0
-
         cfg = self._tutti_config
         try:
+            if isinstance(disk_backend, LocalDiskBackend):
+                unmount_start = time.perf_counter()
+                mount_info = _maybe_unmount_for_tutti(disk_backend.path)
+                unmount_ms = (time.perf_counter() - unmount_start) * 1000.0
+            # Release PyTorch's cached GPU memory so the raw cudaMalloc inside
+            # TuttiDirectLoader.create() can find contiguous free HBM pages.
+            torch.cuda.empty_cache()
             create_start = time.perf_counter()
             self._tutti_loader = TuttiDirectLoader.create(
                 device_path=cfg["device_path"],
@@ -684,6 +839,83 @@ class LMCacheEngine:
                 debug_expected_checksums=debug_expected_checksums,
             )
             create_ms = (time.perf_counter() - create_start) * 1000.0
+            if (
+                isinstance(disk_backend, LocalDiskBackend)
+                and disk_backend.kv_object_tutti_raw_enabled
+            ):
+                if (
+                    disk_backend.kv_object_tutti_raw_base_lba <= 0
+                    and not disk_backend.kv_object_tutti_raw_region_extents
+                ):
+                    logger.warning(
+                        "KV object Tutti raw store requested but "
+                        "kv_object_store_tutti_raw_base_lba and region_extents "
+                        "both zero; raw cold-store writer not installed"
+                    )
+                else:
+
+                    def _write_raw_object(
+                        record: Any,
+                        buffer: memoryview,
+                    ) -> tuple[list[tuple[int, int, int]], float]:
+                        if self._tutti_loader is None:
+                            raise RuntimeError("Tutti loader is not initialised")
+                        if record.offset % 512 != 0:
+                            raise ValueError(
+                                "KV object raw offset must be 512-byte aligned"
+                            )
+                        write_start = time.perf_counter()
+                        if disk_backend.kv_object_tutti_raw_region_extents:
+                            raw_records = self._tutti_loader.store_bytes_to_raw_extents(
+                                buffer,
+                                raw_extents=[
+                                    LbaRecord(
+                                        file_offset=file_offset,
+                                        slba=slba,
+                                        n_sectors=n_sectors,
+                                    )
+                                    for (
+                                        file_offset,
+                                        slba,
+                                        n_sectors,
+                                    ) in disk_backend.map_kv_object_to_raw_region(
+                                        record
+                                    )
+                                ],
+                                base_file_offset=record.offset,
+                                logical_nbytes=record.aligned_length,
+                            )
+                        else:
+                            raw_records = self._tutti_loader.store_bytes_to_raw_lbas(
+                                buffer,
+                                base_slba=(
+                                    disk_backend.kv_object_tutti_raw_base_lba
+                                    + record.offset // 512
+                                ),
+                                logical_file_offset=record.offset,
+                                logical_nbytes=record.aligned_length,
+                            )
+                        path = disk_backend.kv_object_tutti_path(record.pool_id)
+                        self._tutti_loader.register_lba_cache({path: raw_records})
+                        return (
+                            [
+                                (
+                                    raw.file_offset,
+                                    raw.slba,
+                                    raw.n_sectors,
+                                )
+                                for raw in raw_records
+                            ],
+                            (time.perf_counter() - write_start) * 1000.0,
+                        )
+
+                    disk_backend.reset_kv_object_pool_allocation()
+                    disk_backend.set_kv_object_tutti_raw_writer(_write_raw_object)
+                    logger.info(
+                        "KV object Tutti raw cold-store writer installed: "
+                        "pool_base_lba=%d",
+                        disk_backend.kv_object_tutti_raw_base_lba,
+                    )
             logger.info(
                 "TuttiDirectLoader initialised: worker=%d device=%s pci=%s "
                 "cuda:%d slots=%dx%dMiB lba_cache=%d",
@@ -768,6 +1000,7 @@ class LMCacheEngine:
         profile_start = time.perf_counter()
         # Retrieve DiskCacheMetadata from LocalDiskBackend without loading.
         from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
+        from lmcache.v1.gpu_connector.tutti_direct_loader import LbaRecord
         from lmcache.utils import DiskCacheMetadata
 
         disk_backend = self.storage_manager.storage_backends.get(
@@ -789,9 +1022,9 @@ class LMCacheEngine:
 
         kv_object_records = disk_backend.get_kv_object_records(keys)
         if all(record is not None for record in kv_object_records):
-            pool_paths = disk_backend.get_kv_object_pool_paths()
             object_metas: List[Optional[DiskCacheMetadata]] = []
             object_offsets: List[int] = []
+            raw_lba_cache: dict[str, list[LbaRecord]] = {}
             for original_meta, record in zip(
                 disk_metas,
                 kv_object_records,
@@ -799,13 +1032,24 @@ class LMCacheEngine:
             ):
                 assert original_meta is not None
                 assert record is not None
-                pool_path = pool_paths.get(record.pool_id)
-                if pool_path is None:
+                object_path = disk_backend.kv_object_data_path(record)
+                if object_path is None:
                     object_metas = []
                     break
+                if record.raw_extents:
+                    raw_lba_cache.setdefault(object_path, []).extend(
+                        [
+                            LbaRecord(
+                                file_offset=file_offset,
+                                slba=slba,
+                                n_sectors=n_sectors,
+                            )
+                            for file_offset, slba, n_sectors in record.raw_extents
+                        ]
+                    )
                 object_metas.append(
                     DiskCacheMetadata(
-                        path=str(pool_path),
+                        path=object_path,
                         size=record.length,
                         shape=original_meta.shape,
                         dtype=original_meta.dtype,
@@ -818,12 +1062,16 @@ class LMCacheEngine:
                 )
                 object_offsets.append(record.offset)
             if object_metas:
+                if raw_lba_cache:
+                    self._tutti_loader.register_lba_cache(raw_lba_cache)
                 disk_metas = object_metas
                 tutti_file_offsets = object_offsets
                 logger.info(
-                    "TUTTI_OBJECT_STORE_PROFILE op=select keys=%d pools=%d",
+                    "TUTTI_OBJECT_STORE_PROFILE op=select keys=%d pools=%d "
+                    "raw_paths=%d",
                     len(keys),
                     len({meta.path for meta in object_metas if meta is not None}),
+                    len(raw_lba_cache),
                 )
 
         # Recovered on-disk entries only have filename-level metadata.  Keep

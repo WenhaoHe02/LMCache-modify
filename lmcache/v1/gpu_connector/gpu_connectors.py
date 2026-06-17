@@ -456,6 +456,8 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         self._dsv4_policy_logged = False
         self._dsv4_hca_defer_logged = False
         self._dsv4_hca_defer_fallback_logged = False
+        self._dsv4_csa_seed_logged = False
+        self._dsv4_csa_seed_fallback_logged = False
         self._kv_cache_layer_names: tuple[str, ...] = ()
         self._layer_name_to_vllm_group: dict[str, int] = {}
         self._vllm_group_block_sizes: tuple[int, ...] = ()
@@ -753,8 +755,8 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
             return None
         return int(match.group(1))
 
-    def _dsv4_hca_layer_ids_for_group(self, group: KVLayerGroupInfo) -> list[int]:
-        """Return transformer layer ids covered by one LMCache HCA group."""
+    def _dsv4_layer_ids_for_group(self, group: KVLayerGroupInfo) -> list[int]:
+        """Return transformer layer ids covered by one LMCache group."""
         layer_ids: list[int] = []
         for layer_idx in group.layer_indices:
             if layer_idx >= len(self._kv_cache_layer_names):
@@ -765,6 +767,76 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
             if layer_id is not None:
                 layer_ids.append(layer_id)
         return layer_ids
+
+    def _dsv4_hca_layer_ids_for_group(self, group: KVLayerGroupInfo) -> list[int]:
+        """Return transformer layer ids covered by one LMCache HCA group."""
+        return self._dsv4_layer_ids_for_group(group)
+
+    def _prepare_csa_direct_seed_for_group(
+        self,
+        group_idx: int,
+        group: KVLayerGroupInfo,
+        memory_tensor: torch.Tensor,
+        start: int,
+        end: int,
+        role: str,
+        **kwargs: object,
+    ) -> None:
+        """Seed CSA indexer SSD/HBM state directly from a retrieve chunk."""
+        if role != "csa_indexer_cache":
+            return
+        if not self._dsv4_optimized_layout_is_valid():
+            return
+        layer_ids = self._dsv4_layer_ids_for_group(group)
+        if not layer_ids:
+            if not self._dsv4_csa_seed_fallback_logged:
+                logger.info(
+                    "CSA direct LMCache seed skipped: layer ids could not be "
+                    "resolved for group %d",
+                    group_idx,
+                )
+                self._dsv4_csa_seed_fallback_logged = True
+            return
+        try:
+            from lmcache.v1.indexer_ssd_manager import get_indexer_ssd_manager
+        except ImportError:
+            return
+        manager = get_indexer_ssd_manager()
+        if manager is None:
+            if not self._dsv4_csa_seed_fallback_logged:
+                logger.info(
+                    "CSA direct LMCache seed skipped: no IndexerSSDManager "
+                    "is attached"
+                )
+                self._dsv4_csa_seed_fallback_logged = True
+            return
+        seed = getattr(manager, "seed_range_from_lmcache_group", None)
+        if not callable(seed):
+            return
+        slot_mapping = kwargs.get("slot_mapping")
+        total_logical_tokens = kwargs.get("lmcache_cached_tokens", None)
+        if total_logical_tokens is None:
+            total_logical_tokens = (
+                int(slot_mapping.numel())
+                if isinstance(slot_mapping, torch.Tensor)
+                else end
+            )
+        total_logical_tokens = int(total_logical_tokens)
+        seeded = seed(
+            layer_ids,
+            memory_tensor,
+            start,
+            end,
+            total_logical_tokens=total_logical_tokens,
+        )
+        if seeded <= 0:
+            return
+        if not self._dsv4_csa_seed_logged:
+            logger.info(
+                "CSA direct LMCache seed active: seeded IndexerSSDManager "
+                "from LMCache csa_indexer_cache group during retrieve"
+            )
+            self._dsv4_csa_seed_logged = True
 
     def _prepare_hca_defer_for_group(
         self,
@@ -1124,6 +1196,15 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                     **kwargs,
                 ):
                     continue
+                self._prepare_csa_direct_seed_for_group(
+                    i,
+                    group,
+                    memory_obj_tensor,
+                    start,
+                    end,
+                    role,
+                    **kwargs,
+                )
                 if not self._should_transfer_group_to_gpu(
                     i,
                     start,

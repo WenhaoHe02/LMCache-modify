@@ -211,6 +211,7 @@ class HCACompressedStore:
 
     def _open(self) -> int:
         if self._fd is None:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
             self._fd = os.open(str(self._path), os.O_RDWR | os.O_CREAT)
         return self._fd
 
@@ -677,6 +678,17 @@ class HCAPrefetchManager:
                 pending=len(pending_reads),
             )
 
+    def prepare_layer_async(self, layer_id: int) -> None:
+        """Submit a pending HCA drain for asynchronous execution.
+
+        Args:
+            layer_id: Target HCA layer whose pending reads should be drained
+                in the background.
+        """
+        if layer_id not in self._layers:
+            return
+        self._executor.submit(self.drain_for_layer, layer_id)
+
     def drain_for_layer(self, layer_id: int) -> None:
         """Drain pending HCA reads into the target layer's vLLM KV cache.
 
@@ -711,17 +723,9 @@ class HCAPrefetchManager:
         written = 0
         for pending_read in pending:
             t_wait0 = time.perf_counter() if timing else 0.0
-            rows_read = pending_read.future.result()
+            rows_written = pending_read.future.result()
             if timing:
                 wait_ms += (time.perf_counter() - t_wait0) * 1000.0
-            t_write0 = time.perf_counter() if timing else 0.0
-            rows_written = self._write_pending_to_kv_cache(
-                state,
-                pending_read,
-                rows_read,
-            )
-            if timing:
-                write_ms += (time.perf_counter() - t_write0) * 1000.0
             for row_id in range(
                 pending_read.start_row_id,
                 pending_read.start_row_id + rows_written,
@@ -802,12 +806,12 @@ class HCAPrefetchManager:
                 len(slot_ids),
             )
             return None
-        buffer = buffer_obj.byte_array
         future = self._executor.submit(
-            state.store.read_rows_into,
+            self._read_rows_into_kv_cache,
+            state,
             start_row_id,
-            len(slot_ids),
-            buffer,
+            slot_ids,
+            buffer_obj,
         )
         return HCAPendingRead(
             start_row_id=start_row_id,
@@ -944,18 +948,19 @@ class HCAPrefetchManager:
     def _write_pending_to_kv_cache(
         self,
         state: HCALayerState,
-        pending_read: HCAPendingRead,
+        slot_ids: list[int],
+        buffer_obj: Any,
         rows_read: int,
     ) -> int:
-        rows_to_write = min(rows_read, len(pending_read.slot_ids))
+        rows_to_write = min(rows_read, len(slot_ids))
         if rows_to_write <= 0:
             return 0
-        tensor = pending_read.buffer_obj.tensor
+        tensor = buffer_obj.tensor
         if tensor is None:
             return 0
         raw = tensor[: rows_to_write * state.row_bytes].view(torch.uint8)
         src = raw.view(rows_to_write, state.row_bytes)
-        for idx, slot_id in enumerate(pending_read.slot_ids[:rows_to_write]):
+        for idx, slot_id in enumerate(slot_ids[:rows_to_write]):
             block_idx = slot_id // state.block_size
             block_offset = slot_id % state.block_size
             if block_idx >= state.kv_cache.shape[0]:
@@ -965,9 +970,33 @@ class HCAPrefetchManager:
                 raise TypeError(
                     "HCAPrefetchManager currently expects uint8 HCA KV rows, "
                     f"got {row.dtype}"
-                )
+            )
             row.reshape(-1).copy_(src[idx].to(device=row.device, non_blocking=True))
         return rows_to_write
+
+    def _read_rows_into_kv_cache(
+        self,
+        state: HCALayerState,
+        start_row_id: int,
+        slot_ids: list[int],
+        buffer_obj: Any,
+    ) -> int:
+        """Read HCA rows into a pinned buffer and copy them into KV cache."""
+        tensor = buffer_obj.tensor
+        if tensor is None:
+            return 0
+        buffer = buffer_obj.byte_array
+        rows_read = state.store.read_rows_into(
+            start_row_id,
+            len(slot_ids),
+            buffer,
+        )
+        return self._write_pending_to_kv_cache(
+            state,
+            slot_ids,
+            buffer_obj,
+            rows_read,
+        )
 
     def _log_timing(self, event: str, layer_id: int, **fields: Any) -> None:
         if not self._timing_enabled:

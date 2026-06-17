@@ -1,0 +1,63 @@
+﻿prompt_chars=278466
+same_prompt_repeats=3 max_tokens=384 temperature=0
+
+================================================================================
+RUN 1: elapsed_s=38.861 prompt_tokens=107736 completion_tokens=384
+--------------------------------------------------------------------------------
+</think>在这个系统里，full-hit 场景下 HCA overlap 没有明显加速，以及如何设计实验验证 partial prefill 场景的价值，可以从以下几个维度分析：
+
+### 一、为什么 full-hit 场景下 HCA overlap 可能没有明显加速？
+
+1. **I/O 路径未解耦，仍读取完整对象**
+   - 当前 full-hit retrieve 的实现是从 SSD 读取完整的 MemoryObj，而不是只读取 HCA attention 所需的 compressed rows 子集。
+   - 即使 HCAPrefetchManager 的状态机触发了 fire/drain，底层 I/O 仍然在搬运大量无关数据（如 CSA、SWA、indexer cache 等），导致有效带宽被浪费，预取的 latency 优势被淹没。
+
+2. **HCA flat store 依赖 full-hit 结果 seed，形成串行依赖**
+   - 如果 HCA 的 flat store 需要先由 full-hit 的结果填充（seed），再由 Python 逐层写回，那么 HCA 预取实际上变成了“先完整加载，再部分写回”的伪流水。
+   - 这导致 HCA 预取无法与上一层的 MoE/FFN 计算真正重叠，而是退化为在 full-hit 完成后的额外后处理步骤。
+
+3. **GPU 回填路径未按 role-specific 子集设计**
+   - 优化路径要求 SWA 只保留窗口状态、compressor state 只保留边界状态，HCA 按 deterministic row range 预取，CSA 走 true LI + miss correction。
+   - 如果 full-hit 场景下仍然将所有 group 按完整前缀回填到 GPU，HCA 预取节省的显存和传输量被其他 group 的冗余数据抵消，端到端 TTFT 改善不明显。
+
+4. **计时指标混入
+
+================================================================================
+RUN 2: elapsed_s=27.896 prompt_tokens=107736 completion_tokens=384
+--------------------------------------------------------------------------------
+</think>在这个系统中，full-hit 场景下 HCA overlap 没有明显加速，以及如何设计实验验证 partial prefill 场景的价值，可以从以下几个维度分析：
+
+### 一、为什么 full-hit 场景下 HCA overlap 可能没有明显加速？
+
+1.  **I/O 路径未解耦，瓶颈仍在完整对象读取**
+    *   **问题核心**：系统在 full-hit 时，SSD 后端仍在读取完整的 `MemoryObj`，而不是只读取 HCA/CSA attention 所需的 role-specific 压缩子集。
+    *   **后果**：即使 HCA Prefetch Manager 的状态机触发了（日志中出现 fire/drain），其实际 I/O 可能仍在等待或重复读取那个巨大的完整对象。I/O 时间被完整对象的读取延迟所主导，预取的“提前”效果被淹没。
+
+2.  **数据回填路径存在冗余依赖**
+    *   **HCA flat store 的 seed 问题**：如果 HCA 的 flat store 需要先由 full-hit 的结果进行 seed，再由 Python 逐层写回，那么 HCA 预取就退化成了“先完整加载，再整理分发”的模式。这没有节省 I/O 或计算，反而增加了数据搬移的开销。
+    *   **未实现真正的角色分离**：优化路径要求 SWA 和 compressor state 只保留窗口状态，HCA 按 deterministic row range 预取，CSA 走 true LI 与 miss correction。如果 full-hit 仍将所有 group 按完整前缀回填到 GPU，那么 HCA 预取只是多了一步操作，而非替代了全量加载。
+
+3.  **计算与 I/O 重叠不足**
+    *   **窗口错失**：HCA deterministic prefetch 理论上应与上一层的 MoE 或 FF
+
+================================================================================
+RUN 3: elapsed_s=28.943 prompt_tokens=107736 completion_tokens=384
+--------------------------------------------------------------------------------
+</think>在这个系统里，full-hit 场景下 HCA overlap 没有明显加速，以及如何设计实验验证 partial prefill 场景的价值，可以从以下几个维度分析：
+
+---
+
+### 一、为什么 full-hit 场景下 HCA overlap 可能没有明显加速？
+
+1. **I/O 路径未做角色分离，SSD 读取仍是完整对象**
+   - 当前 full-hit retrieve 走的是普通 LMCache 路径，根据 token hash 命中后，从 NVMe SSD 加载的是完整的 `MemoryObj`，而不是只读取 HCA/CSA attention 所需的 compressed KV 子集。
+   - 即使上层 HCAPrefetchManager 触发了 fire/drain 状态机，底层 I/O 仍然在搬运大量无关数据（如 SWA、compressor state、indexer cache 等），导致 SSD 带宽被浪费，预取的 latency 优势被淹没。
+
+2. **HCA flat store 依赖 full-hit 结果 seed，形成串行依赖**
+   - 如果 HCA 的 flat store 需要先由 full-hit 的完整对象填充，再由 Python 逐层写回，那么 HCA 预取就变成了“先完整加载，再提取子集”的伪流水线。
+   - 这导致 HCA 数据就绪时间被推迟到 full-hit 完成之后，无法与上一层的 MoE/FFN 计算窗口真正重叠，预取变成顺序执行。
+
+3. **GPU 回填路径仍是全量回填，未按 group 差异化**
+   - 优化路径要求 SWA 和 compressor state 只保留窗口或边界状态，HCA 按 deterministic row range 预取，CSA 走 true LI + miss correction。
+   - 如果 full-hit 场景下仍然把所有 group 都按完整前缀回填到 GPU
+

@@ -67,9 +67,11 @@ try:
     import lmcache.c_ops as _c_ops  # type: ignore[import]
 
     _HAS_C_OPS: bool = hasattr(_c_ops, "tutti_submit_batch_sgl_read")
+    _HAS_WRITE_C_OPS: bool = hasattr(_c_ops, "tutti_submit_batch_sgl_write")
 except ImportError:
     _c_ops = None  # type: ignore[assignment]
     _HAS_C_OPS = False
+    _HAS_WRITE_C_OPS = False
 
 # ── constants ────────────────────────────────────────────────────────────────
 
@@ -173,6 +175,7 @@ def _cuda_host_register(cpu_ptr: int, size: int) -> None:
         ctypes.c_uint(_CUDA_HOST_REGISTER_IO_MEMORY),
     )
     if ret != 0:
+        _get_cudart().cudaGetLastError()
         raise RuntimeError(f"cudaHostRegister failed (error {ret})")
 
 
@@ -202,6 +205,7 @@ def _cuda_malloc_managed(size: int) -> int:
         ctypes.c_uint(1),
     )
     if ret != 0:
+        _get_cudart().cudaGetLastError()
         raise RuntimeError(f"cudaMallocManaged failed (error {ret})")
     result = ptr.value
     if result is None:
@@ -238,6 +242,10 @@ def _cuda_malloc_device(size: int, device_id: int) -> int:
     ptr = ctypes.c_void_p(0)
     ret = rt.cudaMalloc(ctypes.byref(ptr), ctypes.c_size_t(size))
     if ret != 0:
+        # Consume the CUDA error from the runtime's thread-local state so it
+        # does not surface later as a spurious "CUDA error [ASYNC]" in PyTorch
+        # when control returns to Python torch operations.
+        rt.cudaGetLastError()
         raise RuntimeError(
             f"cudaMalloc({size} bytes, device {device_id}) failed (error {ret})"
         )
@@ -763,9 +771,10 @@ class SnvmeSession:
 
         logger.info(
             "NVM_GET_DEV_INFO: max_data_size=%d MiB  block_size=%d  "
-            "sgl_supported=0x%08x  q_depth=%d  disk=%s",
+            "sgl_supported=0x%08x  q_depth=%d  bar0_size=%d  disk=%s",
             info.max_data_size >> 20, info.block_size,
             info.sgl_supported, info.q_depth,
+            info.bar0_size,
             info.disk_name.decode(errors="replace"),
         )
 
@@ -776,6 +785,7 @@ class SnvmeSession:
             )
 
         # 4. Map BAR0 for GPU doorbell writes.
+        logger.info("BAR0 mmap: fd_dev=%d bar0_size=%d", self._fd_dev, info.bar0_size)
         self._bar0_mmap = mmap.mmap(
             self._fd_dev,
             info.bar0_size,
@@ -785,6 +795,7 @@ class SnvmeSession:
         arr_type = ctypes.c_char * info.bar0_size
         self._bar0_arr = arr_type.from_buffer(self._bar0_mmap)
         bar0_cpu = ctypes.addressof(self._bar0_arr)
+        logger.info("cudaHostRegister BAR0: ptr=0x%x size=%d device=%d", bar0_cpu, info.bar0_size, self._cuda_device)
         _cuda_host_register(bar0_cpu, info.bar0_size)
         self._bar0_gpu_ptr = _cuda_host_get_device_pointer(bar0_cpu)
 
@@ -1102,15 +1113,19 @@ class TuttiDirectLoader:
         )
 
         session_start = time.perf_counter()
-        session = SnvmeSession(
-            device_path=device_path,
-            ctrl_path=ctrl_path,
-            pci_bdf=pci_bdf,
-            staging_tensor=staging,
-            nsid=nsid,
-            kernel_ioq_cap=kernel_ioq_cap,
-            cuda_device=cuda_device,
-        )
+        try:
+            session = SnvmeSession(
+                device_path=device_path,
+                ctrl_path=ctrl_path,
+                pci_bdf=pci_bdf,
+                staging_tensor=staging,
+                nsid=nsid,
+                kernel_ioq_cap=kernel_ioq_cap,
+                cuda_device=cuda_device,
+            )
+        except Exception:
+            _cuda_free(staging_raw_ptr)
+            raise
         session_ms = _elapsed_ms(session_start)
 
         # Allocate managed-memory scalars for SQ/CQ state.
@@ -1176,6 +1191,19 @@ class TuttiDirectLoader:
             self._lba_cache[file_path] = FiemapHelper.query_extents(file_path)
         return self._lba_cache[file_path]
 
+    def register_lba_cache(self, records_by_path: dict[str, list[LbaRecord]]) -> None:
+        """Register known LBA extents that do not require FIEMAP.
+
+        Args:
+            records_by_path: Mapping from logical path to raw LBA records.  The
+                KV object-store raw path uses synthetic paths such as
+                ``tutti://rank0-full`` because no filesystem file exists after
+                snvme bind.
+        """
+        for path, records in records_by_path.items():
+            if records:
+                self._lba_cache[path] = list(records)
+
     def _staging_slice(self, slot_idx: int, nbytes: int) -> torch.Tensor:
         """Return the uint8 view into staging slot slot_idx, trimmed to nbytes."""
         start = slot_idx * self._slot_bytes
@@ -1206,6 +1234,33 @@ class TuttiDirectLoader:
     def _staging_capacity_bytes(self) -> int:
         """Total bytes available in the HBM staging pool."""
         return self._n_slots * self._slot_bytes
+
+    def _check_nvme_status(
+        self,
+        *,
+        op_name: str,
+        n_ios: int,
+        paths: list[str],
+    ) -> None:
+        """Raise if the most recent NVMe command batch reported an error."""
+        if ctypes.c_int32.from_address(self._timed_out_ptr).value != 0:
+            raise RuntimeError(
+                f"Tutti NVMe {op_name} poll timed out; "
+                "check snvme module and NVMe controller health"
+            )
+
+        status_cpu = self._status_buf[:n_ios].cpu()
+        for j in range(n_ios):
+            raw = int(status_cpu[j])
+            nvme_status = (raw >> 1) & 0x7FFF
+            if nvme_status != 0:
+                path = paths[j] if j < len(paths) else "<unknown>"
+                raise RuntimeError(
+                    f"NVMe {op_name} failed for io {j} (path {path}): "
+                    f"raw status 0x{raw:04x} "
+                    f"(SC=0x{nvme_status & 0xFF:02x} "
+                    f"SCT=0x{(nvme_status >> 8) & 0x7:x})"
+                )
 
     def _estimate_chunk_ios(
         self,
@@ -1423,6 +1478,276 @@ class TuttiDirectLoader:
             _elapsed_ms(profile_start),
         )
         return results
+
+    def store_bytes_to_raw_lbas(
+        self,
+        payload: bytes | bytearray | memoryview,
+        *,
+        base_slba: int,
+        logical_file_offset: int,
+        logical_nbytes: Optional[int] = None,
+    ) -> list[LbaRecord]:
+        """Store one KV object into raw NVMe LBAs through Tutti.
+
+        This is the cold-store counterpart of ``load_chunks_to_hbm`` for the
+        KV object-store path.  The current MVP copies the CPU payload into the
+        Tutti HBM staging pool, then submits NVMe WRITE commands from GPU code.
+        The returned extents can be registered in ``_lba_cache`` and reused by
+        the normal direct-read path without FIEMAP.
+
+        Args:
+            payload: Source bytes to persist.
+            base_slba: Starting logical block address for the object.
+            logical_file_offset: Logical byte offset represented by the first
+                returned extent.  For dense object pools this is the object's
+                pool offset.
+            logical_nbytes: Optional logical object reservation size.  When
+                larger than ``len(payload)``, the tail is zero padded before
+                writing so reads can cover the full reserved extent.
+
+        Returns:
+            A list containing the raw extent for this object.
+
+        Raises:
+            RuntimeError: If the extension does not expose the WRITE op, the
+                transfer exceeds staging capacity, or NVMe reports an error.
+            ValueError: If sizing or LBA arguments are invalid.
+        """
+        if base_slba < 0:
+            raise ValueError("base_slba must be non-negative")
+        if logical_file_offset < 0:
+            raise ValueError("logical_file_offset must be non-negative")
+        payload_nbytes = len(memoryview(payload).cast("B"))
+        if payload_nbytes <= 0:
+            raise ValueError("payload must be non-empty")
+        if logical_nbytes is None:
+            logical_nbytes = payload_nbytes
+        dma_nbytes = _align_up(logical_nbytes, _NVME_LBS)
+        return self.store_bytes_to_raw_extents(
+            payload,
+            raw_extents=[
+                LbaRecord(
+                    slba=base_slba,
+                    n_sectors=dma_nbytes // _NVME_LBS,
+                    file_offset=logical_file_offset,
+                )
+            ],
+            base_file_offset=logical_file_offset,
+            logical_nbytes=logical_nbytes,
+        )
+
+    def store_bytes_to_raw_extents(
+        self,
+        payload: bytes | bytearray | memoryview,
+        *,
+        raw_extents: list[LbaRecord],
+        base_file_offset: int,
+        logical_nbytes: Optional[int] = None,
+    ) -> list[LbaRecord]:
+        """Store one KV object through Tutti into known raw LBA extents.
+
+        Args:
+            payload: Source bytes to persist.
+            raw_extents: Physical destination extents covering the object's
+                logical byte range.
+            base_file_offset: Logical byte offset corresponding to
+                ``payload[0]``.
+            logical_nbytes: Optional logical reservation size.  Bytes after the
+                payload are zero padded before WRITE.
+
+        Returns:
+            The normalized raw extents that cover this object.
+
+        Raises:
+            RuntimeError: If WRITE support is unavailable, extents do not cover
+                the object, or NVMe reports an error.
+            ValueError: If arguments are invalid.
+        """
+        if not _HAS_WRITE_C_OPS:
+            raise RuntimeError(
+                "lmcache.c_ops.tutti_submit_batch_sgl_write not found; "
+                "rebuild lmcache with csrc/tutti_kv_ops.cu"
+            )
+        if base_file_offset < 0:
+            raise ValueError("base_file_offset must be non-negative")
+        if not raw_extents:
+            raise ValueError("raw_extents must be non-empty")
+
+        payload_view = memoryview(payload).cast("B")
+        payload_nbytes = len(payload_view)
+        if payload_nbytes <= 0:
+            raise ValueError("payload must be non-empty")
+        if logical_nbytes is None:
+            logical_nbytes = payload_nbytes
+        if logical_nbytes < payload_nbytes:
+            raise ValueError("logical_nbytes cannot be smaller than payload")
+
+        dma_nbytes = _align_up(logical_nbytes, _NVME_LBS)
+        aligned_nbytes = _align_up(dma_nbytes, _GPU_PAGE_SIZE)
+        if aligned_nbytes > self._staging_capacity_bytes():
+            raise RuntimeError(
+                f"Tutti raw store needs {aligned_nbytes} bytes of staging, "
+                f"but only {self._staging_capacity_bytes()} bytes are available"
+            )
+
+        profile_start = time.perf_counter()
+        _dev = f"cuda:{self._cuda_device}"
+        with torch.cuda.device(self._cuda_device):
+            copy_start = time.perf_counter()
+            staging = self._staging_slice_at(0, aligned_nbytes)
+            staging.zero_()
+            cpu_tensor = torch.frombuffer(payload_view, dtype=torch.uint8)
+            staging[:payload_nbytes].copy_(cpu_tensor, non_blocking=False)
+            torch.cuda.synchronize(device=self._cuda_device)
+            h2d_ms = _elapsed_ms(copy_start)
+
+        max_io = self._session.info.max_data_size
+        q_depth = self._q_depth()
+        object_end = base_file_offset + dma_nbytes
+        normalized_extents: list[LbaRecord] = []
+        io_specs: list[tuple[int, int, int]] = []
+        covered_nbytes = 0
+        for extent in sorted(raw_extents, key=lambda item: item.file_offset):
+            extent_start = extent.file_offset
+            extent_end = extent.file_offset + extent.n_sectors * _NVME_LBS
+            write_start = max(base_file_offset, extent_start)
+            write_end = min(object_end, extent_end)
+            if write_start >= write_end:
+                continue
+            write_nbytes = write_end - write_start
+            if write_nbytes % _NVME_LBS != 0:
+                raise ValueError("raw extent write size must be 512-byte aligned")
+            object_skip = write_start - base_file_offset
+            extent_skip = write_start - extent_start
+            normalized_extents.append(
+                LbaRecord(
+                    slba=extent.slba + extent_skip // _NVME_LBS,
+                    n_sectors=write_nbytes // _NVME_LBS,
+                    file_offset=write_start,
+                )
+            )
+            cursor = 0
+            while cursor < write_nbytes:
+                io_nbytes = write_nbytes - cursor
+                if max_io > 0:
+                    io_nbytes = min(io_nbytes, max_io)
+                io_nbytes = (io_nbytes // _NVME_LBS) * _NVME_LBS
+                if io_nbytes <= 0:
+                    raise ValueError("Tutti raw store tail is smaller than one LBA")
+                io_specs.append(
+                    (
+                        object_skip + cursor,
+                        extent.slba + (extent_skip + cursor) // _NVME_LBS,
+                        io_nbytes,
+                    )
+                )
+                cursor += io_nbytes
+            covered_nbytes += write_nbytes
+        if covered_nbytes != dma_nbytes:
+            raise RuntimeError(
+                f"Tutti raw extents cover {covered_nbytes}/{dma_nbytes} bytes"
+            )
+
+        cursor = 0
+        n_ios = 0
+        submit_ms = 0.0
+        poll_sync_ms = 0.0
+        status_ms = 0.0
+        while cursor < len(io_specs):
+            batch_iovas: list[int] = []
+            batch_slbas: list[int] = []
+            batch_lens: list[int] = []
+            batch_paths: list[str] = []
+            while cursor < len(io_specs) and len(batch_iovas) < q_depth:
+                staging_offset, slba, io_nbytes = io_specs[cursor]
+                batch_iovas.append(self._staging_iova_at(staging_offset))
+                batch_slbas.append(slba)
+                batch_lens.append(io_nbytes)
+                batch_paths.append(f"raw://slba/{slba}")
+                cursor += 1
+
+            arg_start = time.perf_counter()
+            staging_iovas_t = torch.tensor(
+                batch_iovas,
+                dtype=torch.int64,
+                device=_dev,
+            )
+            slbas_t = torch.tensor(batch_slbas, dtype=torch.int64, device=_dev)
+            byte_lens_t = torch.tensor(batch_lens, dtype=torch.int32, device=_dev)
+            arg_ms = _elapsed_ms(arg_start)
+
+            q = self._session.queue
+            sq_dev_ptr = q.sq_tensor.data_ptr()
+            cq_dev_ptr = q.cq_tensor.data_ptr()
+            sq_db_ptr = self._session.db_gpu_ptr(q.sq_db_offset)
+            cq_db_ptr = self._session.db_gpu_ptr(q.cq_db_offset)
+
+            with torch.cuda.device(self._cuda_device):
+                submit_start = time.perf_counter()
+                _c_ops.tutti_submit_batch_sgl_write(
+                    sq_dev_ptr=sq_dev_ptr,
+                    cq_dev_ptr=cq_dev_ptr,
+                    sq_db_ptr=sq_db_ptr,
+                    cq_db_ptr=cq_db_ptr,
+                    sq_tail_ptr=self._sq_tail_ptr,
+                    q_depth=q_depth,
+                    qid=q.qid,
+                    nsid=self._session.nsid,
+                    staging_iovas=staging_iovas_t,
+                    slbas=slbas_t,
+                    byte_lens=byte_lens_t,
+                    stream_ptr=0,
+                )
+                submit_ms += _elapsed_ms(submit_start)
+
+                poll_start = time.perf_counter()
+                _c_ops.tutti_poll_batch(
+                    sq_dev_ptr=sq_dev_ptr,
+                    cq_dev_ptr=cq_dev_ptr,
+                    sq_db_ptr=sq_db_ptr,
+                    cq_db_ptr=cq_db_ptr,
+                    cq_head_ptr=self._cq_head_ptr,
+                    cq_phase_ptr=self._cq_phase_ptr,
+                    q_depth=q_depth,
+                    n_ios=len(batch_iovas),
+                    status_out=self._status_buf,
+                    timed_out_ptr=self._timed_out_ptr,
+                    max_iters=self.POLL_MAX_ITERS,
+                    stream_ptr=0,
+                )
+                torch.cuda.synchronize(device=self._cuda_device)
+                poll_sync_ms += _elapsed_ms(poll_start)
+
+            status_start = time.perf_counter()
+            self._check_nvme_status(
+                op_name="WRITE",
+                n_ios=len(batch_iovas),
+                paths=batch_paths,
+            )
+            status_ms += _elapsed_ms(status_start)
+            n_ios += len(batch_iovas)
+            logger.debug(
+                "TUTTI_PROFILE store_raw_batch ios=%d bytes_mb=%.3f arg_ms=%.3f",
+                len(batch_iovas),
+                sum(batch_lens) / 1024**2,
+                arg_ms,
+            )
+
+        logger.info(
+            "TUTTI_PROFILE store_raw bytes=%d dma_bytes=%d extents=%d ios=%d "
+            "h2d_ms=%.3f submit_launch_ms=%.3f poll_sync_ms=%.3f "
+            "status_ms=%.3f total_ms=%.3f",
+            payload_nbytes,
+            dma_nbytes,
+            len(normalized_extents),
+            n_ios,
+            h2d_ms,
+            submit_ms,
+            poll_sync_ms,
+            status_ms,
+            _elapsed_ms(profile_start),
+        )
+        return normalized_extents
 
     def _load_batch(
         self,

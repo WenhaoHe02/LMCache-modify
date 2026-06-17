@@ -1,0 +1,47 @@
+event_summary reuse_prefetch_seed count=240
+  total_ms: sum=18900.444 mean=78.752 median=60.213 min=45.847 max=340.985
+  reset_ms: sum=194.338 mean=0.810 median=0.698 min=0.434 max=12.928
+  read_ms: sum=12427.398 mean=51.781 median=48.197 min=35.294 max=306.051
+  write_ms: sum=1060.418 mean=4.418 median=2.075 min=1.139 max=236.603
+  load_ms: sum=5164.591 mean=21.519 median=7.173 min=2.486 max=286.696
+  seed_tokens: sum=122880.000 mean=512.000 median=512.000 min=512.000 max=512.000
+  load_ids: sum=983040.000 mean=4096.000 median=4096.000 min=4096.000 max=4096.000
+event_summary prefill_fire_async count=480
+  total_ms: sum=9250.244 mean=19.271 median=5.001 min=2.171 max=1082.554
+  proxy_ms: sum=4484.724 mean=9.343 median=3.290 min=1.582 max=510.737
+  filter_ms: sum=53.205 mean=0.111 median=0.092 min=0.048 max=1.681
+  submit_ms: sum=4701.081 mean=9.794 median=1.223 min=0.082 max=572.203
+  prev: sum=451360.000 mean=940.333 median=945.500 min=916.000 max=970.000
+  missing: sum=212744.000 mean=443.217 median=381.500 min=31.000 max=896.000
+event_summary prefill_correct_true_topk count=240
+  total_ms: sum=7313.996 mean=30.475 median=29.037 min=3.283 max=60.953
+  drain_ms: sum=5000.406 mean=20.835 median=16.834 min=1.268 max=49.981
+  miss_ms: sum=24.017 mean=0.100 median=0.099 min=0.045 max=0.624
+  read_ms: sum=62.714 mean=0.261 median=0.242 min=0.040 max=0.821
+  insert_ms: sum=2009.523 mean=8.373 median=7.825 min=1.117 max=26.507
+  true: sum=245760.000 mean=1024.000 median=1024.000 min=1024.000 max=1024.000
+  missing: sum=56952.000 mean=237.300 median=226.000 min=33.000 max=689.000
+event_summary prefill_fire_async_skip count=0
+event_summary prefill_correct_true_topk_skip count=0
+markers
+reuse prefetch seeded: 8
+event=prefill_fire_async : 480
+prefill_correct_true_topk: 240
+LMCacheRetrieveProfile: 8
+Retrieved: 8
+RuntimeError: 0
+AssertionError: 0
+illegal memory: 0
+External prefix cache hit rate: 2
+lmcache_retrieve count=8
+  total_ms: mean=1378.135 min=1329.160 max=1445.565
+  process_tokens_ms: mean=408.731 min=362.936 max=470.671
+  to_gpu_ms: mean=966.843 min=952.381 max=983.591
+  size_gb: mean=4.747 min=4.747 max=4.747
+  required_tokens: mean=248320.000 min=248320.000 max=248320.000
+samples
+retrieve: (Worker_TP7_EP7 pid=844) [32;20m[2026-06-03 07:04:07,993] LMCache INFO:[0m LMCacheRetrieveProfile: req_id=chatcmpl-8ef97412891bdf8c-938f8559 total_ms=1329.1604 process_tokens_ms=362.9358 broadcast_ms=0.0000 to_gpu_ms=963.7486 other_ms=2.4760 size_gb=4.7469 retrieved_tokens=tensor(248320) required_tokens=248320 [3m(cache_engine.py:988:lmcache.v1.cache_engine)[0m
+seeded: (Worker_TP7_EP7 pid=844) [32;20m[2026-06-03 07:04:09,388] LMCache INFO:[0m IndexerSSDManager: reuse prefetch seeded 30 CSA layers for request chatcmpl-8ef97412891bdf8c-938f8559 lmcache_tokens=248320 compressed_tokens~=62080 [3m(vllm_v1_adapter.py:1620:lmcache.integration.vllm.vllm_v1_adapter)[0m
+fire: (Worker_TP6_EP6 pid=843) [32;20m[2026-06-03 07:04:09,728] LMCache INFO:[0m IndexerSSDTiming: event=prefill_fire_async layer=2 total_ms=28.543 proxy_ms=26.187 filter_ms=0.091 submit_ms=2.235 prev=919 missing=867 [3m(indexer_ssd_manager.py:707:lmcache.v1.indexer_ssd_manager)[0m
+correct: (Worker_TP6_EP6 pid=843) [32;20m[2026-06-03 07:04:09,792] LMCache INFO:[0m IndexerSSDTiming: event=prefill_correct_true_topk layer=2 total_ms=44.000 drain_ms=36.392 miss_ms=0.104 read_ms=0.260 insert_ms=6.554 true=1024 missing=192 [3m(indexer_ssd_manager.py:707:lmcache.v1.indexer_ssd_manager)[0m
+prefix_rate: (APIServer pid=1) INFO 06-03 07:04:15 [loggers.py:271] Engine 000: Avg prompt throughput: 43.4 tokens/s, Avg generation throughput: 0.1 tokens/s, Running: 0 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: 0.0%, External prefix cache hit rate: 49.9%

@@ -1,0 +1,25 @@
+{"event": "start", "mode": "csa_on_hca_off", "out": "/tmp/dsv4_csaon_hcaoff_20260602.jsonl", "ts": 1780383664.5605059}
+{"event": "item_start", "item": "csaon_hcaoff_248k_4hit", "prompt_chars": 1171257, "ts": 1780383664.5611079}
+{"label": "csaon_hcaoff_248k_cold_store", "elapsed_s": 36.3274561209837, "usage": {"prompt_tokens": 248460, "total_tokens": 248461, "completion_tokens": 1, "prompt_tokens_details": null}, "text": "What", "item": "csaon_hcaoff_248k_4hit", "prompt_chars": 1171257, "ts": 1780383700.8910582}
+{"event": "sleep_before_hit", "item": "csaon_hcaoff_248k_4hit", "seconds": 60, "ts": 1780383700.8914065}
+{"label": "csaon_hcaoff_248k_full_hit_1", "elapsed_s": 2.5445275329984725, "usage": {"prompt_tokens": 248460, "total_tokens": 248461, "completion_tokens": 1, "prompt_tokens_details": null}, "text": "</", "item": "csaon_hcaoff_248k_4hit", "prompt_chars": 1171257, "ts": 1780383763.5001674}
+{"event": "sleep_before_hit", "item": "csaon_hcaoff_248k_4hit", "hit_next": 2, "seconds": 60, "ts": 1780383763.5003414}
+{"label": "csaon_hcaoff_248k_full_hit_2", "elapsed_s": 3.2876551729859784, "usage": {"prompt_tokens": 248460, "total_tokens": 248461, "completion_tokens": 1, "prompt_tokens_details": null}, "text": "What", "item": "csaon_hcaoff_248k_4hit", "prompt_chars": 1171257, "ts": 1780383826.8491728}
+{"event": "sleep_before_hit", "item": "csaon_hcaoff_248k_4hit", "hit_next": 3, "seconds": 60, "ts": 1780383826.8493052}
+{"label": "csaon_hcaoff_248k_full_hit_3", "elapsed_s": 2.283072817954235, "usage": {"prompt_tokens": 248460, "total_tokens": 248461, "completion_tokens": 1, "prompt_tokens_details": null}, "text": "The", "item": "csaon_hcaoff_248k_4hit", "prompt_chars": 1171257, "ts": 1780383889.1964605}
+{"event": "sleep_before_hit", "item": "csaon_hcaoff_248k_4hit", "hit_next": 4, "seconds": 60, "ts": 1780383889.1966274}
+{"label": "csaon_hcaoff_248k_full_hit_4", "elapsed_s": 2.2905043869977817, "usage": {"prompt_tokens": 248460, "total_tokens": 248461, "completion_tokens": 1, "prompt_tokens_details": null}, "text": "</", "item": "csaon_hcaoff_248k_4hit", "prompt_chars": 1171257, "ts": 1780383951.551328}
+{"event": "summary", "item": "csaon_hcaoff_248k_4hit", "hit_elapsed_s": [2.5445275329984725, 3.2876551729859784, 2.283072817954235, 2.2905043869977817], "hit_min_s": 2.283072817954235, "hit_mean_s": 2.601439977734117, "hit_max_s": 3.2876551729859784, "ts": 1780383951.5515924}
+{"event": "item_start", "item": "csaon_hcaoff_stream_curve", "target": "44K", "prompt_chars": 207987, "ts": 1780383951.5519671}
+{"label": "csaon_hcaoff_curve_44K_cold_store", "ttft_s": 4.981842830078676, "total_s": 4.982047588098794, "events": 1, "text": "</", "item": "csaon_hcaoff_stream_curve", "target": "44K", "prompt_chars": 207987, "ts": 1780383956.534691}
+{"event": "sleep_before_hit", "item": "csaon_hcaoff_stream_curve", "target": "44K", "seconds": 60, "ts": 1780383956.534871}
+{"label": "csaon_hcaoff_curve_44K_hit_1", "ttft_s": 0.5218241260154173, "total_s": 0.5219498850638047, "events": 1, "text": "</", "item": "csaon_hcaoff_stream_curve", "target": "44K", "prompt_chars": 207987, "ts": 1780384017.1177514}
+{"label": "csaon_hcaoff_curve_44K_hit_2", "ttft_s": 0.6718543070601299, "total_s": 0.6719590650172904, "events": 1, "text": "</", "item": "csaon_hcaoff_stream_curve", "target": "44K", "prompt_chars": 207987, "ts": 1780384017.7905743}
+{"event": "summary", "item": "csaon_hcaoff_stream_curve", "target": "44K", "hit_ttft_s": [0.5218241260154173, 0.6718543070601299], "hit_mean_s": 0.5968392165377736, "ts": 1780384017.7907314}
+{"event": "item_start", "item": "csaon_hcaoff_stream_curve", "target": "248K", "prompt_chars": 1171258, "ts": 1780384017.7913687}
+{"label": "csaon_hcaoff_curve_248K_cold_store", "ttft_s": 32.65451771800872, "total_s": 32.65471973200329, "events": 1, "text": "What", "item": "csaon_hcaoff_stream_curve", "target": "248K", "prompt_chars": 1171258, "ts": 1780384050.4487302}
+{"event": "sleep_before_hit", "item": "csaon_hcaoff_stream_curve", "target": "248K", "seconds": 60, "ts": 1780384050.4488993}
+{"label": "csaon_hcaoff_curve_248K_hit_1", "ttft_s": 2.237073226016946, "total_s": 2.237200167030096, "events": 1, "text": "</", "item": "csaon_hcaoff_stream_curve", "target": "248K", "prompt_chars": 1171258, "ts": 1780384112.6938462}
+{"label": "csaon_hcaoff_curve_248K_hit_2", "ttft_s": 3.108033006894402, "total_s": 3.1081794869387522, "events": 1, "text": "</", "item": "csaon_hcaoff_stream_curve", "target": "248K", "prompt_chars": 1171258, "ts": 1780384115.8048623}
+{"event": "summary", "item": "csaon_hcaoff_stream_curve", "target": "248K", "hit_ttft_s": [2.237073226016946, 3.108033006894402], "hit_mean_s": 2.672553116455674, "ts": 1780384115.8051002}
+{"event": "done", "out": "/tmp/dsv4_csaon_hcaoff_20260602.jsonl", "ts": 1780384115.8051484}

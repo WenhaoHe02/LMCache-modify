@@ -42,10 +42,42 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+KVObjectRawWriter = Callable[
+    [KVObjectRecord, memoryview],
+    tuple[Sequence[tuple[int, int, int]], float],
+]
+
 
 def _env_flag(name: str) -> bool:
     value = os.getenv(name, "")
     return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _select_rank_int(value: Any, rank_id: int) -> int:
+    """Return an integer config value, optionally selected by rank.
+
+    Args:
+        value: Either one integer-like value or a comma-separated/list value.
+        rank_id: Local rank used to select from multi-value configs.
+
+    Returns:
+        The selected integer.
+
+    Raises:
+        ValueError: If a rank-indexed value does not contain this rank.
+    """
+    if isinstance(value, (list, tuple)):
+        values = [int(item) for item in value]
+    else:
+        text = str(value)
+        if "," not in text:
+            return int(text)
+        values = [int(item.strip()) for item in text.split(",") if item.strip()]
+    if rank_id >= len(values):
+        raise ValueError(
+            f"rank {rank_id} requested from {len(values)} configured values"
+        )
+    return values[rank_id]
 
 
 # TODO(Jiayi): handle cases where cache is repetitvely prefetched.
@@ -176,6 +208,20 @@ class LocalDiskBackend(StorageBackendInterface):
         self.kv_object_metadata_store: Optional[KVObjectMetadataStore] = None
         self.kv_object_pool_io: Optional[KVObjectPoolIO] = None
         self.kv_object_store_lock = threading.Lock()
+        self.kv_object_tutti_raw_enabled = _env_flag(
+            "LMCACHE_KV_OBJECT_STORE_TUTTI_RAW_ENABLE"
+        )
+        rank_id = int(str(dst_device).removeprefix("cuda:") or "0")
+        self.kv_object_tutti_raw_base_lba = _select_rank_int(
+            os.getenv("LMCACHE_KV_OBJECT_STORE_TUTTI_RAW_BASE_LBA", "0"),
+            rank_id,
+        )
+        raw_region_path = os.getenv("LMCACHE_KV_OBJECT_STORE_TUTTI_RAW_REGION_PATH")
+        self.kv_object_tutti_raw_region_path: Optional[str] = (
+            str(raw_region_path) if raw_region_path else None
+        )
+        self.kv_object_tutti_raw_region_extents: list[tuple[int, int, int]] = []
+        self.kv_object_tutti_raw_writer: Optional[KVObjectRawWriter] = None
         if self.kv_object_store_enabled:
             slot_mb = int(os.getenv("LMCACHE_KV_OBJECT_STORE_SLOT_MB", "128"))
             capacity = int(os.getenv("LMCACHE_KV_OBJECT_STORE_CAPACITY", "2048"))
@@ -186,8 +232,50 @@ class LocalDiskBackend(StorageBackendInterface):
                 capacity = int(
                     config.extra_config.get("kv_object_store_capacity", capacity)
                 )
-            rank_id = str(dst_device).removeprefix("cuda:")
-            pool_id = f"rank{rank_id}-full"
+                self.kv_object_tutti_raw_enabled = bool(
+                    config.extra_config.get(
+                        "kv_object_store_tutti_raw_enable",
+                        self.kv_object_tutti_raw_enabled,
+                    )
+                )
+                self.kv_object_tutti_raw_base_lba = _select_rank_int(
+                    config.extra_config.get(
+                        "kv_object_store_tutti_raw_base_lba",
+                        self.kv_object_tutti_raw_base_lba,
+                    ),
+                    rank_id,
+                )
+                raw_region_config = config.extra_config.get(
+                    "kv_object_store_tutti_raw_region_path",
+                    self.kv_object_tutti_raw_region_path,
+                )
+                if raw_region_config:
+                    if isinstance(raw_region_config, (list, tuple)):
+                        if rank_id >= len(raw_region_config):
+                            raise ValueError(
+                                "rank requested beyond configured raw regions"
+                            )
+                        self.kv_object_tutti_raw_region_path = str(
+                            raw_region_config[rank_id]
+                        )
+                    else:
+                        raw_region_text = str(raw_region_config)
+                        if "," in raw_region_text:
+                            regions = [
+                                item.strip()
+                                for item in raw_region_text.split(",")
+                            ]
+                            if rank_id >= len(regions):
+                                raise ValueError(
+                                    "rank requested beyond configured raw regions"
+                                )
+                            per_rank = regions[rank_id]
+                            if per_rank:
+                                self.kv_object_tutti_raw_region_path = per_rank
+                        else:
+                            self.kv_object_tutti_raw_region_path = raw_region_text
+            rank_name = str(dst_device).removeprefix("cuda:")
+            pool_id = f"rank{rank_name}-full"
             pool_path = Path(self.path) / "_kv_object_store" / f"{pool_id}.pool"
             if pool_path.exists():
                 pool_path.unlink()
@@ -197,17 +285,26 @@ class LocalDiskBackend(StorageBackendInterface):
                 slot_bytes=slot_mb * 1024 * 1024,
                 capacity=capacity,
                 dense=True,
+                materialize_file=not self.kv_object_tutti_raw_enabled,
             )
             self.kv_object_metadata_store = KVObjectMetadataStore()
             self.kv_object_pool_io = KVObjectPoolIO({pool_id: pool_path})
             logger.info(
                 "KV object store enabled: pool_id=%s path=%s slot_mb=%d "
-                "capacity=%d",
+                "capacity=%d tutti_raw=%s raw_base_lba=%d",
                 pool_id,
                 pool_path,
                 slot_mb,
                 capacity,
+                self.kv_object_tutti_raw_enabled,
+                self.kv_object_tutti_raw_base_lba,
             )
+            if self.kv_object_tutti_raw_region_path:
+                logger.info(
+                    "KV object Tutti raw region path: pool_id=%s path=%s",
+                    pool_id,
+                    self.kv_object_tutti_raw_region_path,
+                )
 
         self.disk_worker = LocalDiskWorker(loop)
 
@@ -276,6 +373,120 @@ class LocalDiskBackend(StorageBackendInterface):
         return {
             self.kv_object_pool_layout.pool_id: self.kv_object_pool_layout.pool_path
         }
+
+    def set_kv_object_tutti_raw_writer(
+        self,
+        writer: Optional[KVObjectRawWriter],
+    ) -> None:
+        """Install the Tutti raw-object writer used after snvme bind.
+
+        Args:
+            writer: Callable that writes one allocated object record to raw
+                NVMe LBAs and returns raw extents plus elapsed write time.  Pass
+                ``None`` to disable raw writes and use the filesystem path.
+        """
+        self.kv_object_tutti_raw_writer = writer
+
+    def reset_kv_object_pool_allocation(self) -> None:
+        """Reset logical KV object allocation offsets for future writes."""
+        if self.kv_object_pool_layout is not None:
+            self.kv_object_pool_layout.reset_allocation()
+
+    def set_kv_object_tutti_raw_region_extents(
+        self,
+        raw_extents: Sequence[tuple[int, int, int]],
+    ) -> None:
+        """Install FIEMAP extents for the rank-local raw region file.
+
+        Args:
+            raw_extents: Sequence of ``(file_offset, slba, n_sectors)`` tuples
+                covering the reserved raw-region file.
+        """
+        self.kv_object_tutti_raw_region_extents = [
+            (int(file_offset), int(slba), int(n_sectors))
+            for file_offset, slba, n_sectors in raw_extents
+        ]
+
+    def map_kv_object_to_raw_region(
+        self,
+        record: KVObjectRecord,
+    ) -> list[tuple[int, int, int]]:
+        """Map an object record's logical pool range to raw-region extents.
+
+        Args:
+            record: Allocated object-store record.
+
+        Returns:
+            Raw extents covering ``record.offset`` through
+            ``record.offset + record.aligned_length``.
+
+        Raises:
+            RuntimeError: If the configured raw region does not cover the
+                record's logical byte range.
+        """
+        object_start = record.offset
+        object_end = record.offset + record.aligned_length
+        result: list[tuple[int, int, int]] = []
+        covered = 0
+        for file_offset, slba, n_sectors in self.kv_object_tutti_raw_region_extents:
+            extent_start = file_offset
+            extent_end = file_offset + n_sectors * 512
+            write_start = max(object_start, extent_start)
+            write_end = min(object_end, extent_end)
+            if write_start >= write_end:
+                continue
+            extent_skip = write_start - extent_start
+            write_nbytes = write_end - write_start
+            result.append(
+                (
+                    write_start,
+                    slba + extent_skip // 512,
+                    write_nbytes // 512,
+                )
+            )
+            covered += write_nbytes
+        if covered != record.aligned_length:
+            raise RuntimeError(
+                "KV object raw region does not cover object range "
+                f"{object_start}:{object_end}; covered={covered}"
+            )
+        return result
+
+    def kv_object_tutti_path(self, pool_id: str) -> str:
+        """Return the synthetic path used for raw Tutti object extents."""
+        return f"tutti://{pool_id}"
+
+    def kv_object_data_path(self, record: KVObjectRecord) -> Optional[str]:
+        """Return the path used to read one object record.
+
+        Raw Tutti records return a synthetic ``tutti://`` path.  File-backed
+        records return the dense pool file path.
+        """
+        if record.raw_extents:
+            return self.kv_object_tutti_path(record.pool_id)
+        pool_path = self.get_kv_object_pool_paths().get(record.pool_id)
+        return str(pool_path) if pool_path is not None else None
+
+    def get_kv_object_raw_lba_cache(
+        self,
+        records: Sequence[Optional[KVObjectRecord]],
+    ) -> dict[str, list[tuple[int, int, int]]]:
+        """Return raw Tutti extents grouped by synthetic object path.
+
+        Args:
+            records: Object records to expose to a Tutti loader.
+
+        Returns:
+            Mapping from synthetic path to ``(file_offset, slba, n_sectors)``
+            tuples.
+        """
+        result: dict[str, list[tuple[int, int, int]]] = {}
+        for record in records:
+            if record is None or not record.raw_extents:
+                continue
+            path = self.kv_object_tutti_path(record.pool_id)
+            result.setdefault(path, []).extend(record.raw_extents)
+        return result
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         with self.disk_lock:
@@ -710,9 +921,22 @@ class LocalDiskBackend(StorageBackendInterface):
         self.usage += size
         self.stats_monitor.update_local_storage_usage(self.usage)
 
+        raw_object_attempted = self.kv_object_store_enabled
+        raw_object_written = False
+        if raw_object_attempted:
+            raw_object_written = self._write_kv_object_store(key, buffer)
+
         # TODO(Jiayi): need to add ref count in disk memory object
-        self.write_file(buffer, path)
-        self._write_kv_object_store(key, buffer)
+        if not raw_object_written:
+            if not self.write_file(buffer, path):
+                memory_obj.ref_count_down()
+                self.disk_worker.remove_put_task(key)
+                logger.warning(
+                    "LocalDiskBackend store skipped metadata insert because "
+                    "filesystem write failed for %s",
+                    path,
+                )
+                return
 
         # ref count down here because there's a ref_count_up in
         # `submit_put_task` above.
@@ -832,18 +1056,30 @@ class LocalDiskBackend(StorageBackendInterface):
 
         return memory_obj
 
-    def _write_kv_object_store(self, key: CacheEngineKey, buffer: memoryview) -> None:
-        """Write a chunk-level object-store copy when enabled."""
+    def _write_kv_object_store(self, key: CacheEngineKey, buffer: memoryview) -> bool:
+        """Write a chunk-level object-store copy when enabled.
+
+        Returns:
+            True when the object store is the authoritative durable write and
+            the caller should skip the legacy ``.pt`` filesystem write.  False
+            means the caller still needs the normal filesystem write.
+        """
         if (
             not self.kv_object_store_enabled
             or self.kv_object_pool_layout is None
             or self.kv_object_metadata_store is None
-            or self.kv_object_pool_io is None
         ):
-            return
+            return False
 
         start = time.perf_counter()
         object_id = self._key_to_object_id(key)
+        raw_writer = (
+            self.kv_object_tutti_raw_writer
+            if self.kv_object_tutti_raw_enabled
+            else None
+        )
+        if self.kv_object_tutti_raw_enabled and raw_writer is None:
+            return False
         try:
             with self.kv_object_store_lock:
                 existing = self.kv_object_metadata_store.get(object_id)
@@ -864,24 +1100,37 @@ class LocalDiskBackend(StorageBackendInterface):
                             record.length,
                             len(buffer),
                         )
-                        return
-                write_ms = self.kv_object_pool_io.write_object(record, buffer)
-                self.kv_object_metadata_store.put(record.mark_ready())
+                        return False
+                if raw_writer is not None:
+                    raw_extents, write_ms = raw_writer(record, buffer)
+                    self.kv_object_metadata_store.put(
+                        record.with_raw_extents(raw_extents).mark_ready()
+                    )
+                    mode = "tutti_raw"
+                else:
+                    if self.kv_object_pool_io is None:
+                        return False
+                    write_ms = self.kv_object_pool_io.write_object(record, buffer)
+                    self.kv_object_metadata_store.put(record.mark_ready())
+                    mode = "pool_file"
             elapsed_ms = (time.perf_counter() - start) * 1000.0
             logger.info(
                 "KV_OBJECT_STORE_PROFILE op=write key=%s bytes=%d "
-                "write_ms=%.3f total_ms=%.3f",
+                "mode=%s write_ms=%.3f total_ms=%.3f",
                 key.to_string(),
                 len(buffer),
+                mode,
                 write_ms,
                 elapsed_ms,
             )
+            return True
         except Exception as exc:
             logger.warning(
                 "KV_OBJECT_STORE_PROFILE op=write key=%s status=failed error=%s",
                 key.to_string(),
                 exc,
             )
+            return False
 
     def scan_existing_entries(self, metadata: LMCacheMetadata) -> int:
         """Scan the disk cache directory and register pre-existing ``.pt`` files.
@@ -967,7 +1216,16 @@ class LocalDiskBackend(StorageBackendInterface):
         )
         return n_recovered
 
-    def write_file(self, buffer, path):
+    def write_file(self, buffer: memoryview, path: str) -> bool:
+        """Write a serialized KV chunk to a filesystem path.
+
+        Args:
+            buffer: Serialized KV bytes.
+            path: Destination path.
+
+        Returns:
+            True if the write completed, False otherwise.
+        """
         start_time = time.time()
         size = len(buffer)
         try:
@@ -987,12 +1245,13 @@ class LocalDiskBackend(StorageBackendInterface):
                 path,
                 exc,
             )
-            return
+            return False
         disk_write_time = time.time() - start_time
         logger.debug(
             f"Disk write size: {size} bytes, "
             f"Bandwidth: {size / disk_write_time / 1e6:.2f} MB/s"
         )
+        return True
 
     def read_file(self, key, buffer, path):
         start_time = time.time()

@@ -34,6 +34,7 @@ class KVObjectPoolLayout:
         capacity: int,
         alignment: int = 4096,
         dense: bool = False,
+        materialize_file: bool = True,
     ) -> None:
         """Create a fixed-slot pool layout.
 
@@ -46,6 +47,9 @@ class KVObjectPoolLayout:
             dense: When true, allocate objects back-to-back by aligned object
                 length instead of fixed slot stride. This is the preferred mode
                 for Tutti FIEMAP because it avoids sparse holes.
+            materialize_file: When false, allocation only assigns logical pool
+                offsets and never creates or truncates the pool file.  Tutti
+                raw-object cold store uses this mode after snvme bind.
 
         Raises:
             ValueError: If sizing arguments are invalid.
@@ -66,12 +70,15 @@ class KVObjectPoolLayout:
         self.alignment = alignment
         self.aligned_slot_bytes = self.align_length(slot_bytes)
         self.dense = dense
+        self.materialize_file = materialize_file
         self._next_slot = 0
         self._next_offset = 0
         self._lock = threading.Lock()
 
     def ensure_file(self) -> None:
         """Create or resize the sparse pool file to the required capacity."""
+        if not self.materialize_file:
+            return
         self.pool_path.parent.mkdir(parents=True, exist_ok=True)
         with self.pool_path.open("ab"):
             pass
@@ -122,13 +129,11 @@ class KVObjectPoolLayout:
             if self.dense:
                 offset = self._next_offset
                 self._next_offset += aligned_length
+                if self.materialize_file:
+                    with self.pool_path.open("r+b") as pool_file:
+                        pool_file.truncate(self._next_offset)
             else:
                 offset = slot * self.aligned_slot_bytes
-        if self.dense:
-            with self.pool_path.open("r+b") as pool_file:
-                pool_file.truncate(self._next_offset)
-        else:
-            offset = slot * self.aligned_slot_bytes
         return KVObjectRecord(
             object_id=object_id,
             pool_id=self.pool_id,
@@ -138,6 +143,17 @@ class KVObjectPoolLayout:
             shape=shape,
             dtype=dtype,
         )
+
+    def reset_allocation(self) -> None:
+        """Reset future allocations to the beginning of this pool.
+
+        This is used by Tutti raw-object mode after the loader is initialised:
+        warmup stores may have skipped raw writes before snvme bind, so their
+        failed object attempts should not consume raw-region address space.
+        """
+        with self._lock:
+            self._next_slot = 0
+            self._next_offset = 0
 
     def pool_size_bytes(self) -> int:
         """Return the required pool file size in bytes."""

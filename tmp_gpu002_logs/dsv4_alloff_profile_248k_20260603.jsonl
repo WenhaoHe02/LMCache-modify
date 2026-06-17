@@ -1,0 +1,4 @@
+{"event": "start", "mode": "all_off_profile", "prompt_chars": 1171259, "out": "/tmp/dsv4_alloff_profile_248k_20260603.jsonl", "ts": 1780416567.876852}
+{"label": "alloff_profile_248k_hit_1", "elapsed_s": 33.21439975802787, "usage": {"prompt_tokens": 248462, "total_tokens": 248463, "completion_tokens": 1, "prompt_tokens_details": null}, "text": "What", "ts": 1780416601.0938306}
+{"label": "alloff_profile_248k_hit_2", "elapsed_s": 2.6072734439512715, "usage": {"prompt_tokens": 248462, "total_tokens": 248463, "completion_tokens": 1, "prompt_tokens_details": null}, "text": "What", "ts": 1780416623.7253368}
+{"event": "done", "out": "/tmp/dsv4_alloff_profile_248k_20260603.jsonl", "ts": 1780416623.7254972}
