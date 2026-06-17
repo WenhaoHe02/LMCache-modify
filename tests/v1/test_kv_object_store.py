@@ -7,11 +7,13 @@ import pytest
 
 # First Party
 from lmcache.v1.kv_object_store import (
+    KVObjectByteRange,
     KVObjectId,
     KVObjectMetadataStore,
-    KVObjectPoolIO,
     KVObjectPoolFullError,
+    KVObjectPoolIO,
     KVObjectPoolLayout,
+    KVObjectRecord,
     KVObjectState,
 )
 
@@ -89,7 +91,7 @@ def test_pool_layout_dense_allocates_by_object_length(tmp_path: Path) -> None:
             model_id="model",
             parallel_config_id="tp8",
             rank=3,
-            layer_id=-1,
+            layer_id=0,
             role="full",
             block_id="7",
         ),
@@ -102,7 +104,7 @@ def test_pool_layout_dense_allocates_by_object_length(tmp_path: Path) -> None:
             model_id="model",
             parallel_config_id="tp8",
             rank=3,
-            layer_id=-1,
+            layer_id=0,
             role="full",
             block_id="8",
         ),
@@ -265,3 +267,115 @@ def test_pool_io_rejects_payload_length_mismatch(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="payload length"):
         pool_io.write_object(record, b"short")
+
+
+def test_byte_range_round_trips() -> None:
+    byte_range = KVObjectByteRange(offset=128, length=64, target_offset=32)
+    restored = KVObjectByteRange.from_dict(byte_range.to_dict())
+
+    assert restored == byte_range
+
+
+def test_record_read_ranges_and_json_round_trips() -> None:
+    object_id = KVObjectId(
+        model_id="model",
+        parallel_config_id="tp8",
+        rank=0,
+        layer_id=3,
+        role="csa_attention_kv",
+        block_id="abc",
+    )
+    record = KVObjectRecord(
+        object_id=object_id,
+        pool_id="rank0-csa",
+        offset=256,
+        length=192,
+        aligned_length=192,
+        shape=(192,),
+        dtype="torch.uint8",
+        state=KVObjectState.READY,
+        byte_ranges=(
+            KVObjectByteRange(offset=256, length=64, target_offset=0),
+            KVObjectByteRange(offset=320, length=128, target_offset=64),
+        ),
+    )
+
+    restored = KVObjectRecord.from_dict(record.to_dict())
+
+    assert restored == record
+    assert len(record.read_ranges) == 2
+
+
+def test_record_rejects_gapped_read_ranges() -> None:
+    object_id = KVObjectId(
+        model_id="model",
+        parallel_config_id="tp8",
+        rank=0,
+        layer_id=3,
+        role="csa_attention_kv",
+        block_id="abc",
+    )
+
+    with pytest.raises(ValueError, match="exactly cover"):
+        KVObjectRecord(
+            object_id=object_id,
+            pool_id="rank0-csa",
+            offset=256,
+            length=192,
+            aligned_length=192,
+            shape=(192,),
+            dtype="torch.uint8",
+            state=KVObjectState.READY,
+            byte_ranges=(
+                KVObjectByteRange(offset=256, length=64, target_offset=0),
+                KVObjectByteRange(offset=320, length=64, target_offset=128),
+            ),
+        )
+
+
+def test_pool_io_reads_multi_range_records(tmp_path: Path) -> None:
+    layout = KVObjectPoolLayout(
+        pool_id="rank0-csa",
+        pool_path=tmp_path / "rank0_csa.pool",
+        slot_bytes=4096,
+        capacity=1,
+        dense=True,
+    )
+    record = (
+        layout.allocate(
+            KVObjectId(
+                model_id="model",
+                parallel_config_id="tp8",
+                rank=0,
+                layer_id=3,
+                role="csa_attention_kv",
+                block_id="abc",
+            ),
+            length=192,
+            shape=(192,),
+            dtype="torch.uint8",
+        )
+        .with_byte_ranges(
+            [
+                KVObjectByteRange(offset=0, length=64, target_offset=0),
+                KVObjectByteRange(offset=128, length=64, target_offset=64),
+                KVObjectByteRange(offset=256, length=64, target_offset=128),
+            ]
+        )
+        .mark_ready()
+    )
+
+    with layout.pool_path.open("wb") as handle:
+        handle.write(bytes(range(64)))
+        handle.write(bytes(64))
+        handle.write(bytes(range(64, 128)))
+        handle.write(bytes(64))
+        handle.write(bytes(range(128, 192)))
+
+    pool_io = KVObjectPoolIO({"rank0-csa": layout.pool_path})
+    batch = pool_io.read_many([record])
+
+    assert batch.bytes_read == 192
+    assert batch.payloads[0][:4] == bytes(range(4))
+    assert batch.payloads[0][64:68] == bytes(range(64, 68))
+    assert batch.payloads[0][128:132] == bytes(range(128, 132))

@@ -8,7 +8,11 @@ from lmcache.v1.kv_object_store.pool_layout import (
     KVObjectPoolFullError,
     KVObjectPoolLayout,
 )
-from lmcache.v1.kv_object_store.record import KVObjectRecord, KVObjectState
+from lmcache.v1.kv_object_store.record import (
+    KVObjectByteRange,
+    KVObjectRecord,
+    KVObjectState,
+)
 
 __all__ = [
     "KVObjectId",
@@ -17,6 +21,7 @@ __all__ = [
     "KVObjectPoolFullError",
     "KVObjectPoolLayout",
     "KVObjectReadBatch",
+    "KVObjectByteRange",
     "KVObjectRecord",
     "KVObjectState",
 ]

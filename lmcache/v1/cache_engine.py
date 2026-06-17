@@ -47,6 +47,7 @@ from lmcache.v1.event_manager import EventManager, EventStatus, EventType
 from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
 from lmcache.v1.gpu_connector.tutti_direct_loader import TuttiDirectLoader
 from lmcache.v1.gpu_connector.utils import assert_layerwise_gpu_connector
+from lmcache.v1.kv_object_store import KVObjectByteRange
 from lmcache.v1.memory_management import CuFileMemoryAllocator  # noqa: E501
 from lmcache.v1.memory_management import (  # noqa: E501
     MemoryAllocatorInterface,
@@ -1011,6 +1012,9 @@ class LMCacheEngine:
 
         disk_metas: List[Optional[DiskCacheMetadata]] = []
         tutti_file_offsets: Optional[List[int]] = None
+        tutti_read_ranges: Optional[
+            List[Optional[Tuple[KVObjectByteRange, ...]]]
+        ] = None
         metadata_start = time.perf_counter()
         with disk_backend.disk_lock:
             for key in keys:
@@ -1024,7 +1028,7 @@ class LMCacheEngine:
         if all(record is not None for record in kv_object_records):
             object_metas: List[Optional[DiskCacheMetadata]] = []
             object_offsets: List[int] = []
-            raw_lba_cache: dict[str, list[LbaRecord]] = {}
+            object_read_ranges: List[Optional[Tuple[KVObjectByteRange, ...]]] = []
             for original_meta, record in zip(
                 disk_metas,
                 kv_object_records,
@@ -1036,17 +1040,6 @@ class LMCacheEngine:
                 if object_path is None:
                     object_metas = []
                     break
-                if record.raw_extents:
-                    raw_lba_cache.setdefault(object_path, []).extend(
-                        [
-                            LbaRecord(
-                                file_offset=file_offset,
-                                slba=slba,
-                                n_sectors=n_sectors,
-                            )
-                            for file_offset, slba, n_sectors in record.raw_extents
-                        ]
-                    )
                 object_metas.append(
                     DiskCacheMetadata(
                         path=object_path,
@@ -1061,17 +1054,37 @@ class LMCacheEngine:
                     )
                 )
                 object_offsets.append(record.offset)
+                object_read_ranges.append(record.read_ranges)
             if object_metas:
+                raw_lba_cache = {
+                    path: [
+                        LbaRecord(
+                            file_offset=file_offset,
+                            slba=slba,
+                            n_sectors=n_sectors,
+                        )
+                        for file_offset, slba, n_sectors in raw_extents
+                    ]
+                    for path, raw_extents in disk_backend.get_kv_object_raw_lba_cache(
+                        kv_object_records,
+                    ).items()
+                }
                 if raw_lba_cache:
                     self._tutti_loader.register_lba_cache(raw_lba_cache)
                 disk_metas = object_metas
                 tutti_file_offsets = object_offsets
+                tutti_read_ranges = object_read_ranges
                 logger.info(
                     "TUTTI_OBJECT_STORE_PROFILE op=select keys=%d pools=%d "
-                    "raw_paths=%d",
+                    "raw_paths=%d ranges=%d",
                     len(keys),
                     len({meta.path for meta in object_metas if meta is not None}),
                     len(raw_lba_cache),
+                    sum(
+                        len(read_ranges)
+                        for read_ranges in object_read_ranges
+                        if read_ranges is not None
+                    ),
                 )
 
         # Recovered on-disk entries only have filename-level metadata.  Keep
@@ -1094,6 +1107,7 @@ class LMCacheEngine:
                 disk_metas,  # type: ignore[arg-type]
                 shapes_per_key=shapes_per_key,
                 file_offsets=tutti_file_offsets,
+                read_ranges_per_key=tutti_read_ranges,
             )
         except Exception:
             logger.exception(

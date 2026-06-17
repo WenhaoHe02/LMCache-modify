@@ -19,11 +19,13 @@ from lmcache.utils import CacheEngineKey, DiskCacheMetadata, _lmcache_nvtx_annot
 from lmcache.v1.cache_controller.message import OpType
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.kv_object_store import (
+    KVObjectByteRange,
     KVObjectId,
     KVObjectMetadataStore,
     KVObjectPoolIO,
     KVObjectPoolLayout,
     KVObjectRecord,
+    KVObjectState,
 )
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
 from lmcache.v1.metadata import LMCacheMetadata
@@ -319,6 +321,7 @@ class LocalDiskBackend(StorageBackendInterface):
         self.keys_in_request: List[CacheEngineKey] = []
 
         self.lmcache_worker = lmcache_worker
+        self.metadata = metadata
         self.instance_id = config.lmcache_instance_id
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
         self.usage = 0
@@ -346,24 +349,55 @@ class LocalDiskBackend(StorageBackendInterface):
     ) -> str:
         return os.path.join(self.path, key.to_string().replace("/", "-") + ".pt")
 
-    def _key_to_object_id(self, key: CacheEngineKey) -> KVObjectId:
+    def _key_to_object_id(
+        self,
+        key: CacheEngineKey,
+        *,
+        layer_id: int = 0,
+        role: str = "full",
+    ) -> KVObjectId:
         return KVObjectId(
             model_id=key.model_name,
             parallel_config_id=f"world{key.world_size}",
             rank=key.worker_id,
-            layer_id=0,
-            role="full",
+            layer_id=layer_id,
+            role=role,
             block_id=key.chunk_hash_hex,
         )
 
     def get_kv_object_records(
         self,
         keys: Sequence[CacheEngineKey],
+        *,
+        layer_ids: Optional[Sequence[int]] = None,
+        roles: Optional[Sequence[str]] = None,
     ) -> list[Optional[KVObjectRecord]]:
-        """Return READY KV object records for cache keys in request order."""
+        """Return READY KV object records for cache keys in request order.
+
+        Args:
+            keys: Cache keys to look up.
+            layer_ids: Optional per-key transformer layer ids.  Omit to use
+                the legacy chunk-level object id.
+            roles: Optional per-key object roles, such as ``csa_attention_kv``
+                or ``hca_attention_kv``.  Omit to use ``full``.
+
+        Returns:
+            One metadata record per key, with ``None`` for misses.
+        """
         if not self.kv_object_store_enabled or self.kv_object_metadata_store is None:
             return [None] * len(keys)
-        object_ids = [self._key_to_object_id(key) for key in keys]
+        if layer_ids is not None and len(layer_ids) != len(keys):
+            raise ValueError("layer_ids and keys must have the same length")
+        if roles is not None and len(roles) != len(keys):
+            raise ValueError("roles and keys must have the same length")
+        object_ids = [
+            self._key_to_object_id(
+                key,
+                layer_id=layer_ids[index] if layer_ids is not None else 0,
+                role=roles[index] if roles is not None else "full",
+            )
+            for index, key in enumerate(keys)
+        ]
         return self.kv_object_metadata_store.get_many(object_ids, ready_only=True)
 
     def get_kv_object_pool_paths(self) -> dict[str, Path]:
@@ -485,8 +519,225 @@ class LocalDiskBackend(StorageBackendInterface):
             if record is None or not record.raw_extents:
                 continue
             path = self.kv_object_tutti_path(record.pool_id)
-            result.setdefault(path, []).extend(record.raw_extents)
+            result.setdefault(path, []).extend(self._raw_extents_for_record(record))
         return result
+
+    def _raw_extents_for_record(
+        self,
+        record: KVObjectRecord,
+    ) -> list[tuple[int, int, int]]:
+        """Return raw extents covering the record's logical read ranges."""
+        extents: list[tuple[int, int, int]] = []
+        for byte_range in record.read_ranges:
+            if byte_range.offset % 512 != 0 or byte_range.length % 512 != 0:
+                logger.warning(
+                    "KV object raw range is not 512-byte aligned: "
+                    "object=%s offset=%d length=%d",
+                    record.object_id.to_key(),
+                    byte_range.offset,
+                    byte_range.length,
+                )
+                continue
+            range_start = byte_range.offset
+            range_end = range_start + byte_range.length
+            for file_offset, slba, n_sectors in record.raw_extents:
+                extent_start = file_offset
+                extent_end = file_offset + n_sectors * 512
+                read_start = max(range_start, extent_start)
+                read_end = min(range_end, extent_end)
+                if read_start >= read_end:
+                    continue
+                extent_skip = read_start - extent_start
+                read_nbytes = read_end - read_start
+                if extent_skip % 512 != 0 or read_nbytes % 512 != 0:
+                    logger.warning(
+                        "KV object raw extent overlap is not 512-byte aligned: "
+                        "object=%s read_start=%d read_nbytes=%d",
+                        record.object_id.to_key(),
+                        read_start,
+                        read_nbytes,
+                    )
+                    continue
+                extents.append(
+                    (
+                        read_start,
+                        slba + extent_skip // 512,
+                        read_nbytes // 512,
+                    )
+                )
+        return extents
+
+    def _index_kv_object_layer_views(
+        self,
+        key: CacheEngineKey,
+        full_record: KVObjectRecord,
+        memory_obj: MemoryObj,
+    ) -> int:
+        """Register per-layer/per-role logical views for one stored chunk."""
+        if self.kv_object_metadata_store is None:
+            return 0
+        shapes = memory_obj.metadata.shapes
+        dtypes = memory_obj.metadata.dtypes
+        if shapes is None or dtypes is None or len(shapes) != len(dtypes):
+            return 0
+
+        group_ranges = self._object_group_ranges(memory_obj, full_record)
+        if not group_ranges:
+            return 0
+
+        layer_views = self._object_layer_view_specs(memory_obj, group_ranges)
+        indexed = 0
+        for layer_id, role, byte_ranges in layer_views:
+            view_object_id = self._key_to_object_id(
+                key,
+                layer_id=layer_id,
+                role=role,
+            )
+            view_length = sum(byte_range.length for byte_range in byte_ranges)
+            view_record = KVObjectRecord(
+                object_id=view_object_id,
+                pool_id=full_record.pool_id,
+                offset=byte_ranges[0].offset,
+                length=view_length,
+                aligned_length=view_length,
+                shape=(view_length,),
+                dtype="torch.uint8",
+                state=KVObjectState.READY,
+                raw_extents=full_record.raw_extents,
+                byte_ranges=tuple(byte_ranges),
+            )
+            self.kv_object_metadata_store.put(view_record)
+            indexed += 1
+        return indexed
+
+    def _object_group_ranges(
+        self,
+        memory_obj: MemoryObj,
+        full_record: KVObjectRecord,
+    ) -> list[tuple[int, KVObjectByteRange]]:
+        """Derive per-group byte ranges for one stored chunk."""
+        shapes = memory_obj.metadata.shapes
+        dtypes = memory_obj.metadata.dtypes
+        if shapes is None or dtypes is None or len(shapes) != len(dtypes):
+            return []
+        ranges: list[tuple[int, KVObjectByteRange]] = []
+        target_offset = 0
+        current_offset = full_record.offset
+        for group_idx, (shape, dtype) in enumerate(zip(shapes, dtypes, strict=True)):
+            group_nbytes = shape.numel() * dtype.itemsize
+            if group_nbytes > 0:
+                ranges.append(
+                    (
+                        group_idx,
+                        KVObjectByteRange(
+                            offset=current_offset,
+                            length=group_nbytes,
+                            target_offset=target_offset,
+                        ),
+                    )
+                )
+            current_offset += group_nbytes
+            target_offset += group_nbytes
+        return ranges
+
+    def _object_layer_view_specs(
+        self,
+        memory_obj: MemoryObj,
+        group_ranges: Sequence[tuple[int, KVObjectByteRange]],
+    ) -> list[tuple[int, str, list[KVObjectByteRange]]]:
+        """Return ``(layer_id, role, byte_ranges)`` specs for object views."""
+        klg_manager = (
+            self.metadata.kv_layer_groups_manager if self.metadata is not None else None
+        )
+        if klg_manager is None or not klg_manager.kv_layer_groups:
+            return []
+        dtypes = memory_obj.metadata.dtypes or []
+        shapes = memory_obj.metadata.shapes or []
+        specs: list[tuple[int, str, list[KVObjectByteRange]]] = []
+        for group_idx, group_range in group_ranges:
+            if group_idx >= len(klg_manager.kv_layer_groups):
+                continue
+            group = klg_manager.kv_layer_groups[group_idx]
+            dtype = dtypes[group_idx] if group_idx < len(dtypes) else group.dtype
+            shape = shapes[group_idx] if group_idx < len(shapes) else None
+            role = self._kv_group_role(group, dtype)
+            per_layer_ranges = self._split_group_range_by_layer(
+                group,
+                group_range,
+                shape=shape,
+            )
+            for layer_id, byte_ranges in zip(
+                group.layer_indices,
+                per_layer_ranges,
+                strict=False,
+            ):
+                specs.append((int(layer_id), role, byte_ranges))
+        return specs
+
+    def _split_group_range_by_layer(
+        self,
+        group: Any,
+        group_range: KVObjectByteRange,
+        *,
+        shape: Optional[torch.Size],
+    ) -> list[list[KVObjectByteRange]]:
+        """Split a group byte range into per-layer logical payload ranges."""
+        if shape is not None and len(shape) >= 4:
+            kv_size = int(shape[0])
+            num_layers = int(shape[1])
+            rows = int(shape[2])
+            hidden_dim = int(shape[3])
+        else:
+            kv_size = int(group.shape_desc.kv_size)
+            num_layers = int(group.num_layers)
+            rows = int(group.physical_chunk_size or group.shape_desc.bs)
+            hidden_dim = int(group.hidden_dim_size)
+        element_size = int(group.dtype.itemsize)
+        if kv_size <= 0 or num_layers <= 0 or rows <= 0 or hidden_dim <= 0:
+            return []
+        layer_plane_bytes = rows * hidden_dim * element_size
+        kv_plane_bytes = num_layers * layer_plane_bytes
+        per_layer: list[list[KVObjectByteRange]] = []
+        for layer_idx in range(num_layers):
+            ranges: list[KVObjectByteRange] = []
+            target_offset = 0
+            for kv_idx in range(kv_size):
+                offset = (
+                    group_range.offset
+                    + kv_idx * kv_plane_bytes
+                    + layer_idx * layer_plane_bytes
+                )
+                ranges.append(
+                    KVObjectByteRange(
+                        offset=offset,
+                        length=layer_plane_bytes,
+                        target_offset=target_offset,
+                    )
+                )
+                target_offset += layer_plane_bytes
+            per_layer.append(ranges)
+        return per_layer
+
+    @staticmethod
+    def _kv_group_role(group: Any, dtype: torch.dtype) -> str:
+        """Return a role label for one KV layer group."""
+        hidden_dim = int(group.hidden_dim_size)
+        compress_ratio = int(group.compress_ratio)
+        if dtype == torch.float32:
+            return "compressor_state"
+        if dtype != torch.uint8:
+            return "kv"
+        if hidden_dim == 132:
+            return "csa_indexer_cache"
+        if hidden_dim != 584:
+            return "kv"
+        if compress_ratio == 1:
+            return "swa_cache"
+        if compress_ratio >= 64 or int(group.shape_desc.bs) <= 2:
+            return "hca_attention_kv"
+        if compress_ratio == 4 or int(group.num_layers) == 30:
+            return "csa_attention_kv"
+        return "kv"
 
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         with self.disk_lock:
@@ -924,7 +1175,11 @@ class LocalDiskBackend(StorageBackendInterface):
         raw_object_attempted = self.kv_object_store_enabled
         raw_object_written = False
         if raw_object_attempted:
-            raw_object_written = self._write_kv_object_store(key, buffer)
+            raw_object_written = self._write_kv_object_store(
+                key,
+                buffer,
+                memory_obj=memory_obj,
+            )
 
         # TODO(Jiayi): need to add ref count in disk memory object
         if not raw_object_written:
@@ -1056,7 +1311,13 @@ class LocalDiskBackend(StorageBackendInterface):
 
         return memory_obj
 
-    def _write_kv_object_store(self, key: CacheEngineKey, buffer: memoryview) -> bool:
+    def _write_kv_object_store(
+        self,
+        key: CacheEngineKey,
+        buffer: memoryview,
+        *,
+        memory_obj: MemoryObj,
+    ) -> bool:
         """Write a chunk-level object-store copy when enabled.
 
         Returns:
@@ -1103,24 +1364,30 @@ class LocalDiskBackend(StorageBackendInterface):
                         return False
                 if raw_writer is not None:
                     raw_extents, write_ms = raw_writer(record, buffer)
-                    self.kv_object_metadata_store.put(
-                        record.with_raw_extents(raw_extents).mark_ready()
-                    )
+                    ready_record = record.with_raw_extents(raw_extents).mark_ready()
+                    self.kv_object_metadata_store.put(ready_record)
                     mode = "tutti_raw"
                 else:
                     if self.kv_object_pool_io is None:
                         return False
                     write_ms = self.kv_object_pool_io.write_object(record, buffer)
-                    self.kv_object_metadata_store.put(record.mark_ready())
+                    ready_record = record.mark_ready()
+                    self.kv_object_metadata_store.put(ready_record)
                     mode = "pool_file"
+                indexed_views = self._index_kv_object_layer_views(
+                    key,
+                    ready_record,
+                    memory_obj,
+                )
             elapsed_ms = (time.perf_counter() - start) * 1000.0
             logger.info(
                 "KV_OBJECT_STORE_PROFILE op=write key=%s bytes=%d "
-                "mode=%s write_ms=%.3f total_ms=%.3f",
+                "mode=%s write_ms=%.3f views=%d total_ms=%.3f",
                 key.to_string(),
                 len(buffer),
                 mode,
                 write_ms,
+                indexed_views,
                 elapsed_ms,
             )
             return True

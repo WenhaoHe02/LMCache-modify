@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 import asyncio
 import os
@@ -14,7 +16,12 @@ import torch
 from lmcache.utils import CacheEngineKey, DiskCacheMetadata
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import _parse_local_disk
-from lmcache.v1.memory_management import MemoryFormat, MemoryObj
+from lmcache.v1.kv_layer_groups import KVLayerGroupInfo
+from lmcache.v1.memory_management import (
+    AdHocMemoryAllocator,
+    MemoryFormat,
+    MemoryObj,
+)
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
@@ -67,6 +74,54 @@ def create_test_metadata():
         kv_dtype=torch.bfloat16,
         kv_shape=(28, 2, 256, 8, 128),
     )
+
+
+def _make_shape_desc(
+    *,
+    kv_size: int,
+    nl: int,
+    nb: int,
+    bs: int,
+    nh: int,
+    hs: int,
+    dtype: torch.dtype,
+) -> Any:
+    """Build a PageBufferShapeDesc for object-store indexing tests."""
+    return SimpleNamespace(
+        kv_size=kv_size,
+        nl=nl,
+        nb=nb,
+        bs=bs,
+        nh=nh,
+        hs=hs,
+        element_size=dtype.itemsize,
+        block_stride_elems=0,
+    )
+
+
+def create_object_store_metadata() -> LMCacheMetadata:
+    """Create metadata with a CSA layer group."""
+    metadata = create_test_metadata()
+    csa_group = KVLayerGroupInfo(
+        layer_indices=[0, 1],
+        shape_desc=_make_shape_desc(
+            kv_size=2,
+            nl=2,
+            nb=1,
+            bs=512,
+            nh=1,
+            hs=584,
+            dtype=torch.uint8,
+        ),
+        dtype=torch.uint8,
+        compress_ratio=4,
+        physical_chunk_size=512,
+    )
+    metadata.kv_layer_groups_manager = SimpleNamespace(
+        kv_layer_groups=[csa_group],
+        num_groups=1,
+    )
+    return metadata
 
 
 def create_test_key(key_id: int = 0) -> CacheEngineKey:
@@ -195,6 +250,147 @@ class TestLocalDiskBackend:
         assert result is None
 
         local_disk_backend.local_cpu_backend.memory_allocator.close()
+
+
+class TestKVObjectStoreLocalDiskBackend:
+    """Tests for LocalDiskBackend KV object-store control-plane metadata."""
+
+    def _create_object_store_backend(
+        self,
+        temp_disk_path: str,
+        async_loop: asyncio.AbstractEventLoop,
+        local_cpu_backend: LocalCPUBackend,
+    ) -> LocalDiskBackend:
+        """Create a LocalDiskBackend with the KV object store enabled."""
+        config = create_test_config(temp_disk_path)
+        config.extra_config = {
+            "kv_object_store_enable": True,
+            "kv_object_store_slot_mb": 2,
+            "kv_object_store_capacity": 4,
+        }
+        return LocalDiskBackend(
+            config=config,
+            loop=async_loop,
+            local_cpu_backend=local_cpu_backend,
+            dst_device="cuda:0",
+            metadata=create_object_store_metadata(),
+        )
+
+    def _allocate_object_store_memory(self) -> MemoryObj:
+        """Allocate one CSA memory object."""
+        allocator = AdHocMemoryAllocator(device="cpu")
+        memory_obj = allocator.allocate(
+            [torch.Size([2, 2, 512, 584])],
+            [torch.uint8],
+            fmt=MemoryFormat.KV_2LTD,
+        )
+        assert memory_obj is not None
+        assert memory_obj.raw_tensor is not None
+        memory_obj.raw_tensor.fill_(7)
+        return memory_obj
+
+    def test_write_indexes_layer_role_views(
+        self,
+        temp_disk_path: str,
+        async_loop: asyncio.AbstractEventLoop,
+        local_cpu_backend: LocalCPUBackend,
+    ) -> None:
+        """Writing a full object also indexes CSA per-layer views."""
+        backend = self._create_object_store_backend(
+            temp_disk_path,
+            async_loop,
+            local_cpu_backend,
+        )
+        key = create_test_key(201)
+        memory_obj = self._allocate_object_store_memory()
+
+        backend.async_save_bytes_to_disk(
+            key,
+            memory_obj,
+        )
+
+        full_record = backend.get_kv_object_records([key])[0]
+        csa0, csa1 = backend.get_kv_object_records(
+            [key, key],
+            layer_ids=[0, 1],
+            roles=[
+                "csa_attention_kv",
+                "csa_attention_kv",
+            ],
+        )
+        assert full_record is not None
+        assert csa0 is not None
+        assert csa1 is not None
+        assert csa0.length == 2 * 512 * 584
+        assert csa1.length == 2 * 512 * 584
+        assert [byte_range.offset for byte_range in csa0.read_ranges] == [
+            full_record.offset,
+            full_record.offset + 2 * 512 * 584,
+        ]
+        assert [byte_range.offset for byte_range in csa1.read_ranges] == [
+            full_record.offset + 512 * 584,
+            full_record.offset + 3 * 512 * 584,
+        ]
+
+        backend.local_cpu_backend.memory_allocator.close()
+
+    def test_raw_lba_cache_is_sliced_to_view_ranges(
+        self,
+        temp_disk_path: str,
+        async_loop: asyncio.AbstractEventLoop,
+        local_cpu_backend: LocalCPUBackend,
+    ) -> None:
+        """Raw Tutti LBA registration follows explicit object view ranges."""
+        backend = self._create_object_store_backend(
+            temp_disk_path,
+            async_loop,
+            local_cpu_backend,
+        )
+        key = create_test_key(202)
+        memory_obj = self._allocate_object_store_memory()
+        backend.set_kv_object_tutti_raw_writer(
+            lambda record, _buffer: (
+                [
+                    (
+                        record.offset,
+                        1000 + record.offset // 512,
+                        record.aligned_length // 512,
+                    )
+                ],
+                0.0,
+            )
+        )
+        backend.kv_object_tutti_raw_enabled = True
+
+        backend.async_save_bytes_to_disk(
+            key,
+            memory_obj,
+        )
+        csa0 = backend.get_kv_object_records(
+            [key],
+            layer_ids=[0],
+            roles=["csa_attention_kv"],
+        )[0]
+        csa1 = backend.get_kv_object_records(
+            [key],
+            layer_ids=[1],
+            roles=["csa_attention_kv"],
+        )[0]
+        assert csa0 is not None
+        assert csa1 is not None
+
+        raw_lba_cache = backend.get_kv_object_raw_lba_cache([csa0, csa1])
+
+        assert raw_lba_cache == {
+            backend.kv_object_tutti_path(csa0.pool_id): [
+                (0, 1000, 584),
+                (598016, 2168, 584),
+                (299008, 1584, 584),
+                (897024, 2752, 584),
+            ]
+        }
+
+        backend.local_cpu_backend.memory_allocator.close()
 
 
 class TestMultiPathDiskBackend:

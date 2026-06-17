@@ -20,6 +20,55 @@ class KVObjectState(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class KVObjectByteRange:
+    """One byte range backing a logical KV object.
+
+    Args:
+        offset: Byte offset inside the pool or raw-region namespace.
+        length: Number of payload bytes in this range.
+        target_offset: Byte offset inside the logical object payload where this
+            range should be placed.
+    """
+
+    offset: int
+    length: int
+    target_offset: int = 0
+
+    def __post_init__(self) -> None:
+        """Validate range bounds."""
+        if self.offset < 0:
+            raise ValueError("offset must be non-negative")
+        if self.length <= 0:
+            raise ValueError("length must be positive")
+        if self.target_offset < 0:
+            raise ValueError("target_offset must be non-negative")
+
+    def to_dict(self) -> dict[str, int]:
+        """Return a JSON-compatible representation."""
+        return {
+            "offset": self.offset,
+            "length": self.length,
+            "target_offset": self.target_offset,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "KVObjectByteRange":
+        """Build a byte range from a JSON-compatible dictionary.
+
+        Args:
+            value: Dictionary produced by :meth:`to_dict`.
+
+        Returns:
+            The reconstructed byte range.
+        """
+        return cls(
+            offset=int(value["offset"]),
+            length=int(value["length"]),
+            target_offset=int(value.get("target_offset", 0)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class KVObjectRecord:
     """Location and tensor metadata for one KV object.
 
@@ -35,6 +84,8 @@ class KVObjectRecord:
         raw_extents: Optional raw LBA extents represented as
             ``(file_offset, slba, n_sectors)`` tuples.  These are used by
             Tutti raw-object storage after the filesystem has been unmounted.
+        byte_ranges: Optional byte ranges backing this logical object.  Empty
+            means the object is stored as one contiguous range at ``offset``.
     """
 
     object_id: KVObjectId
@@ -46,6 +97,7 @@ class KVObjectRecord:
     dtype: str
     state: KVObjectState = KVObjectState.ALLOCATED
     raw_extents: tuple[tuple[int, int, int], ...] = ()
+    byte_ranges: tuple[KVObjectByteRange, ...] = ()
 
     def __post_init__(self) -> None:
         """Validate byte ranges and tensor metadata."""
@@ -68,6 +120,31 @@ class KVObjectRecord:
                 raise ValueError("raw extent slba must be non-negative")
             if n_sectors <= 0:
                 raise ValueError("raw extent n_sectors must be positive")
+        if not self.byte_ranges:
+            return
+        covered_until = 0
+        for byte_range in sorted(self.byte_ranges, key=lambda item: item.target_offset):
+            if byte_range.target_offset != covered_until:
+                raise ValueError("byte_ranges must exactly cover the logical payload")
+            covered_until += byte_range.length
+        if covered_until != self.length:
+            raise ValueError("byte_ranges must cover exactly record.length bytes")
+
+    @property
+    def read_ranges(self) -> tuple[KVObjectByteRange, ...]:
+        """Return byte ranges to read for this record.
+
+        Contiguous legacy records expose a synthetic one-range view.
+        """
+        if self.byte_ranges:
+            return self.byte_ranges
+        return (KVObjectByteRange(offset=self.offset, length=self.length),)
+
+    @property
+    def is_contiguous(self) -> bool:
+        """Return True when the logical payload is backed by one byte range."""
+        ranges = self.read_ranges
+        return len(ranges) == 1 and ranges[0].target_offset == 0
 
     def mark_ready(self) -> "KVObjectRecord":
         """Return a copy of this record marked as ready for retrieval."""
@@ -81,6 +158,7 @@ class KVObjectRecord:
             dtype=self.dtype,
             state=KVObjectState.READY,
             raw_extents=self.raw_extents,
+            byte_ranges=self.byte_ranges,
         )
 
     def mark_evicted(self) -> "KVObjectRecord":
@@ -95,6 +173,7 @@ class KVObjectRecord:
             dtype=self.dtype,
             state=KVObjectState.EVICTED,
             raw_extents=self.raw_extents,
+            byte_ranges=self.byte_ranges,
         )
 
     def with_raw_extents(
@@ -123,6 +202,42 @@ class KVObjectRecord:
                 (int(file_offset), int(slba), int(n_sectors))
                 for file_offset, slba, n_sectors in raw_extents
             ),
+            byte_ranges=self.byte_ranges,
+        )
+
+    def with_byte_ranges(
+        self,
+        byte_ranges: Sequence[KVObjectByteRange],
+        *,
+        length: int | None = None,
+    ) -> "KVObjectRecord":
+        """Return a logical view record backed by explicit byte ranges.
+
+        Args:
+            byte_ranges: Byte ranges that cover the logical payload.
+            length: Optional logical payload length.  When omitted, this is
+                derived from the ranges.
+
+        Returns:
+            A metadata record with the supplied byte-range view.
+        """
+        normalized = tuple(byte_ranges)
+        view_length = (
+            int(length)
+            if length is not None
+            else sum(byte_range.length for byte_range in normalized)
+        )
+        return KVObjectRecord(
+            object_id=self.object_id,
+            pool_id=self.pool_id,
+            offset=normalized[0].offset if normalized else self.offset,
+            length=view_length,
+            aligned_length=self.aligned_length,
+            shape=(view_length,),
+            dtype=self.dtype,
+            state=self.state,
+            raw_extents=self.raw_extents,
+            byte_ranges=normalized,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -139,6 +254,9 @@ class KVObjectRecord:
             "raw_extents": [
                 [file_offset, slba, n_sectors]
                 for file_offset, slba, n_sectors in self.raw_extents
+            ],
+            "byte_ranges": [
+                byte_range.to_dict() for byte_range in self.byte_ranges
             ],
         }
 
@@ -168,5 +286,9 @@ class KVObjectRecord:
             raw_extents=tuple(
                 (int(item[0]), int(item[1]), int(item[2]))
                 for item in value.get("raw_extents", [])
+            ),
+            byte_ranges=tuple(
+                KVObjectByteRange.from_dict(item)
+                for item in value.get("byte_ranges", [])
             ),
         )

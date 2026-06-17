@@ -42,19 +42,30 @@ Usage
 """
 
 import ctypes
-import fcntl
 import hashlib
 import mmap
 import os
 import struct as _struct
+import sys
 import time
+import types
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
 
+# ``fcntl`` is POSIX-only.  Import-time fallback keeps the heavily mocked unit
+# tests importable on Windows; real snvme paths still fail loudly if called.
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised only on non-POSIX hosts
+    fcntl = types.SimpleNamespace(ioctl=None)  # type: ignore[assignment]
+    sys.modules.setdefault("fcntl", fcntl)
+
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey, DiskCacheMetadata
+from lmcache.v1.kv_object_store import KVObjectByteRange
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj, MemoryObjMetadata
 
 # TensorMemoryObj lives here; import carefully to avoid circular deps
@@ -142,6 +153,56 @@ def _effective_nbytes(
         sum(
             shape.numel() * dtype.itemsize
             for shape, dtype in zip(effective_shapes, effective_dtypes, strict=True)
+        )
+    )
+
+
+def _logical_read_ranges(
+    disk_meta: DiskCacheMetadata,
+    shapes_override: Optional[list[torch.Size]],
+    *,
+    file_offset: int = 0,
+    read_ranges: Optional[Sequence[KVObjectByteRange]] = None,
+) -> tuple[KVObjectByteRange, ...]:
+    """Return source ranges that compose one logical HBM payload.
+
+    Args:
+        disk_meta: Metadata for the backing file or object pool.
+        shapes_override: Optional per-key logical shape override.
+        file_offset: Contiguous source offset used when explicit ranges are
+            not supplied.
+        read_ranges: Optional object-store byte ranges.  When provided,
+            ``target_offset`` controls where each range lands in staging.
+
+    Returns:
+        Source ranges covering the logical payload.
+    """
+    if read_ranges is not None:
+        return tuple(read_ranges)
+    return (
+        KVObjectByteRange(
+            offset=file_offset,
+            length=_effective_nbytes(disk_meta, shapes_override),
+            target_offset=0,
+        ),
+    )
+
+
+def _logical_read_nbytes(
+    disk_meta: DiskCacheMetadata,
+    shapes_override: Optional[list[torch.Size]],
+    *,
+    file_offset: int = 0,
+    read_ranges: Optional[Sequence[KVObjectByteRange]] = None,
+) -> int:
+    """Return logical bytes produced by one direct-read request."""
+    return sum(
+        byte_range.length
+        for byte_range in _logical_read_ranges(
+            disk_meta,
+            shapes_override,
+            file_offset=file_offset,
+            read_ranges=read_ranges,
         )
     )
 
@@ -442,6 +503,8 @@ _NVM_MAP_KIND_RING_CQ: int = 2
 
 def _ioctl(fd: int, request: int, arg: ctypes.Structure) -> None:
     """Call ioctl(fd, request, &arg), updating arg fields in-place."""
+    if fcntl.ioctl is None:
+        raise OSError("fcntl is unavailable on this platform")
     size = ctypes.sizeof(arg)
     buf = ctypes.create_string_buffer(bytes(arg), size)
     fcntl.ioctl(fd, request, buf, True)
@@ -500,6 +563,8 @@ class FiemapHelper:
         """
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"File not found: {file_path}")
+        if fcntl.ioctl is None:
+            raise OSError("fcntl is unavailable on this platform")
 
         n = FiemapHelper._MAX_EXTENTS
         hdr_size = ctypes.sizeof(_FiemapHeader)
@@ -1334,6 +1399,9 @@ class TuttiDirectLoader:
         disk_metadatas: list[Optional[DiskCacheMetadata]],
         shapes_per_key: Optional[list[Optional[list[torch.Size]]]] = None,
         file_offsets: Optional[list[int]] = None,
+        read_ranges_per_key: Optional[
+            list[Optional[Sequence[KVObjectByteRange]]]
+        ] = None,
     ) -> list[Optional[MemoryObj]]:
         """Load KV chunks directly from NVMe into HBM staging.
 
@@ -1358,6 +1426,9 @@ class TuttiDirectLoader:
             file_offsets: Optional per-key byte offset inside the metadata
                           path. This is used by the KV object-store path,
                           where many objects live inside one pool file.
+            read_ranges_per_key: Optional per-key explicit source ranges.
+                This is the object-view path: each range is read from the
+                source path and placed at its ``target_offset`` in staging.
 
         Returns:
             List parallel to keys.  Each element is either a GPU-resident
@@ -1369,6 +1440,8 @@ class TuttiDirectLoader:
         n = len(keys)
         if n == 0:
             return []
+        if read_ranges_per_key is not None and len(read_ranges_per_key) != n:
+            raise ValueError("read_ranges_per_key and keys must have the same length")
 
         profile_start = time.perf_counter()
         results: list[Optional[MemoryObj]] = [None] * n
@@ -1396,17 +1469,40 @@ class TuttiDirectLoader:
                     if shapes_per_key is not None
                     else None
                 )
-                chunk_nbytes = _effective_nbytes(meta, key_shapes_override)
-                chunk_dma_nbytes = _align_up(chunk_nbytes, _NVME_LBS)
-                chunk_bytes = _align_up(chunk_dma_nbytes, _GPU_PAGE_SIZE)
+                chunk_read_ranges = (
+                    read_ranges_per_key[batch_end]
+                    if read_ranges_per_key is not None
+                    else None
+                )
+                chunk_logical_nbytes = _logical_read_nbytes(
+                    meta,
+                    key_shapes_override,
+                    file_offset=(
+                        file_offsets[batch_end] if file_offsets is not None else 0
+                    ),
+                    read_ranges=chunk_read_ranges,
+                )
+                chunk_logical_dma_nbytes = _align_up(
+                    chunk_logical_nbytes,
+                    _NVME_LBS,
+                )
+                chunk_bytes = _align_up(chunk_logical_dma_nbytes, _GPU_PAGE_SIZE)
                 chunk_file_offset = (
                     file_offsets[batch_end] if file_offsets is not None else 0
                 )
                 try:
-                    chunk_ios = self._estimate_chunk_ios(
-                        meta,
-                        chunk_dma_nbytes,
-                        file_offset=chunk_file_offset,
+                    chunk_ios = sum(
+                        self._estimate_chunk_ios(
+                            meta,
+                            _align_up(byte_range.length, _NVME_LBS),
+                            file_offset=byte_range.offset,
+                        )
+                        for byte_range in _logical_read_ranges(
+                            meta,
+                            key_shapes_override,
+                            file_offset=chunk_file_offset,
+                            read_ranges=chunk_read_ranges,
+                        )
                     )
                 except (FileNotFoundError, ValueError, OSError):
                     chunk_ios = 1
@@ -1446,6 +1542,11 @@ class TuttiDirectLoader:
                 file_offsets=(
                     file_offsets[batch_start:batch_end]
                     if file_offsets is not None
+                    else None
+                ),
+                read_ranges_per_key=(
+                    read_ranges_per_key[batch_start:batch_end]
+                    if read_ranges_per_key is not None
                     else None
                 ),
             )
@@ -1755,6 +1856,9 @@ class TuttiDirectLoader:
         metas: list[Optional[DiskCacheMetadata]],
         shapes_per_key: Optional[list[Optional[list[torch.Size]]]] = None,
         file_offsets: Optional[list[int]] = None,
+        read_ranges_per_key: Optional[
+            list[Optional[Sequence[KVObjectByteRange]]]
+        ] = None,
     ) -> list[Optional[MemoryObj]]:
         """Load one queue/staging-capacity-bounded batch into HBM staging."""
 
@@ -1764,6 +1868,7 @@ class TuttiDirectLoader:
         # READs into different offsets of the same staging slot.
         completed_indices: list[int] = []
         completed_offsets: list[int] = []
+        completed_nbytes: list[int] = []
         io_to_key_index: list[int] = []
         staging_iovas_list: list[int] = []
         slbas_list: list[int] = []
@@ -1788,8 +1893,20 @@ class TuttiDirectLoader:
                 if shapes_per_key is not None
                 else None
             )
-            nbytes = _effective_nbytes(meta, key_shapes_override)
             base_file_offset = file_offsets[i] if file_offsets is not None else 0
+            read_ranges = (
+                read_ranges_per_key[i]
+                if read_ranges_per_key is not None
+                else None
+            )
+            explicit_read_ranges = read_ranges is not None
+            logical_read_ranges = _logical_read_ranges(
+                meta,
+                key_shapes_override,
+                file_offset=base_file_offset,
+                read_ranges=read_ranges,
+            )
+            nbytes = sum(byte_range.length for byte_range in logical_read_ranges)
             dma_nbytes = _align_up(nbytes, _NVME_LBS)
             if dma_nbytes > self._slot_bytes:
                 logger.warning(
@@ -1814,51 +1931,43 @@ class TuttiDirectLoader:
             io_start = len(io_to_key_index)
             file_ios = 0
             skip_file = False
-            for extent in extents:
-                extent_start = extent.file_offset
-                extent_end = extent_start + extent.n_sectors * _NVME_LBS
-                read_start = max(base_file_offset, extent_start)
-                read_end = min(base_file_offset + dma_nbytes, extent_end)
-                if read_start >= read_end:
-                    continue
-                read_nbytes = read_end - read_start
-                extent_skip = read_start - extent_start
-                object_skip = read_start - base_file_offset
-                if read_start % _GPU_PAGE_SIZE != 0:
-                    logger.debug(
-                        "Chunk %s extent offset %d is not 64 KiB aligned",
-                        key,
-                        read_start,
-                    )
-                if len(io_to_key_index) >= self._q_depth():
+            for byte_range in logical_read_ranges:
+                range_dma_nbytes = _align_up(byte_range.length, _NVME_LBS)
+                if byte_range.offset % _NVME_LBS != 0:
                     logger.warning(
-                        "Tutti batch for %s would exceed queue depth %d; skipping",
+                        "Chunk %s read offset %d is not 512B aligned; skipping",
                         key,
-                        self._q_depth(),
+                        byte_range.offset,
                     )
                     skip_file = True
                     break
-                if read_nbytes % _NVME_LBS != 0:
+                if explicit_read_ranges and range_dma_nbytes != byte_range.length:
                     logger.warning(
-                        "Chunk %s extent read size %d is not 512B aligned; skipping",
+                        "Chunk %s read length %d is not 512B aligned; skipping",
                         key,
-                        read_nbytes,
+                        byte_range.length,
                     )
                     skip_file = True
                     break
-                cursor = 0
-                while cursor < read_nbytes:
-                    chunk_nbytes = read_nbytes - cursor
-                    if max_io > 0:
-                        chunk_nbytes = min(chunk_nbytes, max_io)
-                    chunk_nbytes = (chunk_nbytes // _NVME_LBS) * _NVME_LBS
-                    if chunk_nbytes == 0:
-                        logger.warning(
-                            "Chunk %s extent tail is smaller than 512B; skipping",
+                range_ios_start = len(io_to_key_index)
+                range_file_bytes = 0
+                range_end_offset = byte_range.offset + range_dma_nbytes
+                for extent in extents:
+                    extent_start = extent.file_offset
+                    extent_end = extent_start + extent.n_sectors * _NVME_LBS
+                    read_start = max(byte_range.offset, extent_start)
+                    read_end = min(range_end_offset, extent_end)
+                    if read_start >= read_end:
+                        continue
+                    read_nbytes = read_end - read_start
+                    extent_skip = read_start - extent_start
+                    target_skip = read_start - byte_range.offset
+                    if read_start % _GPU_PAGE_SIZE != 0:
+                        logger.debug(
+                            "Chunk %s extent offset %d is not 64 KiB aligned",
                             key,
+                            read_start,
                         )
-                        skip_file = True
-                        break
                     if len(io_to_key_index) >= self._q_depth():
                         logger.warning(
                             "Tutti batch for %s would exceed queue depth %d; "
@@ -1868,28 +1977,80 @@ class TuttiDirectLoader:
                         )
                         skip_file = True
                         break
-                    io_object_offset = object_skip + cursor
-                    lba_slba = (
-                        extent.slba + (extent_skip + cursor) // _NVME_LBS
-                    )
-                    staging_iovas_list.append(
-                        self._staging_iova_at(chunk_offset + io_object_offset)
-                    )
-                    slbas_list.append(lba_slba)
-                    byte_lens_list.append(chunk_nbytes)
-                    io_to_key_index.append(i)
-                    file_ios += 1
-                    logger.debug(
-                        "Tutti extent read: key=%s staging_offset=%d slba=%d "
-                        "offset=%d bytes=%d",
-                        key,
-                        chunk_offset,
-                        lba_slba,
-                        io_object_offset,
-                        chunk_nbytes,
-                    )
-                    cursor += chunk_nbytes
+                    if read_nbytes % _NVME_LBS != 0:
+                        logger.warning(
+                            "Chunk %s extent read size %d is not 512B aligned; "
+                            "skipping",
+                            key,
+                            read_nbytes,
+                        )
+                        skip_file = True
+                        break
+                    cursor = 0
+                    while cursor < read_nbytes:
+                        chunk_nbytes = read_nbytes - cursor
+                        if max_io > 0:
+                            chunk_nbytes = min(chunk_nbytes, max_io)
+                        chunk_nbytes = (chunk_nbytes // _NVME_LBS) * _NVME_LBS
+                        if chunk_nbytes == 0:
+                            logger.warning(
+                                "Chunk %s extent tail is smaller than 512B; "
+                                "skipping",
+                                key,
+                            )
+                            skip_file = True
+                            break
+                        if len(io_to_key_index) >= self._q_depth():
+                            logger.warning(
+                                "Tutti batch for %s would exceed queue depth %d; "
+                                "skipping",
+                                key,
+                                self._q_depth(),
+                            )
+                            skip_file = True
+                            break
+                        io_target_offset = (
+                            byte_range.target_offset + target_skip + cursor
+                        )
+                        lba_slba = (
+                            extent.slba + (extent_skip + cursor) // _NVME_LBS
+                        )
+                        staging_iovas_list.append(
+                            self._staging_iova_at(chunk_offset + io_target_offset)
+                        )
+                        slbas_list.append(lba_slba)
+                        byte_lens_list.append(chunk_nbytes)
+                        io_to_key_index.append(i)
+                        file_ios += 1
+                        range_file_bytes += chunk_nbytes
+                        logger.debug(
+                            "Tutti extent read: key=%s staging_offset=%d "
+                            "slba=%d offset=%d bytes=%d",
+                            key,
+                            chunk_offset,
+                            lba_slba,
+                            io_target_offset,
+                            chunk_nbytes,
+                        )
+                        cursor += chunk_nbytes
+                    if skip_file:
+                        break
                 if skip_file:
+                    break
+                if range_file_bytes != range_dma_nbytes:
+                    range_ios_added = len(io_to_key_index) - range_ios_start
+                    del staging_iovas_list[range_ios_start:]
+                    del slbas_list[range_ios_start:]
+                    del byte_lens_list[range_ios_start:]
+                    del io_to_key_index[range_ios_start:]
+                    file_ios -= range_ios_added
+                    logger.warning(
+                        "Tutti extents for %s cover range %d/%d bytes; skipping",
+                        meta.path,
+                        range_file_bytes,
+                        range_dma_nbytes,
+                    )
+                    skip_file = True
                     break
 
             total_file_bytes = sum(
@@ -1909,6 +2070,7 @@ class TuttiDirectLoader:
                 continue
             completed_indices.append(i)
             completed_offsets.append(chunk_offset)
+            completed_nbytes.append(nbytes)
             next_staging_offset += aligned_nbytes
 
         n_ios = len(io_to_key_index)
@@ -2010,7 +2172,12 @@ class TuttiDirectLoader:
         wrap_start = time.perf_counter()
         persist_ms = 0.0
         results: list[Optional[MemoryObj]] = [None] * len(keys)
-        for chunk_offset, i_orig in zip(completed_offsets, completed_indices):
+        for chunk_offset, nbytes, i_orig in zip(
+            completed_offsets,
+            completed_nbytes,
+            completed_indices,
+            strict=True,
+        ):
             meta = metas[i_orig]
             if meta is None:
                 raise RuntimeError(
@@ -2025,7 +2192,6 @@ class TuttiDirectLoader:
                 if shapes_per_key is not None
                 else None
             )
-            nbytes = _effective_nbytes(meta, key_shapes_override)
             gpu_raw = self._staging_slice_at(chunk_offset, nbytes)
             self._debug_verify_direct_read(meta, gpu_raw)
             persist_start = time.perf_counter()

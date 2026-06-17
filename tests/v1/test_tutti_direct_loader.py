@@ -11,6 +11,8 @@ import os
 import sys
 import tempfile
 import types
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Optional
 from unittest.mock import MagicMock, patch
 
@@ -48,8 +50,42 @@ from lmcache.v1.gpu_connector.tutti_direct_loader import (  # noqa: E402
     _IOWR,
     _make_memory_obj_metadata,
 )
+from lmcache.v1.kv_object_store import KVObjectByteRange  # noqa: E402
 from lmcache.utils import CacheEngineKey, DiskCacheMetadata  # noqa: E402
 from lmcache.v1.memory_management import MemoryFormat, MemoryObjMetadata, TensorMemoryObj  # noqa: E402
+
+
+@contextmanager
+def _patch_cuda_runtime_for_cpu_tests() -> Iterator[None]:
+    """Run mocked Tutti loader paths on CPU-only PyTorch builds."""
+    original_tensor = torch.tensor
+    original_as_tensor = torch.as_tensor
+    original_zeros = torch.zeros
+
+    def tensor_on_cpu(*args, **kwargs):
+        if str(kwargs.get("device", "")).startswith("cuda"):
+            kwargs["device"] = "cpu"
+        return original_tensor(*args, **kwargs)
+
+    def zeros_on_cpu(*args, **kwargs):
+        if str(kwargs.get("device", "")).startswith("cuda"):
+            kwargs["device"] = "cpu"
+        return original_zeros(*args, **kwargs)
+
+    def as_tensor_on_cpu(data, *args, **kwargs):
+        if hasattr(data, "__cuda_array_interface__"):
+            shape = data.__cuda_array_interface__["shape"]
+            return torch.zeros(shape, dtype=torch.uint8)
+        return original_as_tensor(data, *args, **kwargs)
+
+    with (
+        patch("torch.tensor", side_effect=tensor_on_cpu),
+        patch("torch.as_tensor", side_effect=as_tensor_on_cpu),
+        patch("torch.zeros", side_effect=zeros_on_cpu),
+        patch("torch.cuda.synchronize"),
+        patch("torch.cuda.device"),
+    ):
+        yield
 
 
 # ── ioctl number helpers ─────────────────────────────────────────────────────
@@ -332,6 +368,7 @@ def _make_loader(n_slots: int = 4, slot_mb: int = 32, q_depth: Optional[int] = N
     loader = TuttiDirectLoader(
         session=session,
         staging_tensor=staging,
+        staging_raw_ptr=staging.data_ptr(),
         n_slots=n_slots,
         slot_gpu_pages=slot_gpu_pages,
         sq_tail_ptr=ctypes.addressof(sq_tail_arr),
@@ -406,8 +443,8 @@ class TestTuttiDirectLoaderLoadBatch:
                 mock_c.tutti_submit_batch_sgl_read = MagicMock()
                 mock_c.tutti_poll_batch.side_effect = fake_poll
 
-                # Patch synchronize so tests run without a GPU.
-                with patch("torch.cuda.synchronize"):
+                # Patch CUDA helpers so tests run without a GPU.
+                with _patch_cuda_runtime_for_cpu_tests():
                     return loader._load_batch(keys, metas)
 
     def test_all_valid_returns_memory_objs(self) -> None:
@@ -503,7 +540,7 @@ class TestTuttiDirectLoaderLoadBatch:
 
                 mock_c.tutti_poll_batch.side_effect = fake_poll
 
-                with patch("torch.cuda.synchronize"):
+                with _patch_cuda_runtime_for_cpu_tests():
                     results = loader._load_batch(keys, metas)
 
         assert results[0] is not None
@@ -527,7 +564,7 @@ class TestTuttiDirectLoaderLoadBatch:
                 mock_c.tutti_submit_batch_sgl_read = MagicMock()
                 mock_c.tutti_poll_batch = MagicMock()
 
-                with patch("torch.cuda.synchronize"):
+                with _patch_cuda_runtime_for_cpu_tests():
                     # Manually set timed_out_ptr = 1 to simulate timeout.
                     ctypes.c_int32.from_address(loader._timed_out_ptr).value = 1
 
@@ -566,7 +603,7 @@ class TestTuttiDirectLoaderLoadChunksToHbm:
 
                 mock_c.tutti_poll_batch.side_effect = fake_poll
 
-                with patch("torch.cuda.synchronize"):
+                with _patch_cuda_runtime_for_cpu_tests():
                     results = loader.load_chunks_to_hbm(keys, metas)
 
         assert len(results) == n_keys
@@ -597,7 +634,7 @@ class TestTuttiDirectLoaderLoadChunksToHbm:
 
                 mock_c.tutti_poll_batch.side_effect = fake_poll
 
-                with patch("torch.cuda.synchronize"):
+                with _patch_cuda_runtime_for_cpu_tests():
                     results = loader.load_chunks_to_hbm(keys, metas)
 
         assert all(r is not None for r in results)
@@ -627,12 +664,53 @@ class TestTuttiDirectLoaderLoadChunksToHbm:
 
                 mock_c.tutti_poll_batch.side_effect = fake_poll
 
-                with patch("torch.cuda.synchronize"):
+                with _patch_cuda_runtime_for_cpu_tests():
                     results = loader.load_chunks_to_hbm(keys, metas)
 
         assert results[0] is not None
         assert results[1] is None
         assert results[2] is not None
+
+    def test_explicit_read_ranges_submit_multiple_reads(self) -> None:
+        loader, _ctrl = _make_loader(n_slots=2, q_depth=8)
+        size = 1024
+        keys = [_fake_key(0)]
+        metas = [_disk_meta_for(size)]
+        read_ranges = [
+            [
+                KVObjectByteRange(offset=0, length=512, target_offset=0),
+                KVObjectByteRange(offset=1024, length=512, target_offset=512),
+            ]
+        ]
+        extents = [
+            LbaRecord(slba=100, n_sectors=1, file_offset=0),
+            LbaRecord(slba=200, n_sectors=1, file_offset=1024),
+        ]
+
+        with patch.object(
+            _tdl.FiemapHelper, "query_extents", return_value=extents
+        ):
+            with patch.object(_tdl, "_c_ops") as mock_c:
+                mock_c.tutti_submit_batch_sgl_read = MagicMock()
+
+                def fake_poll(**kwargs):
+                    n_ios = kwargs.get("n_ios", 0)
+                    loader._status_buf[:n_ios] = 0
+
+                mock_c.tutti_poll_batch.side_effect = fake_poll
+
+                with _patch_cuda_runtime_for_cpu_tests():
+                    results = loader.load_chunks_to_hbm(
+                        keys,
+                        metas,
+                        read_ranges_per_key=read_ranges,
+                    )
+
+        assert results[0] is not None
+        submit_kwargs = mock_c.tutti_submit_batch_sgl_read.call_args.kwargs
+        assert submit_kwargs["byte_lens"].cpu().tolist() == [512, 512]
+        assert submit_kwargs["slbas"].cpu().tolist() == [100, 200]
+        assert submit_kwargs["staging_iovas"].cpu().tolist() == [0, 512]
 
 
 class TestTuttiDirectLoaderCreate:
@@ -679,6 +757,10 @@ class TestTuttiDirectLoaderCreate:
         with patch.object(_tdl, "_HAS_C_OPS", True), patch.object(
             _tdl, "SnvmeSession", return_value=mock_session
         ), patch.object(
+            _tdl, "_cuda_malloc_device", return_value=1 << 20
+        ), patch.object(
+            _tdl, "_get_cudart", return_value=MagicMock()
+        ), patch.object(
             _tdl, "_cuda_malloc_managed", return_value=id(b"x")
         ), patch(
             "ctypes.c_uint16.from_address", return_value=MagicMock()
@@ -687,14 +769,15 @@ class TestTuttiDirectLoaderCreate:
         ), patch(
             "ctypes.c_int32.from_address", return_value=MagicMock()
         ):
-            with pytest.raises(RuntimeError, match="n_slots"):
-                TuttiDirectLoader.create(
-                    device_path="/dev/ssnvme0",
-                    ctrl_path="/dev/snvm_control",
-                    pci_bdf="0000:08:00.0",
-                    n_slots=16,  # > q_depth=8
-                    slot_bytes=64 * 1024,
-                )
+            with _patch_cuda_runtime_for_cpu_tests():
+                with pytest.raises(RuntimeError, match="n_slots"):
+                    TuttiDirectLoader.create(
+                        device_path="/dev/ssnvme0",
+                        ctrl_path="/dev/snvm_control",
+                        pci_bdf="0000:08:00.0",
+                        n_slots=16,  # > q_depth=8
+                        slot_bytes=64 * 1024,
+                    )
 
 
 # ── TuttiDirectLoader.close ───────────────────────────────────────────────────
@@ -713,7 +796,7 @@ class TestTuttiDirectLoaderClose:
         with patch.object(_tdl, "_cuda_free", side_effect=spy_free):
             loader.close()
 
-        assert len(freed) == 4  # sq_tail, cq_head, cq_phase, timed_out
+        assert len(freed) == 5  # control scalars plus raw staging allocation
         loader._session.close.assert_called_once()
 
     def test_context_manager(self) -> None:

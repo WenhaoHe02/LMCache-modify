@@ -6,10 +6,85 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 import os
+import threading
 import time
 
 # First Party
 from lmcache.v1.kv_object_store.record import KVObjectRecord
+
+
+_FD_LOCKS: dict[int, threading.Lock] = {}
+_FD_LOCKS_GUARD = threading.Lock()
+
+
+def _fd_lock(fd: int) -> threading.Lock:
+    """Return a process-local lock for fd-position fallback I/O."""
+    with _FD_LOCKS_GUARD:
+        if fd not in _FD_LOCKS:
+            _FD_LOCKS[fd] = threading.Lock()
+        return _FD_LOCKS[fd]
+
+
+def _pread(fd: int, length: int, offset: int) -> bytes:
+    """Read bytes at offset without changing fd position when supported."""
+    if hasattr(os, "pread"):
+        return os.pread(fd, length, offset)
+    chunks: list[bytes] = []
+    remaining = length
+    cursor = offset
+    with _fd_lock(fd):
+        os.lseek(fd, offset, os.SEEK_SET)
+        while remaining > 0:
+            chunk = os.read(fd, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            read_len = len(chunk)
+            remaining -= read_len
+            cursor += read_len
+            os.lseek(fd, cursor, os.SEEK_SET)
+    return b"".join(chunks)
+
+
+def _preadv(fd: int, buffers: Sequence[memoryview], offset: int) -> int:
+    """Read into buffers at offset without changing fd position when supported."""
+    if hasattr(os, "preadv"):
+        return os.preadv(fd, buffers, offset)
+    total = 0
+    cursor = offset
+    for buffer in buffers:
+        payload = _pread(fd, len(buffer), cursor)
+        read_len = len(payload)
+        buffer[:read_len] = payload
+        total += read_len
+        cursor += read_len
+        if read_len != len(buffer):
+            break
+    return total
+
+
+def _pwritev(fd: int, buffers: Sequence[memoryview], offset: int) -> int:
+    """Write buffers at offset without changing fd position when supported."""
+    if hasattr(os, "pwritev"):
+        return os.pwritev(fd, buffers, offset)
+    total = 0
+    cursor = offset
+    with _fd_lock(fd):
+        os.lseek(fd, offset, os.SEEK_SET)
+        for buffer in buffers:
+            view = memoryview(buffer).cast("B")
+            written = 0
+            while written < len(view):
+                nbytes = os.write(fd, view[written:])
+                if nbytes == 0:
+                    break
+                written += nbytes
+                total += nbytes
+                cursor += nbytes
+                os.lseek(fd, cursor, os.SEEK_SET)
+            if written != len(view):
+                break
+    return total
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,7 +194,7 @@ class KVObjectPoolIO:
                 write_buffers = [payload_view]
                 if pad_len > 0:
                     write_buffers.append(memoryview(bytes(pad_len)))
-                written = os.pwritev(
+                written = _pwritev(
                     fds[record.pool_id],
                     write_buffers,
                     record.offset,
@@ -152,12 +227,22 @@ class KVObjectPoolIO:
         fds = self._open_pool_fds(records, os.O_RDONLY)
         try:
             for record in records:
-                payload = os.pread(fds[record.pool_id], record.length, record.offset)
-                if len(payload) != record.length:
-                    raise OSError(
-                        f"short read for {record.object_id.to_key()}: "
-                        f"{len(payload)} of {record.length} bytes"
+                payload_buffer = bytearray(record.length)
+                for byte_range in record.read_ranges:
+                    payload = _pread(
+                        fds[record.pool_id],
+                        byte_range.length,
+                        byte_range.offset,
                     )
+                    if len(payload) != byte_range.length:
+                        raise OSError(
+                            f"short read for {record.object_id.to_key()}: "
+                            f"{len(payload)} of {byte_range.length} bytes"
+                        )
+                    target_start = byte_range.target_offset
+                    target_end = target_start + byte_range.length
+                    payload_buffer[target_start:target_end] = payload
+                payload = bytes(payload_buffer)
                 payloads.append(payload)
                 bytes_read += len(payload)
         finally:
@@ -204,13 +289,22 @@ class KVObjectPoolIO:
         fds = self._open_pool_fds(records, os.O_RDONLY)
         try:
             for record, buffer in zip(records, cast_buffers, strict=True):
-                read = os.preadv(fds[record.pool_id], [buffer], record.offset)
-                if read != record.length:
-                    raise OSError(
-                        f"short read for {record.object_id.to_key()}: "
-                        f"{read} of {record.length} bytes"
+                read_total = 0
+                for byte_range in record.read_ranges:
+                    target_start = byte_range.target_offset
+                    target_end = target_start + byte_range.length
+                    read = _preadv(
+                        fds[record.pool_id],
+                        [buffer[target_start:target_end]],
+                        byte_range.offset,
                     )
-                bytes_read += read
+                    if read != byte_range.length:
+                        raise OSError(
+                            f"short read for {record.object_id.to_key()}: "
+                            f"{read} of {byte_range.length} bytes"
+                        )
+                    read_total += read
+                bytes_read += read_total
         finally:
             self._close_pool_fds(fds)
         elapsed_ms = (time.perf_counter() - start) * 1000.0
@@ -230,7 +324,7 @@ class KVObjectPoolIO:
         try:
             for pool_id in pool_ids:
                 path = self.pool_paths[pool_id]
-                fds[pool_id] = os.open(path, flags)
+                fds[pool_id] = os.open(path, flags | getattr(os, "O_BINARY", 0))
         except Exception:
             self._close_pool_fds(fds)
             raise
@@ -238,4 +332,8 @@ class KVObjectPoolIO:
 
     def _close_pool_fds(self, fds: Mapping[str, int]) -> None:
         for fd in fds.values():
-            os.close(fd)
+            try:
+                os.close(fd)
+            finally:
+                with _FD_LOCKS_GUARD:
+                    _FD_LOCKS.pop(fd, None)
