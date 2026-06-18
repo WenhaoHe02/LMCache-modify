@@ -654,6 +654,9 @@ class IndexerSSDManager:
         self._pending: Dict[int, List[Tuple[int, "Future[bytes]"]]] = {
             lid: [] for lid in csa_layer_ids
         }
+        self._inflight_tokens: Dict[int, Set[int]] = {
+            lid: set() for lid in csa_layer_ids
+        }
         self._prefill_overlap_pending: Dict[
             int, List[Tuple[int, "Future[Tuple[bytes, float, float, float]]"]]
         ] = {lid: [] for lid in csa_layer_ids}
@@ -677,6 +680,9 @@ class IndexerSSDManager:
         # Future tracking for post-prefill async SSD eviction.
         # prepare_pool blocks on this before scoring if it's not yet done.
         self._ready_futures: Dict[int, Optional[Future[None]]] = {
+            lid: None for lid in csa_layer_ids
+        }
+        self._drain_futures: Dict[int, Optional[Future[None]]] = {
             lid: None for lid in csa_layer_ids
         }
         self._direct_seed_tail_buffers: Dict[int, List[Tuple[int, torch.Tensor]]] = {
@@ -1103,7 +1109,13 @@ class IndexerSSDManager:
             return
         pool = self._pools[layer_id]
         store = self._stores[layer_id]
-        missing = [tid for tid in prev if not pool.contains(tid)]
+        with self._lock:
+            pending_token_ids = set(self._inflight_tokens[layer_id])
+        missing = [
+            tid
+            for tid in prev
+            if not pool.contains(tid) and tid not in pending_token_ids
+        ]
         filter_ms = (time.perf_counter() - t_filter0) * 1000.0
         if not missing:
             if layer_id not in self._debug_fire_active_logged:
@@ -1142,6 +1154,8 @@ class IndexerSSDManager:
         submit_ms = (time.perf_counter() - t_submit0) * 1000.0
         with self._lock:
             self._pending[layer_id].extend(futures)
+            self._inflight_tokens[layer_id].update(tid for tid, _ in futures)
+        self.prepare_layer_async(layer_id)
         self._log_timing(
             "prefill_fire_async" if is_prefill_proxy else "fire_async",
             layer_id,
@@ -1167,8 +1181,18 @@ class IndexerSSDManager:
             return
         with self._lock:
             ready_fut = self._ready_futures.get(layer_id)
+            previous_drain = self._drain_futures.get(layer_id)
+            has_pending = bool(self._pending.get(layer_id))
+            if (
+                ready_fut is None
+                and not has_pending
+                and (previous_drain is None or previous_drain.done())
+            ):
+                return
 
         def _prepare() -> None:
+            if previous_drain is not None:
+                previous_drain.result(timeout=self._prefill_ready_timeout_s)
             if ready_fut is not None:
                 ready_fut.result(timeout=self._prefill_ready_timeout_s)
                 if self._device.type == "cuda":
@@ -1180,7 +1204,23 @@ class IndexerSSDManager:
             if self._device.type == "cuda":
                 torch.cuda.synchronize(self._device)
 
-        self._executor.submit(_prepare)
+        drain_future = self._executor.submit(_prepare)
+        with self._lock:
+            self._drain_futures[layer_id] = drain_future
+
+        def _clear_done(fut: Future[None]) -> None:
+            try:
+                fut.result()
+            except Exception:
+                logger.exception(
+                    "IndexerSSDManager: async prepare failed for layer %d",
+                    layer_id,
+                )
+            with self._lock:
+                if self._drain_futures.get(layer_id) is fut:
+                    self._drain_futures[layer_id] = None
+
+        drain_future.add_done_callback(_clear_done)
 
     def _prefill_overlap_profile_fire(
         self,
@@ -1490,6 +1530,7 @@ class IndexerSSDManager:
         waited_ready = False
         with self._lock:
             ready_fut = self._ready_futures.get(layer_id)
+            drain_fut = self._drain_futures.get(layer_id)
         if ready_fut is not None:
             if not ready_fut.done():
                 waited_ready = True
@@ -1508,6 +1549,11 @@ class IndexerSSDManager:
                 if self._ready_futures.get(layer_id) is ready_fut:
                     self._ready_futures[layer_id] = None
         t_drain0 = time.perf_counter()
+        if drain_fut is not None:
+            drain_fut.result(timeout=self._prefill_ready_timeout_s)
+            with self._lock:
+                if self._drain_futures.get(layer_id) is drain_fut:
+                    self._drain_futures[layer_id] = None
         self._drain(layer_id)
         drain_ms = (time.perf_counter() - t_drain0) * 1000.0
         if self._device.type == "cuda":
@@ -2368,6 +2414,9 @@ class IndexerSSDManager:
                     logger.error(
                         "IndexerSSDManager: fallback sync read also failed: %s", exc2
                     )
+            finally:
+                with self._lock:
+                    self._inflight_tokens[layer_id].discard(tid)
         self._log_timing(
             "drain",
             layer_id,
@@ -2387,7 +2436,9 @@ class IndexerSSDManager:
             for lid in self._csa_layer_ids:
                 self._prev_topk[lid] = None
                 self._pending[lid] = []
+                self._inflight_tokens[lid].clear()
                 self._ready_futures[lid] = None
+                self._drain_futures[lid] = None
                 self._decode_cursor[lid] = 0
 
     def close(self) -> None:

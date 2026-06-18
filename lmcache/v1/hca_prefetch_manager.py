@@ -273,6 +273,7 @@ class HCAPrefetchManager:
         )
         self._layers: dict[int, HCALayerState] = {}
         self._pending: dict[int, list[HCAPendingRead]] = {}
+        self._drain_futures: dict[int, Future[None] | None] = {}
         self._resident_hbm: dict[int, set[int]] = {}
         self._active_slots: dict[int, torch.Tensor] = {}
         self._lock = threading.Lock()
@@ -335,6 +336,7 @@ class HCAPrefetchManager:
         )
         self._layers[layer_id] = state
         self._pending.setdefault(layer_id, [])
+        self._drain_futures.setdefault(layer_id, None)
         self._resident_hbm.setdefault(layer_id, set())
         _register_ready_layer(layer_id)
 
@@ -656,6 +658,10 @@ class HCAPrefetchManager:
                 (time.perf_counter() - t_submit0) * 1000.0 if timing else 0.0
             )
             self._pending[layer_id].extend(pending_reads)
+        for pending_read in pending_reads:
+            pending_read.future.add_done_callback(
+                lambda _future, lid=layer_id: self.prepare_layer_async(lid)
+            )
         if missing and layer_id not in self._debug_fire_logged:
             self._debug_fire_logged.add(layer_id)
             logger.info(
@@ -687,23 +693,69 @@ class HCAPrefetchManager:
         """
         if layer_id not in self._layers:
             return
-        self._executor.submit(self.drain_for_layer, layer_id)
+        with self._lock:
+            previous_drain = self._drain_futures.get(layer_id)
+            has_pending = bool(self._pending.get(layer_id))
+            if not has_pending and (
+                previous_drain is None or previous_drain.done()
+            ):
+                return
 
-    def drain_for_layer(self, layer_id: int) -> None:
+            def _prepare() -> None:
+                if previous_drain is not None:
+                    previous_drain.result()
+                self._drain_for_layer_once(layer_id)
+
+            drain_future = self._executor.submit(_prepare)
+            self._drain_futures[layer_id] = drain_future
+
+        def _clear_done(fut: Future[None]) -> None:
+            try:
+                fut.result()
+            except Exception:
+                logger.exception(
+                    "HCAPrefetchManager: async drain failed for layer %d",
+                    layer_id,
+                )
+            with self._lock:
+                if self._drain_futures.get(layer_id) is fut:
+                    self._drain_futures[layer_id] = None
+
+        drain_future.add_done_callback(_clear_done)
+
+    def drain_for_layer(self, layer_id: int, blocking: bool | None = None) -> None:
         """Drain pending HCA reads into the target layer's vLLM KV cache.
 
         Args:
             layer_id: Target HCA layer id.
+            blocking: Override for whether this drain should wait for pending
+                reads. ``None`` uses the manager's configured default.
         """
+        with self._lock:
+            drain_future = self._drain_futures.get(layer_id)
+        if drain_future is not None:
+            drain_future.result()
+            with self._lock:
+                if self._drain_futures.get(layer_id) is drain_future:
+                    self._drain_futures[layer_id] = None
+        self._drain_for_layer_once(layer_id, blocking=blocking)
+
+    def _drain_for_layer_once(
+        self,
+        layer_id: int,
+        blocking: bool | None = None,
+    ) -> None:
+        """Drain currently ready HCA reads without waiting for future drains."""
         state = self._layers.get(layer_id)
         if state is None:
             return
+        wait_for_pending = self._blocking_drain if blocking is None else blocking
         timing = self._timing_enabled
         t0 = time.perf_counter() if timing else 0.0
         t_select0 = time.perf_counter() if timing else 0.0
         with self._lock:
             pending = self._pending.get(layer_id, [])
-            if not self._blocking_drain:
+            if not wait_for_pending:
                 ready = [
                     pending_read
                     for pending_read in pending

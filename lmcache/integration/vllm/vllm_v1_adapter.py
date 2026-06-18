@@ -3,7 +3,9 @@
 from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
+from types import MethodType
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
+import inspect
 import math
 import os
 
@@ -62,6 +64,7 @@ logger = init_logger(__name__)
 
 _INDEXER_PREFETCH_MANAGER: Any = None
 _HCA_PREFETCH_MANAGER: Any = None
+_OVERLAP_HOOK_ERROR_LOGGED: set[tuple[str, int, str]] = set()
 
 
 def _env_flag(name: str) -> bool:
@@ -255,6 +258,308 @@ def _decoder_hca_attention(decoder_layer: Any) -> Any:
     return None
 
 
+def _same_callable(left: Any, right: Any) -> bool:
+    if left is None or right is None:
+        return False
+    if left is right:
+        return True
+    left_func = getattr(left, "__func__", None)
+    right_func = getattr(right, "__func__", None)
+    left_self = getattr(left, "__self__", None)
+    right_self = getattr(right, "__self__", None)
+    if left_func is not None and right_func is not None:
+        return left_func is right_func and left_self is right_self
+    try:
+        return bool(left == right)
+    except Exception:
+        return False
+
+
+def _hc_pre_fn_arg(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+    if args:
+        return args[0]
+    for name in ("fn", "hc_fn", "kernel", "op"):
+        if name in kwargs:
+            return kwargs[name]
+    return None
+
+
+def _is_ffn_hc_pre_call(
+    decoder_layer: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> bool:
+    return _same_callable(
+        _hc_pre_fn_arg(args, kwargs),
+        getattr(decoder_layer, "hc_ffn_fn", None),
+    )
+
+
+def _positions_from_forward_frame(
+    frame: Any,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor | None:
+    device = hidden_states.device
+    rows = int(hidden_states.shape[0]) if hidden_states.ndim > 0 else 1
+    current = frame
+    for _ in range(6):
+        if current is None:
+            return None
+        locals_map = current.f_locals
+        for name in ("positions", "position_ids", "input_positions"):
+            value = locals_map.get(name)
+            if isinstance(value, torch.Tensor) and value.numel() > 0:
+                return value.reshape(-1).to(
+                    device=device,
+                    dtype=torch.long,
+                    non_blocking=True,
+                )
+        for name in ("start_pos", "start_position"):
+            value = locals_map.get(name)
+            if isinstance(value, int):
+                return torch.arange(
+                    value,
+                    value + rows,
+                    device=device,
+                    dtype=torch.long,
+                )
+            if isinstance(value, torch.Tensor) and value.numel() > 0:
+                start = int(value.reshape(-1)[0].detach().cpu().item())
+                return torch.arange(
+                    start,
+                    start + rows,
+                    device=device,
+                    dtype=torch.long,
+                )
+        current = current.f_back
+    return None
+
+
+def _forward_position_source(
+    signature: inspect.Signature | None,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> Any:
+    values: dict[str, Any] = dict(kwargs)
+    if signature is not None:
+        try:
+            values.update(signature.bind_partial(*args, **kwargs).arguments)
+        except TypeError:
+            pass
+    for name in ("positions", "position_ids", "input_positions"):
+        value = values.get(name)
+        if isinstance(value, torch.Tensor) and value.numel() > 0:
+            return value
+    for name in ("start_pos", "start_position"):
+        value = values.get(name)
+        if isinstance(value, (int, torch.Tensor)):
+            return value
+    for value in args:
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def _positions_from_source(
+    source: Any,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor | None:
+    device = hidden_states.device
+    rows = int(hidden_states.shape[0]) if hidden_states.ndim > 0 else 1
+    if isinstance(source, torch.Tensor) and source.numel() > 0:
+        return source.reshape(-1).to(
+            device=device,
+            dtype=torch.long,
+            non_blocking=True,
+        )
+    if isinstance(source, int):
+        return torch.arange(
+            source,
+            source + rows,
+            device=device,
+            dtype=torch.long,
+        )
+    return None
+
+
+def _install_decoder_forward_position_hook(decoder_layer: Any) -> bool:
+    if getattr(decoder_layer, "_lmcache_forward_position_installed", False):
+        return True
+    original_forward = getattr(decoder_layer, "forward", None)
+    if not callable(original_forward):
+        return False
+    try:
+        signature = inspect.signature(original_forward)
+    except (TypeError, ValueError):
+        signature = None
+
+    def _lmcache_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
+        previous_source = getattr(self, "_lmcache_forward_position_source", None)
+        self._lmcache_forward_position_source = _forward_position_source(
+            signature,
+            args,
+            kwargs,
+        )
+        try:
+            return original_forward(*args, **kwargs)
+        finally:
+            if previous_source is None:
+                try:
+                    delattr(self, "_lmcache_forward_position_source")
+                except AttributeError:
+                    pass
+            else:
+                self._lmcache_forward_position_source = previous_source
+
+    decoder_layer._lmcache_original_forward = original_forward
+    decoder_layer.forward = MethodType(_lmcache_forward, decoder_layer)
+    decoder_layer._lmcache_forward_position_installed = True
+    return True
+
+
+def _log_overlap_hook_error_once(
+    kind: str,
+    layer_id: int,
+    exc: Exception,
+) -> None:
+    reason = type(exc).__name__
+    key = (kind, layer_id, reason)
+    if key in _OVERLAP_HOOK_ERROR_LOGGED:
+        return
+    _OVERLAP_HOOK_ERROR_LOGGED.add(key)
+    logger.warning(
+        "LMCache %s early-overlap hook failed at decoder layer %d: %r",
+        kind,
+        layer_id,
+        exc,
+    )
+
+
+def _fire_decoder_ffn_overlap(
+    decoder_layer: Any,
+    residual_after_attention: torch.Tensor,
+    positions: torch.Tensor | None,
+) -> None:
+    layer_id = getattr(decoder_layer, "layer_idx", -1)
+
+    indexer_manager = getattr(
+        decoder_layer,
+        "_lmcache_indexer_prefetch_manager",
+        None,
+    )
+    next_csa = getattr(decoder_layer, "_lmcache_next_csa_layer_id", -1)
+    if indexer_manager is not None and isinstance(next_csa, int) and next_csa >= 0:
+        try:
+            indexer_manager.fire_async_for_layer(
+                next_csa,
+                residual_f=residual_after_attention,
+                positions=positions,
+            )
+            prepare = getattr(indexer_manager, "prepare_layer_async", None)
+            if callable(prepare):
+                prepare(next_csa)
+        except Exception as exc:
+            _log_overlap_hook_error_once("CSA", int(layer_id), exc)
+
+    hca_manager = getattr(decoder_layer, "_lmcache_hca_prefetch_manager", None)
+    next_hca = getattr(decoder_layer, "_lmcache_next_hca_layer_id", -1)
+    if hca_manager is not None and isinstance(next_hca, int) and next_hca >= 0:
+        try:
+            if positions is not None:
+                hca_manager.fire_async_for_layer(next_hca, positions)
+            prepare = getattr(hca_manager, "prepare_layer_async", None)
+            if callable(prepare):
+                prepare(next_hca)
+        except Exception as exc:
+            _log_overlap_hook_error_once("HCA", int(layer_id), exc)
+
+
+def _install_decoder_hc_pre_overlap_hook(decoder_layer: Any) -> bool:
+    """Install an FFN-entry hook that fires CSA/HCA prefetch before MoE."""
+    hc_pre = getattr(decoder_layer, "hc_pre", None)
+    if not callable(hc_pre):
+        return False
+    if getattr(decoder_layer, "_lmcache_hc_pre_overlap_installed", False):
+        return True
+
+    original_hc_pre = hc_pre
+
+    def _lmcache_hc_pre(
+        self: Any,
+        hidden_states: torch.Tensor,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        if isinstance(hidden_states, torch.Tensor) and _is_ffn_hc_pre_call(
+            self,
+            args,
+            kwargs,
+        ):
+            positions = _positions_from_source(
+                getattr(self, "_lmcache_forward_position_source", None),
+                hidden_states,
+            )
+            if positions is None:
+                frame = inspect.currentframe()
+                try:
+                    caller = frame.f_back if frame is not None else None
+                    positions = _positions_from_forward_frame(caller, hidden_states)
+                finally:
+                    del frame
+            _fire_decoder_ffn_overlap(self, hidden_states, positions)
+        return original_hc_pre(hidden_states, *args, **kwargs)
+
+    _install_decoder_forward_position_hook(decoder_layer)
+    decoder_layer._lmcache_original_hc_pre = original_hc_pre
+    decoder_layer.hc_pre = MethodType(_lmcache_hc_pre, decoder_layer)
+    decoder_layer._lmcache_hc_pre_overlap_installed = True
+    return True
+
+
+def _configure_decoder_csa_overlap(
+    decoder_layer: Any,
+    manager: Any,
+    next_csa_layer_id: int,
+) -> bool:
+    decoder_layer._lmcache_indexer_prefetch_manager = manager
+    decoder_layer._lmcache_next_csa_layer_id = next_csa_layer_id
+    return _install_decoder_hc_pre_overlap_hook(decoder_layer)
+
+
+def _configure_decoder_hca_overlap(
+    decoder_layer: Any,
+    manager: Any,
+    next_hca_layer_id: int,
+) -> bool:
+    decoder_layer._lmcache_hca_prefetch_manager = manager
+    decoder_layer._lmcache_next_hca_layer_id = next_hca_layer_id
+    return _install_decoder_hc_pre_overlap_hook(decoder_layer)
+
+
+def _install_hca_attention_drain_hook(
+    hca_layer: Any,
+    manager: Any,
+    layer_id: int,
+) -> bool:
+    """Install a final safety drain before the target HCA attention runs."""
+    if getattr(hca_layer, "_lmcache_hca_drain_installed", False):
+        return True
+    original_forward = getattr(hca_layer, "forward", None)
+    if not callable(original_forward):
+        return False
+
+    def _lmcache_hca_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
+        drain = getattr(manager, "drain_for_layer", None)
+        if callable(drain):
+            drain(layer_id, blocking=True)
+        return original_forward(*args, **kwargs)
+
+    hca_layer._lmcache_original_forward = original_forward
+    hca_layer.forward = MethodType(_lmcache_hca_forward, hca_layer)
+    hca_layer._lmcache_hca_drain_installed = True
+    return True
+
+
 def _compressed_slot_mapping(
     slot_mapping: torch.Tensor,
     seq_len: int,
@@ -387,6 +692,7 @@ def _attach_indexer_prefetch() -> None:
                 register(layer_id, decoder_layer)
 
     attached_decoders = 0
+    early_overlap_hooks = 0
     for decoder_layer in decoder_layers:
         decoder_layer_id = getattr(decoder_layer, "layer_idx", -1)
         next_csa = next(
@@ -401,8 +707,10 @@ def _attach_indexer_prefetch() -> None:
         if callable(attach):
             attach(manager, next_csa)
             attached_decoders += 1
+        if _configure_decoder_csa_overlap(decoder_layer, manager, next_csa):
+            early_overlap_hooks += 1
 
-    if attached_decoders != len(decoder_layers):
+    if attached_decoders != len(decoder_layers) and early_overlap_hooks == 0:
         logger.warning(
             "CSA prefetch requested, but only %d/%d DeepSeek decoder layers "
             "expose attach_indexer_prefetch(); FFN-window prefetch may be "
@@ -412,9 +720,11 @@ def _attach_indexer_prefetch() -> None:
         )
 
     logger.info(
-        "IndexerSSDManager: enabled CSA prefetch on %d decoder layers and "
-        "attached %d CSA indexers, pool_size=%d, store=%s",
+        "IndexerSSDManager: enabled CSA prefetch on %d native decoder hooks, "
+        "%d FFN-entry early-overlap hooks, and attached %d CSA indexers, "
+        "pool_size=%d, store=%s",
         attached_decoders,
+        early_overlap_hooks,
         len(csa_layer_ids),
         pool_size,
         store_dir,
@@ -513,7 +823,13 @@ def _attach_hca_prefetch() -> None:
     for layer_id, hca_layer in hca_info:
         manager.register_hca_layer(layer_id, hca_layer)
 
+    hca_drain_hooks = 0
+    for layer_id, hca_layer in hca_info:
+        if _install_hca_attention_drain_hook(hca_layer, manager, layer_id):
+            hca_drain_hooks += 1
+
     attached_decoders = 0
+    early_overlap_hooks = 0
     hca_set = set(hca_layer_ids)
     for decoder_layer in decoder_layers:
         decoder_layer_id = getattr(decoder_layer, "layer_idx", -1)
@@ -532,8 +848,10 @@ def _attach_hca_prefetch() -> None:
         if callable(attach):
             attach(manager, current_hca, next_hca)
             attached_decoders += 1
+        if _configure_decoder_hca_overlap(decoder_layer, manager, next_hca):
+            early_overlap_hooks += 1
 
-    if attached_decoders == 0:
+    if attached_decoders == 0 and early_overlap_hooks == 0:
         logger.warning(
             "HCA prefetch requested, but DeepSeek decoder layers do not expose "
             "attach_hca_prefetch(); attention-drain HCA overlap is disabled"
@@ -543,8 +861,11 @@ def _attach_hca_prefetch() -> None:
     _HCA_PREFETCH_MANAGER = manager
     logger.info(
         "HCAPrefetchManager: enabled pinned-transient HCA state; "
-        "decoder_hooks=%d HCA caches=%d store=%s",
+        "native_decoder_hooks=%d FFN-entry early-overlap hooks=%d "
+        "attention-drain hooks=%d HCA caches=%d store=%s",
         attached_decoders,
+        early_overlap_hooks,
+        hca_drain_hooks,
         len(hca_layer_ids),
         store_dir,
     )
