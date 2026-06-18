@@ -186,6 +186,17 @@ def _hca_pinned_bounce_enabled() -> bool:
     return value.lower() in {"1", "true", "yes", "on"}
 
 
+def _vllm_kv_reuse_seed_enabled() -> bool:
+    """Return whether reuse prefetch may seed by copying vLLM KV to CPU.
+
+    DSv4 optimized KV retrieve can seed CSA/HCA object stores directly from
+    LMCache chunks while moving those chunks to HBM.  Copying vLLM's KV cache
+    back to CPU after a full LMCache hit duplicates that work and can leak into
+    the first-token critical path, so it stays opt-in for ablation.
+    """
+    return _env_flag("LMCACHE_REUSE_PREFETCH_SEED_FROM_VLLM_KV")
+
+
 def _env_int(name: str, default: int) -> int:
     """Parse an integer environment variable with a safe fallback."""
     value = os.environ.get(name)
@@ -551,7 +562,10 @@ def _install_hca_attention_drain_hook(
     def _lmcache_hca_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
         drain = getattr(manager, "drain_for_layer", None)
         if callable(drain):
-            drain(layer_id, blocking=True)
+            drain(
+                layer_id,
+                blocking=_env_flag("LMCACHE_HCA_BLOCKING_DRAIN"),
+            )
         return original_forward(*args, **kwargs)
 
     hca_layer._lmcache_original_forward = original_forward
@@ -1785,16 +1799,17 @@ class LMCacheConnectorV1Impl:
                     )
                     self._invalid_block_ids.update(missing_blocks)
                 else:
-                    self._maybe_seed_hca_reuse_prefetch(
-                        request,
-                        lmcache_cached_tokens,
-                        slot_mapping,
-                    )
-                    self._maybe_seed_indexer_reuse_prefetch(
-                        request,
-                        lmcache_cached_tokens,
-                        slot_mapping,
-                    )
+                    if _vllm_kv_reuse_seed_enabled():
+                        self._maybe_seed_hca_reuse_prefetch(
+                            request,
+                            lmcache_cached_tokens,
+                            slot_mapping,
+                        )
+                        self._maybe_seed_indexer_reuse_prefetch(
+                            request,
+                            lmcache_cached_tokens,
+                            slot_mapping,
+                        )
 
     def record_failed_blocks(
         self,
