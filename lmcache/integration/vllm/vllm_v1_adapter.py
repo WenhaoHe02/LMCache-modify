@@ -466,9 +466,6 @@ def _fire_decoder_ffn_overlap(
                 residual_f=residual_after_attention,
                 positions=positions,
             )
-            prepare = getattr(indexer_manager, "prepare_layer_async", None)
-            if callable(prepare):
-                prepare(next_csa)
         except Exception as exc:
             _log_overlap_hook_error_once("CSA", int(layer_id), exc)
 
@@ -478,9 +475,6 @@ def _fire_decoder_ffn_overlap(
         try:
             if positions is not None:
                 hca_manager.fire_async_for_layer(next_hca, positions)
-            prepare = getattr(hca_manager, "prepare_layer_async", None)
-            if callable(prepare):
-                prepare(next_hca)
         except Exception as exc:
             _log_overlap_hook_error_once("HCA", int(layer_id), exc)
 
@@ -1799,16 +1793,26 @@ class LMCacheConnectorV1Impl:
                     )
                     self._invalid_block_ids.update(missing_blocks)
                 else:
+                    self._prepare_hca_active_slots(
+                        request,
+                        lmcache_cached_tokens,
+                        request.slot_mapping,
+                    )
+                    self._maybe_seed_indexer_reuse_prefetch(
+                        request,
+                        lmcache_cached_tokens,
+                        request.slot_mapping,
+                    )
                     if _vllm_kv_reuse_seed_enabled():
                         self._maybe_seed_hca_reuse_prefetch(
                             request,
                             lmcache_cached_tokens,
-                            slot_mapping,
+                            request.slot_mapping,
                         )
-                        self._maybe_seed_indexer_reuse_prefetch(
-                            request,
-                            lmcache_cached_tokens,
-                            slot_mapping,
+                        logger.debug(
+                            "LMCACHE_REUSE_PREFETCH_SEED_FROM_VLLM_KV is "
+                            "deprecated for DSv4 CSA reuse; HCA VLLM-KV "
+                            "seed remains opt-in for ablation"
                         )
 
     def record_failed_blocks(
@@ -1959,7 +1963,7 @@ class LMCacheConnectorV1Impl:
                 request.req_id,
                 _seed_indexer_async,
             ):
-                logger.info(
+                logger.debug(
                     "IndexerSSDManager: submitted async reuse prefetch seed "
                     "for request %s lmcache_tokens=%d",
                     request.req_id,
@@ -2011,6 +2015,7 @@ class LMCacheConnectorV1Impl:
 
         csa_entries.sort(key=lambda item: item[0])
         submitted = 0
+        covered = 0
         for layer_id, indexer_op in csa_entries:
             key = (request.req_id, layer_id)
             if key in self._reuse_prefetch_seen:
@@ -2032,7 +2037,7 @@ class LMCacheConnectorV1Impl:
                 compressed_seq_len,
             ):
                 self._reuse_prefetch_seen.add(key)
-                submitted += 1
+                covered += 1
                 continue
             compressed_block_size = int(k_cache.shape[1])
             compressed_slots = _compressed_slot_mapping(
@@ -2080,6 +2085,15 @@ class LMCacheConnectorV1Impl:
                 "IndexerSSDManager: reuse prefetch seeded %d CSA layers for "
                 "request %s lmcache_tokens=%d compressed_tokens~=%d",
                 submitted,
+                request.req_id,
+                lmcache_cached_tokens,
+                lmcache_cached_tokens // 4,
+            )
+        elif covered > 0:
+            logger.debug(
+                "IndexerSSDManager: reuse prefetch already covered %d CSA "
+                "layers for request %s lmcache_tokens=%d compressed_tokens~=%d",
+                covered,
                 request.req_id,
                 lmcache_cached_tokens,
                 lmcache_cached_tokens // 4,
@@ -2186,6 +2200,84 @@ class LMCacheConnectorV1Impl:
                 "HCAPrefetchManager: reuse prefetch prepared %d HCA "
                 "layers for request %s lmcache_tokens=%d compressed_tokens~=%d",
                 submitted,
+                request.req_id,
+                lmcache_cached_tokens,
+                lmcache_cached_tokens // 128,
+            )
+
+    def _prepare_hca_active_slots(
+        self,
+        request: ReqMeta,
+        lmcache_cached_tokens: int,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Install current-request compressed slot maps for HCA prefetch."""
+        manager = _HCA_PREFETCH_MANAGER
+        if manager is None or request.load_spec is None:
+            return
+        if lmcache_cached_tokens <= request.load_spec.vllm_cached_tokens:
+            return
+        set_slots = getattr(manager, "set_active_request_slots", None)
+        if not callable(set_slots):
+            return
+
+        compressed_slots_by_block_size: dict[int, torch.Tensor] = {}
+        prepared = 0
+        for registry in _deepseek_decoder_registries():
+            for decoder_layer in list(registry):
+                layer_id = getattr(decoder_layer, "layer_idx", -1)
+                hca_layer = _decoder_hca_attention(decoder_layer)
+                if (
+                    not isinstance(layer_id, int)
+                    or layer_id < 0
+                    or hca_layer is None
+                ):
+                    continue
+                kv_cache = getattr(hca_layer, "kv_cache", None)
+                if not isinstance(kv_cache, torch.Tensor) or kv_cache.numel() == 0:
+                    continue
+                compress_ratio = int(getattr(hca_layer, "compress_ratio", 1))
+                if compress_ratio != 128:
+                    continue
+                compressed_seq_len = lmcache_cached_tokens // compress_ratio
+                if compressed_seq_len <= 0:
+                    continue
+                compressed_block_size = int(kv_cache.shape[1])
+                compressed_slots = compressed_slots_by_block_size.get(
+                    compressed_block_size
+                )
+                if compressed_slots is None:
+                    compressed_slots = _compressed_slot_mapping(
+                        slot_mapping,
+                        lmcache_cached_tokens,
+                        compress_ratio,
+                        compressed_block_size,
+                    )
+                    compressed_slots_by_block_size[compressed_block_size] = (
+                        compressed_slots
+                    )
+                if compressed_slots.numel() < compressed_seq_len:
+                    continue
+                active_slots = compressed_slots[:compressed_seq_len]
+                if bool((active_slots < 0).any().item()):
+                    continue
+                set_slots(layer_id, compressed_seq_len, active_slots)
+                prepared += 1
+        fired = 0
+        fire_active = getattr(manager, "fire_active_request_layers", None)
+        if (
+            prepared > 0
+            and callable(fire_active)
+            and not _env_flag("LMCACHE_HCA_DISABLE_ACTIVE_PREFIRE")
+        ):
+            fired = int(fire_active())
+        if prepared > 0:
+            logger.debug(
+                "HCAPrefetchManager: prepared active slot maps for %d HCA "
+                "layers and prefired %d layers request %s lmcache_tokens=%d "
+                "compressed_tokens~=%d",
+                prepared,
+                fired,
                 request.req_id,
                 lmcache_cached_tokens,
                 lmcache_cached_tokens // 128,

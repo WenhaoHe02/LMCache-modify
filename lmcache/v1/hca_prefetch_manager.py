@@ -275,7 +275,9 @@ class HCAPrefetchManager:
         self._pending: dict[int, list[HCAPendingRead]] = {}
         self._drain_futures: dict[int, Future[None] | None] = {}
         self._resident_hbm: dict[int, set[int]] = {}
+        self._inflight_hbm: dict[int, set[int]] = {}
         self._active_slots: dict[int, torch.Tensor] = {}
+        self._active_fire_plans: dict[int, tuple[list[int], list[int]]] = {}
         self._lock = threading.Lock()
         self._debug_fire_logged: set[int] = set()
         self._debug_drain_logged: set[int] = set()
@@ -284,6 +286,8 @@ class HCAPrefetchManager:
         self._timing_enabled = _env_flag("LMCACHE_HCA_TIMING") or _env_flag(
             "LMCACHE_INDEXER_TIMING"
         )
+        self._timing_verbose = _env_flag("LMCACHE_HCA_TIMING_VERBOSE")
+        self._timing_seed_verbose = _env_flag("LMCACHE_HCA_TIMING_SEED_VERBOSE")
         self._timing_seen = 0
         self._timing_limit = max(0, _env_int("LMCACHE_HCA_TIMING_LIMIT", 512))
         pinned_mb = max(1, _env_int("LMCACHE_HCA_PINNED_BUFFER_MB", 64))
@@ -338,6 +342,7 @@ class HCAPrefetchManager:
         self._pending.setdefault(layer_id, [])
         self._drain_futures.setdefault(layer_id, None)
         self._resident_hbm.setdefault(layer_id, set())
+        self._inflight_hbm.setdefault(layer_id, set())
         _register_ready_layer(layer_id)
 
     def submit_seed_after_reuse(
@@ -564,7 +569,44 @@ class HCAPrefetchManager:
             return
         slots = slot_mapping_cpu[:compressed_seq_len].to(device="cpu", dtype=torch.long)
         self._active_slots[layer_id] = slots
-        self._resident_hbm[layer_id].clear()
+        row_ids = self._deterministic_row_ids_from_compressed_rows(
+            min(compressed_seq_len, state.initialized_rows),
+            state,
+        )
+        slot_ids: list[int] = []
+        if row_ids:
+            selected = slots[row_ids[0] : row_ids[-1] + 1]
+            if not bool(torch.any(selected < 0).item()):
+                slot_ids = [int(slot_id) for slot_id in selected.tolist()]
+            else:
+                row_ids = []
+        self._active_fire_plans[layer_id] = (row_ids, slot_ids)
+        with self._lock:
+            self._resident_hbm[layer_id].clear()
+            self._inflight_hbm[layer_id].clear()
+
+    def fire_active_request_layers(self) -> int:
+        """Fire all current-request HCA plans as soon as slots are known.
+
+        Returns:
+            Number of layers with a non-empty plan submitted or already covered.
+        """
+        fired = 0
+        for layer_id in sorted(self._active_fire_plans):
+            state = self._layers.get(layer_id)
+            if state is None:
+                continue
+            row_ids, slot_ids = self._active_fire_plans[layer_id]
+            if not row_ids or not slot_ids:
+                continue
+            self._fire_rows(
+                layer_id,
+                state,
+                row_ids,
+                precomputed_slot_ids=slot_ids,
+            )
+            fired += 1
+        return fired
 
     def prefire_first_hca(self, seq_len: int) -> None:
         """Optionally fire the first HCA layer before forward for diagnostics."""
@@ -604,16 +646,29 @@ class HCAPrefetchManager:
                 prefill-hit chunks and one-token decode.
         """
         state = self._layers.get(layer_id)
-        if state is None or positions is None or positions.numel() == 0:
-            return
-        if positions.reshape(-1).numel() == 1 and not _env_flag(
-            "LMCACHE_HCA_ENABLE_DECODE_HOOK"
-        ):
+        if state is None:
             return
         if state.initialized_rows <= 0:
             return
         timing = self._timing_enabled
         t0 = time.perf_counter() if timing else None
+        active_plan = self._active_fire_plans.get(layer_id)
+        if active_plan is not None:
+            row_ids, slot_ids = active_plan
+            self._fire_rows(
+                layer_id,
+                state,
+                row_ids,
+                start_time=t0,
+                precomputed_slot_ids=slot_ids,
+            )
+            return
+        if positions is None or positions.numel() == 0:
+            return
+        if positions.reshape(-1).numel() == 1 and not _env_flag(
+            "LMCACHE_HCA_ENABLE_DECODE_HOOK"
+        ):
+            return
         row_ids = self._deterministic_row_ids(positions, state)
         self._fire_rows(layer_id, state, row_ids, start_time=t0)
 
@@ -623,37 +678,73 @@ class HCAPrefetchManager:
         state: HCALayerState,
         row_ids: list[int],
         start_time: float | None = None,
+        precomputed_slot_ids: list[int] | None = None,
     ) -> None:
         if not row_ids:
             return
         timing = self._timing_enabled
         t0 = time.perf_counter() if timing and start_time is None else start_time
-        t_slots0 = time.perf_counter() if timing else 0.0
-        slot_ids = self._global_slots_for_rows(layer_id, row_ids, state)
-        if slot_ids is None:
-            return
-        slots_ms = (time.perf_counter() - t_slots0) * 1000.0 if timing else 0.0
         t_filter0 = time.perf_counter() if timing else 0.0
         with self._lock:
             resident = self._resident_hbm[layer_id]
-            pending_ids = {
+            inflight = self._inflight_hbm[layer_id]
+            missing_row_ids = [
                 row_id
-                for pending in self._pending[layer_id]
-                for row_id in range(
-                    pending.start_row_id,
-                    pending.start_row_id + len(pending.slot_ids),
+                for row_id in row_ids
+                if row_id not in resident and row_id not in inflight
+            ]
+        filter_ms = (time.perf_counter() - t_filter0) * 1000.0 if timing else 0.0
+        if not missing_row_ids:
+            if timing and self._timing_verbose and t0 is not None:
+                self._log_timing(
+                    "fire",
+                    layer_id,
+                    total_ms=f"{(time.perf_counter() - t0) * 1000.0:.3f}",
+                    slots_ms="0.000",
+                    filter_ms=f"{filter_ms:.3f}",
+                    submit_ms="0.000",
+                    rows=len(row_ids),
+                    missing=0,
+                    pending=0,
                 )
-            }
+            return
+
+        if precomputed_slot_ids is not None:
+            if len(precomputed_slot_ids) != len(row_ids):
+                return
+            row_start = row_ids[0]
+            slot_ids = [
+                precomputed_slot_ids[row_id - row_start]
+                for row_id in missing_row_ids
+            ]
+            slots_ms = 0.0
+        else:
+            t_slots0 = time.perf_counter() if timing else 0.0
+            slot_ids = self._global_slots_for_rows(layer_id, missing_row_ids, state)
+            if slot_ids is None:
+                return
+            slots_ms = (time.perf_counter() - t_slots0) * 1000.0 if timing else 0.0
+        t_submit0 = time.perf_counter() if timing else 0.0
+        with self._lock:
+            resident = self._resident_hbm[layer_id]
+            inflight = self._inflight_hbm[layer_id]
             missing = [
                 (row_id, slot_id)
-                for row_id, slot_id in zip(row_ids, slot_ids, strict=False)
-                if row_id not in resident and row_id not in pending_ids
+                for row_id, slot_id in zip(
+                    missing_row_ids,
+                    slot_ids,
+                    strict=False,
+                )
+                if row_id not in resident and row_id not in inflight
             ]
-            filter_ms = (
-                (time.perf_counter() - t_filter0) * 1000.0 if timing else 0.0
-            )
-            t_submit0 = time.perf_counter() if timing else 0.0
             pending_reads = self._build_pending_reads(state, missing)
+            for pending_read in pending_reads:
+                inflight.update(
+                    range(
+                        pending_read.start_row_id,
+                        pending_read.start_row_id + len(pending_read.slot_ids),
+                    )
+                )
             submit_ms = (
                 (time.perf_counter() - t_submit0) * 1000.0 if timing else 0.0
             )
@@ -664,14 +755,14 @@ class HCAPrefetchManager:
             )
         if missing and layer_id not in self._debug_fire_logged:
             self._debug_fire_logged.add(layer_id)
-            logger.info(
+            logger.debug(
                 "HCAPrefetchManager: fire layer=%d rows=%d missing=%d "
                 "mode=pinned_transient",
                 layer_id,
                 len(row_ids),
                 len(missing),
             )
-        if timing and t0 is not None:
+        if timing and t0 is not None and (missing or self._timing_verbose):
             self._log_timing(
                 "fire",
                 layer_id,
@@ -696,14 +787,12 @@ class HCAPrefetchManager:
         with self._lock:
             previous_drain = self._drain_futures.get(layer_id)
             has_pending = bool(self._pending.get(layer_id))
-            if not has_pending and (
-                previous_drain is None or previous_drain.done()
-            ):
+            if previous_drain is not None and not previous_drain.done():
+                return
+            if not has_pending and previous_drain is None:
                 return
 
             def _prepare() -> None:
-                if previous_drain is not None:
-                    previous_drain.result()
                 self._drain_for_layer_once(layer_id)
 
             drain_future = self._executor.submit(_prepare)
@@ -775,19 +864,43 @@ class HCAPrefetchManager:
         written = 0
         for pending_read in pending:
             t_wait0 = time.perf_counter() if timing else 0.0
-            rows_written = pending_read.future.result()
-            if timing:
-                wait_ms += (time.perf_counter() - t_wait0) * 1000.0
-            for row_id in range(
+            row_span = range(
                 pending_read.start_row_id,
-                pending_read.start_row_id + rows_written,
-            ):
-                self._mark_resident(layer_id, row_id)
-            written += rows_written
-            pending_read.buffer_obj.ref_count_down()
+                pending_read.start_row_id + len(pending_read.slot_ids),
+            )
+            try:
+                rows_written = pending_read.future.result()
+                if timing:
+                    wait_ms += (time.perf_counter() - t_wait0) * 1000.0
+                if rows_written > 0:
+                    with self._lock:
+                        resident = self._resident_hbm[layer_id]
+                        resident.update(
+                            range(
+                                pending_read.start_row_id,
+                                pending_read.start_row_id + rows_written,
+                            )
+                        )
+                        if self._resident_budget_blocks > 0 and len(resident) > (
+                            self._resident_budget_blocks * 2
+                        ):
+                            keep_start = max(
+                                0,
+                                pending_read.start_row_id
+                                + rows_written
+                                - self._resident_budget_blocks,
+                            )
+                            self._resident_hbm[layer_id] = {
+                                rid for rid in resident if rid >= keep_start
+                            }
+                written += rows_written
+            finally:
+                with self._lock:
+                    self._inflight_hbm[layer_id].difference_update(row_span)
+                pending_read.buffer_obj.ref_count_down()
         if written and layer_id not in self._debug_drain_logged:
             self._debug_drain_logged.add(layer_id)
-            logger.info(
+            logger.debug(
                 "HCAPrefetchManager: drain layer=%d written=%d "
                 "mode=pinned_transient",
                 layer_id,
@@ -889,6 +1002,13 @@ class HCAPrefetchManager:
             seq_len // state.compress_ratio,
             state.initialized_rows,
         )
+        return self._deterministic_row_ids_from_compressed_rows(num_rows, state)
+
+    def _deterministic_row_ids_from_compressed_rows(
+        self,
+        num_rows: int,
+        state: HCALayerState,
+    ) -> list[int]:
         if num_rows <= 0:
             return []
         start = 0
@@ -912,15 +1032,20 @@ class HCAPrefetchManager:
     ) -> list[int] | None:
         active_slots = self._active_slots.get(layer_id)
         if active_slots is not None:
-            slot_ids: list[int] = []
-            for row_id in row_ids:
-                if row_id >= active_slots.numel():
-                    return None
-                slot_id = int(active_slots[row_id].item())
-                if slot_id < 0:
-                    return None
-                slot_ids.append(slot_id)
-            return slot_ids
+            if not row_ids:
+                return []
+            if row_ids[-1] >= active_slots.numel() or row_ids[0] < 0:
+                return None
+            if row_ids[-1] - row_ids[0] + 1 == len(row_ids):
+                selected = active_slots[row_ids[0] : row_ids[-1] + 1]
+            else:
+                selected = active_slots.index_select(
+                    0,
+                    torch.tensor(row_ids, dtype=torch.long),
+                )
+            if bool(torch.any(selected < 0).item()):
+                return None
+            return [int(slot_id) for slot_id in selected.tolist()]
 
         try:
             from vllm.forward_context import get_forward_context
@@ -1022,8 +1147,8 @@ class HCAPrefetchManager:
                 raise TypeError(
                     "HCAPrefetchManager currently expects uint8 HCA KV rows, "
                     f"got {row.dtype}"
-            )
-            row.reshape(-1).copy_(src[idx].to(device=row.device, non_blocking=True))
+                )
+            row.reshape(-1).copy_(src[idx], non_blocking=True)
         return rows_to_write
 
     def _read_rows_into_kv_cache(
@@ -1053,11 +1178,24 @@ class HCAPrefetchManager:
     def _log_timing(self, event: str, layer_id: int, **fields: Any) -> None:
         if not self._timing_enabled:
             return
+        detail = " ".join(f"{key}={value}" for key, value in fields.items())
+        if event == "seed_lmcache" and not self._timing_seed_verbose:
+            logger.debug(
+                "HCAPrefetchTiming: event=%s layer=%d %s",
+                event,
+                layer_id,
+                detail,
+            )
+            return
         if self._timing_seen >= self._timing_limit:
             return
         self._timing_seen += 1
-        detail = " ".join(f"{key}={value}" for key, value in fields.items())
-        logger.info("HCAPrefetchTiming: event=%s layer=%d %s", event, layer_id, detail)
+        logger.info(
+            "HCAPrefetchTiming: event=%s layer=%d %s",
+            event,
+            layer_id,
+            detail,
+        )
 
     def _log_skip_once(self, layer_id: int, reason: str, message: str) -> None:
         key = (layer_id, reason)

@@ -816,6 +816,8 @@ class LocalDiskBackend(StorageBackendInterface):
         with self.disk_lock:
             if key not in self.dict:
                 return False
+            if not self._has_readable_chunk_object_unlocked(key):
+                return False
             if pin:
                 self.dict[key].pin()
                 # vllm lookup sets pin to True
@@ -1217,11 +1219,27 @@ class LocalDiskBackend(StorageBackendInterface):
             for key in keys:
                 if key not in self.dict:
                     return num_hit_counts
+                if not self._has_readable_chunk_object_unlocked(key):
+                    return num_hit_counts
                 if pin:
                     self.dict[key].pin()
                     self.keys_in_request.append(key)
                 num_hit_counts += 1
         return num_hit_counts
+
+    def _has_readable_chunk_object_unlocked(self, key: CacheEngineKey) -> bool:
+        """Return whether a raw object-store chunk can be read by Tutti."""
+        if not self.kv_object_store_enabled or not self.kv_object_tutti_raw_enabled:
+            return True
+        if self.kv_object_metadata_store is None:
+            return False
+        object_id = self._key_to_object_id(key)
+        record = self.kv_object_metadata_store.get(object_id)
+        if record is None or record.state != KVObjectState.READY:
+            return False
+        if not record.raw_extents:
+            return False
+        return self.kv_object_record_raw_readable(record)
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -1588,14 +1606,34 @@ class LocalDiskBackend(StorageBackendInterface):
         """
         start_time = time.time()
         size = len(buffer)
-        try:
+
+        def _write_once() -> None:
             if size % self.os_disk_bs != 0 or not self.use_odirect:
                 with open(path, "wb") as f:
                     f.write(buffer)
             else:
                 fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_DIRECT, 0o644)
-                os.write(fd, buffer)
-                os.close(fd)
+                try:
+                    os.write(fd, buffer)
+                finally:
+                    os.close(fd)
+
+        try:
+            _write_once()
+        except FileNotFoundError:
+            parent_dir = os.path.dirname(path)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
+            try:
+                _write_once()
+            except OSError as exc:
+                logger.warning(
+                    "write_file failed (filesystem EIO or permission error) "
+                    "path=%s error=%s; write skipped (Tutti read-only mode?)",
+                    path,
+                    exc,
+                )
+                return False
         except OSError as exc:
             # Filesystem may be EIO when Tutti (snvme) has exclusive NVMe
             # control.  Log a warning and skip the write rather than crashing.

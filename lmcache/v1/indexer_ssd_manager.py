@@ -170,17 +170,35 @@ _RESIDUAL_PROXY_ENABLED: bool = _env_flag("LMCACHE_INDEXER_ENABLE_RESIDUAL_PROXY
 _DECODE_PREFETCH_ENABLED: bool = _env_flag(
     "LMCACHE_INDEXER_ENABLE_DECODE_PREFETCH"
 )
-_PREFILL_RESIDUAL_PROXY_ENABLED: bool = _env_flag(
+_PREFILL_RESIDUAL_PROXY_ENV = os.environ.get(
     "LMCACHE_INDEXER_ENABLE_PREFILL_RESIDUAL_PROXY"
 )
-_PREFILL_PROXY_ROWS: int = max(
-    0, _env_int("LMCACHE_INDEXER_PREFETCH_PREFILL_ROWS", 0)
+_PREFILL_RESIDUAL_PROXY_ENABLED: bool = (
+    _env_flag("LMCACHE_INDEXER_ENABLE_PREFILL_RESIDUAL_PROXY")
+    if _PREFILL_RESIDUAL_PROXY_ENV is not None
+    else (
+        _RESIDUAL_PROXY_ENABLED
+        and _env_flag("LMCACHE_INDEXER_ENABLE_REUSE_PREFETCH")
+    )
 )
+_PREFILL_PROXY_ROWS: int = max(
+    0,
+    _env_int(
+        "LMCACHE_INDEXER_PREFETCH_PREFILL_ROWS",
+        1 if _PREFILL_RESIDUAL_PROXY_ENABLED else 0,
+    ),
+)
+if _PREFILL_RESIDUAL_PROXY_ENABLED and _PREFILL_PROXY_ROWS <= 0:
+    _PREFILL_PROXY_ROWS = 1
 _PREFILL_EVICTION_ENABLED: bool = _env_flag(
     "LMCACHE_INDEXER_ENABLE_PREFILL_EVICTION"
 )
 _PREFILL_EVICTION_FLAG_FILE = "/tmp/lmcache_indexer_enable_prefill_eviction"
 _TIMING_LIMIT: int = max(0, _env_int("LMCACHE_INDEXER_TIMING_LIMIT", 512))
+_TIMING_SEED_VERBOSE = _env_flag("LMCACHE_INDEXER_TIMING_SEED_VERBOSE")
+_PREFILL_NATIVE_PROXY_TOPK_ENABLED = _env_flag(
+    "LMCACHE_INDEXER_ENABLE_PREFILL_NATIVE_PROXY_TOPK"
+)
 _PREFILL_OVERLAP_PROFILE_FLAG_FILE = "/tmp/lmcache_indexer_prefill_overlap_profile"
 _PREFILL_OVERLAP_PROFILE_LIMIT: int = max(
     0, _env_int("LMCACHE_INDEXER_PREFILL_OVERLAP_PROFILE_LIMIT", 512)
@@ -717,6 +735,15 @@ class IndexerSSDManager:
         self._attention_profile_hits = 0
         self._attention_profile_total = 0
         self._timing_seen = 0
+        logger.info(
+            "IndexerSSDManager: config residual_proxy=%s reuse_prefetch=%s "
+            "decode_prefetch=%s prefill_proxy=%s prefill_rows=%d",
+            _RESIDUAL_PROXY_ENABLED,
+            self.reuse_prefetch_enabled(),
+            _DECODE_PREFETCH_ENABLED,
+            _PREFILL_RESIDUAL_PROXY_ENABLED,
+            _PREFILL_PROXY_ROWS,
+        )
 
     @staticmethod
     def _profile_read_token(
@@ -733,10 +760,18 @@ class IndexerSSDManager:
         """Emit one lightweight timing line when timing diagnostics are enabled."""
         if not _timing_enabled():
             return
+        detail = " ".join(f"{key}={value}" for key, value in fields.items())
+        if event == "seed_lmcache" and not _TIMING_SEED_VERBOSE:
+            logger.debug(
+                "IndexerSSDTiming: event=%s layer=%d %s",
+                event,
+                layer_id,
+                detail,
+            )
+            return
         if self._timing_seen >= _TIMING_LIMIT:
             return
         self._timing_seen += 1
-        detail = " ".join(f"{key}={value}" for key, value in fields.items())
         logger.info(
             "IndexerSSDTiming: event=%s layer=%d %s",
             event,
@@ -1037,18 +1072,10 @@ class IndexerSSDManager:
         if cursor <= 0:
             if layer_id not in self._debug_fire_no_prev_logged:
                 self._debug_fire_no_prev_logged.add(layer_id)
-                logger.info(
+                logger.debug(
                     "IndexerSSDManager: fire_async_for_layer layer %d skipped "
                     "because SSD state is not initialized yet",
                     layer_id,
-                )
-            if is_prefill_proxy:
-                self._log_timing(
-                    "prefill_fire_async_skip",
-                    layer_id,
-                    reason="ssd_uninitialized",
-                    rows=proxy_rows,
-                    cursor=cursor,
                 )
             return
         if _RESIDUAL_PROXY_ENABLED and proxy_state is not None and positions is not None:
@@ -1056,6 +1083,7 @@ class IndexerSSDManager:
                 min_rows = min(proxy_state.shape[0], positions.shape[0])
                 proxy_state = proxy_state[-min_rows:]
                 positions = positions[-min_rows:]
+            run_native_proxy = True
             if is_prefill_proxy:
                 original_shape = tuple(proxy_state.shape)
                 topk_tail_rows = min(
@@ -1063,41 +1091,66 @@ class IndexerSSDManager:
                     int(proxy_state.shape[0]),
                     int(positions.shape[0]),
                 )
+                # vLLM's prefill sparse-indexer kernels validate against the
+                # full prefill metadata chunk. Running the native indexer on
+                # only the tail token breaks that invariant, so the default
+                # prefill path uses corrected previous top-K stability for I/O
+                # overlap. The full native proxy remains available as an
+                # explicit ablation because it is metadata-safe but expensive.
+                run_native_proxy = _PREFILL_NATIVE_PROXY_TOPK_ENABLED
                 if layer_id not in self._debug_residual_proxy_attempt_logged:
-                    logger.info(
+                    logger.debug(
                         "IndexerSSDManager: residual_proxy prefill layer %d "
-                        "using_tail_rows=%d original_shape=%s compute_shape=%s",
+                        "using_tail_rows=%d original_shape=%s compute_shape=%s "
+                        "native_topk=%s",
                         layer_id,
                         topk_tail_rows,
                         original_shape,
                         tuple(proxy_state.shape),
+                        run_native_proxy,
                     )
             if layer_id not in self._debug_residual_proxy_attempt_logged:
                 self._debug_residual_proxy_attempt_logged.add(layer_id)
-                logger.info(
+                logger.debug(
                     "IndexerSSDManager: residual_proxy_attempt layer %d "
                     "proxy_shape=%s positions_shape=%s",
                     layer_id,
                     tuple(proxy_state.shape),
                     tuple(positions.shape),
                 )
-            t_proxy0 = time.perf_counter()
-            prev = self._residual_proxy_topk(
-                layer_id,
-                proxy_state,
-                positions,
-                llama_4_scaling,
-                topk_tail_rows=topk_tail_rows,
-            )
-            proxy_ms = (time.perf_counter() - t_proxy0) * 1000.0
-            self._last_proxy_topk[layer_id] = prev
+            if run_native_proxy:
+                t_proxy0 = time.perf_counter()
+                try:
+                    prev = self._residual_proxy_topk(
+                        layer_id,
+                        proxy_state,
+                        positions,
+                        llama_4_scaling,
+                        topk_tail_rows=topk_tail_rows,
+                    )
+                except Exception as exc:
+                    self._log_residual_proxy_skip(
+                        layer_id,
+                        f"native_proxy_exception={type(exc).__name__}",
+                    )
+                    logger.debug(
+                        "IndexerSSDManager: native residual proxy failed for "
+                        "layer %d",
+                        layer_id,
+                        exc_info=True,
+                    )
+                    prev = None
+                proxy_ms = (time.perf_counter() - t_proxy0) * 1000.0
+                self._last_proxy_topk[layer_id] = prev
+            elif is_prefill_proxy:
+                self._last_proxy_topk[layer_id] = None
         if prev is None:
             self._last_proxy_topk[layer_id] = None
             prev = self._prev_topk.get(layer_id)
         if prev is None:
             if layer_id not in self._debug_fire_no_prev_logged:
                 self._debug_fire_no_prev_logged.add(layer_id)
-                logger.info(
+                logger.debug(
                     "IndexerSSDManager: fire_async_for_layer layer %d has no "
                     "previous topk yet",
                     layer_id,
@@ -1120,7 +1173,7 @@ class IndexerSSDManager:
         if not missing:
             if layer_id not in self._debug_fire_active_logged:
                 self._debug_fire_active_logged.add(layer_id)
-                logger.info(
+                logger.debug(
                     "IndexerSSDManager: fire_async_for_layer layer %d active, "
                     "prev_topk=%d, all already resident",
                     layer_id,
@@ -1139,7 +1192,7 @@ class IndexerSSDManager:
             return
         if layer_id not in self._debug_fire_active_logged:
             self._debug_fire_active_logged.add(layer_id)
-            logger.info(
+            logger.debug(
                 "IndexerSSDManager: fire_async_for_layer layer %d active, "
                 "prev_topk=%d, missing=%d",
                 layer_id,
@@ -1183,16 +1236,16 @@ class IndexerSSDManager:
             ready_fut = self._ready_futures.get(layer_id)
             previous_drain = self._drain_futures.get(layer_id)
             has_pending = bool(self._pending.get(layer_id))
+            if previous_drain is not None and not previous_drain.done():
+                return
             if (
                 ready_fut is None
                 and not has_pending
-                and (previous_drain is None or previous_drain.done())
+                and previous_drain is None
             ):
                 return
 
         def _prepare() -> None:
-            if previous_drain is not None:
-                previous_drain.result(timeout=self._prefill_ready_timeout_s)
             if ready_fut is not None:
                 ready_fut.result(timeout=self._prefill_ready_timeout_s)
                 if self._device.type == "cuda":

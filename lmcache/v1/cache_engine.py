@@ -1024,8 +1024,104 @@ class LMCacheEngine:
         if any(m is None for m in disk_metas):
             return [None] * len(keys)
 
+        original_key_count = len(keys)
         tutti_shapes_per_key = shapes_per_key
         kv_object_records = disk_backend.get_kv_object_records(keys)
+        pad_missing_objects = 0
+        if (
+            disk_backend.kv_object_store_enabled
+            and disk_backend.kv_object_tutti_raw_enabled
+        ):
+            first_unreadable = len(kv_object_records)
+            for index, record in enumerate(kv_object_records):
+                if (
+                    record is None
+                    or not record.raw_extents
+                    or not disk_backend.kv_object_record_raw_readable(record)
+                ):
+                    first_unreadable = index
+                    break
+            if first_unreadable < len(keys):
+                logger.info(
+                    "TUTTI_OBJECT_STORE_PROFILE op=select status=trimmed "
+                    "keys=%d readable=%d missing=%d",
+                    len(keys),
+                    first_unreadable,
+                    len(keys) - first_unreadable,
+                )
+                if first_unreadable == 0:
+                    return [None] * len(keys)
+                pad_missing_objects = len(keys) - first_unreadable
+                keys = keys[:first_unreadable]
+                disk_metas = disk_metas[:first_unreadable]
+                kv_object_records = kv_object_records[:first_unreadable]
+                if shapes_per_key is not None:
+                    shapes_per_key = shapes_per_key[:first_unreadable]
+                tutti_shapes_per_key = shapes_per_key
+            first_unreadable = len(kv_object_records)
+            for index, (original_meta, record) in enumerate(
+                zip(disk_metas, kv_object_records, strict=True)
+            ):
+                if record is None or original_meta is None:
+                    first_unreadable = index
+                    break
+                read_record = record
+                object_shapes = (
+                    shapes_per_key[index] if shapes_per_key is not None else None
+                )
+                if object_shapes is None:
+                    object_shapes = original_meta.shapes
+                object_dtypes = original_meta.dtypes
+                if object_shapes is not None and object_dtypes is not None:
+                    requested_nbytes = sum(
+                        self._shape_nbytes(shape, dtype)
+                        for shape, dtype in zip(
+                            object_shapes,
+                            object_dtypes,
+                            strict=True,
+                        )
+                    )
+                    if requested_nbytes <= 0:
+                        first_unreadable = index
+                        break
+                    if requested_nbytes < record.length:
+                        try:
+                            read_record = self._kv_object_prefix_view(
+                                record,
+                                requested_nbytes,
+                            )
+                        except ValueError:
+                            first_unreadable = index
+                            break
+                    elif requested_nbytes > record.length:
+                        fitted_shapes = self._dsv4_fit_shapes_to_payload(
+                            object_shapes,
+                            object_dtypes,
+                            record.length,
+                        )
+                        if fitted_shapes is None:
+                            first_unreadable = index
+                            break
+                if not disk_backend.kv_object_record_raw_readable(read_record):
+                    first_unreadable = index
+                    break
+            if first_unreadable < len(keys):
+                logger.info(
+                    "TUTTI_OBJECT_STORE_PROFILE op=select status=trimmed "
+                    "keys=%d readable=%d missing=%d reason=read_ranges",
+                    len(keys),
+                    first_unreadable,
+                    len(keys) - first_unreadable,
+                )
+                if first_unreadable == 0:
+                    return [None] * original_key_count
+                pad_missing_objects += len(keys) - first_unreadable
+                keys = keys[:first_unreadable]
+                disk_metas = disk_metas[:first_unreadable]
+                kv_object_records = kv_object_records[:first_unreadable]
+                if shapes_per_key is not None:
+                    shapes_per_key = shapes_per_key[:first_unreadable]
+                tutti_shapes_per_key = shapes_per_key
         if all(record is not None for record in kv_object_records):
             object_metas: List[Optional[DiskCacheMetadata]] = []
             object_offsets: List[int] = []
@@ -1034,6 +1130,9 @@ class LMCacheEngine:
             object_shapes_per_key: Optional[List[Optional[List[torch.Size]]]] = (
                 [None] * len(keys) if shapes_per_key is not None else None
             )
+            shape_adjust_partial_count = 0
+            shape_adjust_adjusted_count = 0
+            first_shape_adjust_key: Optional[str] = None
             for index, (key, original_meta, record) in enumerate(
                 zip(
                     keys,
@@ -1083,14 +1182,9 @@ class LMCacheEngine:
                             record,
                             requested_nbytes,
                         )
-                        logger.info(
-                            "TUTTI_OBJECT_STORE_PROFILE op=shape_adjust "
-                            "status=partial key=%s record_bytes=%d "
-                            "requested_bytes=%d",
-                            key.to_string(),
-                            record.length,
-                            requested_nbytes,
-                        )
+                        shape_adjust_partial_count += 1
+                        if first_shape_adjust_key is None:
+                            first_shape_adjust_key = key.to_string()
                     elif requested_nbytes > record.length:
                         fitted_shapes = self._dsv4_fit_shapes_to_payload(
                             object_shapes,
@@ -1108,14 +1202,9 @@ class LMCacheEngine:
                             )
                             object_metas = []
                             break
-                        logger.info(
-                            "TUTTI_OBJECT_STORE_PROFILE op=shape_adjust "
-                            "status=adjusted key=%s record_bytes=%d "
-                            "requested_bytes=%d",
-                            key.to_string(),
-                            record.length,
-                            requested_nbytes,
-                        )
+                        shape_adjust_adjusted_count += 1
+                        if first_shape_adjust_key is None:
+                            first_shape_adjust_key = key.to_string()
                         object_shapes = fitted_shapes
                     if object_shapes_per_key is not None:
                         object_shapes_per_key[index] = object_shapes
@@ -1135,6 +1224,17 @@ class LMCacheEngine:
                 object_offsets.append(read_record.offset)
                 object_read_ranges.append(read_record.read_ranges)
                 object_records_for_read.append(read_record)
+            if object_metas and (
+                shape_adjust_partial_count or shape_adjust_adjusted_count
+            ):
+                logger.info(
+                    "TUTTI_OBJECT_STORE_PROFILE op=shape_adjust status=summary "
+                    "keys=%d partial=%d adjusted=%d first_key=%s",
+                    len(object_metas),
+                    shape_adjust_partial_count,
+                    shape_adjust_adjusted_count,
+                    first_shape_adjust_key,
+                )
             if object_metas:
                 raw_lba_cache = {
                     path: [
@@ -1201,12 +1301,15 @@ class LMCacheEngine:
                 else "cache miss",
             )
             if self._tutti_can_cpu_fallback:
-                return self.storage_manager.batched_get(
+                fallback_results = self.storage_manager.batched_get(
                     keys=keys,
                     location="LocalDiskBackend",
                     shapes_per_key=tutti_shapes_per_key,
                 )
-            return [None] * len(keys)
+                if pad_missing_objects:
+                    fallback_results.extend([None] * pad_missing_objects)
+                return fallback_results
+            return [None] * original_key_count
         load_ms = (time.perf_counter() - load_start) * 1000.0
         loaded = sum(1 for result in results if result is not None)
         total_bytes = sum(
@@ -1222,6 +1325,8 @@ class LMCacheEngine:
             load_ms,
             (time.perf_counter() - profile_start) * 1000.0,
         )
+        if pad_missing_objects:
+            results.extend([None] * pad_missing_objects)
         return results
 
     def _make_tutti_store_warmup_callback(
@@ -1706,8 +1811,6 @@ class LMCacheEngine:
         )
         disk_keys = block_mapping["LocalDiskBackend"]
         records = disk_backend.get_kv_object_records(disk_keys)
-        if any(record is None for record in records):
-            return hit_chunks
         readable = 0
         staging_bytes = (
             int(self._tutti_config["slot_mb"])
