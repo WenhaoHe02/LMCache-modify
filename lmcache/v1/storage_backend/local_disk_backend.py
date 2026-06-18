@@ -539,6 +539,55 @@ class LocalDiskBackend(StorageBackendInterface):
             result.setdefault(path, []).extend(self._raw_extents_for_record(record))
         return result
 
+    def kv_object_record_raw_readable(self, record: KVObjectRecord) -> bool:
+        """Return whether a raw Tutti object record can satisfy its read ranges.
+
+        Args:
+            record: KV object metadata record to validate.
+
+        Returns:
+            ``True`` when the record is file-backed, or when its raw extents cover
+            every byte that the direct loader will request.  ``False`` means
+            lookup must not advertise this object as a Tutti raw hit.
+        """
+        if not record.raw_extents:
+            return self.kv_object_data_path(record) is not None
+
+        expected_bytes = self.kv_object_record_raw_read_bytes(record)
+        if expected_bytes <= 0:
+            return False
+
+        covered_bytes = sum(
+            n_sectors * 512
+            for _file_offset, _slba, n_sectors in self._raw_extents_for_record(
+                record
+            )
+        )
+        return covered_bytes == expected_bytes
+
+    def kv_object_record_raw_read_bytes(self, record: KVObjectRecord) -> int:
+        """Return DMA bytes needed to read a raw Tutti object record.
+
+        Args:
+            record: KV object metadata record to inspect.
+
+        Returns:
+            The sector-aligned number of bytes Tutti will read, or ``0`` when
+            any logical range violates direct-read alignment requirements.
+        """
+        expected_bytes = 0
+        for byte_range in record.read_ranges:
+            range_dma_length = ((byte_range.length + 511) // 512) * 512
+            is_tail_range = (
+                byte_range.target_offset + byte_range.length == record.length
+            )
+            if byte_range.offset % 512 != 0:
+                return 0
+            if range_dma_length != byte_range.length and not is_tail_range:
+                return 0
+            expected_bytes += range_dma_length
+        return expected_bytes
+
     def _raw_extents_for_record(
         self,
         record: KVObjectRecord,

@@ -1665,6 +1665,180 @@ class LMCacheEngine:
             )
         return record.with_byte_ranges(prefix_ranges, length=prefix_nbytes)
 
+    def _filter_tutti_raw_lookup_prefix(
+        self,
+        chunk_info_list: list[tuple[int, int, CacheEngineKey]],
+        hit_chunks: int,
+        block_mapping: dict[str, list[CacheEngineKey]],
+        *,
+        pin: bool,
+        total_tokens: int,
+    ) -> int:
+        """Trim LocalDisk hits that the Tutti raw object path cannot read.
+
+        The legacy disk ``contains`` check only verifies chunk-level metadata.
+        When KV object raw mode is active, retrieve will instead use object
+        records and explicit byte ranges.  Lookup must advertise only the prefix
+        that the object path can actually DMA; otherwise vLLM treats a later
+        miss as an invalid-block update and can fail the request.
+        """
+        if hit_chunks <= 0 or self.storage_manager is None:
+            return hit_chunks
+        if self._tutti_config is None or "LocalDiskBackend" not in block_mapping:
+            return hit_chunks
+
+        from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
+
+        disk_backend = self.storage_manager.storage_backends.get("LocalDiskBackend")
+        if not isinstance(disk_backend, LocalDiskBackend):
+            return hit_chunks
+        if (
+            not disk_backend.kv_object_store_enabled
+            or not disk_backend.kv_object_tutti_raw_enabled
+        ):
+            return hit_chunks
+
+        locations = list(block_mapping)
+        disk_location_index = locations.index("LocalDiskBackend")
+        preceding_hit_chunks = sum(
+            len(block_mapping[location])
+            for location in locations[:disk_location_index]
+        )
+        disk_keys = block_mapping["LocalDiskBackend"]
+        records = disk_backend.get_kv_object_records(disk_keys)
+        if any(record is None for record in records):
+            return hit_chunks
+        readable = 0
+        slot_bytes = int(self._tutti_config["slot_mb"]) * 1024 * 1024
+        for index, (key, record) in enumerate(
+            zip(disk_keys, records, strict=True)
+        ):
+            if record is None:
+                logger.info(
+                    "TUTTI_OBJECT_STORE_PROFILE op=lookup_filter status=miss "
+                    "index=%d key=%s reason=no_record",
+                    index,
+                    key.to_string(),
+                )
+                break
+            if not record.raw_extents:
+                logger.info(
+                    "TUTTI_OBJECT_STORE_PROFILE op=lookup_filter status=miss "
+                    "index=%d key=%s reason=no_raw_extents",
+                    index,
+                    key.to_string(),
+                )
+                break
+            read_record = self._tutti_lookup_read_record(
+                chunk_info_list[preceding_hit_chunks + index],
+                record,
+                total_tokens,
+            )
+            if read_record is None:
+                logger.info(
+                    "TUTTI_OBJECT_STORE_PROFILE op=lookup_filter status=miss "
+                    "index=%d key=%s reason=shape_mismatch",
+                    index,
+                    key.to_string(),
+                )
+                break
+            read_bytes = disk_backend.kv_object_record_raw_read_bytes(read_record)
+            if read_bytes <= 0:
+                logger.info(
+                    "TUTTI_OBJECT_STORE_PROFILE op=lookup_filter status=miss "
+                    "index=%d key=%s reason=alignment",
+                    index,
+                    key.to_string(),
+                )
+                break
+            if read_bytes > slot_bytes:
+                logger.info(
+                    "TUTTI_OBJECT_STORE_PROFILE op=lookup_filter status=miss "
+                    "index=%d key=%s reason=slot_bytes read_bytes=%d slot_bytes=%d",
+                    index,
+                    key.to_string(),
+                    read_bytes,
+                    slot_bytes,
+                )
+                break
+            if not disk_backend.kv_object_record_raw_readable(read_record):
+                logger.info(
+                    "TUTTI_OBJECT_STORE_PROFILE op=lookup_filter status=miss "
+                    "index=%d key=%s reason=raw_extents",
+                    index,
+                    key.to_string(),
+                )
+                break
+            readable += 1
+
+        if readable == len(disk_keys):
+            return hit_chunks
+
+        dropped_keys = disk_keys[readable:]
+        following_locations = locations[disk_location_index + 1 :]
+        if pin:
+            if dropped_keys:
+                self.storage_manager.batched_unpin(
+                    dropped_keys,
+                    ["LocalDiskBackend"],
+                )
+            for location in following_locations:
+                self.storage_manager.batched_unpin(
+                    block_mapping[location],
+                    [location],
+                )
+        if readable == 0:
+            del block_mapping["LocalDiskBackend"]
+        else:
+            block_mapping["LocalDiskBackend"] = disk_keys[:readable]
+        for location in following_locations:
+            del block_mapping[location]
+        trimmed_hit_chunks = preceding_hit_chunks + readable
+        logger.info(
+            "TUTTI_OBJECT_STORE_PROFILE op=lookup_filter status=trimmed "
+            "hit_chunks=%d readable=%d dropped=%d",
+            hit_chunks,
+            trimmed_hit_chunks,
+            hit_chunks - trimmed_hit_chunks,
+        )
+        return trimmed_hit_chunks
+
+    def _tutti_lookup_read_record(
+        self,
+        chunk_info: tuple[int, int, CacheEngineKey],
+        record: KVObjectRecord,
+        total_tokens: int,
+    ) -> Optional[KVObjectRecord]:
+        """Return the object record shape-adjusted the same way retrieve will read."""
+        start, end, _key = chunk_info
+        if not self.dsv4_optimized_kv:
+            return record
+        dtypes = self.metadata.get_dtypes()
+        shapes = self._dsv4_store_shapes_for_range(
+            self.metadata.get_shapes(end - start),
+            dtypes,
+            start,
+            end,
+            total_tokens,
+        )
+        requested_nbytes = sum(
+            self._shape_nbytes(shape, dtype)
+            for shape, dtype in zip(shapes, dtypes, strict=True)
+        )
+        if requested_nbytes <= 0:
+            return None
+        if requested_nbytes < record.length:
+            return self._kv_object_prefix_view(record, requested_nbytes)
+        if requested_nbytes > record.length:
+            fitted_shapes = self._dsv4_fit_shapes_to_payload(
+                shapes,
+                dtypes,
+                record.length,
+            )
+            if fitted_shapes is None:
+                return None
+        return record
+
     def _dsv4_fit_shapes_to_payload(
         self,
         shapes: list[torch.Size],
@@ -2384,6 +2558,15 @@ class LMCacheEngine:
                 # hit chunks by prefix matching
                 hit_chunks, block_mapping = self.storage_manager.batched_contains(
                     keys, search_range, pin
+                )
+                hit_chunks = self._filter_tutti_raw_lookup_prefix(
+                    chunk_info_list,
+                    hit_chunks,
+                    block_mapping,
+                    pin=pin,
+                    total_tokens=len(tokens)
+                    if tokens is not None
+                    else sum(offsets or []),
                 )
                 if pin and block_mapping:
                     assert lookup_id is not None, (

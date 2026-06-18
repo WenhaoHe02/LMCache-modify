@@ -441,6 +441,35 @@ class TestKVObjectStoreLocalDiskBackend:
         assert not backend.kv_object_raw_region_covers(0, 513)
         assert not backend.kv_object_raw_region_covers(512, 512)
 
+    def test_raw_object_readable_requires_full_dma_coverage(self) -> None:
+        """Lookup only advertises raw objects whose extents cover direct reads."""
+        backend = LocalDiskBackend.__new__(LocalDiskBackend)
+        object_id = KVObjectId(
+            model_id="model",
+            parallel_config_id="world1",
+            rank=0,
+            layer_id=0,
+            role="full",
+            block_id="readable",
+        )
+        record = KVObjectRecord(
+            object_id=object_id,
+            pool_id="rank0-full",
+            offset=0,
+            length=1024,
+            aligned_length=1024,
+            shape=(1024,),
+            dtype="torch.uint8",
+            state=KVObjectState.READY,
+            raw_extents=((0, 1000, 1),),
+        )
+
+        assert backend.kv_object_record_raw_read_bytes(record) == 1024
+        assert not backend.kv_object_record_raw_readable(record)
+        assert backend.kv_object_record_raw_readable(
+            record.with_raw_extents(((0, 1000, 2),))
+        )
+
 
 class TestMultiPathDiskBackend:
     """Test cases for multi-path (multi-device) LocalDiskBackend."""
