@@ -47,7 +47,7 @@ from lmcache.v1.event_manager import EventManager, EventStatus, EventType
 from lmcache.v1.gpu_connector.gpu_connectors import GPUConnectorInterface
 from lmcache.v1.gpu_connector.tutti_direct_loader import TuttiDirectLoader
 from lmcache.v1.gpu_connector.utils import assert_layerwise_gpu_connector
-from lmcache.v1.kv_object_store import KVObjectByteRange
+from lmcache.v1.kv_object_store import KVObjectByteRange, KVObjectRecord
 from lmcache.v1.memory_management import CuFileMemoryAllocator  # noqa: E501
 from lmcache.v1.memory_management import (  # noqa: E501
     MemoryAllocatorInterface,
@@ -1030,6 +1030,7 @@ class LMCacheEngine:
             object_metas: List[Optional[DiskCacheMetadata]] = []
             object_offsets: List[int] = []
             object_read_ranges: List[Optional[Tuple[KVObjectByteRange, ...]]] = []
+            object_records_for_read: List[Optional[KVObjectRecord]] = []
             object_shapes_per_key: Optional[List[Optional[List[torch.Size]]]] = (
                 [None] * len(keys) if shapes_per_key is not None else None
             )
@@ -1047,6 +1048,7 @@ class LMCacheEngine:
                 if object_path is None:
                     object_metas = []
                     break
+                read_record = record
                 shape_override = (
                     shapes_per_key[index] if shapes_per_key is not None else None
                 )
@@ -1065,7 +1067,31 @@ class LMCacheEngine:
                             strict=True,
                         )
                     )
-                    if requested_nbytes != record.length:
+                    if requested_nbytes < record.length:
+                        if requested_nbytes <= 0:
+                            logger.warning(
+                                "TUTTI_OBJECT_STORE_PROFILE op=shape_adjust "
+                                "status=failed key=%s record_bytes=%d "
+                                "requested_bytes=%d",
+                                key.to_string(),
+                                record.length,
+                                requested_nbytes,
+                            )
+                            object_metas = []
+                            break
+                        read_record = self._kv_object_prefix_view(
+                            record,
+                            requested_nbytes,
+                        )
+                        logger.info(
+                            "TUTTI_OBJECT_STORE_PROFILE op=shape_adjust "
+                            "status=partial key=%s record_bytes=%d "
+                            "requested_bytes=%d",
+                            key.to_string(),
+                            record.length,
+                            requested_nbytes,
+                        )
+                    elif requested_nbytes > record.length:
                         fitted_shapes = self._dsv4_fit_shapes_to_payload(
                             object_shapes,
                             object_dtypes,
@@ -1096,7 +1122,7 @@ class LMCacheEngine:
                 object_metas.append(
                     DiskCacheMetadata(
                         path=object_path,
-                        size=record.length,
+                        size=read_record.length,
                         shape=original_meta.shape,
                         dtype=original_meta.dtype,
                         cached_positions=original_meta.cached_positions,
@@ -1106,8 +1132,9 @@ class LMCacheEngine:
                         dtypes=object_dtypes,
                     )
                 )
-                object_offsets.append(record.offset)
-                object_read_ranges.append(record.read_ranges)
+                object_offsets.append(read_record.offset)
+                object_read_ranges.append(read_record.read_ranges)
+                object_records_for_read.append(read_record)
             if object_metas:
                 raw_lba_cache = {
                     path: [
@@ -1119,7 +1146,7 @@ class LMCacheEngine:
                         for file_offset, slba, n_sectors in raw_extents
                     ]
                     for path, raw_extents in disk_backend.get_kv_object_raw_lba_cache(
-                        kv_object_records,
+                        object_records_for_read,
                     ).items()
                 }
                 if raw_lba_cache:
@@ -1606,6 +1633,37 @@ class LMCacheEngine:
         if len(shape) >= 3:
             return torch.Size([*shape[:2], 0, *shape[3:]])
         return torch.Size([0])
+
+    @staticmethod
+    def _kv_object_prefix_view(
+        record: KVObjectRecord,
+        prefix_nbytes: int,
+    ) -> KVObjectRecord:
+        """Return a byte-range view for the logical prefix of a KV object."""
+        prefix_ranges: list[KVObjectByteRange] = []
+        remaining = prefix_nbytes
+        next_target_offset = 0
+        for byte_range in sorted(
+            record.read_ranges,
+            key=lambda item: item.target_offset,
+        ):
+            if remaining <= 0:
+                break
+            range_length = min(byte_range.length, remaining)
+            prefix_ranges.append(
+                KVObjectByteRange(
+                    offset=byte_range.offset,
+                    length=range_length,
+                    target_offset=next_target_offset,
+                )
+            )
+            next_target_offset += range_length
+            remaining -= range_length
+        if remaining != 0:
+            raise ValueError(
+                "KV object prefix length exceeds record read-range coverage"
+            )
+        return record.with_byte_ranges(prefix_ranges, length=prefix_nbytes)
 
     def _dsv4_fit_shapes_to_payload(
         self,

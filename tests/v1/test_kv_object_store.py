@@ -384,6 +384,46 @@ def test_record_read_ranges_and_json_round_trips() -> None:
     assert len(record.read_ranges) == 2
 
 
+def test_record_prefix_view_preserves_logical_prefix_ranges() -> None:
+    object_id = KVObjectId(
+        model_id="model",
+        parallel_config_id="tp8",
+        rank=0,
+        layer_id=3,
+        role="csa_attention_kv",
+        block_id="abc",
+    )
+    record = KVObjectRecord(
+        object_id=object_id,
+        pool_id="rank0-csa",
+        offset=256,
+        length=192,
+        aligned_length=192,
+        shape=(192,),
+        dtype="torch.uint8",
+        state=KVObjectState.READY,
+        byte_ranges=(
+            KVObjectByteRange(offset=256, length=64, target_offset=0),
+            KVObjectByteRange(offset=512, length=128, target_offset=64),
+        ),
+    )
+
+    view = record.with_byte_ranges(
+        (
+            KVObjectByteRange(offset=256, length=64, target_offset=0),
+            KVObjectByteRange(offset=512, length=32, target_offset=64),
+        ),
+        length=96,
+    )
+
+    assert view.length == 96
+    assert view.offset == 256
+    assert view.read_ranges == (
+        KVObjectByteRange(offset=256, length=64, target_offset=0),
+        KVObjectByteRange(offset=512, length=32, target_offset=64),
+    )
+
+
 def test_record_rejects_gapped_read_ranges() -> None:
     object_id = KVObjectId(
         model_id="model",
