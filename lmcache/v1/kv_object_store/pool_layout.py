@@ -17,12 +17,12 @@ class KVObjectPoolFullError(RuntimeError):
 
 
 class KVObjectPoolLayout:
-    """Fixed-slot file layout for KV objects in one logical pool.
+    """Pool-file layout for KV objects in one logical pool.
 
-    This first MVP keeps allocation deterministic and cheap: each object gets one
-    aligned slot in a sparse pool file. Later integration can replace allocation
-    with a free-list or extent allocator without changing the object identifier
-    and metadata contract.
+    Sparse mode keeps allocation deterministic and cheap: each object gets one
+    fixed-size aligned slot.  Dense mode appends objects by their actual aligned
+    length so Tutti raw regions can stay contiguous without rejecting larger
+    chunks when memory-constrained tests use a small nominal slot size.
     """
 
     def __init__(
@@ -41,7 +41,10 @@ class KVObjectPoolLayout:
         Args:
             pool_id: Logical identifier used in metadata records.
             pool_path: File path for the sparse pool.
-            slot_bytes: Maximum bytes per slot before alignment.
+            slot_bytes: Maximum bytes per sparse slot before alignment.  Dense
+                pools treat this as nominal sizing metadata and allow larger
+                objects because allocation advances by each object's aligned
+                length.
             capacity: Number of object slots in the pool.
             alignment: Byte alignment for each slot.
             dense: When true, allocate objects back-to-back by aligned object
@@ -98,7 +101,7 @@ class KVObjectPoolLayout:
         shape: tuple[int, ...],
         dtype: str,
     ) -> KVObjectRecord:
-        """Allocate one fixed slot and return its metadata record.
+        """Allocate one object slot and return its metadata record.
 
         Args:
             object_id: Object identifier for the new slot.
@@ -110,12 +113,13 @@ class KVObjectPoolLayout:
             An allocated metadata record.
 
         Raises:
-            ValueError: If the object is larger than one slot.
-            KVObjectPoolFullError: If the pool has no remaining slot.
+            ValueError: If the length is invalid, or if a sparse-pool object is
+                larger than one fixed slot.
+            KVObjectPoolFullError: If the pool has no remaining object slot.
         """
         if length <= 0:
             raise ValueError("length must be positive")
-        if length > self.slot_bytes:
+        if not self.dense and length > self.slot_bytes:
             raise ValueError("length exceeds fixed slot size")
         self.ensure_file()
         aligned_length = self.align_length(length)
