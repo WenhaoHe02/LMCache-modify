@@ -148,6 +148,31 @@ class KVObjectPoolLayout:
             dtype=dtype,
         )
 
+    def next_allocation_bounds(self, length: int) -> tuple[int, int, int]:
+        """Return the byte range a future allocation would reserve.
+
+        Args:
+            length: Raw object byte length.
+
+        Returns:
+            ``(offset, end_offset, aligned_length)`` for the next allocation.
+
+        Raises:
+            ValueError: If the length is invalid, or if a sparse-pool object is
+                larger than one fixed slot.
+        """
+        if length <= 0:
+            raise ValueError("length must be positive")
+        if not self.dense and length > self.slot_bytes:
+            raise ValueError("length exceeds fixed slot size")
+        aligned_length = self.align_length(length)
+        with self._lock:
+            if self.dense:
+                offset = self._next_offset
+            else:
+                offset = self._next_slot * self.aligned_slot_bytes
+        return offset, offset + aligned_length, aligned_length
+
     def reset_allocation(self) -> None:
         """Reset future allocations to the beginning of this pool.
 

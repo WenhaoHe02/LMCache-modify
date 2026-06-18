@@ -166,6 +166,39 @@ def test_pool_layout_dense_allows_objects_larger_than_nominal_slot(
     assert layout.pool_size_bytes() == 12288
 
 
+def test_pool_layout_next_allocation_bounds_do_not_consume_slot(
+    tmp_path: Path,
+) -> None:
+    layout = KVObjectPoolLayout(
+        pool_id="rank3-full",
+        pool_path=tmp_path / "rank3_full.pool",
+        slot_bytes=4096,
+        capacity=1,
+        alignment=4096,
+        dense=True,
+    )
+
+    assert layout.next_allocation_bounds(4097) == (0, 8192, 8192)
+    assert layout.pool_size_bytes() == 0
+
+    record = layout.allocate(
+        KVObjectId(
+            model_id="model",
+            parallel_config_id="tp8",
+            rank=3,
+            layer_id=0,
+            role="full",
+            block_id="large",
+        ),
+        length=4097,
+        shape=(4097,),
+        dtype="torch.uint8",
+    )
+
+    assert record.offset == 0
+    assert layout.pool_size_bytes() == 8192
+
+
 def test_pool_layout_rejects_full_and_oversized_objects(tmp_path: Path) -> None:
     layout = KVObjectPoolLayout(
         pool_id="rank0-hca",

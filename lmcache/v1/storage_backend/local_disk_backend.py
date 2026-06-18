@@ -486,6 +486,23 @@ class LocalDiskBackend(StorageBackendInterface):
             )
         return result
 
+    def kv_object_raw_region_covers(self, offset: int, length: int) -> bool:
+        """Return whether the rank-local raw region covers a byte range."""
+        if length <= 0:
+            return False
+        object_start = offset
+        object_end = offset + length
+        covered = 0
+        for file_offset, _slba, n_sectors in self.kv_object_tutti_raw_region_extents:
+            extent_start = file_offset
+            extent_end = file_offset + n_sectors * 512
+            write_start = max(object_start, extent_start)
+            write_end = min(object_end, extent_end)
+            if write_start >= write_end:
+                continue
+            covered += write_end - write_start
+        return covered == length
+
     def kv_object_tutti_path(self, pool_id: str) -> str:
         """Return the synthetic path used for raw Tutti object extents."""
         return f"tutti://{pool_id}"
@@ -1352,6 +1369,26 @@ class LocalDiskBackend(StorageBackendInterface):
             with self.kv_object_store_lock:
                 existing = self.kv_object_metadata_store.get(object_id)
                 if existing is None:
+                    if raw_writer is not None:
+                        offset, end_offset, aligned_length = (
+                            self.kv_object_pool_layout.next_allocation_bounds(
+                                len(buffer)
+                            )
+                        )
+                        if not self.kv_object_raw_region_covers(
+                            offset,
+                            aligned_length,
+                        ):
+                            logger.warning(
+                                "KV_OBJECT_STORE_PROFILE op=write key=%s "
+                                "status=skip reason=raw_region_full "
+                                "offset=%d end=%d aligned_bytes=%d",
+                                key.to_string(),
+                                offset,
+                                end_offset,
+                                aligned_length,
+                            )
+                            return False
                     record = self.kv_object_pool_layout.allocate(
                         object_id,
                         length=len(buffer),

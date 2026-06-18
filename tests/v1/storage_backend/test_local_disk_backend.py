@@ -432,6 +432,15 @@ class TestKVObjectStoreLocalDiskBackend:
 
         backend.local_cpu_backend.memory_allocator.close()
 
+    def test_raw_region_cover_check_requires_full_range(self) -> None:
+        """Raw-object writes only proceed when the reserved region fully covers them."""
+        backend = LocalDiskBackend.__new__(LocalDiskBackend)
+        backend.kv_object_tutti_raw_region_extents = [(0, 1000, 1)]
+
+        assert backend.kv_object_raw_region_covers(0, 512)
+        assert not backend.kv_object_raw_region_covers(0, 513)
+        assert not backend.kv_object_raw_region_covers(512, 512)
+
 
 class TestMultiPathDiskBackend:
     """Test cases for multi-path (multi-device) LocalDiskBackend."""
