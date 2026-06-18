@@ -483,10 +483,21 @@ class TestTuttiDirectLoaderLoadBatch:
 
         assert all(r is None for r in results)
 
-    def test_chunk_too_large_raises(self) -> None:
+    def test_chunk_larger_than_slot_can_span_staging_pool(self) -> None:
         loader, _ctrl = _make_loader(n_slots=2, slot_mb=1)  # 1 MiB slots
-        # 2 MiB chunk > 1 MiB slot → should be skipped
+        # 2 MiB chunk > 1 MiB slot but fits the 2 MiB staging pool.
         size = 2 * 1024 * 1024
+        keys = [_fake_key(0)]
+        metas = [_disk_meta_for(size)]
+
+        results = self._run_load(loader, keys, metas)
+
+        assert results[0] is not None
+        assert results[0].get_size() == size
+
+    def test_chunk_larger_than_staging_pool_raises(self) -> None:
+        loader, _ctrl = _make_loader(n_slots=2, slot_mb=1)  # 2 MiB total
+        size = 2 * 1024 * 1024 + 512
         keys = [_fake_key(0)]
         metas = [_disk_meta_for(size)]
 

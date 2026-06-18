@@ -1926,7 +1926,7 @@ class TuttiDirectLoader:
         profile_start = time.perf_counter()
         # Build per-I/O parameters. A single KV file can occupy multiple
         # filesystem extents, so one logical chunk may expand to multiple NVMe
-        # READs into different offsets of the same staging slot.
+        # READs into different offsets of the same contiguous staging pool.
         completed_indices: list[int] = []
         completed_offsets: list[int] = []
         completed_nbytes: list[int] = []
@@ -1968,14 +1968,6 @@ class TuttiDirectLoader:
             )
             nbytes = sum(byte_range.length for byte_range in logical_read_ranges)
             dma_nbytes = _align_up(nbytes, _NVME_LBS)
-            if dma_nbytes > self._slot_bytes:
-                logger.warning(
-                    "Chunk %s (%d bytes) exceeds slot size (%d bytes); skipping",
-                    key,
-                    dma_nbytes,
-                    self._slot_bytes,
-                )
-                continue
             aligned_nbytes = _align_up(dma_nbytes, _GPU_PAGE_SIZE)
             if next_staging_offset + aligned_nbytes > self._staging_capacity_bytes():
                 logger.warning(

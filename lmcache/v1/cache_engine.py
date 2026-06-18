@@ -1709,7 +1709,12 @@ class LMCacheEngine:
         if any(record is None for record in records):
             return hit_chunks
         readable = 0
-        slot_bytes = int(self._tutti_config["slot_mb"]) * 1024 * 1024
+        staging_bytes = (
+            int(self._tutti_config["slot_mb"])
+            * 1024
+            * 1024
+            * int(self._tutti_config["n_slots"])
+        )
         for index, (key, record) in enumerate(
             zip(disk_keys, records, strict=True)
         ):
@@ -1751,14 +1756,15 @@ class LMCacheEngine:
                     key.to_string(),
                 )
                 break
-            if read_bytes > slot_bytes:
+            if read_bytes > staging_bytes:
                 logger.info(
                     "TUTTI_OBJECT_STORE_PROFILE op=lookup_filter status=miss "
-                    "index=%d key=%s reason=slot_bytes read_bytes=%d slot_bytes=%d",
+                    "index=%d key=%s reason=staging_capacity read_bytes=%d "
+                    "staging_bytes=%d",
                     index,
                     key.to_string(),
                     read_bytes,
-                    slot_bytes,
+                    staging_bytes,
                 )
                 break
             if not disk_backend.kv_object_record_raw_readable(read_record):
