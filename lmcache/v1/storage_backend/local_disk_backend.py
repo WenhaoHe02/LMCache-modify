@@ -529,7 +529,14 @@ class LocalDiskBackend(StorageBackendInterface):
         """Return raw extents covering the record's logical read ranges."""
         extents: list[tuple[int, int, int]] = []
         for byte_range in record.read_ranges:
-            if byte_range.offset % 512 != 0 or byte_range.length % 512 != 0:
+            range_length = byte_range.length
+            range_dma_length = ((range_length + 511) // 512) * 512
+            is_tail_range = (
+                byte_range.target_offset + range_length == record.length
+            )
+            if byte_range.offset % 512 != 0 or (
+                range_dma_length != range_length and not is_tail_range
+            ):
                 logger.warning(
                     "KV object raw range is not 512-byte aligned: "
                     "object=%s offset=%d length=%d",
@@ -539,7 +546,7 @@ class LocalDiskBackend(StorageBackendInterface):
                 )
                 continue
             range_start = byte_range.offset
-            range_end = range_start + byte_range.length
+            range_end = range_start + range_dma_length
             for file_offset, slba, n_sectors in record.raw_extents:
                 extent_start = file_offset
                 extent_end = file_offset + n_sectors * 512

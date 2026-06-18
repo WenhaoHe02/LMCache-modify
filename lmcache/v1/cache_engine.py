@@ -1024,15 +1024,22 @@ class LMCacheEngine:
         if any(m is None for m in disk_metas):
             return [None] * len(keys)
 
+        tutti_shapes_per_key = shapes_per_key
         kv_object_records = disk_backend.get_kv_object_records(keys)
         if all(record is not None for record in kv_object_records):
             object_metas: List[Optional[DiskCacheMetadata]] = []
             object_offsets: List[int] = []
             object_read_ranges: List[Optional[Tuple[KVObjectByteRange, ...]]] = []
-            for original_meta, record in zip(
-                disk_metas,
-                kv_object_records,
-                strict=True,
+            object_shapes_per_key: Optional[List[Optional[List[torch.Size]]]] = (
+                [None] * len(keys) if shapes_per_key is not None else None
+            )
+            for index, (key, original_meta, record) in enumerate(
+                zip(
+                    keys,
+                    disk_metas,
+                    kv_object_records,
+                    strict=True,
+                )
             ):
                 assert original_meta is not None
                 assert record is not None
@@ -1040,6 +1047,52 @@ class LMCacheEngine:
                 if object_path is None:
                     object_metas = []
                     break
+                shape_override = (
+                    shapes_per_key[index] if shapes_per_key is not None else None
+                )
+                object_shapes = (
+                    shape_override
+                    if shape_override is not None
+                    else original_meta.shapes
+                )
+                object_dtypes = original_meta.dtypes
+                if object_shapes is not None and object_dtypes is not None:
+                    requested_nbytes = sum(
+                        self._shape_nbytes(shape, dtype)
+                        for shape, dtype in zip(
+                            object_shapes,
+                            object_dtypes,
+                            strict=True,
+                        )
+                    )
+                    if requested_nbytes != record.length:
+                        fitted_shapes = self._dsv4_fit_shapes_to_payload(
+                            object_shapes,
+                            object_dtypes,
+                            record.length,
+                        )
+                        if fitted_shapes is None:
+                            logger.warning(
+                                "TUTTI_OBJECT_STORE_PROFILE op=shape_adjust "
+                                "status=failed key=%s record_bytes=%d "
+                                "requested_bytes=%d",
+                                key.to_string(),
+                                record.length,
+                                requested_nbytes,
+                            )
+                            object_metas = []
+                            break
+                        logger.info(
+                            "TUTTI_OBJECT_STORE_PROFILE op=shape_adjust "
+                            "status=adjusted key=%s record_bytes=%d "
+                            "requested_bytes=%d",
+                            key.to_string(),
+                            record.length,
+                            requested_nbytes,
+                        )
+                        object_shapes = fitted_shapes
+                    if object_shapes_per_key is not None:
+                        object_shapes_per_key[index] = object_shapes
                 object_metas.append(
                     DiskCacheMetadata(
                         path=object_path,
@@ -1049,8 +1102,8 @@ class LMCacheEngine:
                         cached_positions=original_meta.cached_positions,
                         fmt=original_meta.fmt,
                         pin_count=original_meta.pin_count,
-                        shapes=original_meta.shapes,
-                        dtypes=original_meta.dtypes,
+                        shapes=object_shapes,
+                        dtypes=object_dtypes,
                     )
                 )
                 object_offsets.append(record.offset)
@@ -1074,6 +1127,8 @@ class LMCacheEngine:
                 disk_metas = object_metas
                 tutti_file_offsets = object_offsets
                 tutti_read_ranges = object_read_ranges
+                if object_shapes_per_key is not None:
+                    tutti_shapes_per_key = object_shapes_per_key
                 logger.info(
                     "TUTTI_OBJECT_STORE_PROFILE op=select keys=%d pools=%d "
                     "raw_paths=%d ranges=%d",
@@ -1105,7 +1160,7 @@ class LMCacheEngine:
             results = self._tutti_loader.load_chunks_to_hbm(
                 keys,
                 disk_metas,  # type: ignore[arg-type]
-                shapes_per_key=shapes_per_key,
+                shapes_per_key=tutti_shapes_per_key,
                 file_offsets=tutti_file_offsets,
                 read_ranges_per_key=tutti_read_ranges,
             )
@@ -1122,7 +1177,7 @@ class LMCacheEngine:
                 return self.storage_manager.batched_get(
                     keys=keys,
                     location="LocalDiskBackend",
-                    shapes_per_key=shapes_per_key,
+                    shapes_per_key=tutti_shapes_per_key,
                 )
             return [None] * len(keys)
         load_ms = (time.perf_counter() - load_start) * 1000.0
@@ -1542,6 +1597,52 @@ class LMCacheEngine:
             store_stats.put_time * 1000,
         )
 
+    @staticmethod
+    def _shape_nbytes(shape: torch.Size, dtype: torch.dtype) -> int:
+        return int(shape.numel() * dtype.itemsize)
+
+    @staticmethod
+    def _zero_token_shape(shape: torch.Size) -> torch.Size:
+        if len(shape) >= 3:
+            return torch.Size([*shape[:2], 0, *shape[3:]])
+        return torch.Size([0])
+
+    def _dsv4_fit_shapes_to_payload(
+        self,
+        shapes: list[torch.Size],
+        dtypes: list[torch.dtype],
+        payload_nbytes: int,
+    ) -> Optional[list[torch.Size]]:
+        fitted: list[torch.Size] = []
+        remaining = payload_nbytes
+        for shape, dtype in zip(shapes, dtypes, strict=True):
+            group_nbytes = self._shape_nbytes(shape, dtype)
+            if group_nbytes == 0:
+                fitted.append(shape)
+                continue
+            if remaining >= group_nbytes:
+                fitted.append(shape)
+                remaining -= group_nbytes
+                continue
+            if remaining == 0:
+                fitted.append(self._zero_token_shape(shape))
+                continue
+            if len(shape) < 3 or int(shape[2]) <= 0:
+                return None
+            token_count = int(shape[2])
+            if group_nbytes % token_count != 0:
+                return None
+            bytes_per_token = group_nbytes // token_count
+            if bytes_per_token <= 0 or remaining % bytes_per_token != 0:
+                return None
+            fitted.append(
+                torch.Size([*shape[:2], remaining // bytes_per_token, *shape[3:]])
+            )
+            remaining = 0
+        if remaining != 0:
+            return None
+        return fitted
+
     def _dsv4_store_shapes_for_range(
         self,
         shapes: list[torch.Size],
@@ -1566,7 +1667,7 @@ class LMCacheEngine:
         ):
             role = self._dsv4_group_role(group, dtype)
             if role in {"swa_cache", "compressor_state"} and not keep_tail_groups:
-                optimized.append(torch.Size([*shape[:2], 0, *shape[3:]]))
+                optimized.append(self._zero_token_shape(shape))
             else:
                 optimized.append(shape)
         return optimized

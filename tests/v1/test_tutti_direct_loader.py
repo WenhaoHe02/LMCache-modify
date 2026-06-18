@@ -426,7 +426,7 @@ class TestTuttiDirectLoaderLoadBatch:
 
         def fake_fiemap(path):
             meta = meta_by_path.get(path)
-            n_sectors = meta.size // 512 if meta is not None else 1
+            n_sectors = (meta.size + 511) // 512 if meta is not None else 1
             return [LbaRecord(slba=fiemap_lba, n_sectors=n_sectors)]
 
         # Patch FIEMAP so no real ioctl is issued.
@@ -494,15 +494,34 @@ class TestTuttiDirectLoaderLoadBatch:
             with pytest.raises(RuntimeError, match="no readable KV extents"):
                 loader._load_batch(keys, metas)
 
-    def test_non_sector_aligned_size_raises(self) -> None:
+    def test_non_sector_aligned_size_reads_padded_tail(self) -> None:
         loader, _ctrl = _make_loader(n_slots=2)
         size = 1000  # not a multiple of 512
         keys = [_fake_key(0)]
         metas = [_disk_meta_for(size)]
 
-        with patch.object(_tdl.FiemapHelper, "query_extents"):
-            with pytest.raises(RuntimeError, match="no readable KV extents"):
-                loader._load_batch(keys, metas)
+        with patch.object(
+            _tdl.FiemapHelper,
+            "query_extents",
+            return_value=[LbaRecord(slba=10, n_sectors=2)],
+        ):
+            with patch.object(_tdl, "_c_ops") as mock_c:
+                mock_c.tutti_submit_batch_sgl_read = MagicMock()
+
+                def fake_poll(**kwargs):
+                    n_ios = kwargs.get("n_ios", 0)
+                    loader._status_buf[:n_ios] = 0
+
+                mock_c.tutti_poll_batch.side_effect = fake_poll
+
+                with _patch_cuda_runtime_for_cpu_tests():
+                    results = loader._load_batch(keys, metas)
+
+        assert results[0] is not None
+        assert results[0].get_size() == size
+        assert results[0].raw_data.numel() == size
+        submit_kwargs = mock_c.tutti_submit_batch_sgl_read.call_args.kwargs
+        assert submit_kwargs["byte_lens"].cpu().tolist() == [1024]
 
     def test_nvme_error_raises(self) -> None:
         loader, _ctrl = _make_loader(n_slots=2)
@@ -711,6 +730,40 @@ class TestTuttiDirectLoaderLoadChunksToHbm:
         assert submit_kwargs["byte_lens"].cpu().tolist() == [512, 512]
         assert submit_kwargs["slbas"].cpu().tolist() == [100, 200]
         assert submit_kwargs["staging_iovas"].cpu().tolist() == [0, 512]
+
+    def test_explicit_single_read_range_reads_padded_tail(self) -> None:
+        loader, _ctrl = _make_loader(n_slots=2, q_depth=8)
+        size = 1000
+        keys = [_fake_key(0)]
+        metas = [_disk_meta_for(size)]
+        read_ranges = [[KVObjectByteRange(offset=0, length=size, target_offset=0)]]
+
+        with patch.object(
+            _tdl.FiemapHelper,
+            "query_extents",
+            return_value=[LbaRecord(slba=100, n_sectors=2, file_offset=0)],
+        ):
+            with patch.object(_tdl, "_c_ops") as mock_c:
+                mock_c.tutti_submit_batch_sgl_read = MagicMock()
+
+                def fake_poll(**kwargs):
+                    n_ios = kwargs.get("n_ios", 0)
+                    loader._status_buf[:n_ios] = 0
+
+                mock_c.tutti_poll_batch.side_effect = fake_poll
+
+                with _patch_cuda_runtime_for_cpu_tests():
+                    results = loader.load_chunks_to_hbm(
+                        keys,
+                        metas,
+                        read_ranges_per_key=read_ranges,
+                    )
+
+        assert results[0] is not None
+        assert results[0].get_size() == size
+        submit_kwargs = mock_c.tutti_submit_batch_sgl_read.call_args.kwargs
+        assert submit_kwargs["byte_lens"].cpu().tolist() == [1024]
+        assert submit_kwargs["staging_iovas"].cpu().tolist() == [0]
 
 
 class TestTuttiDirectLoaderCreate:

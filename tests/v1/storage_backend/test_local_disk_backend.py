@@ -17,6 +17,7 @@ from lmcache.utils import CacheEngineKey, DiskCacheMetadata
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import _parse_local_disk
 from lmcache.v1.kv_layer_groups import KVLayerGroupInfo
+from lmcache.v1.kv_object_store import KVObjectId, KVObjectRecord, KVObjectState
 from lmcache.v1.memory_management import (
     AdHocMemoryAllocator,
     MemoryFormat,
@@ -388,6 +389,45 @@ class TestKVObjectStoreLocalDiskBackend:
                 (299008, 1584, 584),
                 (897024, 2752, 584),
             ]
+        }
+
+        backend.local_cpu_backend.memory_allocator.close()
+
+    def test_raw_lba_cache_pads_full_record_tail_to_sector(
+        self,
+        temp_disk_path: str,
+        async_loop: asyncio.AbstractEventLoop,
+        local_cpu_backend: LocalCPUBackend,
+    ) -> None:
+        """Raw Tutti reads may cover padded sectors without changing payload length."""
+        backend = self._create_object_store_backend(
+            temp_disk_path,
+            async_loop,
+            local_cpu_backend,
+        )
+        record = KVObjectRecord(
+            object_id=KVObjectId(
+                model_id="model",
+                parallel_config_id="world1",
+                rank=0,
+                layer_id=0,
+                role="full",
+                block_id="tail",
+            ),
+            pool_id="rank0-full",
+            offset=0,
+            length=1000,
+            aligned_length=4096,
+            shape=(1000,),
+            dtype="torch.uint8",
+            state=KVObjectState.READY,
+            raw_extents=((0, 1000, 8),),
+        )
+
+        raw_lba_cache = backend.get_kv_object_raw_lba_cache([record])
+
+        assert raw_lba_cache == {
+            backend.kv_object_tutti_path(record.pool_id): [(0, 1000, 2)]
         }
 
         backend.local_cpu_backend.memory_allocator.close()

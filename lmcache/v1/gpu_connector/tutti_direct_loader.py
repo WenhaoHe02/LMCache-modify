@@ -240,6 +240,16 @@ def _cuda_host_register(cpu_ptr: int, size: int) -> None:
         raise RuntimeError(f"cudaHostRegister failed (error {ret})")
 
 
+def _cuda_host_unregister(cpu_ptr: int) -> None:
+    """Unregister memory previously registered with cudaHostRegister."""
+    if cpu_ptr == 0:
+        return
+    ret = _get_cudart().cudaHostUnregister(ctypes.c_void_p(cpu_ptr))
+    if ret != 0:
+        _get_cudart().cudaGetLastError()
+        logger.warning("cudaHostUnregister failed (error %d)", ret)
+
+
 def _cuda_host_get_device_pointer(cpu_ptr: int) -> int:
     """Return the GPU VA for a CPU-side pointer registered with cudaHostRegister."""
     dev_ptr = ctypes.c_void_p(0)
@@ -275,6 +285,8 @@ def _cuda_malloc_managed(size: int) -> int:
 
 
 def _cuda_free(ptr: int) -> None:
+    if ptr == 0:
+        return
     _get_cudart().cudaFree(ctypes.c_void_p(ptr))
 
 
@@ -364,6 +376,10 @@ def _IOWR(type_: int, nr: int, struct_type: type) -> int:  # noqa: N802
 
 def _IOW_uint32(type_: int, nr: int) -> int:  # noqa: N802
     return _ioc(_IOC_WRITE, type_, nr, ctypes.sizeof(ctypes.c_uint32))
+
+
+def _IOW_uint64(type_: int, nr: int) -> int:  # noqa: N802
+    return _ioc(_IOC_WRITE, type_, nr, ctypes.sizeof(ctypes.c_uint64))
 
 
 # ── ctypes struct definitions (must match ioctl.h exactly on x86_64) ─────────
@@ -480,6 +496,7 @@ _NVM_IOCTL_TYPE: int = 0x80
 _CTRL_IOCTL_TYPE: int = 0x90
 
 _NVM_MAP_DEVICE_MEMORY: int = _IOW(_NVM_IOCTL_TYPE, 2, _NvmIoctlMap)
+_NVM_UNMAP_DEVICE_MEMORY: int = _IOW_uint64(_NVM_IOCTL_TYPE, 5)
 _NVM_GET_DEV_INFO: int = _IOR(_NVM_IOCTL_TYPE, 9, _NvmIoctlDev)
 _NVM_CREATE_QUEUE_GROUP: int = _IOWR(_NVM_IOCTL_TYPE, 12, _NvmIoctlQueueGroup)
 _NVM_DESTROY_QUEUE_GROUP: int = _IOW_uint32(_NVM_IOCTL_TYPE, 13)
@@ -509,6 +526,13 @@ def _ioctl(fd: int, request: int, arg: ctypes.Structure) -> None:
     buf = ctypes.create_string_buffer(bytes(arg), size)
     fcntl.ioctl(fd, request, buf, True)
     ctypes.memmove(ctypes.addressof(arg), buf, size)
+
+
+def _ioctl_u64(fd: int, request: int, value: int) -> None:
+    """Call ioctl(fd, request, &uint64_t(value))."""
+    if fcntl.ioctl is None:
+        raise OSError("fcntl is unavailable on this platform")
+    fcntl.ioctl(fd, request, _struct.pack("Q", value))
 
 
 def _clear_driver_override(pci_bdf: str) -> None:
@@ -715,13 +739,19 @@ class SnvmeSession:
         self._fd_ctrl: int = -1
         self._bar0_mmap: Optional[mmap.mmap] = None
         self._bar0_arr: Optional[ctypes.Array] = None
+        self._bar0_cpu_ptr: int = 0
         self._bar0_gpu_ptr: int = 0
         self._info: Optional[_NvmIoctlDev] = None
         self._queue: Optional[_QueueResources] = None
         self._staging_iovas: list[int] = []
+        self._staging_data_mapped: bool = False
         self._staging_tensor = staging_tensor
 
-        self._setup(ctrl_path, pci_bdf, kernel_ioq_cap)
+        try:
+            self._setup(ctrl_path, pci_bdf, kernel_ioq_cap)
+        except Exception:
+            self.close()
+            raise
 
     def _parse_bdf(self, bdf: str) -> _PciDeviceAddr:
         parts = bdf.replace(":", " ").replace(".", " ").split()
@@ -860,6 +890,7 @@ class SnvmeSession:
         arr_type = ctypes.c_char * info.bar0_size
         self._bar0_arr = arr_type.from_buffer(self._bar0_mmap)
         bar0_cpu = ctypes.addressof(self._bar0_arr)
+        self._bar0_cpu_ptr = bar0_cpu
         logger.info("cudaHostRegister BAR0: ptr=0x%x size=%d device=%d", bar0_cpu, info.bar0_size, self._cuda_device)
         _cuda_host_register(bar0_cpu, info.bar0_size)
         self._bar0_gpu_ptr = _cuda_host_get_device_pointer(bar0_cpu)
@@ -874,6 +905,7 @@ class SnvmeSession:
             group_id=0,
             map_kind=_NVM_MAP_KIND_DATA,
         )
+        self._staging_data_mapped = True
         # Validate physical contiguity (required for single-SGL-descriptor per slot).
         for i in range(1, len(self._staging_iovas)):
             if self._staging_iovas[i] != self._staging_iovas[i - 1] + _GPU_PAGE_SIZE:
@@ -961,6 +993,24 @@ class SnvmeSession:
             except OSError as exc:
                 logger.warning("NVM_DESTROY_QUEUE_GROUP failed: %s", exc)
             self._queue = None
+
+        if self._staging_data_mapped and self._fd_dev >= 0:
+            try:
+                _ioctl_u64(
+                    self._fd_dev,
+                    _NVM_UNMAP_DEVICE_MEMORY,
+                    self._staging_tensor.data_ptr(),
+                )
+            except OSError as exc:
+                logger.warning("NVM_UNMAP_DEVICE_MEMORY(DATA) failed: %s", exc)
+            self._staging_data_mapped = False
+            self._staging_iovas = []
+        self._staging_tensor = torch.empty(0, dtype=torch.uint8)
+
+        if self._bar0_cpu_ptr != 0:
+            _cuda_host_unregister(self._bar0_cpu_ptr)
+            self._bar0_gpu_ptr = 0
+            self._bar0_cpu_ptr = 0
 
         if self._bar0_mmap is not None:
             self._bar0_arr = None  # release ctypes ref before closing mmap
@@ -1144,6 +1194,12 @@ class TuttiDirectLoader:
         slot_gpu_pages = slot_bytes // _GPU_PAGE_SIZE
         total_bytes = n_slots * slot_bytes
         profile_start = time.perf_counter()
+        session: Optional[SnvmeSession] = None
+        staging_raw_ptr = 0
+        sq_tail_ptr = 0
+        cq_head_ptr = 0
+        cq_phase_ptr = 0
+        timed_out_ptr = 0
 
         # Allocate the staging pool via raw cudaMalloc (not PyTorch's caching
         # allocator) so that nvidia_p2p_get_pages_persistent can find the VA
@@ -1152,33 +1208,34 @@ class TuttiDirectLoader:
         # the legacy P2P RM lookup and causes EINVAL.
         alloc_bytes = total_bytes + _GPU_PAGE_SIZE  # headroom for 64 KiB alignment
         cuda_malloc_start = time.perf_counter()
-        staging_raw_ptr = _cuda_malloc_device(alloc_bytes, cuda_device)
-        _get_cudart().cudaMemset(
-            ctypes.c_void_p(staging_raw_ptr),
-            ctypes.c_int(0),
-            ctypes.c_size_t(alloc_bytes),
-        )
-        torch.cuda.synchronize(device=cuda_dev_str)
-        cuda_malloc_ms = _elapsed_ms(cuda_malloc_start)
-        align_offset = (-staging_raw_ptr) % _GPU_PAGE_SIZE
-        # Wrap cudaMalloc pointer as a non-owning PyTorch tensor via CAI.
-        _buf_obj = _ExternalCudaBuffer(staging_raw_ptr, alloc_bytes)
-        staging_full = torch.as_tensor(_buf_obj)
-        if align_offset > 0:
-            staging = staging_full[align_offset : align_offset + total_bytes]
-        else:
-            staging = staging_full[:total_bytes]
-        if staging.data_ptr() % _GPU_PAGE_SIZE != 0:
-            raise RuntimeError(
-                f"staging ptr 0x{staging.data_ptr():x} not 64 KiB aligned"
-            )
-        logger.debug(
-            "Staging buffer: ptr=0x%x device=%s total_bytes=%d (cudaMalloc direct)",
-            staging.data_ptr(), cuda_dev_str, total_bytes,
-        )
-
-        session_start = time.perf_counter()
         try:
+            staging_raw_ptr = _cuda_malloc_device(alloc_bytes, cuda_device)
+            _get_cudart().cudaMemset(
+                ctypes.c_void_p(staging_raw_ptr),
+                ctypes.c_int(0),
+                ctypes.c_size_t(alloc_bytes),
+            )
+            torch.cuda.synchronize(device=cuda_dev_str)
+            cuda_malloc_ms = _elapsed_ms(cuda_malloc_start)
+            align_offset = (-staging_raw_ptr) % _GPU_PAGE_SIZE
+            # Wrap cudaMalloc pointer as a non-owning PyTorch tensor via CAI.
+            _buf_obj = _ExternalCudaBuffer(staging_raw_ptr, alloc_bytes)
+            staging_full = torch.as_tensor(_buf_obj)
+            if align_offset > 0:
+                staging = staging_full[align_offset : align_offset + total_bytes]
+            else:
+                staging = staging_full[:total_bytes]
+            if staging.data_ptr() % _GPU_PAGE_SIZE != 0:
+                raise RuntimeError(
+                    f"staging ptr 0x{staging.data_ptr():x} not 64 KiB aligned"
+                )
+            logger.debug(
+                "Staging buffer: ptr=0x%x device=%s total_bytes=%d "
+                "(cudaMalloc direct)",
+                staging.data_ptr(), cuda_dev_str, total_bytes,
+            )
+
+            session_start = time.perf_counter()
             session = SnvmeSession(
                 device_path=device_path,
                 ctrl_path=ctrl_path,
@@ -1188,65 +1245,69 @@ class TuttiDirectLoader:
                 kernel_ioq_cap=kernel_ioq_cap,
                 cuda_device=cuda_device,
             )
-        except Exception:
-            _cuda_free(staging_raw_ptr)
-            raise
-        session_ms = _elapsed_ms(session_start)
+            session_ms = _elapsed_ms(session_start)
 
-        # Allocate managed-memory scalars for SQ/CQ state.
-        aux_alloc_start = time.perf_counter()
-        sq_tail_ptr = _cuda_malloc_managed(ctypes.sizeof(ctypes.c_uint16))
-        cq_head_ptr = _cuda_malloc_managed(ctypes.sizeof(ctypes.c_uint16))
-        cq_phase_ptr = _cuda_malloc_managed(ctypes.sizeof(ctypes.c_uint8))
-        timed_out_ptr = _cuda_malloc_managed(ctypes.sizeof(ctypes.c_int32))
+            # Allocate managed-memory scalars for SQ/CQ state.
+            aux_alloc_start = time.perf_counter()
+            sq_tail_ptr = _cuda_malloc_managed(ctypes.sizeof(ctypes.c_uint16))
+            cq_head_ptr = _cuda_malloc_managed(ctypes.sizeof(ctypes.c_uint16))
+            cq_phase_ptr = _cuda_malloc_managed(ctypes.sizeof(ctypes.c_uint8))
+            timed_out_ptr = _cuda_malloc_managed(ctypes.sizeof(ctypes.c_int32))
 
-        # Initialise: sq_tail=0, cq_head=0, cq_phase=1 (NVMe starts with phase=1).
-        ctypes.c_uint16.from_address(sq_tail_ptr).value = 0
-        ctypes.c_uint16.from_address(cq_head_ptr).value = 0
-        ctypes.c_uint8.from_address(cq_phase_ptr).value = 1
-        ctypes.c_int32.from_address(timed_out_ptr).value = 0
+            # Initialise: sq_tail=0, cq_head=0, cq_phase=1 (NVMe starts with phase=1).
+            ctypes.c_uint16.from_address(sq_tail_ptr).value = 0
+            ctypes.c_uint16.from_address(cq_head_ptr).value = 0
+            ctypes.c_uint8.from_address(cq_phase_ptr).value = 1
+            ctypes.c_int32.from_address(timed_out_ptr).value = 0
 
-        q_depth = int(session.info.q_depth)
-        status_buf = torch.zeros(q_depth, dtype=torch.int32, device=cuda_dev_str)
-        aux_alloc_ms = _elapsed_ms(aux_alloc_start)
+            q_depth = int(session.info.q_depth)
+            status_buf = torch.zeros(q_depth, dtype=torch.int32, device=cuda_dev_str)
+            aux_alloc_ms = _elapsed_ms(aux_alloc_start)
 
-        if n_slots > q_depth:
-            raise RuntimeError(
-                f"n_slots ({n_slots}) > q_depth ({q_depth}); "
-                "reduce n_slots or increase the NVMe queue depth"
+            if n_slots > q_depth:
+                raise RuntimeError(
+                    f"n_slots ({n_slots}) > q_depth ({q_depth}); "
+                    "reduce n_slots or increase the NVMe queue depth"
+                )
+
+            logger.info(
+                "TUTTI_PROFILE create cuda_device=%d pci=%s slots=%d slot_mb=%.1f "
+                "total_mb=%.1f cuda_malloc_ms=%.3f session_bind_map_ms=%.3f "
+                "aux_alloc_ms=%.3f total_ms=%.3f q_depth=%d",
+                cuda_device,
+                pci_bdf,
+                n_slots,
+                slot_bytes / 1024**2,
+                total_bytes / 1024**2,
+                cuda_malloc_ms,
+                session_ms,
+                aux_alloc_ms,
+                _elapsed_ms(profile_start),
+                q_depth,
             )
 
-        logger.info(
-            "TUTTI_PROFILE create cuda_device=%d pci=%s slots=%d slot_mb=%.1f "
-            "total_mb=%.1f cuda_malloc_ms=%.3f session_bind_map_ms=%.3f "
-            "aux_alloc_ms=%.3f total_ms=%.3f q_depth=%d",
-            cuda_device,
-            pci_bdf,
-            n_slots,
-            slot_bytes / 1024**2,
-            total_bytes / 1024**2,
-            cuda_malloc_ms,
-            session_ms,
-            aux_alloc_ms,
-            _elapsed_ms(profile_start),
-            q_depth,
-        )
-
-        return TuttiDirectLoader(
-            session=session,
-            staging_tensor=staging,
-            staging_raw_ptr=staging_raw_ptr,
-            n_slots=n_slots,
-            slot_gpu_pages=slot_gpu_pages,
-            sq_tail_ptr=sq_tail_ptr,
-            cq_head_ptr=cq_head_ptr,
-            cq_phase_ptr=cq_phase_ptr,
-            timed_out_ptr=timed_out_ptr,
-            status_buf=status_buf,
-            cuda_device=cuda_device,
-            initial_lba_cache=initial_lba_cache,
-            debug_expected_checksums=debug_expected_checksums,
-        )
+            return TuttiDirectLoader(
+                session=session,
+                staging_tensor=staging,
+                staging_raw_ptr=staging_raw_ptr,
+                n_slots=n_slots,
+                slot_gpu_pages=slot_gpu_pages,
+                sq_tail_ptr=sq_tail_ptr,
+                cq_head_ptr=cq_head_ptr,
+                cq_phase_ptr=cq_phase_ptr,
+                timed_out_ptr=timed_out_ptr,
+                status_buf=status_buf,
+                cuda_device=cuda_device,
+                initial_lba_cache=initial_lba_cache,
+                debug_expected_checksums=debug_expected_checksums,
+            )
+        except Exception:
+            if session is not None:
+                session.close()
+            for ptr in (sq_tail_ptr, cq_head_ptr, cq_phase_ptr, timed_out_ptr):
+                _cuda_free(ptr)
+            _cuda_free(staging_raw_ptr)
+            raise
 
     # ── internal helpers ────────────────────────────────────────────────────
 
@@ -1899,7 +1960,6 @@ class TuttiDirectLoader:
                 if read_ranges_per_key is not None
                 else None
             )
-            explicit_read_ranges = read_ranges is not None
             logical_read_ranges = _logical_read_ranges(
                 meta,
                 key_shapes_override,
@@ -1933,6 +1993,7 @@ class TuttiDirectLoader:
             skip_file = False
             for byte_range in logical_read_ranges:
                 range_dma_nbytes = _align_up(byte_range.length, _NVME_LBS)
+                is_tail_range = byte_range.target_offset + byte_range.length == nbytes
                 if byte_range.offset % _NVME_LBS != 0:
                     logger.warning(
                         "Chunk %s read offset %d is not 512B aligned; skipping",
@@ -1941,9 +2002,10 @@ class TuttiDirectLoader:
                     )
                     skip_file = True
                     break
-                if explicit_read_ranges and range_dma_nbytes != byte_range.length:
+                if range_dma_nbytes != byte_range.length and not is_tail_range:
                     logger.warning(
-                        "Chunk %s read length %d is not 512B aligned; skipping",
+                        "Chunk %s non-tail read length %d is not 512B aligned; "
+                        "skipping",
                         key,
                         byte_range.length,
                     )
@@ -2241,12 +2303,19 @@ class TuttiDirectLoader:
 
     def close(self) -> None:
         """Release all GPU and NVMe resources."""
-        _cuda_free(self._sq_tail_ptr)
-        _cuda_free(self._cq_head_ptr)
-        _cuda_free(self._cq_phase_ptr)
-        _cuda_free(self._timed_out_ptr)
-        _cuda_free(self._staging_raw_ptr)
         self._session.close()
+        _cuda_free(self._sq_tail_ptr)
+        self._sq_tail_ptr = 0
+        _cuda_free(self._cq_head_ptr)
+        self._cq_head_ptr = 0
+        _cuda_free(self._cq_phase_ptr)
+        self._cq_phase_ptr = 0
+        _cuda_free(self._timed_out_ptr)
+        self._timed_out_ptr = 0
+        self._status_buf = torch.empty(0, dtype=torch.int32)
+        self._staging = torch.empty(0, dtype=torch.uint8)
+        _cuda_free(self._staging_raw_ptr)
+        self._staging_raw_ptr = 0
 
     def __enter__(self) -> "TuttiDirectLoader":
         return self
