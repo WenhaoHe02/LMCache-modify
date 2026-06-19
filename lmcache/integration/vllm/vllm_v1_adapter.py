@@ -189,18 +189,21 @@ def _hca_pinned_bounce_enabled() -> bool:
 def _hca_active_prefire_enabled() -> bool:
     """Return whether HCA may prefire all active-request layers at once.
 
-    Full active prefire is useful for HCA-only ablations because HCA rows are
-    deterministic as soon as the request slot mapping is known. When CSA
-    overlap is also enabled, however, prefire can consume the same NVMe,
-    pinned-buffer, executor, and H2D bandwidth that CSA needs. In that mode the
-    safer default is to install HCA slot maps but let FFN-entry layer lookahead
-    issue HCA reads gradually.
+    This is intentionally opt-in. HCA overlap is only useful while the model is
+    inside the compute/communication window before the target HCA attention.
+    Firing every later layer as soon as request slots are known can consume the
+    same NVMe, pinned-buffer, executor, and H2D bandwidth that CSA or nearer HCA
+    deadlines need. The default path only installs slot maps; FFN-entry hooks
+    submit HCA reads for the configured near-layer lookahead.
     """
     if _env_flag("LMCACHE_HCA_DISABLE_ACTIVE_PREFIRE"):
         return False
-    if _env_flag("LMCACHE_HCA_ACTIVE_PREFIRE"):
-        return True
-    return not _indexer_prefetch_enabled()
+    return _env_flag("LMCACHE_HCA_ACTIVE_PREFIRE")
+
+
+def _hca_overlap_lookahead() -> int:
+    """Return how many upcoming HCA layers each FFN-entry hook may fire."""
+    return max(1, _env_int("LMCACHE_HCA_OVERLAP_LOOKAHEAD", 1))
 
 
 def _vllm_kv_reuse_seed_enabled() -> bool:
@@ -487,11 +490,16 @@ def _fire_decoder_ffn_overlap(
             _log_overlap_hook_error_once("CSA", int(layer_id), exc)
 
     hca_manager = getattr(decoder_layer, "_lmcache_hca_prefetch_manager", None)
-    next_hca = getattr(decoder_layer, "_lmcache_next_hca_layer_id", -1)
-    if hca_manager is not None and isinstance(next_hca, int) and next_hca >= 0:
+    hca_targets = getattr(decoder_layer, "_lmcache_next_hca_layer_ids", ())
+    if (
+        hca_manager is not None
+        and isinstance(hca_targets, tuple)
+        and hca_targets
+    ):
         try:
             if positions is not None:
-                hca_manager.fire_async_for_layer(next_hca, positions)
+                for next_hca in hca_targets:
+                    hca_manager.fire_async_for_layer(next_hca, positions)
         except Exception as exc:
             _log_overlap_hook_error_once("HCA", int(layer_id), exc)
 
@@ -552,9 +560,11 @@ def _configure_decoder_hca_overlap(
     decoder_layer: Any,
     manager: Any,
     next_hca_layer_id: int,
+    next_hca_layer_ids: tuple[int, ...] = (),
 ) -> bool:
     decoder_layer._lmcache_hca_prefetch_manager = manager
     decoder_layer._lmcache_next_hca_layer_id = next_hca_layer_id
+    decoder_layer._lmcache_next_hca_layer_ids = next_hca_layer_ids
     return _install_decoder_hc_pre_overlap_hook(decoder_layer)
 
 
@@ -869,11 +879,21 @@ def _attach_hca_prefetch() -> None:
             ),
             -1,
         )
+        next_hca_layers = tuple(
+            hca_layer_id
+            for hca_layer_id in hca_layer_ids
+            if hca_layer_id > decoder_layer_id
+        )[:_hca_overlap_lookahead()]
         attach = getattr(decoder_layer, "attach_hca_prefetch", None)
         if callable(attach):
             attach(manager, current_hca, next_hca)
             attached_decoders += 1
-        if _configure_decoder_hca_overlap(decoder_layer, manager, next_hca):
+        if _configure_decoder_hca_overlap(
+            decoder_layer,
+            manager,
+            next_hca,
+            next_hca_layers,
+        ):
             early_overlap_hooks += 1
 
     if attached_decoders == 0 and early_overlap_hooks == 0:
