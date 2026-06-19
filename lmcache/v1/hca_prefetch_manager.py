@@ -66,6 +66,14 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
 
 
+def _env_flag_default(name: str, default: bool) -> bool:
+    """Return an environment flag, or ``default`` when it is unset."""
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
 def _env_int(name: str, default: int) -> int:
     """Parse an integer environment variable.
 
@@ -266,7 +274,7 @@ class HCAPrefetchManager:
         self._max_seq_len = max_seq_len
         self._resident_budget_blocks = max(0, resident_budget_blocks)
         self._prefetch_window_tokens = max(0, prefetch_window_tokens)
-        self._blocking_drain = _env_flag("LMCACHE_HCA_BLOCKING_DRAIN")
+        self._blocking_drain = _env_flag_default("LMCACHE_HCA_BLOCKING_DRAIN", True)
         self._executor = ThreadPoolExecutor(
             max_workers=max(1, io_workers),
             thread_name_prefix="lmcache-hca-prefetch",
@@ -1148,7 +1156,7 @@ class HCAPrefetchManager:
                     "HCAPrefetchManager currently expects uint8 HCA KV rows, "
                     f"got {row.dtype}"
                 )
-            row.reshape(-1).copy_(src[idx], non_blocking=True)
+            row.reshape(-1).copy_(src[idx], non_blocking=False)
         return rows_to_write
 
     def _read_rows_into_kv_cache(

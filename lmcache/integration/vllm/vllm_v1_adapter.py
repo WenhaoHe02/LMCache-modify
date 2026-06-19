@@ -206,6 +206,14 @@ def _hca_overlap_lookahead() -> int:
     return max(1, _env_int("LMCACHE_HCA_OVERLAP_LOOKAHEAD", 1))
 
 
+def _hca_blocking_drain_enabled() -> bool:
+    """Return whether final HCA attention drain should wait for pending I/O."""
+    value = os.environ.get("LMCACHE_HCA_BLOCKING_DRAIN")
+    if value is None:
+        return True
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
 def _vllm_kv_reuse_seed_enabled() -> bool:
     """Return whether reuse prefetch may seed by copying vLLM KV to CPU.
 
@@ -585,7 +593,7 @@ def _install_hca_attention_drain_hook(
         if callable(drain):
             drain(
                 layer_id,
-                blocking=_env_flag("LMCACHE_HCA_BLOCKING_DRAIN"),
+                blocking=_hca_blocking_drain_enabled(),
             )
         return original_forward(*args, **kwargs)
 
