@@ -186,6 +186,23 @@ def _hca_pinned_bounce_enabled() -> bool:
     return value.lower() in {"1", "true", "yes", "on"}
 
 
+def _hca_active_prefire_enabled() -> bool:
+    """Return whether HCA may prefire all active-request layers at once.
+
+    Full active prefire is useful for HCA-only ablations because HCA rows are
+    deterministic as soon as the request slot mapping is known. When CSA
+    overlap is also enabled, however, prefire can consume the same NVMe,
+    pinned-buffer, executor, and H2D bandwidth that CSA needs. In that mode the
+    safer default is to install HCA slot maps but let FFN-entry layer lookahead
+    issue HCA reads gradually.
+    """
+    if _env_flag("LMCACHE_HCA_DISABLE_ACTIVE_PREFIRE"):
+        return False
+    if _env_flag("LMCACHE_HCA_ACTIVE_PREFIRE"):
+        return True
+    return not _indexer_prefetch_enabled()
+
+
 def _vllm_kv_reuse_seed_enabled() -> bool:
     """Return whether reuse prefetch may seed by copying vLLM KV to CPU.
 
@@ -2268,7 +2285,7 @@ class LMCacheConnectorV1Impl:
         if (
             prepared > 0
             and callable(fire_active)
-            and not _env_flag("LMCACHE_HCA_DISABLE_ACTIVE_PREFIRE")
+            and _hca_active_prefire_enabled()
         ):
             fired = int(fire_active())
         if prepared > 0:
