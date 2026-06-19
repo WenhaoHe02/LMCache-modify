@@ -275,6 +275,7 @@ class HCAPrefetchManager:
         self._resident_budget_blocks = max(0, resident_budget_blocks)
         self._prefetch_window_tokens = max(0, prefetch_window_tokens)
         self._blocking_drain = _env_flag_default("LMCACHE_HCA_BLOCKING_DRAIN", True)
+        self._async_hbm_drain = _env_flag("LMCACHE_HCA_ENABLE_ASYNC_HBM_DRAIN")
         self._executor = ThreadPoolExecutor(
             max_workers=max(1, io_workers),
             thread_name_prefix="lmcache-hca-prefetch",
@@ -790,6 +791,8 @@ class HCAPrefetchManager:
             layer_id: Target HCA layer whose pending reads should be drained
                 in the background.
         """
+        if not self._async_hbm_drain:
+            return
         if layer_id not in self._layers:
             return
         with self._lock:
@@ -877,9 +880,15 @@ class HCAPrefetchManager:
                 pending_read.start_row_id + len(pending_read.slot_ids),
             )
             try:
-                rows_written = pending_read.future.result()
+                rows_read = pending_read.future.result()
                 if timing:
                     wait_ms += (time.perf_counter() - t_wait0) * 1000.0
+                rows_written = self._write_pending_to_kv_cache(
+                    state,
+                    pending_read.slot_ids,
+                    pending_read.buffer_obj,
+                    rows_read,
+                )
                 if rows_written > 0:
                     with self._lock:
                         resident = self._resident_hbm[layer_id]
@@ -980,7 +989,7 @@ class HCAPrefetchManager:
             )
             return None
         future = self._executor.submit(
-            self._read_rows_into_kv_cache,
+            self._read_rows_into_buffer,
             state,
             start_row_id,
             slot_ids,
@@ -1159,28 +1168,28 @@ class HCAPrefetchManager:
             row.reshape(-1).copy_(src[idx], non_blocking=False)
         return rows_to_write
 
-    def _read_rows_into_kv_cache(
+    def _read_rows_into_buffer(
         self,
         state: HCALayerState,
         start_row_id: int,
         slot_ids: list[int],
         buffer_obj: Any,
     ) -> int:
-        """Read HCA rows into a pinned buffer and copy them into KV cache."""
+        """Read HCA rows into a pinned buffer.
+
+        GPU KV writes are deliberately performed by ``drain_for_layer`` on the
+        model thread by default.  PyTorch CUDA work launched from this Python
+        executor can race vLLM's graph/MoE execution and surface as unrelated
+        illegal-memory-access failures.
+        """
         tensor = buffer_obj.tensor
         if tensor is None:
             return 0
         buffer = buffer_obj.byte_array
-        rows_read = state.store.read_rows_into(
+        return state.store.read_rows_into(
             start_row_id,
             len(slot_ids),
             buffer,
-        )
-        return self._write_pending_to_kv_cache(
-            state,
-            slot_ids,
-            buffer_obj,
-            rows_read,
         )
 
     def _log_timing(self, event: str, layer_id: int, **fields: Any) -> None:
