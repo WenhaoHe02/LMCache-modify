@@ -248,6 +248,14 @@ class HCAPendingRead:
     future: Future[int]
 
 
+@dataclass
+class HCAMemoryRange:
+    """CPU-resident HCA rows from one LMCache retrieve chunk."""
+
+    start_row_id: int
+    rows: torch.Tensor
+
+
 class HCAPrefetchManager:
     """Environment-gated deterministic prefetch manager for DSv4 HCA layers."""
 
@@ -287,11 +295,14 @@ class HCAPrefetchManager:
         self._inflight_hbm: dict[int, set[int]] = {}
         self._active_slots: dict[int, torch.Tensor] = {}
         self._active_fire_plans: dict[int, tuple[list[int], list[int]]] = {}
+        self._memory_backing: dict[int, dict[int, HCAMemoryRange]] = {}
+        self._memory_backed_layers: set[int] = set()
         self._lock = threading.Lock()
         self._debug_fire_logged: set[int] = set()
         self._debug_drain_logged: set[int] = set()
         self._debug_seed_logged: set[int] = set()
         self._debug_skip_logged: set[tuple[int, str]] = set()
+        self._memory_backing_enabled = _env_flag("LMCACHE_HCA_ENABLE_MEMORY_BACKING")
         self._timing_enabled = _env_flag("LMCACHE_HCA_TIMING") or _env_flag(
             "LMCACHE_INDEXER_TIMING"
         )
@@ -352,6 +363,7 @@ class HCAPrefetchManager:
         self._drain_futures.setdefault(layer_id, None)
         self._resident_hbm.setdefault(layer_id, set())
         self._inflight_hbm.setdefault(layer_id, set())
+        self._memory_backing.setdefault(layer_id, {})
         _register_ready_layer(layer_id)
 
     def submit_seed_after_reuse(
@@ -398,6 +410,8 @@ class HCAPrefetchManager:
                 # is not HBM residency. The next request may receive different
                 # vLLM physical slots, so only drain_for_layer() may mark rows
                 # resident for the current forward.
+                self._memory_backed_layers.discard(layer_id)
+                self._memory_backing[layer_id] = {}
                 self._resident_hbm[layer_id].clear()
                 _mark_ready_layer(layer_id)
             if layer_id not in self._debug_seed_logged:
@@ -492,6 +506,7 @@ class HCAPrefetchManager:
         reshape_ms = 0.0
         write_ms = 0.0
         state_ms = 0.0
+        memory_backed = self._memory_backing_enabled
         for group_layer_idx, layer_id in enumerate(layer_ids):
             state = self._layers.get(int(layer_id))
             if state is None:
@@ -520,10 +535,20 @@ class HCAPrefetchManager:
                     f"{state.row_bytes} bytes"
                 )
             t_write0 = time.perf_counter() if timing else 0.0
-            state.store.write_rows_contiguous(
-                start_row,
-                flat_rows.numpy().tobytes(),
-            )
+            if memory_backed:
+                with self._lock:
+                    if start_row == 0:
+                        self._memory_backing[int(layer_id)] = {}
+                    self._memory_backing[int(layer_id)][start_row] = HCAMemoryRange(
+                        start_row_id=start_row,
+                        rows=flat_rows.clone(),
+                    )
+                    self._memory_backed_layers.add(int(layer_id))
+            else:
+                state.store.write_rows_contiguous(
+                    start_row,
+                    flat_rows.numpy().tobytes(),
+                )
             if timing:
                 write_ms += (time.perf_counter() - t_write0) * 1000.0
             t_state0 = time.perf_counter() if timing else 0.0
@@ -551,6 +576,7 @@ class HCAPrefetchManager:
                 layers=seeded,
                 start_row=start_row,
                 rows=rows_to_seed,
+                backing="memory" if memory_backed else "ssd",
             )
         return seeded
 
@@ -883,12 +909,15 @@ class HCAPrefetchManager:
                 rows_read = pending_read.future.result()
                 if timing:
                     wait_ms += (time.perf_counter() - t_wait0) * 1000.0
+                t_write0 = time.perf_counter() if timing else 0.0
                 rows_written = self._write_pending_to_kv_cache(
                     state,
                     pending_read.slot_ids,
                     pending_read.buffer_obj,
                     rows_read,
                 )
+                if timing:
+                    write_ms += (time.perf_counter() - t_write0) * 1000.0
                 if rows_written > 0:
                     with self._lock:
                         resident = self._resident_hbm[layer_id]
@@ -1154,19 +1183,61 @@ class HCAPrefetchManager:
             return 0
         raw = tensor[: rows_to_write * state.row_bytes].view(torch.uint8)
         src = raw.view(rows_to_write, state.row_bytes)
-        for idx, slot_id in enumerate(slot_ids[:rows_to_write]):
-            block_idx = slot_id // state.block_size
-            block_offset = slot_id % state.block_size
-            if block_idx >= state.kv_cache.shape[0]:
-                continue
-            row = state.kv_cache[block_idx, block_offset]
-            if row.dtype != torch.uint8:
-                raise TypeError(
-                    "HCAPrefetchManager currently expects uint8 HCA KV rows, "
-                    f"got {row.dtype}"
+        if state.kv_cache.dtype != torch.uint8:
+            raise TypeError(
+                "HCAPrefetchManager currently expects uint8 HCA KV rows, "
+                f"got {state.kv_cache.dtype}"
+            )
+        if not state.kv_cache.is_contiguous():
+            written = 0
+            for idx, slot_id in enumerate(slot_ids[:rows_to_write]):
+                block_idx = slot_id // state.block_size
+                block_offset = slot_id % state.block_size
+                if block_idx < 0 or block_idx >= state.kv_cache.shape[0]:
+                    continue
+                state.kv_cache[block_idx, block_offset].reshape(-1).copy_(
+                    src[idx],
+                    non_blocking=True,
                 )
-            row.reshape(-1).copy_(src[idx], non_blocking=False)
-        return rows_to_write
+                written += 1
+            return written
+        flat_kv = state.kv_cache.reshape(
+            state.kv_cache.shape[0] * state.block_size,
+            -1,
+        )
+        max_slot = flat_kv.shape[0]
+        written = 0
+        run_src_start = -1
+        run_slot_start = -1
+        run_len = 0
+
+        def _flush_run() -> None:
+            nonlocal written, run_src_start, run_slot_start, run_len
+            if run_len <= 0:
+                return
+            dst = flat_kv[run_slot_start : run_slot_start + run_len]
+            dst.copy_(
+                src[run_src_start : run_src_start + run_len],
+                non_blocking=True,
+            )
+            written += run_len
+            run_src_start = -1
+            run_slot_start = -1
+            run_len = 0
+
+        for src_idx, slot_id in enumerate(slot_ids[:rows_to_write]):
+            if slot_id < 0 or slot_id >= max_slot:
+                _flush_run()
+                continue
+            if run_len > 0 and slot_id == run_slot_start + run_len:
+                run_len += 1
+                continue
+            _flush_run()
+            run_src_start = src_idx
+            run_slot_start = slot_id
+            run_len = 1
+        _flush_run()
+        return written
 
     def _read_rows_into_buffer(
         self,
@@ -1186,11 +1257,65 @@ class HCAPrefetchManager:
         if tensor is None:
             return 0
         buffer = buffer_obj.byte_array
+        if self._memory_backing_enabled:
+            with self._lock:
+                memory_backed = state.layer_id in self._memory_backed_layers
+            rows = self._read_rows_from_memory_backing(
+                state,
+                start_row_id,
+                len(slot_ids),
+                buffer,
+            )
+            if rows > 0 or memory_backed:
+                return rows
         return state.store.read_rows_into(
             start_row_id,
             len(slot_ids),
             buffer,
         )
+
+    def _read_rows_from_memory_backing(
+        self,
+        state: HCALayerState,
+        start_row_id: int,
+        count: int,
+        buffer: memoryview,
+    ) -> int:
+        """Copy a contiguous HCA row range from CPU memory backing."""
+        if count <= 0:
+            return 0
+        with self._lock:
+            ranges = list(self._memory_backing.get(state.layer_id, {}).values())
+        if not ranges:
+            return 0
+        ranges.sort(key=lambda item: item.start_row_id)
+        dst = buffer.cast("B") if buffer.format != "B" else buffer
+        row_id = start_row_id
+        copied = 0
+        while copied < count:
+            source: HCAMemoryRange | None = None
+            for memory_range in ranges:
+                range_end = memory_range.start_row_id + int(memory_range.rows.shape[0])
+                if memory_range.start_row_id <= row_id < range_end:
+                    source = memory_range
+                    break
+            if source is None:
+                break
+            local_start = row_id - source.start_row_id
+            available = int(source.rows.shape[0]) - local_start
+            take = min(count - copied, available)
+            byte_start = copied * state.row_bytes
+            byte_end = byte_start + take * state.row_bytes
+            src = (
+                source.rows[local_start : local_start + take]
+                .contiguous()
+                .view(torch.uint8)
+                .numpy()
+            )
+            dst[byte_start:byte_end] = memoryview(src).cast("B")
+            copied += take
+            row_id += take
+        return copied
 
     def _log_timing(self, event: str, layer_id: int, **fields: Any) -> None:
         if not self._timing_enabled:

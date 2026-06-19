@@ -452,10 +452,17 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
             "dsv4_defer_hca_to_moe",
             "LMCACHE_DSV4_DEFER_HCA_TO_MOE",
         )
+        self.dsv4_defer_hca_max_tokens = self._read_config_int(
+            "dsv4_defer_hca_max_tokens",
+            "LMCACHE_DSV4_DEFER_HCA_MAX_TOKENS",
+            default=0,
+            minimum=0,
+        )
         self._dsv4_layout_valid: Optional[bool] = None
         self._dsv4_policy_logged = False
         self._dsv4_hca_defer_logged = False
         self._dsv4_hca_defer_fallback_logged = False
+        self._dsv4_hca_defer_gate_logged = False
         self._dsv4_csa_seed_logged = False
         self._dsv4_csa_seed_fallback_logged = False
         self._kv_cache_layer_names: tuple[str, ...] = ()
@@ -698,7 +705,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                 "tail-only"
                 if role in {"swa_cache", "compressor_state"}
                 else "defer-to-moe"
-                if self._should_defer_hca_group(role)
+                if role == "hca_attention_kv" and self.dsv4_defer_hca_to_moe
                 else "full"
             )
             group_summaries.append(
@@ -744,8 +751,40 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
             return self._dsv4_is_tail_transfer(start, end, **kwargs)
         return True
 
-    def _should_defer_hca_group(self, role: str) -> bool:
-        return role == "hca_attention_kv" and self.dsv4_defer_hca_to_moe
+    def _should_defer_hca_group(
+        self,
+        role: str,
+        end: int,
+        **kwargs: object,
+    ) -> bool:
+        if role != "hca_attention_kv" or not self.dsv4_defer_hca_to_moe:
+            return False
+        if self.dsv4_defer_hca_max_tokens <= 0:
+            return True
+        cached_tokens = kwargs.get("lmcache_cached_tokens")
+        try:
+            if cached_tokens is not None:
+                logical_tokens = int(cached_tokens)
+            else:
+                slot_mapping = kwargs.get("slot_mapping")
+                logical_tokens = (
+                    int(slot_mapping.numel())
+                    if isinstance(slot_mapping, torch.Tensor)
+                    else end
+                )
+        except (TypeError, ValueError):
+            logical_tokens = end
+        if logical_tokens <= self.dsv4_defer_hca_max_tokens:
+            return True
+        if not self._dsv4_hca_defer_gate_logged:
+            logger.info(
+                "LMCACHE_DSV4_DEFER_HCA_TO_MOE=1 but HCA defer is gated "
+                "off for %d cached tokens above max %d; using normal H2D",
+                logical_tokens,
+                self.dsv4_defer_hca_max_tokens,
+            )
+            self._dsv4_hca_defer_gate_logged = True
+        return False
 
     @staticmethod
     def _dsv4_layer_id_from_name(layer_name: str) -> Optional[int]:
@@ -849,7 +888,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         **kwargs: object,
     ) -> bool:
         """Seed HCA flat store from this retrieve chunk and skip normal H2D."""
-        if not self._should_defer_hca_group(role):
+        if not self._should_defer_hca_group(role, end, **kwargs):
             return False
         self._update_hma_metadata(**kwargs)
         layer_ids = self._dsv4_hca_layer_ids_for_group(group)
