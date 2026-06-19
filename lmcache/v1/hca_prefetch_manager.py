@@ -295,6 +295,7 @@ class HCAPrefetchManager:
         self._inflight_hbm: dict[int, set[int]] = {}
         self._active_slots: dict[int, torch.Tensor] = {}
         self._active_fire_plans: dict[int, tuple[list[int], list[int]]] = {}
+        self._active_fired_layers: set[int] = set()
         self._memory_backing: dict[int, dict[int, HCAMemoryRange]] = {}
         self._memory_backed_layers: set[int] = set()
         self._lock = threading.Lock()
@@ -413,6 +414,7 @@ class HCAPrefetchManager:
                 self._memory_backed_layers.discard(layer_id)
                 self._memory_backing[layer_id] = {}
                 self._resident_hbm[layer_id].clear()
+                self._active_fired_layers.discard(layer_id)
                 _mark_ready_layer(layer_id)
             if layer_id not in self._debug_seed_logged:
                 self._debug_seed_logged.add(layer_id)
@@ -558,6 +560,7 @@ class HCAPrefetchManager:
                     start_row + rows_to_seed,
                 )
                 self._resident_hbm[layer_id].clear()
+                self._active_fired_layers.discard(layer_id)
                 _mark_ready_layer(layer_id)
             if timing:
                 state_ms += (time.perf_counter() - t_state0) * 1000.0
@@ -584,6 +587,13 @@ class HCAPrefetchManager:
         """Return whether ``layer_id`` has enough HCA rows in its flat store."""
         state = self._layers.get(layer_id)
         return state is not None and state.initialized_rows >= compressed_seq_len
+
+    def begin_active_request(self) -> None:
+        """Reset current-request HCA prefetch plans before slot maps are installed."""
+        with self._lock:
+            self._active_slots.clear()
+            self._active_fire_plans.clear()
+            self._active_fired_layers.clear()
 
     def set_active_request_slots(
         self,
@@ -619,6 +629,7 @@ class HCAPrefetchManager:
         with self._lock:
             self._resident_hbm[layer_id].clear()
             self._inflight_hbm[layer_id].clear()
+            self._active_fired_layers.discard(layer_id)
 
     def fire_active_request_layers(self) -> int:
         """Fire all current-request HCA plans as soon as slots are known.
@@ -634,12 +645,17 @@ class HCAPrefetchManager:
             row_ids, slot_ids = self._active_fire_plans[layer_id]
             if not row_ids or not slot_ids:
                 continue
+            with self._lock:
+                if layer_id in self._active_fired_layers:
+                    continue
             self._fire_rows(
                 layer_id,
                 state,
                 row_ids,
                 precomputed_slot_ids=slot_ids,
             )
+            with self._lock:
+                self._active_fired_layers.add(layer_id)
             fired += 1
         return fired
 
@@ -689,6 +705,9 @@ class HCAPrefetchManager:
         t0 = time.perf_counter() if timing else None
         active_plan = self._active_fire_plans.get(layer_id)
         if active_plan is not None:
+            with self._lock:
+                if layer_id in self._active_fired_layers:
+                    return
             row_ids, slot_ids = active_plan
             self._fire_rows(
                 layer_id,
@@ -697,6 +716,8 @@ class HCAPrefetchManager:
                 start_time=t0,
                 precomputed_slot_ids=slot_ids,
             )
+            with self._lock:
+                self._active_fired_layers.add(layer_id)
             return
         if positions is None or positions.numel() == 0:
             return

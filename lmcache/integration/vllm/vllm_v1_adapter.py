@@ -503,6 +503,7 @@ def _fire_decoder_ffn_overlap(
         hca_manager is not None
         and isinstance(hca_targets, tuple)
         and hca_targets
+        and not _hca_active_prefire_enabled()
     ):
         try:
             if positions is not None:
@@ -2265,6 +2266,9 @@ class LMCacheConnectorV1Impl:
         set_slots = getattr(manager, "set_active_request_slots", None)
         if not callable(set_slots):
             return
+        begin_active = getattr(manager, "begin_active_request", None)
+        if callable(begin_active):
+            begin_active()
 
         compressed_slots_by_block_size: dict[int, torch.Tensor] = {}
         prepared = 0
