@@ -210,6 +210,11 @@ class LocalDiskBackend(StorageBackendInterface):
         self.kv_object_metadata_store: Optional[KVObjectMetadataStore] = None
         self.kv_object_pool_io: Optional[KVObjectPoolIO] = None
         self.kv_object_store_lock = threading.Lock()
+        self._diagnose_contains_misses = _env_flag(
+            "LMCACHE_DISK_CONTAINS_DIAGNOSTICS"
+        )
+        self._contains_miss_log_counts: dict[str, int] = {}
+        self._object_write_skip_log_counts: dict[str, int] = {}
         self.kv_object_tutti_raw_enabled = _env_flag(
             "LMCACHE_KV_OBJECT_STORE_TUTTI_RAW_ENABLE"
         )
@@ -420,6 +425,10 @@ class LocalDiskBackend(StorageBackendInterface):
                 ``None`` to disable raw writes and use the filesystem path.
         """
         self.kv_object_tutti_raw_writer = writer
+
+    def has_kv_object_tutti_raw_writer(self) -> bool:
+        """Return whether Tutti raw-object writes are currently available."""
+        return self.kv_object_tutti_raw_writer is not None
 
     def reset_kv_object_pool_allocation(self) -> None:
         """Reset logical KV object allocation offsets for future writes."""
@@ -815,8 +824,22 @@ class LocalDiskBackend(StorageBackendInterface):
     def contains(self, key: CacheEngineKey, pin: bool = False) -> bool:
         with self.disk_lock:
             if key not in self.dict:
+                self._log_contains_miss_unlocked(
+                    "contains",
+                    key,
+                    reason="dict_miss",
+                    index=0,
+                    hit_count=0,
+                )
                 return False
             if not self._has_readable_chunk_object_unlocked(key):
+                self._log_contains_miss_unlocked(
+                    "contains",
+                    key,
+                    reason="object_unreadable",
+                    index=0,
+                    hit_count=0,
+                )
                 return False
             if pin:
                 self.dict[key].pin()
@@ -1216,10 +1239,24 @@ class LocalDiskBackend(StorageBackendInterface):
     ) -> int:
         num_hit_counts = 0
         with self.disk_lock:
-            for key in keys:
+            for index, key in enumerate(keys):
                 if key not in self.dict:
+                    self._log_contains_miss_unlocked(
+                        "batched_async_contains",
+                        key,
+                        reason="dict_miss",
+                        index=index,
+                        hit_count=num_hit_counts,
+                    )
                     return num_hit_counts
                 if not self._has_readable_chunk_object_unlocked(key):
+                    self._log_contains_miss_unlocked(
+                        "batched_async_contains",
+                        key,
+                        reason="object_unreadable",
+                        index=index,
+                        hit_count=num_hit_counts,
+                    )
                     return num_hit_counts
                 if pin:
                     self.dict[key].pin()
@@ -1431,6 +1468,11 @@ class LocalDiskBackend(StorageBackendInterface):
             else None
         )
         if self.kv_object_tutti_raw_enabled and raw_writer is None:
+            self._log_kv_object_write_skip(
+                key,
+                reason="raw_writer_missing",
+                bytes_len=len(buffer),
+            )
             return False
         try:
             with self.kv_object_store_lock:
@@ -1509,6 +1551,84 @@ class LocalDiskBackend(StorageBackendInterface):
                 exc,
             )
             return False
+
+    def _log_contains_miss_unlocked(
+        self,
+        op: str,
+        key: CacheEngineKey,
+        *,
+        reason: str,
+        index: int,
+        hit_count: int,
+    ) -> None:
+        """Log bounded diagnostics for disk/object-store prefix lookup misses."""
+        if not self._diagnose_contains_misses:
+            return
+        log_key = f"{op}:{reason}"
+        count = self._contains_miss_log_counts.get(log_key, 0)
+        if count >= 32:
+            return
+        self._contains_miss_log_counts[log_key] = count + 1
+
+        object_state = "disabled"
+        raw_extents = 0
+        raw_readable = False
+        raw_read_bytes = 0
+        if self.kv_object_store_enabled and self.kv_object_tutti_raw_enabled:
+            object_state = "metadata_store_missing"
+            if self.kv_object_metadata_store is not None:
+                record = self.kv_object_metadata_store.get(
+                    self._key_to_object_id(key)
+                )
+                if record is None:
+                    object_state = "no_record"
+                else:
+                    object_state = getattr(record.state, "name", str(record.state))
+                    raw_extents = len(record.raw_extents)
+                    raw_read_bytes = self.kv_object_record_raw_read_bytes(record)
+                    raw_readable = self.kv_object_record_raw_readable(record)
+
+        logger.info(
+            "DISK_CONTAINS_PROFILE op=%s status=miss reason=%s index=%d "
+            "hit_count=%d key=%s dict_size=%d in_put=%s path_exists=%s "
+            "raw_enabled=%s object_state=%s raw_extents=%d "
+            "raw_readable=%s raw_read_bytes=%d",
+            op,
+            reason,
+            index,
+            hit_count,
+            key.to_string(),
+            len(self.dict),
+            self.exists_in_put_tasks(key),
+            os.path.exists(self._key_to_path(key)),
+            self.kv_object_store_enabled and self.kv_object_tutti_raw_enabled,
+            object_state,
+            raw_extents,
+            raw_readable,
+            raw_read_bytes,
+        )
+
+    def _log_kv_object_write_skip(
+        self,
+        key: CacheEngineKey,
+        *,
+        reason: str,
+        bytes_len: int,
+    ) -> None:
+        """Log bounded diagnostics when object-store writes fall back to files."""
+        log_count = self._object_write_skip_log_counts.get(reason, 0)
+        if log_count >= 32:
+            return
+        self._object_write_skip_log_counts[reason] = log_count + 1
+        logger.info(
+            "KV_OBJECT_STORE_PROFILE op=write key=%s status=skip "
+            "reason=%s bytes=%d raw_enabled=%s writer_installed=%s",
+            key.to_string(),
+            reason,
+            bytes_len,
+            self.kv_object_tutti_raw_enabled,
+            self.kv_object_tutti_raw_writer is not None,
+        )
 
     def scan_existing_entries(self, metadata: LMCacheMetadata) -> int:
         """Scan the disk cache directory and register pre-existing ``.pt`` files.

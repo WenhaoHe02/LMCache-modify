@@ -824,21 +824,22 @@ class LMCacheEngine:
                 unmount_start = time.perf_counter()
                 mount_info = _maybe_unmount_for_tutti(disk_backend.path)
                 unmount_ms = (time.perf_counter() - unmount_start) * 1000.0
-            # Release PyTorch's cached GPU memory so the raw cudaMalloc inside
-            # TuttiDirectLoader.create() can find contiguous free HBM pages.
-            torch.cuda.empty_cache()
+            # Release cached memory on this rank's CUDA device before the raw
+            # cudaMalloc inside TuttiDirectLoader.create().
             create_start = time.perf_counter()
-            self._tutti_loader = TuttiDirectLoader.create(
-                device_path=cfg["device_path"],
-                ctrl_path=cfg["ctrl_path"],
-                pci_bdf=cfg["pci_bdf"],
-                n_slots=cfg["n_slots"],
-                slot_bytes=cfg["slot_mb"] * 1024 * 1024,
-                nsid=cfg["nsid"],
-                cuda_device=cfg["cuda_device"],
-                initial_lba_cache=initial_lba_cache,
-                debug_expected_checksums=debug_expected_checksums,
-            )
+            with torch.cuda.device(cfg["cuda_device"]):
+                torch.cuda.empty_cache()
+                self._tutti_loader = TuttiDirectLoader.create(
+                    device_path=cfg["device_path"],
+                    ctrl_path=cfg["ctrl_path"],
+                    pci_bdf=cfg["pci_bdf"],
+                    n_slots=cfg["n_slots"],
+                    slot_bytes=cfg["slot_mb"] * 1024 * 1024,
+                    nsid=cfg["nsid"],
+                    cuda_device=cfg["cuda_device"],
+                    initial_lba_cache=initial_lba_cache,
+                    debug_expected_checksums=debug_expected_checksums,
+                )
             create_ms = (time.perf_counter() - create_start) * 1000.0
             if (
                 isinstance(disk_backend, LocalDiskBackend)

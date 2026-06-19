@@ -1218,50 +1218,55 @@ class TuttiDirectLoader:
             torch.cuda.synchronize(device=cuda_dev_str)
             cuda_malloc_ms = _elapsed_ms(cuda_malloc_start)
             align_offset = (-staging_raw_ptr) % _GPU_PAGE_SIZE
-            # Wrap cudaMalloc pointer as a non-owning PyTorch tensor via CAI.
-            _buf_obj = _ExternalCudaBuffer(staging_raw_ptr, alloc_bytes)
-            staging_full = torch.as_tensor(_buf_obj)
-            if align_offset > 0:
-                staging = staging_full[align_offset : align_offset + total_bytes]
-            else:
-                staging = staging_full[:total_bytes]
-            if staging.data_ptr() % _GPU_PAGE_SIZE != 0:
-                raise RuntimeError(
-                    f"staging ptr 0x{staging.data_ptr():x} not 64 KiB aligned"
+            with torch.cuda.device(cuda_device):
+                # Wrap cudaMalloc pointer as a non-owning PyTorch tensor via CAI.
+                _buf_obj = _ExternalCudaBuffer(staging_raw_ptr, alloc_bytes)
+                staging_full = torch.as_tensor(_buf_obj)
+                if align_offset > 0:
+                    staging = staging_full[align_offset : align_offset + total_bytes]
+                else:
+                    staging = staging_full[:total_bytes]
+                if staging.data_ptr() % _GPU_PAGE_SIZE != 0:
+                    raise RuntimeError(
+                        f"staging ptr 0x{staging.data_ptr():x} not 64 KiB aligned"
+                    )
+                logger.debug(
+                    "Staging buffer: ptr=0x%x device=%s total_bytes=%d "
+                    "(cudaMalloc direct)",
+                    staging.data_ptr(), cuda_dev_str, total_bytes,
                 )
-            logger.debug(
-                "Staging buffer: ptr=0x%x device=%s total_bytes=%d "
-                "(cudaMalloc direct)",
-                staging.data_ptr(), cuda_dev_str, total_bytes,
-            )
 
-            session_start = time.perf_counter()
-            session = SnvmeSession(
-                device_path=device_path,
-                ctrl_path=ctrl_path,
-                pci_bdf=pci_bdf,
-                staging_tensor=staging,
-                nsid=nsid,
-                kernel_ioq_cap=kernel_ioq_cap,
-                cuda_device=cuda_device,
-            )
-            session_ms = _elapsed_ms(session_start)
+                session_start = time.perf_counter()
+                session = SnvmeSession(
+                    device_path=device_path,
+                    ctrl_path=ctrl_path,
+                    pci_bdf=pci_bdf,
+                    staging_tensor=staging,
+                    nsid=nsid,
+                    kernel_ioq_cap=kernel_ioq_cap,
+                    cuda_device=cuda_device,
+                )
+                session_ms = _elapsed_ms(session_start)
 
-            # Allocate managed-memory scalars for SQ/CQ state.
-            aux_alloc_start = time.perf_counter()
-            sq_tail_ptr = _cuda_malloc_managed(ctypes.sizeof(ctypes.c_uint16))
-            cq_head_ptr = _cuda_malloc_managed(ctypes.sizeof(ctypes.c_uint16))
-            cq_phase_ptr = _cuda_malloc_managed(ctypes.sizeof(ctypes.c_uint8))
-            timed_out_ptr = _cuda_malloc_managed(ctypes.sizeof(ctypes.c_int32))
+                # Allocate managed-memory scalars for SQ/CQ state.
+                aux_alloc_start = time.perf_counter()
+                sq_tail_ptr = _cuda_malloc_managed(ctypes.sizeof(ctypes.c_uint16))
+                cq_head_ptr = _cuda_malloc_managed(ctypes.sizeof(ctypes.c_uint16))
+                cq_phase_ptr = _cuda_malloc_managed(ctypes.sizeof(ctypes.c_uint8))
+                timed_out_ptr = _cuda_malloc_managed(ctypes.sizeof(ctypes.c_int32))
 
-            # Initialise: sq_tail=0, cq_head=0, cq_phase=1 (NVMe starts with phase=1).
-            ctypes.c_uint16.from_address(sq_tail_ptr).value = 0
-            ctypes.c_uint16.from_address(cq_head_ptr).value = 0
-            ctypes.c_uint8.from_address(cq_phase_ptr).value = 1
-            ctypes.c_int32.from_address(timed_out_ptr).value = 0
+                # Initialise: sq_tail=0, cq_head=0, cq_phase=1 (NVMe starts with phase=1).
+                ctypes.c_uint16.from_address(sq_tail_ptr).value = 0
+                ctypes.c_uint16.from_address(cq_head_ptr).value = 0
+                ctypes.c_uint8.from_address(cq_phase_ptr).value = 1
+                ctypes.c_int32.from_address(timed_out_ptr).value = 0
 
-            q_depth = int(session.info.q_depth)
-            status_buf = torch.zeros(q_depth, dtype=torch.int32, device=cuda_dev_str)
+                q_depth = int(session.info.q_depth)
+                status_buf = torch.zeros(
+                    q_depth,
+                    dtype=torch.int32,
+                    device=cuda_dev_str,
+                )
             aux_alloc_ms = _elapsed_ms(aux_alloc_start)
 
             if n_slots > q_depth:
