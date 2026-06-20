@@ -499,16 +499,18 @@ def _fire_decoder_ffn_overlap(
 
     hca_manager = getattr(decoder_layer, "_lmcache_hca_prefetch_manager", None)
     hca_targets = getattr(decoder_layer, "_lmcache_next_hca_layer_ids", ())
-    if (
-        hca_manager is not None
-        and isinstance(hca_targets, tuple)
-        and hca_targets
-        and not _hca_active_prefire_enabled()
-    ):
+    if hca_manager is not None and isinstance(hca_targets, tuple) and hca_targets:
         try:
+            hca_fired = getattr(hca_manager, "layer_fired_for_active_request", None)
             if positions is not None:
                 for next_hca in hca_targets:
+                    if callable(hca_fired) and hca_fired(next_hca):
+                        continue
                     hca_manager.fire_async_for_layer(next_hca, positions)
+            prepare_hca = getattr(hca_manager, "prepare_layer_async", None)
+            if callable(prepare_hca):
+                for next_hca in hca_targets:
+                    prepare_hca(next_hca)
         except Exception as exc:
             _log_overlap_hook_error_once("HCA", int(layer_id), exc)
 
@@ -583,6 +585,8 @@ def _install_hca_attention_drain_hook(
     layer_id: int,
 ) -> bool:
     """Install a final safety drain before the target HCA attention runs."""
+    hca_layer._lmcache_hca_prefetch_manager = manager
+    hca_layer._lmcache_hca_layer_id = layer_id
     if getattr(hca_layer, "_lmcache_hca_drain_installed", False):
         return True
     original_forward = getattr(hca_layer, "forward", None)
@@ -590,10 +594,12 @@ def _install_hca_attention_drain_hook(
         return False
 
     def _lmcache_hca_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
-        drain = getattr(manager, "drain_for_layer", None)
+        active_manager = getattr(self, "_lmcache_hca_prefetch_manager", manager)
+        active_layer_id = getattr(self, "_lmcache_hca_layer_id", layer_id)
+        drain = getattr(active_manager, "drain_for_layer", None)
         if callable(drain):
             drain(
-                layer_id,
+                active_layer_id,
                 blocking=_hca_blocking_drain_enabled(),
             )
         return original_forward(*args, **kwargs)

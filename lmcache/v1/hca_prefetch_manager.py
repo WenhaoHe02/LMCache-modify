@@ -18,6 +18,7 @@ from __future__ import annotations
 
 # Standard
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -284,7 +285,7 @@ class HCAObjectSource:
 
 @dataclass
 class HCAObjectReadLayout:
-    """Plane-major object read layout for one pending HCA drain."""
+    """Object-source read layout for one pending HCA drain."""
 
     rows: int
     hidden_bytes: int
@@ -292,6 +293,10 @@ class HCAObjectReadLayout:
     v_prefix_bytes: int
     k_dma_bytes: int
     v_dma_bytes: int
+    row_major: bool = False
+    row_prefix_bytes: int = 0
+    row_dma_bytes: int = 0
+    row_bytes: int = 0
 
 
 @dataclass
@@ -363,6 +368,8 @@ class HCAPrefetchManager:
         self._layers: dict[int, HCALayerState] = {}
         self._pending: dict[int, list[HCAPendingRead]] = {}
         self._drain_futures: dict[int, Future[None] | None] = {}
+        self._drain_streams: dict[int, Any] = {}
+        self._copy_releases: dict[int, list[tuple[Any, list[Any]]]] = {}
         self._resident_hbm: dict[int, set[int]] = {}
         self._inflight_hbm: dict[int, set[int]] = {}
         self._active_slots: dict[int, torch.Tensor] = {}
@@ -394,6 +401,13 @@ class HCAPrefetchManager:
             "HCAPrefetchManager: using transient pinned I/O slab size=%d MiB; "
             "this is not a CPU KV cache",
             pinned_mb,
+        )
+        logger.info(
+            "HCAPrefetchManager: blocking_drain=%s async_hbm_drain=%s "
+            "object_source=%s",
+            self._blocking_drain,
+            self._async_hbm_drain,
+            self._object_source_enabled,
         )
         global _ACTIVE_MANAGER
         _ACTIVE_MANAGER = self
@@ -483,6 +497,7 @@ class HCAPrefetchManager:
                 chunks=valid_chunks,
             )
             state = self._layers[layer_id]
+            source_start = min(chunk.start_row_id for chunk in valid_chunks)
             source_rows = max(
                 chunk.start_row_id + chunk.rows for chunk in valid_chunks
             )
@@ -501,11 +516,114 @@ class HCAPrefetchManager:
             self._debug_object_source_logged.add(layer_id)
             logger.info(
                 "HCAPrefetchManager: object-source layer=%d chunks=%d "
-                "rows=%d",
+                "rows=%d range=[%d,%d)",
                 layer_id,
                 len(valid_chunks),
                 sum(chunk.rows for chunk in valid_chunks),
+                source_start,
+                source_rows,
             )
+
+    def replace_object_sources(
+        self,
+        entries: Sequence[tuple[int, Sequence[HCAObjectChunk], Any, Any | None]],
+    ) -> int:
+        """Atomically replace active object-store backed rows.
+
+        Args:
+            entries: Per-layer object-source tuples of ``(layer_id, chunks,
+                loader, loader_lock)`` for the current LMCache hit.
+
+        Returns:
+            Number of layers whose object source was installed.
+        """
+        if not self._object_source_enabled:
+            return 0
+        prepared: list[tuple[int, HCAObjectSource, int, int, int, int]] = []
+        for layer_id, chunks, loader, loader_lock in entries:
+            if layer_id not in self._layers:
+                continue
+            valid_chunks = [
+                chunk
+                for chunk in sorted(chunks, key=lambda item: item.start_row_id)
+                if chunk.rows > 0 and getattr(chunk.record, "length", 0) > 0
+            ]
+            if not valid_chunks:
+                continue
+            source_start = min(chunk.start_row_id for chunk in valid_chunks)
+            source_rows = max(
+                chunk.start_row_id + chunk.rows for chunk in valid_chunks
+            )
+            prepared.append(
+                (
+                    layer_id,
+                    HCAObjectSource(
+                        loader=loader,
+                        loader_lock=loader_lock,
+                        chunks=valid_chunks,
+                    ),
+                    len(valid_chunks),
+                    sum(chunk.rows for chunk in valid_chunks),
+                    source_start,
+                    source_rows,
+                )
+            )
+        if not prepared:
+            return 0
+        with self._lock:
+            self._object_sources.clear()
+            for (
+                layer_id,
+                source,
+                _chunk_count,
+                _row_count,
+                _source_start,
+                source_rows,
+            ) in prepared:
+                self._object_sources[layer_id] = source
+                state = self._layers[layer_id]
+                state.initialized_rows = max(state.initialized_rows, source_rows)
+                self._resident_hbm[layer_id].clear()
+                self._inflight_hbm[layer_id].clear()
+                self._active_fired_layers.discard(layer_id)
+                _mark_ready_layer(layer_id)
+        if not self._object_source_log_logged:
+            self._object_source_log_logged = True
+            logger.info(
+                "HCAPrefetchManager: object-source HCA reads enabled; "
+                "SSD rows will be loaded from per-layer KV objects"
+            )
+        for (
+            layer_id,
+            _source,
+            chunk_count,
+            row_count,
+            source_start,
+            source_rows,
+        ) in prepared:
+            if layer_id in self._debug_object_source_logged:
+                continue
+            self._debug_object_source_logged.add(layer_id)
+            logger.info(
+                "HCAPrefetchManager: object-source layer=%d chunks=%d "
+                "rows=%d range=[%d,%d)",
+                layer_id,
+                chunk_count,
+                row_count,
+                source_start,
+                source_rows,
+            )
+        return len(prepared)
+
+    def has_object_source(self, layer_id: int) -> bool:
+        """Return whether ``layer_id`` has an active object-backed source."""
+        with self._lock:
+            return layer_id in self._object_sources
+
+    def layer_fired_for_active_request(self, layer_id: int) -> bool:
+        """Return whether active-request HCA reads were already fired."""
+        with self._lock:
+            return layer_id in self._active_fired_layers
 
     def clear_object_sources(self) -> None:
         """Clear active object-backed sources between requests."""
@@ -795,6 +913,11 @@ class HCAPrefetchManager:
             with self._lock:
                 if layer_id in self._active_fired_layers:
                     continue
+                if (
+                    self._object_source_enabled
+                    and layer_id not in self._object_sources
+                ):
+                    continue
             self._fire_rows(
                 layer_id,
                 state,
@@ -952,10 +1075,6 @@ class HCAPrefetchManager:
                 )
             self._pending[layer_id].extend(pending_reads)
         submit_ms = (time.perf_counter() - t_submit0) * 1000.0 if timing else 0.0
-        for pending_read in pending_reads:
-            pending_read.future.add_done_callback(
-                lambda _future, lid=layer_id: self.prepare_layer_async(lid)
-            )
         if missing and layer_id not in self._debug_fire_logged:
             self._debug_fire_logged.add(layer_id)
             logger.debug(
@@ -979,43 +1098,22 @@ class HCAPrefetchManager:
             )
 
     def prepare_layer_async(self, layer_id: int) -> None:
-        """Submit a pending HCA drain for asynchronous execution.
+        """Enqueue ready HCA rows for copy-back without waiting.
 
         Args:
             layer_id: Target HCA layer whose pending reads should be drained
-                in the background.
+                from the caller's CUDA context when their I/O futures are ready.
         """
         if not self._async_hbm_drain:
             return
         if layer_id not in self._layers:
             return
-        with self._lock:
-            previous_drain = self._drain_futures.get(layer_id)
-            has_pending = bool(self._pending.get(layer_id))
-            if previous_drain is not None and not previous_drain.done():
-                return
-            if not has_pending and previous_drain is None:
-                return
-
-            def _prepare() -> None:
-                self._drain_for_layer_once(layer_id)
-
-            drain_future = self._executor.submit(_prepare)
-            self._drain_futures[layer_id] = drain_future
-
-        def _clear_done(fut: Future[None]) -> None:
-            try:
-                fut.result()
-            except Exception:
-                logger.exception(
-                    "HCAPrefetchManager: async drain failed for layer %d",
-                    layer_id,
-                )
-            with self._lock:
-                if self._drain_futures.get(layer_id) is fut:
-                    self._drain_futures[layer_id] = None
-
-        drain_future.add_done_callback(_clear_done)
+        self._release_completed_copies(layer_id, blocking=False)
+        self._drain_for_layer_once(
+            layer_id,
+            blocking=False,
+            synchronize_copy=False,
+        )
 
     def drain_for_layer(self, layer_id: int, blocking: bool | None = None) -> None:
         """Drain pending HCA reads into the target layer's vLLM KV cache.
@@ -1033,11 +1131,14 @@ class HCAPrefetchManager:
                 if self._drain_futures.get(layer_id) is drain_future:
                     self._drain_futures[layer_id] = None
         self._drain_for_layer_once(layer_id, blocking=blocking)
+        self._release_completed_copies(layer_id, blocking=True)
 
     def _drain_for_layer_once(
         self,
         layer_id: int,
         blocking: bool | None = None,
+        *,
+        synchronize_copy: bool = True,
     ) -> None:
         """Drain currently ready HCA reads without waiting for future drains."""
         state = self._layers.get(layer_id)
@@ -1067,6 +1168,14 @@ class HCAPrefetchManager:
         wait_ms = 0.0
         write_ms = 0.0
         written = 0
+        copy_stream = self._drain_stream_for_state(state)
+        copy_device_context = nullcontext()
+        if copy_stream is not None and state.kv_cache.device.index is not None:
+            copy_device_context = torch.cuda.device(
+                int(state.kv_cache.device.index)
+            )
+        copy_submitted = False
+        release_objs: list[Any] = []
         for pending_read in pending:
             t_wait0 = time.perf_counter() if timing else 0.0
             row_span = range(
@@ -1090,13 +1199,21 @@ class HCAPrefetchManager:
                 if buffer_obj is None:
                     rows_written = 0
                 else:
-                    rows_written = self._write_pending_to_kv_cache(
-                        state,
-                        pending_read.slot_ids,
-                        buffer_obj,
-                        rows_read,
-                        object_layout=pending_read.object_layout,
+                    context = (
+                        torch.cuda.stream(copy_stream)
+                        if copy_stream is not None
+                        else nullcontext()
                     )
+                    with copy_device_context:
+                        with context:
+                            rows_written = self._write_pending_to_kv_cache(
+                                state,
+                                pending_read.slot_ids,
+                                buffer_obj,
+                                rows_read,
+                                object_layout=pending_read.object_layout,
+                            )
+                    copy_submitted = copy_submitted or rows_written > 0
                 if timing:
                     write_ms += (time.perf_counter() - t_write0) * 1000.0
                 if rows_written > 0:
@@ -1124,12 +1241,16 @@ class HCAPrefetchManager:
             finally:
                 with self._lock:
                     self._inflight_hbm[layer_id].difference_update(row_span)
-                if isinstance(buffer_obj, HCAObjectBatchResult):
-                    for memory_obj in buffer_obj.memory_objs:
-                        if memory_obj is not None:
-                            memory_obj.ref_count_down()
-                elif buffer_obj is not None:
-                    buffer_obj.ref_count_down()
+                if buffer_obj is not None:
+                    release_objs.append(buffer_obj)
+        if copy_stream is not None and copy_submitted:
+            if synchronize_copy:
+                copy_stream.synchronize()
+            else:
+                self._defer_buffer_releases(layer_id, copy_stream, release_objs)
+                release_objs = []
+        for obj in release_objs:
+            self._release_buffer_obj(obj)
         if written and layer_id not in self._debug_drain_logged:
             self._debug_drain_logged.add(layer_id)
             logger.debug(
@@ -1153,9 +1274,97 @@ class HCAPrefetchManager:
     def close(self) -> None:
         """Close files and shut down the background executor."""
         self._executor.shutdown(wait=True)
+        self._release_completed_copies(blocking=True)
         self._pinned_allocator.memcheck()
         for state in self._layers.values():
             state.store.close()
+
+    def _has_ready_pending(self, layer_id: int) -> bool:
+        """Return whether ``layer_id`` has completed reads waiting to drain."""
+        with self._lock:
+            return any(
+                pending_read.future.done()
+                for pending_read in self._pending.get(layer_id, [])
+            )
+
+    def _drain_stream_for_state(self, state: HCALayerState) -> Any | None:
+        """Return the CUDA stream used for HCA KV copy-back, if applicable."""
+        if not state.kv_cache.is_cuda or not torch.cuda.is_available():
+            return None
+        device = state.kv_cache.device
+        device_index = (
+            int(device.index)
+            if device.index is not None
+            else int(torch.cuda.current_device())
+        )
+        with self._lock:
+            stream = self._drain_streams.get(device_index)
+            if stream is None:
+                with torch.cuda.device(device_index):
+                    stream = torch.cuda.Stream()
+                self._drain_streams[device_index] = stream
+            return stream
+
+    def _defer_buffer_releases(
+        self,
+        layer_id: int,
+        copy_stream: Any,
+        release_objs: list[Any],
+    ) -> None:
+        """Release HCA buffers after the copy stream reaches a recorded event."""
+        if not release_objs:
+            return
+        event = torch.cuda.Event()
+        event.record(copy_stream)
+        with self._lock:
+            self._copy_releases.setdefault(layer_id, []).append(
+                (event, release_objs)
+            )
+
+    def _release_completed_copies(
+        self,
+        layer_id: int | None = None,
+        *,
+        blocking: bool,
+    ) -> None:
+        """Release buffers whose asynchronous copy-back has completed."""
+        with self._lock:
+            if layer_id is None:
+                items = list(self._copy_releases.items())
+                self._copy_releases.clear()
+            else:
+                items = [(layer_id, self._copy_releases.pop(layer_id, []))]
+        keep_by_layer: dict[int, list[tuple[Any, list[Any]]]] = {}
+        for current_layer_id, pending in items:
+            for event, release_objs in pending:
+                if blocking:
+                    event.synchronize()
+                    ready = True
+                else:
+                    ready = event.query()
+                if ready:
+                    for obj in release_objs:
+                        self._release_buffer_obj(obj)
+                else:
+                    keep_by_layer.setdefault(current_layer_id, []).append(
+                        (event, release_objs)
+                    )
+        if keep_by_layer:
+            with self._lock:
+                for current_layer_id, pending in keep_by_layer.items():
+                    self._copy_releases.setdefault(current_layer_id, []).extend(
+                        pending
+                    )
+
+    @staticmethod
+    def _release_buffer_obj(buffer_obj: Any) -> None:
+        """Release a flat or object-batch HCA drain buffer."""
+        if isinstance(buffer_obj, HCAObjectBatchResult):
+            for memory_obj in buffer_obj.memory_objs:
+                if memory_obj is not None:
+                    memory_obj.ref_count_down()
+            return
+        buffer_obj.ref_count_down()
 
     def _build_pending_reads(
         self,
@@ -1240,24 +1449,101 @@ class HCAPrefetchManager:
     ) -> list[HCAPendingRead]:
         with self._lock:
             source = self._object_sources.get(state.layer_id)
-        if source is None or not slot_ids:
+        if not slot_ids:
+            return []
+        if source is None:
+            self._log_skip_once(
+                state.layer_id,
+                "object_no_source",
+                "HCAPrefetchManager: object-source skip layer=%d "
+                "reason=no_source request=[%d,%d)",
+                start_row_id,
+                start_row_id + len(slot_ids),
+            )
             return []
 
-        spans: list[tuple[HCAObjectChunk, int, int, int]] = []
-        row_id = start_row_id
-        remaining_slots = slot_ids
-        slot_offset = 0
+        request_end = start_row_id + len(slot_ids)
+        pending: list[HCAPendingRead] = []
+        cursor = start_row_id
+        covered_rows = 0
+        object_run_start: int | None = None
+        object_run_slots: list[int] = []
+        object_spans: list[tuple[HCAObjectChunk, int, int, int]] = []
+
+        def _flush_object_run() -> None:
+            nonlocal object_run_start, object_run_slots, object_spans
+            if object_run_start is None or not object_run_slots or not object_spans:
+                object_run_start = None
+                object_run_slots = []
+                object_spans = []
+                return
+            object_pending = self._submit_object_batch_read(
+                state,
+                source,
+                object_run_start,
+                object_run_slots,
+                object_spans,
+            )
+            if object_pending is None:
+                object_pending = self._submit_flat_range_read(
+                    state,
+                    object_run_start,
+                    object_run_slots,
+                )
+            if object_pending is not None:
+                pending.append(object_pending)
+            object_run_start = None
+            object_run_slots = []
+            object_spans = []
+
+        def _append_flat_segment(segment_start: int, segment_end: int) -> None:
+            if segment_end <= segment_start:
+                return
+            _flush_object_run()
+            segment_offset = segment_start - start_row_id
+            segment_rows = segment_end - segment_start
+            flat_pending = self._submit_flat_range_read(
+                state,
+                segment_start,
+                slot_ids[segment_offset : segment_offset + segment_rows],
+            )
+            if flat_pending is not None:
+                pending.append(flat_pending)
+
         for chunk in source.chunks:
             chunk_end = chunk.start_row_id + chunk.rows
-            if chunk_end <= row_id:
+            if chunk_end <= cursor:
                 continue
-            if chunk.start_row_id > row_id:
+            if chunk.start_row_id >= request_end:
                 break
-            local_start = row_id - chunk.start_row_id
-            take = min(chunk_end - row_id, len(remaining_slots))
-            if take <= 0:
+            if chunk.start_row_id > cursor:
+                gap_end = min(chunk.start_row_id, request_end)
+                _append_flat_segment(cursor, gap_end)
+                cursor = gap_end
+                if cursor >= request_end:
+                    break
+            cover_start = max(cursor, chunk.start_row_id)
+            cover_end = min(request_end, chunk_end)
+            if cover_end <= cover_start:
                 continue
-            spans.append(
+            expected_start = (
+                object_run_start + len(object_run_slots)
+                if object_run_start is not None
+                else cover_start
+            )
+            if object_run_start is None:
+                object_run_start = cover_start
+            elif cover_start != expected_start:
+                _flush_object_run()
+                object_run_start = cover_start
+            slot_offset = cover_start - object_run_start
+            local_start = cover_start - chunk.start_row_id
+            take = cover_end - cover_start
+            cover_offset = cover_start - start_row_id
+            object_run_slots.extend(
+                slot_ids[cover_offset : cover_offset + take]
+            )
+            object_spans.append(
                 (
                     chunk,
                     local_start,
@@ -1265,19 +1551,31 @@ class HCAPrefetchManager:
                     slot_offset,
                 )
             )
-            row_id += take
-            slot_offset += take
-            remaining_slots = remaining_slots[take:]
-            if not remaining_slots:
-                pending = self._submit_object_batch_read(
-                    state,
-                    source,
-                    start_row_id,
-                    list(slot_ids),
-                    spans,
-                )
-                return [pending] if pending is not None else []
-        return []
+            cursor = cover_end
+            covered_rows += take
+            if cursor >= request_end:
+                break
+        _flush_object_run()
+        if covered_rows <= 0:
+            source_start = min(chunk.start_row_id for chunk in source.chunks)
+            source_end = max(
+                chunk.start_row_id + chunk.rows for chunk in source.chunks
+            )
+            self._log_skip_once(
+                state.layer_id,
+                "object_no_intersection",
+                "HCAPrefetchManager: object-source skip layer=%d "
+                "reason=no_intersection request=[%d,%d) "
+                "source=[%d,%d) chunks=%d",
+                start_row_id,
+                request_end,
+                source_start,
+                source_end,
+                len(source.chunks),
+            )
+        if cursor < request_end:
+            _append_flat_segment(cursor, request_end)
+        return pending
 
     def _submit_object_batch_read(
         self,
@@ -1349,26 +1647,54 @@ class HCAPrefetchManager:
         rows: int,
     ) -> tuple[HCAObjectReadLayout, tuple[Any, ...], int] | None:
         if rows <= 0 or state.row_bytes <= 0 or state.row_bytes % 2 != 0:
+            self._log_skip_once(
+                state.layer_id,
+                "object_layout_invalid_shape",
+                "HCAPrefetchManager: object-source skip layer=%d "
+                "reason=invalid_shape rows=%d row_bytes=%d",
+                rows,
+                state.row_bytes,
+            )
             return None
-        ranges = sorted(
-            tuple(getattr(chunk.record, "read_ranges", ())),
-            key=lambda item: item.target_offset,
-        )
-        if len(ranges) < 2:
+        raw_ranges = tuple(getattr(chunk.record, "read_ranges", ()))
+        try:
+            ranges = sorted(raw_ranges, key=lambda item: item.target_offset)
+        except AttributeError:
+            self._log_skip_once(
+                state.layer_id,
+                "object_layout_bad_range",
+                "HCAPrefetchManager: object-source skip layer=%d "
+                "reason=bad_range range_type=%s path=%s",
+                type(raw_ranges[0]).__name__ if raw_ranges else "none",
+                chunk.path,
+            )
             return None
-        hidden_bytes = state.row_bytes // 2
-        payload_bytes = rows * hidden_bytes
-        if payload_bytes <= 0:
+        if not ranges:
+            self._log_skip_once(
+                state.layer_id,
+                "object_layout_no_ranges",
+                "HCAPrefetchManager: object-source skip layer=%d "
+                "reason=no_ranges raw_extents=%d path=%s",
+                len(tuple(getattr(chunk.record, "raw_extents", ()))),
+                chunk.path,
+            )
             return None
 
         try:
             from lmcache.v1.kv_object_store import KVObjectByteRange
         except ImportError:
+            self._log_skip_once(
+                state.layer_id,
+                "object_layout_import",
+                "HCAPrefetchManager: object-source skip layer=%d "
+                "reason=import_kv_object_range",
+            )
             return None
 
         def _aligned_range(
             source_offset: int,
             target_offset: int,
+            payload_bytes: int,
         ) -> tuple[KVObjectByteRange, int, int]:
             aligned_offset = (source_offset // 512) * 512
             prefix_bytes = source_offset - aligned_offset
@@ -1383,10 +1709,59 @@ class HCAPrefetchManager:
                 dma_bytes,
             )
 
+        row_payload_bytes = rows * state.row_bytes
+        if len(ranges) == 1:
+            if row_payload_bytes <= 0:
+                self._log_skip_once(
+                    state.layer_id,
+                    "object_layout_empty_row_payload",
+                    "HCAPrefetchManager: object-source skip layer=%d "
+                    "reason=empty_row_payload rows=%d row_bytes=%d",
+                    rows,
+                    state.row_bytes,
+                )
+                return None
+            source = int(ranges[0].offset) + local_start * state.row_bytes
+            row_range, row_prefix, row_dma = _aligned_range(
+                source,
+                0,
+                row_payload_bytes,
+            )
+            layout = HCAObjectReadLayout(
+                rows=rows,
+                hidden_bytes=state.row_bytes // 2,
+                k_prefix_bytes=0,
+                v_prefix_bytes=0,
+                k_dma_bytes=0,
+                v_dma_bytes=0,
+                row_major=True,
+                row_prefix_bytes=row_prefix,
+                row_dma_bytes=row_dma,
+                row_bytes=state.row_bytes,
+            )
+            return layout, (row_range,), row_dma
+
+        hidden_bytes = state.row_bytes // 2
+        payload_bytes = rows * hidden_bytes
+        if payload_bytes <= 0:
+            self._log_skip_once(
+                state.layer_id,
+                "object_layout_empty_payload",
+                "HCAPrefetchManager: object-source skip layer=%d "
+                "reason=empty_payload rows=%d hidden_bytes=%d",
+                rows,
+                hidden_bytes,
+            )
+            return None
+
         k_source = int(ranges[0].offset) + local_start * hidden_bytes
-        k_range, k_prefix, k_dma = _aligned_range(k_source, 0)
+        k_range, k_prefix, k_dma = _aligned_range(k_source, 0, payload_bytes)
         v_source = int(ranges[1].offset) + local_start * hidden_bytes
-        v_range, v_prefix, v_dma = _aligned_range(v_source, k_dma)
+        v_range, v_prefix, v_dma = _aligned_range(
+            v_source,
+            k_dma,
+            payload_bytes,
+        )
         layout = HCAObjectReadLayout(
             rows=rows,
             hidden_bytes=hidden_bytes,
@@ -1609,12 +1984,25 @@ class HCAPrefetchManager:
         rows_to_write: int,
         layout: HCAObjectReadLayout,
     ) -> int:
-        """Write plane-major object-source rows into vLLM HCA KV cache."""
+        """Write object-source rows into vLLM HCA KV cache."""
         rows_to_write = min(rows_to_write, layout.rows, len(slot_ids))
         if rows_to_write <= 0:
             return 0
-        hidden = layout.hidden_bytes
         raw = tensor.view(torch.uint8)
+        if layout.row_major:
+            row_bytes = layout.row_bytes or state.row_bytes
+            start = layout.row_prefix_bytes
+            end = start + rows_to_write * row_bytes
+            if row_bytes != state.row_bytes or end > raw.numel():
+                return 0
+            src = raw[start:end].view(rows_to_write, row_bytes)
+            return self._write_row_major_to_kv_cache(
+                state,
+                slot_ids,
+                src,
+                rows_to_write,
+            )
+        hidden = layout.hidden_bytes
         k_start = layout.k_prefix_bytes
         v_start = layout.k_dma_bytes + layout.v_prefix_bytes
         k_end = k_start + rows_to_write * hidden
@@ -1933,9 +2321,15 @@ class HCAPrefetchManager:
             detail,
         )
 
-    def _log_skip_once(self, layer_id: int, reason: str, message: str) -> None:
+    def _log_skip_once(
+        self,
+        layer_id: int,
+        reason: str,
+        message: str,
+        *args: Any,
+    ) -> None:
         key = (layer_id, reason)
         if key in self._debug_skip_logged:
             return
         self._debug_skip_logged.add(key)
-        logger.info(message, layer_id)
+        logger.info(message, layer_id, *args)

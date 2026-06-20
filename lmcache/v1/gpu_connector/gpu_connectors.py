@@ -972,6 +972,21 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                 )
                 self._dsv4_hca_defer_fallback_logged = True
             return False
+        object_source_enabled = getattr(manager, "object_source_enabled", None)
+        has_object_source = getattr(manager, "has_object_source", None)
+        if (
+            callable(object_source_enabled)
+            and object_source_enabled()
+            and callable(has_object_source)
+            and all(bool(has_object_source(layer_id)) for layer_id in layer_ids)
+        ):
+            if not self._dsv4_hca_defer_logged:
+                logger.info(
+                    "LMCACHE_DSV4_DEFER_HCA_TO_MOE=1: using HCA object-source "
+                    "Tutti reads and deferred normal HCA H2D"
+                )
+                self._dsv4_hca_defer_logged = True
+            return True
         seed = getattr(manager, "seed_range_from_lmcache_group", None)
         if not callable(seed):
             return False

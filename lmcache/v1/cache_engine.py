@@ -2236,12 +2236,9 @@ class LMCacheEngine:
         except ImportError:
             return
 
-        clear_sources = getattr(manager, "clear_object_sources", None)
-        if callable(clear_sources):
-            clear_sources()
-
         keys = [key for key, _, _ in blocks]
-        registered_layers = 0
+        object_source_entries = []
+        combined_raw_lba_cache: dict[str, list[LbaRecord]] = {}
         for manager_layer_id, object_layer_id in layer_pairs:
             records = disk_backend.get_kv_object_records(
                 keys,
@@ -2278,15 +2275,41 @@ class LMCacheEngine:
                     )
             if not source_chunks:
                 continue
-            if raw_lba_cache:
-                self._tutti_loader.register_lba_cache(raw_lba_cache)
-            manager.set_layer_object_source(
+            for path, records_for_path in raw_lba_cache.items():
+                combined_raw_lba_cache.setdefault(path, []).extend(records_for_path)
+            object_source_entries.append(
+                (
+                    manager_layer_id,
+                    source_chunks,
+                    self._tutti_loader,
+                    self._tutti_warmup_lock,
+                )
+            )
+        registered_layers = 0
+        replace_sources = getattr(manager, "replace_object_sources", None)
+        if object_source_entries and callable(replace_sources):
+            if combined_raw_lba_cache:
+                self._tutti_loader.register_lba_cache(combined_raw_lba_cache)
+            registered_layers = int(replace_sources(object_source_entries))
+        elif object_source_entries:
+            clear_sources = getattr(manager, "clear_object_sources", None)
+            if callable(clear_sources):
+                clear_sources()
+            if combined_raw_lba_cache:
+                self._tutti_loader.register_lba_cache(combined_raw_lba_cache)
+            for (
                 manager_layer_id,
                 source_chunks,
-                self._tutti_loader,
-                self._tutti_warmup_lock,
-            )
-            registered_layers += 1
+                loader,
+                loader_lock,
+            ) in object_source_entries:
+                manager.set_layer_object_source(
+                    manager_layer_id,
+                    source_chunks,
+                    loader,
+                    loader_lock,
+                )
+                registered_layers += 1
         if registered_layers:
             logger.info(
                 "HCAPrefetchManager: registered object-source chunks for "
