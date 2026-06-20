@@ -125,6 +125,26 @@ class GPUConnectorInterface(metaclass=abc.ABCMeta):
         """
         raise NotImplementedError
 
+    def dsv4_hca_layer_ids(self, **kwargs: object) -> tuple[int, ...]:
+        """Return transformer layer ids for DSv4 HCA KV groups.
+
+        Connectors that do not expose DSv4 heterogeneous KV groups return an
+        empty tuple.  CacheEngine uses this public hook to look up per-layer
+        KV-object records without reaching into connector internals.
+        """
+        return ()
+
+    def dsv4_hca_layer_object_ids(self, **kwargs: object) -> tuple[tuple[int, int], ...]:
+        """Return ``(manager_layer_id, object_layer_id)`` HCA mappings.
+
+        ``manager_layer_id`` names the vLLM attention layer used by
+        HCAPrefetchManager.  ``object_layer_id`` names the layer-id field used
+        when LocalDiskBackend indexed per-layer KV objects.  They are equal for
+        simple layouts but can differ when KV cache layer names are grouped or
+        reordered.
+        """
+        return ()
+
     @abc.abstractmethod
     def get_shape(self, num_tokens: int) -> torch.Size:
         """Get the shape of the data given the number of tokens."""
@@ -810,6 +830,44 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
     def _dsv4_hca_layer_ids_for_group(self, group: KVLayerGroupInfo) -> list[int]:
         """Return transformer layer ids covered by one LMCache HCA group."""
         return self._dsv4_layer_ids_for_group(group)
+
+    def dsv4_hca_layer_ids(self, **kwargs: object) -> tuple[int, ...]:
+        """Return transformer layer ids covered by DSv4 HCA groups."""
+        return tuple(
+            dict.fromkeys(
+                manager_layer_id
+                for manager_layer_id, _object_layer_id in (
+                    self.dsv4_hca_layer_object_ids(**kwargs)
+                )
+            )
+        )
+
+    def dsv4_hca_layer_object_ids(self, **kwargs: object) -> tuple[tuple[int, int], ...]:
+        """Return HCA manager layer ids mapped to KV-object layer ids."""
+        self._update_hma_metadata(**kwargs)
+        if not self._dsv4_optimized_layout_is_valid():
+            return ()
+        assert self.metadata.kv_layer_groups_manager is not None
+        layer_ids: list[tuple[int, int]] = []
+        for group in self.metadata.kv_layer_groups_manager.kv_layer_groups:
+            if self._dsv4_group_role(group) != "hca_attention_kv":
+                continue
+            resolved = self._dsv4_hca_layer_ids_for_group(group)
+            if len(resolved) == len(group.layer_indices):
+                layer_ids.extend(
+                    (int(manager_layer_id), int(object_layer_id))
+                    for manager_layer_id, object_layer_id in zip(
+                        resolved,
+                        group.layer_indices,
+                        strict=True,
+                    )
+                )
+            else:
+                layer_ids.extend(
+                    (int(layer_idx), int(layer_idx))
+                    for layer_idx in group.layer_indices
+                )
+        return tuple(dict.fromkeys(layer_ids))
 
     def _prepare_csa_direct_seed_for_group(
         self,

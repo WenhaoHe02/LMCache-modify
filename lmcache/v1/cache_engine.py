@@ -82,6 +82,17 @@ def _env_flag(name: str) -> bool:
     return value.lower() in {"1", "true", "yes", "on"}
 
 
+def _env_int(name: str, default: int = 0) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("Invalid integer for %s=%r; using %d", name, value, default)
+        return default
+
+
 def _maybe_unmount_for_tutti(cache_path: str) -> Optional[Tuple[str, str]]:
     """Unmount a local cache filesystem before snvme binds its NVMe device.
 
@@ -969,6 +980,9 @@ class LMCacheEngine:
         self,
         keys: List[CacheEngineKey],
         shapes_per_key: Optional[List[Optional[List[torch.Size]]]] = None,
+        read_ranges_per_key: Optional[
+            List[Optional[Tuple[KVObjectByteRange, ...]]]
+        ] = None,
     ) -> List[Optional[MemoryObj]]:
         """Fast-path disk load via GPU-direct NVMe (Tutti).
 
@@ -986,6 +1000,10 @@ class LMCacheEngine:
                 the shapes used to build the MemoryObjMetadata for
                 ``keys[i]``.  A ``None`` entry means "use shapes stored in
                 disk metadata for that key".
+            read_ranges_per_key: Optional per-key compact read ranges relative
+                to the selected object record.  This is used by HCA-deferred
+                DSv4 retrieval to read non-HCA groups without requiring the
+                retained groups to form a prefix of the full object payload.
 
         Returns:
             List of MemoryObj (GPU-resident TensorMemoryObj) or None per key.
@@ -1058,6 +1076,8 @@ class LMCacheEngine:
                 kv_object_records = kv_object_records[:first_unreadable]
                 if shapes_per_key is not None:
                     shapes_per_key = shapes_per_key[:first_unreadable]
+                if read_ranges_per_key is not None:
+                    read_ranges_per_key = read_ranges_per_key[:first_unreadable]
                 tutti_shapes_per_key = shapes_per_key
             first_unreadable = len(kv_object_records)
             for index, (original_meta, record) in enumerate(
@@ -1067,6 +1087,22 @@ class LMCacheEngine:
                     first_unreadable = index
                     break
                 read_record = record
+                external_ranges = (
+                    read_ranges_per_key[index]
+                    if read_ranges_per_key is not None
+                    else None
+                )
+                if external_ranges is not None:
+                    read_record = record.with_byte_ranges(
+                        tuple(
+                            KVObjectByteRange(
+                                offset=record.offset + byte_range.offset,
+                                length=byte_range.length,
+                                target_offset=byte_range.target_offset,
+                            )
+                            for byte_range in external_ranges
+                        )
+                    )
                 object_shapes = (
                     shapes_per_key[index] if shapes_per_key is not None else None
                 )
@@ -1085,7 +1121,10 @@ class LMCacheEngine:
                     if requested_nbytes <= 0:
                         first_unreadable = index
                         break
-                    if requested_nbytes < record.length:
+                    if requested_nbytes < read_record.length:
+                        if external_ranges is not None:
+                            first_unreadable = index
+                            break
                         try:
                             read_record = self._kv_object_prefix_view(
                                 record,
@@ -1094,11 +1133,11 @@ class LMCacheEngine:
                         except ValueError:
                             first_unreadable = index
                             break
-                    elif requested_nbytes > record.length:
+                    elif requested_nbytes > read_record.length:
                         fitted_shapes = self._dsv4_fit_shapes_to_payload(
                             object_shapes,
                             object_dtypes,
-                            record.length,
+                            read_record.length,
                         )
                         if fitted_shapes is None:
                             first_unreadable = index
@@ -1122,6 +1161,8 @@ class LMCacheEngine:
                 kv_object_records = kv_object_records[:first_unreadable]
                 if shapes_per_key is not None:
                     shapes_per_key = shapes_per_key[:first_unreadable]
+                if read_ranges_per_key is not None:
+                    read_ranges_per_key = read_ranges_per_key[:first_unreadable]
                 tutti_shapes_per_key = shapes_per_key
         if all(record is not None for record in kv_object_records):
             object_metas: List[Optional[DiskCacheMetadata]] = []
@@ -1158,6 +1199,21 @@ class LMCacheEngine:
                     else original_meta.shapes
                 )
                 object_dtypes = original_meta.dtypes
+                external_ranges = (
+                    read_ranges_per_key[index]
+                    if read_ranges_per_key is not None
+                    else None
+                )
+                if external_ranges is not None:
+                    absolute_ranges = tuple(
+                        KVObjectByteRange(
+                            offset=record.offset + byte_range.offset,
+                            length=byte_range.length,
+                            target_offset=byte_range.target_offset,
+                        )
+                        for byte_range in external_ranges
+                    )
+                    read_record = record.with_byte_ranges(absolute_ranges)
                 if object_shapes is not None and object_dtypes is not None:
                     requested_nbytes = sum(
                         self._shape_nbytes(shape, dtype)
@@ -1167,14 +1223,26 @@ class LMCacheEngine:
                             strict=True,
                         )
                     )
-                    if requested_nbytes < record.length:
+                    available_nbytes = read_record.length
+                    if requested_nbytes < available_nbytes:
                         if requested_nbytes <= 0:
                             logger.warning(
                                 "TUTTI_OBJECT_STORE_PROFILE op=shape_adjust "
                                 "status=failed key=%s record_bytes=%d "
                                 "requested_bytes=%d",
                                 key.to_string(),
-                                record.length,
+                                available_nbytes,
+                                requested_nbytes,
+                            )
+                            object_metas = []
+                            break
+                        if external_ranges is not None:
+                            logger.warning(
+                                "TUTTI_OBJECT_STORE_PROFILE op=shape_adjust "
+                                "status=failed key=%s view_bytes=%d "
+                                "requested_bytes=%d reason=external_ranges",
+                                key.to_string(),
+                                available_nbytes,
                                 requested_nbytes,
                             )
                             object_metas = []
@@ -1186,11 +1254,11 @@ class LMCacheEngine:
                         shape_adjust_partial_count += 1
                         if first_shape_adjust_key is None:
                             first_shape_adjust_key = key.to_string()
-                    elif requested_nbytes > record.length:
+                    elif requested_nbytes > available_nbytes:
                         fitted_shapes = self._dsv4_fit_shapes_to_payload(
                             object_shapes,
                             object_dtypes,
-                            record.length,
+                            available_nbytes,
                         )
                         if fitted_shapes is None:
                             logger.warning(
@@ -1198,7 +1266,7 @@ class LMCacheEngine:
                                 "status=failed key=%s record_bytes=%d "
                                 "requested_bytes=%d",
                                 key.to_string(),
-                                record.length,
+                                available_nbytes,
                                 requested_nbytes,
                             )
                             object_metas = []
@@ -1924,30 +1992,47 @@ class LMCacheEngine:
         if not self.dsv4_optimized_kv:
             return record
         dtypes = self.metadata.get_dtypes()
-        shapes = self._dsv4_store_shapes_for_range(
+        shapes, read_ranges = self._dsv4_retrieve_view_for_range(
             self.metadata.get_shapes(end - start),
             dtypes,
             start,
             end,
             total_tokens,
         )
+        read_record = record
+        if read_ranges is not None:
+            try:
+                read_record = record.with_byte_ranges(
+                    tuple(
+                        KVObjectByteRange(
+                            offset=record.offset + byte_range.offset,
+                            length=byte_range.length,
+                            target_offset=byte_range.target_offset,
+                        )
+                        for byte_range in read_ranges
+                    )
+                )
+            except ValueError:
+                return None
         requested_nbytes = sum(
             self._shape_nbytes(shape, dtype)
             for shape, dtype in zip(shapes, dtypes, strict=True)
         )
         if requested_nbytes <= 0:
             return None
-        if requested_nbytes < record.length:
-            return self._kv_object_prefix_view(record, requested_nbytes)
-        if requested_nbytes > record.length:
+        if requested_nbytes < read_record.length:
+            if read_ranges is not None:
+                return None
+            return self._kv_object_prefix_view(read_record, requested_nbytes)
+        if requested_nbytes > read_record.length:
             fitted_shapes = self._dsv4_fit_shapes_to_payload(
                 shapes,
                 dtypes,
-                record.length,
+                read_record.length,
             )
             if fitted_shapes is None:
                 return None
-        return record
+        return read_record
 
     def _dsv4_fit_shapes_to_payload(
         self,
@@ -2013,6 +2098,258 @@ class LMCacheEngine:
             else:
                 optimized.append(shape)
         return optimized
+
+    def _dsv4_hca_defer_retrieve_enabled(self, total_tokens: int) -> bool:
+        """Return whether retrieve should leave HCA payloads for overlap."""
+        if not _env_flag("LMCACHE_DSV4_DEFER_HCA_TO_MOE"):
+            return False
+        if not _env_flag("LMCACHE_HCA_ENABLE_OBJECT_SOURCE"):
+            return False
+        manager = self._dsv4_hca_object_source_manager()
+        if manager is None:
+            return False
+        max_tokens = _env_int("LMCACHE_DSV4_DEFER_HCA_MAX_TOKENS", 0)
+        return max_tokens <= 0 or total_tokens <= max_tokens
+
+    def _dsv4_hca_object_source_manager(self) -> Any | None:
+        """Return the active HCA manager when object-source reads are enabled."""
+        try:
+            from lmcache.v1.hca_prefetch_manager import get_hca_prefetch_manager
+        except ImportError:
+            return None
+        manager = get_hca_prefetch_manager()
+        if manager is None:
+            return None
+        object_source_enabled = getattr(manager, "object_source_enabled", None)
+        if callable(object_source_enabled) and not object_source_enabled():
+            return None
+        set_source = getattr(manager, "set_layer_object_source", None)
+        if not callable(set_source):
+            return None
+        return manager
+
+    def _dsv4_hca_object_source_layer_pairs(
+        self,
+        manager: Any,
+        **kwargs: Any,
+    ) -> tuple[tuple[int, int], ...]:
+        """Return ``(manager_layer_id, object_layer_id)`` HCA mappings."""
+        connector_pairs: tuple[tuple[int, int], ...] = ()
+        if self.gpu_connector is not None:
+            get_layer_pairs = getattr(
+                self.gpu_connector,
+                "dsv4_hca_layer_object_ids",
+                None,
+            )
+            if callable(get_layer_pairs):
+                try:
+                    connector_pairs = tuple(
+                        (int(manager_layer_id), int(object_layer_id))
+                        for manager_layer_id, object_layer_id in (
+                            get_layer_pairs(**kwargs)
+                        )
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "Failed to resolve DSv4 HCA layer object ids: %s",
+                        exc,
+                    )
+                    connector_pairs = ()
+        registered_layer_ids = getattr(manager, "registered_layer_ids", None)
+        registered = (
+            tuple(int(v) for v in registered_layer_ids())
+            if callable(registered_layer_ids)
+            else ()
+        )
+        if connector_pairs and registered:
+            registered_set = set(registered)
+            filtered = tuple(
+                pair for pair in connector_pairs if pair[0] in registered_set
+            )
+            return filtered or connector_pairs
+        if connector_pairs:
+            return connector_pairs
+        return tuple((layer_id, layer_id) for layer_id in registered)
+
+    def _dsv4_hca_object_source_available(
+        self,
+        blocks: list[tuple[CacheEngineKey, int, int]],
+        manager: Any,
+        disk_backend: Any,
+        **kwargs: Any,
+    ) -> bool:
+        """Return whether the current LocalDisk hit has HCA object views."""
+        layer_pairs = self._dsv4_hca_object_source_layer_pairs(manager, **kwargs)
+        if not blocks or not layer_pairs:
+            return False
+        keys = [key for key, _, _ in blocks]
+        for _manager_layer_id, object_layer_id in layer_pairs:
+            records = disk_backend.get_kv_object_records(
+                keys,
+                layer_ids=[object_layer_id] * len(keys),
+                roles=["hca_attention_kv"] * len(keys),
+            )
+            if not records or any(record is None for record in records):
+                logger.info(
+                    "HCAPrefetchManager: HCA object-source unavailable "
+                    "object_layer=%d blocks=%d missing=%d",
+                    object_layer_id,
+                    len(blocks),
+                    len(blocks)
+                    if not records
+                    else sum(1 for record in records if record is None),
+                )
+                return False
+        return True
+
+    def _dsv4_register_hca_object_sources(
+        self,
+        blocks: list[tuple[CacheEngineKey, int, int]],
+        manager: Any,
+        disk_backend: Any,
+        **kwargs: Any,
+    ) -> None:
+        """Register per-layer object-source chunks for HCA overlap."""
+        if self._tutti_loader is None or not blocks:
+            return
+        layer_pairs = self._dsv4_hca_object_source_layer_pairs(manager, **kwargs)
+        if not layer_pairs:
+            return
+        try:
+            from lmcache.v1.gpu_connector.tutti_direct_loader import LbaRecord
+            from lmcache.v1.hca_prefetch_manager import HCAObjectChunk
+        except ImportError:
+            return
+
+        clear_sources = getattr(manager, "clear_object_sources", None)
+        if callable(clear_sources):
+            clear_sources()
+
+        keys = [key for key, _, _ in blocks]
+        registered_layers = 0
+        for manager_layer_id, object_layer_id in layer_pairs:
+            records = disk_backend.get_kv_object_records(
+                keys,
+                layer_ids=[object_layer_id] * len(keys),
+                roles=["hca_attention_kv"] * len(keys),
+            )
+            source_chunks = []
+            raw_lba_cache: dict[str, list[LbaRecord]] = {}
+            for (key, start, end), record in zip(blocks, records, strict=True):
+                if record is None:
+                    source_chunks = []
+                    break
+                path = disk_backend.kv_object_data_path(record)
+                if path is None:
+                    source_chunks = []
+                    break
+                source_chunks.append(
+                    HCAObjectChunk(
+                        start_row_id=start // 128,
+                        rows=max(0, (end - start) // 128),
+                        key=key,
+                        path=path,
+                        record=record,
+                    )
+                )
+                if record.raw_extents:
+                    raw_lba_cache.setdefault(path, []).extend(
+                        LbaRecord(
+                            file_offset=file_offset,
+                            slba=slba,
+                            n_sectors=n_sectors,
+                        )
+                        for file_offset, slba, n_sectors in record.raw_extents
+                    )
+            if not source_chunks:
+                continue
+            if raw_lba_cache:
+                self._tutti_loader.register_lba_cache(raw_lba_cache)
+            manager.set_layer_object_source(
+                manager_layer_id,
+                source_chunks,
+                self._tutti_loader,
+                self._tutti_warmup_lock,
+            )
+            registered_layers += 1
+        if registered_layers:
+            logger.info(
+                "HCAPrefetchManager: registered object-source chunks for "
+                "%d HCA layers blocks=%d",
+                registered_layers,
+                len(blocks),
+            )
+        else:
+            logger.info(
+                "HCAPrefetchManager: no HCA object-source layers registered "
+                "blocks=%d layer_pairs=%d",
+                len(blocks),
+                len(layer_pairs),
+            )
+
+    def _dsv4_retrieve_view_for_range(
+        self,
+        shapes: list[torch.Size],
+        dtypes: list[torch.dtype],
+        start: int,
+        end: int,
+        total_tokens: int,
+    ) -> tuple[list[torch.Size], Optional[Tuple[KVObjectByteRange, ...]]]:
+        """Return retrieve shapes and compact object ranges for one chunk.
+
+        The store layout may already omit DSv4 tail-only groups for non-tail
+        chunks.  HCA overlap needs a second view: keep the stored non-HCA
+        groups compacted in the returned MemoryObj while skipping HCA bytes so
+        those per-layer objects can be fetched independently by the overlap
+        path.
+        """
+        stored_shapes = self._dsv4_store_shapes_for_range(
+            shapes,
+            dtypes,
+            start,
+            end,
+            total_tokens,
+        )
+        if not self._dsv4_hca_defer_retrieve_enabled(total_tokens):
+            return stored_shapes, None
+        klg_manager = self.metadata.kv_layer_groups_manager
+        if klg_manager is None or not klg_manager.kv_layer_groups:
+            return stored_shapes, None
+
+        retrieve_shapes: list[torch.Size] = []
+        read_ranges: list[KVObjectByteRange] = []
+        source_offset = 0
+        target_offset = 0
+        skipped_hca = False
+        for shape, dtype, group in zip(
+            stored_shapes,
+            dtypes,
+            klg_manager.kv_layer_groups,
+            strict=True,
+        ):
+            group_nbytes = self._shape_nbytes(shape, dtype)
+            role = self._dsv4_group_role(group, dtype)
+            if role == "hca_attention_kv" and group_nbytes > 0:
+                retrieve_shapes.append(self._zero_token_shape(shape))
+                skipped_hca = True
+            else:
+                retrieve_shapes.append(shape)
+                if group_nbytes > 0:
+                    read_ranges.append(
+                        KVObjectByteRange(
+                            offset=source_offset,
+                            length=group_nbytes,
+                            target_offset=target_offset,
+                        )
+                    )
+                    target_offset += group_nbytes
+            source_offset += group_nbytes
+
+        if not skipped_hca:
+            return stored_shapes, None
+        if not read_ranges:
+            return stored_shapes, None
+        return retrieve_shapes, tuple(read_ranges)
 
     @staticmethod
     def _dsv4_group_role(group: Any, dtype: torch.dtype) -> str:
@@ -3192,7 +3529,7 @@ class LMCacheEngine:
             # vLLM RPC timeouts caused by reading ~110 GB sequentially for
             # large prompts.
             if self.dsv4_optimized_kv:
-                shapes_per_key: Optional[List[Optional[List[torch.Size]]]] = [
+                store_shapes_per_key: Optional[List[Optional[List[torch.Size]]]] = [
                     self._dsv4_store_shapes_for_range(
                         self.metadata.get_shapes(end - start),
                         self.metadata.get_dtypes(),
@@ -3203,19 +3540,63 @@ class LMCacheEngine:
                     for _, start, end in blocks
                 ]
             else:
-                shapes_per_key = None
+                store_shapes_per_key = None
+
+            shapes_per_key = store_shapes_per_key
+            read_ranges_per_key: Optional[
+                List[Optional[Tuple[KVObjectByteRange, ...]]]
+            ] = None
 
             if location == "LocalDiskBackend" and self._tutti_config is not None:
                 if self._ensure_tutti_loader(keys):
+                    if self.dsv4_optimized_kv:
+                        manager = self._dsv4_hca_object_source_manager()
+                        disk_backend = self.storage_manager.storage_backends.get(
+                            "LocalDiskBackend"
+                        )
+                        if (
+                            manager is not None
+                            and disk_backend is not None
+                            and self._dsv4_hca_object_source_available(
+                                blocks,
+                                manager,
+                                disk_backend,
+                                **kwargs,
+                            )
+                        ):
+                            retrieve_views = [
+                                self._dsv4_retrieve_view_for_range(
+                                    self.metadata.get_shapes(end - start),
+                                    self.metadata.get_dtypes(),
+                                    start,
+                                    end,
+                                    total_tokens,
+                                )
+                                for _, start, end in blocks
+                            ]
+                            shapes_per_key = [
+                                shapes for shapes, _read_ranges in retrieve_views
+                            ]
+                            read_ranges_per_key = [
+                                read_ranges
+                                for _shapes, read_ranges in retrieve_views
+                            ]
+                            self._dsv4_register_hca_object_sources(
+                                blocks,
+                                manager,
+                                disk_backend,
+                                **kwargs,
+                            )
                     memory_objs = self._tutti_batched_get(
                         keys,
                         shapes_per_key=shapes_per_key,
+                        read_ranges_per_key=read_ranges_per_key,
                     )
                 elif self._tutti_can_cpu_fallback:
                     memory_objs = self.storage_manager.batched_get(
                         keys=keys,
                         location=location,
-                        shapes_per_key=shapes_per_key,
+                        shapes_per_key=store_shapes_per_key,
                     )
                 else:
                     logger.warning(
@@ -3229,7 +3610,7 @@ class LMCacheEngine:
                 memory_objs = self.storage_manager.batched_get(
                     keys=keys,
                     location=location,
-                    shapes_per_key=shapes_per_key,
+                    shapes_per_key=store_shapes_per_key,
                 )
 
             used_keys: set[CacheEngineKey] = set()
