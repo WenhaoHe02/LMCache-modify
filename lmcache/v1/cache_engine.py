@@ -93,6 +93,21 @@ def _env_int(name: str, default: int = 0) -> int:
         return default
 
 
+def _raw_ranges_sector_readable(
+    ranges: Tuple[KVObjectByteRange, ...],
+    logical_length: int,
+) -> bool:
+    """Return whether Tutti can read explicit ranges without compaction."""
+    for byte_range in ranges:
+        range_dma_length = ((byte_range.length + 511) // 512) * 512
+        is_tail_range = byte_range.target_offset + byte_range.length == logical_length
+        if byte_range.offset % 512 != 0:
+            return False
+        if range_dma_length != byte_range.length and not is_tail_range:
+            return False
+    return True
+
+
 def _maybe_unmount_for_tutti(cache_path: str) -> Optional[Tuple[str, str]]:
     """Unmount a local cache filesystem before snvme binds its NVMe device.
 
@@ -2349,7 +2364,17 @@ class LMCacheEngine:
             return stored_shapes, None
         if not read_ranges:
             return stored_shapes, None
-        return retrieve_shapes, tuple(read_ranges)
+        compact_ranges = tuple(read_ranges)
+        if not _raw_ranges_sector_readable(compact_ranges, target_offset):
+            logger.info(
+                "HCAPrefetchManager: skip compact HCA-deferred retrieve "
+                "start=%d end=%d compact_bytes=%d reason=unaligned_ranges",
+                start,
+                end,
+                target_offset,
+            )
+            return stored_shapes, None
+        return retrieve_shapes, compact_ranges
 
     @staticmethod
     def _dsv4_group_role(group: Any, dtype: torch.dtype) -> str:
