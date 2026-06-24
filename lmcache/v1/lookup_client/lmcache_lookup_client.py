@@ -261,8 +261,8 @@ class LMCacheLookupServer:
                     logger.error(f"Error decoding JSON in lookup request: {e}")
                 except UnicodeDecodeError as e:
                     logger.error(f"Error decoding UTF-8 in lookup request: {e}")
-                except Exception as e:
-                    logger.error(f"Error processing lookup request: {e}")
+                except Exception:
+                    logger.exception("Error processing lookup request")
 
         logger.info("lmcache lookup server started")
         self.thread = threading.Thread(

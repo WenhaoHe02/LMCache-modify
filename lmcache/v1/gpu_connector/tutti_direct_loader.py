@@ -49,7 +49,7 @@ import struct as _struct
 import sys
 import time
 import types
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -508,6 +508,7 @@ _SNVM_CHRDEV_CREATE: int = _IOWR(_CTRL_IOCTL_TYPE, 3, _PciDeviceAddr)
 
 # FS_IOC_FIEMAP = _IOWR('f', 11, struct fiemap_header)
 _FS_IOC_FIEMAP: int = _IOWR(ord("f"), 11, _FiemapHeader)
+_FIEMAP_EXTENT_LAST: int = 0x00000001
 
 # snvme NVM_MAP_KIND_* enum values (ioctl.h)
 _NVM_MAP_KIND_DATA: int = 3
@@ -590,30 +591,44 @@ class FiemapHelper:
         if fcntl.ioctl is None:
             raise OSError("fcntl is unavailable on this platform")
 
+        records: list[LbaRecord] = []
         n = FiemapHelper._MAX_EXTENTS
         hdr_size = ctypes.sizeof(_FiemapHeader)
         ext_size = ctypes.sizeof(_FiemapExtent)
-        buf = ctypes.create_string_buffer(hdr_size + n * ext_size)
-
-        hdr = _FiemapHeader.from_buffer(buf)
-        hdr.fm_start = 0
-        hdr.fm_length = 0xFFFF_FFFF_FFFF_FFFF
-        hdr.fm_flags = 0
-        hdr.fm_extent_count = n
+        file_size = os.path.getsize(file_path)
+        start = 0
 
         with open(file_path, "rb") as f:
-            fcntl.ioctl(f.fileno(), _FS_IOC_FIEMAP, buf, True)
+            while start < file_size:
+                buf = ctypes.create_string_buffer(hdr_size + n * ext_size)
+                hdr = _FiemapHeader.from_buffer(buf)
+                hdr.fm_start = start
+                hdr.fm_length = 0xFFFF_FFFF_FFFF_FFFF
+                hdr.fm_flags = 0
+                hdr.fm_extent_count = n
+                fcntl.ioctl(f.fileno(), _FS_IOC_FIEMAP, buf, True)
 
-        records: list[LbaRecord] = []
-        for i in range(hdr.fm_mapped_extents):
-            ext = _FiemapExtent.from_buffer(buf, hdr_size + i * ext_size)
-            records.append(
-                LbaRecord(
-                    slba=ext.fe_physical // _NVME_LBS,
-                    n_sectors=ext.fe_length // _NVME_LBS,
-                    file_offset=ext.fe_logical,
-                )
-            )
+                if hdr.fm_mapped_extents == 0:
+                    break
+
+                last_end = start
+                saw_last = False
+                for i in range(hdr.fm_mapped_extents):
+                    ext = _FiemapExtent.from_buffer(buf, hdr_size + i * ext_size)
+                    if ext.fe_length <= 0:
+                        continue
+                    records.append(
+                        LbaRecord(
+                            slba=ext.fe_physical // _NVME_LBS,
+                            n_sectors=ext.fe_length // _NVME_LBS,
+                            file_offset=ext.fe_logical,
+                        )
+                    )
+                    last_end = max(last_end, ext.fe_logical + ext.fe_length)
+                    saw_last = saw_last or bool(ext.fe_flags & _FIEMAP_EXTENT_LAST)
+                if saw_last or hdr.fm_mapped_extents < n or last_end <= start:
+                    break
+                start = last_end
         return sorted(records, key=lambda record: record.file_offset)
 
     @staticmethod
@@ -1468,6 +1483,9 @@ class TuttiDirectLoader:
         read_ranges_per_key: Optional[
             list[Optional[Sequence[KVObjectByteRange]]]
         ] = None,
+        on_batch_loaded: Optional[
+            Callable[[int, list[Optional[MemoryObj]]], None]
+        ] = None,
     ) -> list[Optional[MemoryObj]]:
         """Load KV chunks directly from NVMe into HBM staging.
 
@@ -1495,6 +1513,10 @@ class TuttiDirectLoader:
             read_ranges_per_key: Optional per-key explicit source ranges.
                 This is the object-view path: each range is read from the
                 source path and placed at its ``target_offset`` in staging.
+            on_batch_loaded: Optional callback invoked after each internal
+                staging batch is read. When supplied, returned memory objects
+                are staging views and must be consumed before the callback
+                returns.
 
         Returns:
             List parallel to keys.  Each element is either a GPU-resident
@@ -1615,6 +1637,7 @@ class TuttiDirectLoader:
                     if read_ranges_per_key is not None
                     else None
                 ),
+                clone_results=on_batch_loaded is None,
             )
             n_batches += 1
             batch_loaded = sum(1 for res in batch_results if res is not None)
@@ -1632,8 +1655,11 @@ class TuttiDirectLoader:
                 pack_ms,
                 _elapsed_ms(batch_profile_start),
             )
-            for i, res in enumerate(batch_results):
-                results[batch_start + i] = res
+            if on_batch_loaded is None:
+                for i, res in enumerate(batch_results):
+                    results[batch_start + i] = res
+            else:
+                on_batch_loaded(batch_start, batch_results)
             batch_start = batch_end
 
         logger.info(
@@ -1925,6 +1951,7 @@ class TuttiDirectLoader:
         read_ranges_per_key: Optional[
             list[Optional[Sequence[KVObjectByteRange]]]
         ] = None,
+        clone_results: bool = True,
     ) -> list[Optional[MemoryObj]]:
         """Load one queue/staging-capacity-bounded batch into HBM staging."""
 
@@ -2254,7 +2281,7 @@ class TuttiDirectLoader:
             gpu_raw = self._staging_slice_at(chunk_offset, nbytes)
             self._debug_verify_direct_read(meta, gpu_raw)
             persist_start = time.perf_counter()
-            owned_raw = gpu_raw.clone()
+            owned_raw = gpu_raw.clone() if clone_results else gpu_raw
             persist_ms += _elapsed_ms(persist_start)
 
             # Wrap the staging slice as a TensorMemoryObj with GPU raw_data.

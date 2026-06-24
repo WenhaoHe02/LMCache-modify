@@ -150,9 +150,9 @@ class KVLayerGroupsManager:
 
     def __init__(
         self,
-        kv_caches: "DiscoverableKVCache",
-        gpu_kv_format: "lmc_ops.GPUKVFormat",
-        num_blocks: int,
+        kv_caches: "DiscoverableKVCache | None" = None,
+        gpu_kv_format: "lmc_ops.GPUKVFormat | None" = None,
+        num_blocks: int | None = None,
         layout_hints: "LayoutHints | None" = None,
         lmcache_logical_chunk_size: int = 256,
     ) -> None:
@@ -227,6 +227,12 @@ class KVLayerGroupsManager:
                     )
                     vllm_logical_block_sizes_by_layer = ()
         self.kv_layer_groups: list[KVLayerGroupInfo] = []
+        if kv_caches is None or gpu_kv_format is None or num_blocks is None:
+            self.inference_engine_logical_block_size_ = (
+                self.inference_engine_logical_block_size_
+                or lmcache_logical_chunk_size
+            )
+            return
 
         num_layers = get_num_layers(kv_caches, gpu_kv_format)
         if num_layers == 0:

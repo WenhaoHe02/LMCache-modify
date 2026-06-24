@@ -12,7 +12,18 @@ import time
 import torch
 
 # First Party
-from lmcache import torch_dev, torch_device_type
+try:
+    # First Party
+    from lmcache import torch_dev, torch_device_type
+except ImportError:
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch_dev, torch_device_type = torch.xpu, "xpu"
+    elif hasattr(torch, "hpu") and torch.hpu.is_available():
+        torch_dev, torch_device_type = torch.hpu, "hpu"
+    elif torch.cuda.is_available():
+        torch_dev, torch_device_type = torch.cuda, "cuda"
+    else:
+        torch_dev, torch_device_type = torch, "cpu"
 from lmcache.logging import init_logger
 from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import CacheEngineKey, DiskCacheMetadata, _lmcache_nvtx_annotate
@@ -44,6 +55,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_DSV4_HCA_DEFERRED_RETRIEVE_ROLE = "hca_deferred_retrieve"
+_DSV4_HCA_SLAB_ROLE = "hca_attention_kv_slab"
+
 KVObjectRawWriter = Callable[
     [KVObjectRecord, memoryview],
     tuple[Sequence[tuple[int, int, int]], float],
@@ -53,6 +67,24 @@ KVObjectRawWriter = Callable[
 def _env_flag(name: str) -> bool:
     value = os.getenv(name, "")
     return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _env_flag_default(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int = 0) -> int:
+    """Return an integer environment value, falling back on parse errors."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
 def _select_rank_int(value: Any, rank_id: int) -> int:
@@ -218,6 +250,13 @@ class LocalDiskBackend(StorageBackendInterface):
         self.kv_object_tutti_raw_enabled = _env_flag(
             "LMCACHE_KV_OBJECT_STORE_TUTTI_RAW_ENABLE"
         )
+        self.kv_object_tutti_raw_cold_store_enabled = (
+            self.kv_object_tutti_raw_enabled
+            and _env_flag_default(
+                "LMCACHE_KV_OBJECT_STORE_TUTTI_RAW_COLD_STORE",
+                True,
+            )
+        )
         rank_id = int(str(dst_device).removeprefix("cuda:") or "0")
         self.kv_object_tutti_raw_base_lba = _select_rank_int(
             os.getenv("LMCACHE_KV_OBJECT_STORE_TUTTI_RAW_BASE_LBA", "0"),
@@ -229,9 +268,18 @@ class LocalDiskBackend(StorageBackendInterface):
         )
         self.kv_object_tutti_raw_region_extents: list[tuple[int, int, int]] = []
         self.kv_object_tutti_raw_writer: Optional[KVObjectRawWriter] = None
+        self.kv_object_tutti_raw_staging_bytes: Optional[int] = None
         if self.kv_object_store_enabled:
             slot_mb = int(os.getenv("LMCACHE_KV_OBJECT_STORE_SLOT_MB", "128"))
             capacity = int(os.getenv("LMCACHE_KV_OBJECT_STORE_CAPACITY", "2048"))
+            raw_slot_mb = _env_int(
+                "LMCACHE_ABLATION_TUTTI_SLOT_MB",
+                _env_int("LMCACHE_TUTTI_SLOT_MB", 0),
+            )
+            raw_n_slots = _env_int(
+                "LMCACHE_ABLATION_TUTTI_N_SLOTS",
+                _env_int("LMCACHE_TUTTI_N_SLOTS", 0),
+            )
             if config.extra_config is not None:
                 slot_mb = int(
                     config.extra_config.get("kv_object_store_slot_mb", slot_mb)
@@ -239,10 +287,22 @@ class LocalDiskBackend(StorageBackendInterface):
                 capacity = int(
                     config.extra_config.get("kv_object_store_capacity", capacity)
                 )
+                raw_slot_mb = int(
+                    config.extra_config.get("tutti_slot_mb", raw_slot_mb)
+                )
+                raw_n_slots = int(
+                    config.extra_config.get("tutti_n_slots", raw_n_slots)
+                )
                 self.kv_object_tutti_raw_enabled = bool(
                     config.extra_config.get(
                         "kv_object_store_tutti_raw_enable",
                         self.kv_object_tutti_raw_enabled,
+                    )
+                )
+                self.kv_object_tutti_raw_cold_store_enabled = bool(
+                    config.extra_config.get(
+                        "kv_object_store_tutti_raw_cold_store",
+                        self.kv_object_tutti_raw_cold_store_enabled,
                     )
                 )
                 self.kv_object_tutti_raw_base_lba = _select_rank_int(
@@ -281,6 +341,14 @@ class LocalDiskBackend(StorageBackendInterface):
                                 self.kv_object_tutti_raw_region_path = per_rank
                         else:
                             self.kv_object_tutti_raw_region_path = raw_region_text
+                self.kv_object_tutti_raw_cold_store_enabled = (
+                    self.kv_object_tutti_raw_enabled
+                    and self.kv_object_tutti_raw_cold_store_enabled
+                )
+            if raw_slot_mb > 0 and raw_n_slots > 0:
+                self.kv_object_tutti_raw_staging_bytes = (
+                    raw_slot_mb * 1024 * 1024 * raw_n_slots
+                )
             rank_name = str(dst_device).removeprefix("cuda:")
             pool_id = f"rank{rank_name}-full"
             pool_path = Path(self.path) / "_kv_object_store" / f"{pool_id}.pool"
@@ -292,19 +360,22 @@ class LocalDiskBackend(StorageBackendInterface):
                 slot_bytes=slot_mb * 1024 * 1024,
                 capacity=capacity,
                 dense=True,
-                materialize_file=not self.kv_object_tutti_raw_enabled,
+                materialize_file=not self.kv_object_tutti_raw_cold_store_enabled,
             )
             self.kv_object_metadata_store = KVObjectMetadataStore()
             self.kv_object_pool_io = KVObjectPoolIO({pool_id: pool_path})
             logger.info(
                 "KV object store enabled: pool_id=%s path=%s slot_mb=%d "
-                "capacity=%d tutti_raw=%s raw_base_lba=%d",
+                "capacity=%d tutti_raw=%s raw_cold_store=%s raw_base_lba=%d "
+                "raw_staging_bytes=%s",
                 pool_id,
                 pool_path,
                 slot_mb,
                 capacity,
                 self.kv_object_tutti_raw_enabled,
+                self.kv_object_tutti_raw_cold_store_enabled,
                 self.kv_object_tutti_raw_base_lba,
+                self.kv_object_tutti_raw_staging_bytes,
             )
             if self.kv_object_tutti_raw_region_path:
                 logger.info(
@@ -512,6 +583,19 @@ class LocalDiskBackend(StorageBackendInterface):
             covered += write_end - write_start
         return covered == length
 
+    def kv_object_payload_fits_tutti_staging(self, length: int) -> bool:
+        """Return whether one raw object write fits the Tutti staging buffer."""
+        if length <= 0:
+            return False
+        if self.kv_object_tutti_raw_staging_bytes is None:
+            return True
+        if self.kv_object_pool_layout is None:
+            return length <= self.kv_object_tutti_raw_staging_bytes
+        return (
+            self.kv_object_pool_layout.align_length(length)
+            <= self.kv_object_tutti_raw_staging_bytes
+        )
+
     def kv_object_tutti_path(self, pool_id: str) -> str:
         """Return the synthetic path used for raw Tutti object extents."""
         return f"tutti://{pool_id}"
@@ -573,6 +657,15 @@ class LocalDiskBackend(StorageBackendInterface):
             )
         )
         return covered_bytes == expected_bytes
+
+    def _ready_tutti_raw_record(
+        self,
+        record: Optional[KVObjectRecord],
+    ) -> bool:
+        """Return whether a READY record can be consumed by Tutti."""
+        if record is None or record.state != KVObjectState.READY:
+            return False
+        return self.kv_object_record_raw_readable(record)
 
     def kv_object_record_raw_read_bytes(self, record: KVObjectRecord) -> int:
         """Return DMA bytes needed to read a raw Tutti object record.
@@ -667,8 +760,26 @@ class LocalDiskBackend(StorageBackendInterface):
         if not group_ranges:
             return 0
 
+        group_views = self._object_group_view_specs(memory_obj, group_ranges)
         layer_views = self._object_layer_view_specs(memory_obj, group_ranges)
         indexed = 0
+        for role, byte_ranges in group_views:
+            view_object_id = self._key_to_object_id(key, role=role)
+            view_length = sum(byte_range.length for byte_range in byte_ranges)
+            view_record = KVObjectRecord(
+                object_id=view_object_id,
+                pool_id=full_record.pool_id,
+                offset=byte_ranges[0].offset,
+                length=view_length,
+                aligned_length=view_length,
+                shape=(view_length,),
+                dtype="torch.uint8",
+                state=KVObjectState.READY,
+                raw_extents=full_record.raw_extents,
+                byte_ranges=tuple(byte_ranges),
+            )
+            self.kv_object_metadata_store.put(view_record)
+            indexed += 1
         for layer_id, role, byte_ranges in layer_views:
             view_object_id = self._key_to_object_id(
                 key,
@@ -692,19 +803,312 @@ class LocalDiskBackend(StorageBackendInterface):
             indexed += 1
         return indexed
 
+    def _write_hca_deferred_retrieve_object(
+        self,
+        key: CacheEngineKey,
+        memory_obj: MemoryObj,
+        buffer: memoryview,
+        raw_writer: Optional[KVObjectRawWriter],
+    ) -> bool:
+        """Materialize the non-HCA DSv4 retrieve payload as a compact object."""
+        if (
+            self.kv_object_pool_layout is None
+            or self.kv_object_metadata_store is None
+        ):
+            return False
+        group_ranges = self._object_group_ranges_for_offset(memory_obj, 0)
+        if not group_ranges:
+            return False
+        klg_manager = (
+            self.metadata.kv_layer_groups_manager if self.metadata is not None else None
+        )
+        if klg_manager is None or not klg_manager.kv_layer_groups:
+            return False
+        dtypes = memory_obj.metadata.dtypes or []
+
+        selected_ranges: list[KVObjectByteRange] = []
+        skipped_hca = False
+        for group_idx, group_range in group_ranges:
+            if group_idx >= len(klg_manager.kv_layer_groups):
+                continue
+            group = klg_manager.kv_layer_groups[group_idx]
+            dtype = dtypes[group_idx] if group_idx < len(dtypes) else group.dtype
+            role = self._kv_group_role(group, dtype)
+            if role == "hca_attention_kv":
+                skipped_hca = True
+                continue
+            selected_ranges.append(group_range)
+        if not skipped_hca or not selected_ranges:
+            return False
+
+        selected_ranges.sort(key=lambda byte_range: byte_range.target_offset)
+        compact_nbytes = sum(byte_range.length for byte_range in selected_ranges)
+        if compact_nbytes <= 0:
+            return False
+        if raw_writer is not None and not self.kv_object_payload_fits_tutti_staging(
+            compact_nbytes
+        ):
+            logger.warning(
+                "KV_OBJECT_STORE_PROFILE op=write_hca_deferred key=%s "
+                "status=skip reason=staging_capacity bytes=%d "
+                "staging_bytes=%s",
+                key.to_string(),
+                compact_nbytes,
+                self.kv_object_tutti_raw_staging_bytes,
+            )
+            return False
+
+        compact_payload = bytearray(compact_nbytes)
+        target_offset = 0
+        for byte_range in selected_ranges:
+            source_start = byte_range.target_offset
+            source_end = source_start + byte_range.length
+            compact_payload[target_offset : target_offset + byte_range.length] = (
+                buffer[source_start:source_end].tobytes()
+            )
+            target_offset += byte_range.length
+
+        object_id = self._key_to_object_id(
+            key,
+            role=_DSV4_HCA_DEFERRED_RETRIEVE_ROLE,
+        )
+        start = time.perf_counter()
+        existing = self.kv_object_metadata_store.get(object_id)
+        if existing is None:
+            if raw_writer is not None:
+                offset, end_offset, aligned_length = (
+                    self.kv_object_pool_layout.next_allocation_bounds(compact_nbytes)
+                )
+                if not self.kv_object_raw_region_covers(offset, aligned_length):
+                    logger.warning(
+                        "KV_OBJECT_STORE_PROFILE op=write_hca_deferred key=%s "
+                        "status=skip reason=raw_region_full offset=%d end=%d "
+                        "aligned_bytes=%d",
+                        key.to_string(),
+                        offset,
+                        end_offset,
+                        aligned_length,
+                    )
+                    return False
+            record = self.kv_object_pool_layout.allocate(
+                object_id,
+                length=compact_nbytes,
+                shape=(compact_nbytes,),
+                dtype="torch.uint8",
+            )
+        else:
+            record = existing
+            if record.length != compact_nbytes:
+                if raw_writer is not None:
+                    offset, end_offset, aligned_length = (
+                        self.kv_object_pool_layout.next_allocation_bounds(
+                            compact_nbytes
+                        )
+                    )
+                    if not self.kv_object_raw_region_covers(offset, aligned_length):
+                        logger.warning(
+                            "KV_OBJECT_STORE_PROFILE op=write_hca_deferred key=%s "
+                            "status=skip reason=raw_region_full offset=%d end=%d "
+                            "aligned_bytes=%d",
+                            key.to_string(),
+                            offset,
+                            end_offset,
+                            aligned_length,
+                        )
+                        return False
+                logger.info(
+                    "KV_OBJECT_STORE_PROFILE op=write_hca_deferred key=%s "
+                    "status=reallocate reason=length_changed old=%d new=%d",
+                    key.to_string(),
+                    record.length,
+                    compact_nbytes,
+                )
+                record = self.kv_object_pool_layout.allocate(
+                    object_id,
+                    length=compact_nbytes,
+                    shape=(compact_nbytes,),
+                    dtype="torch.uint8",
+                )
+
+        payload_view = memoryview(compact_payload)
+        if raw_writer is not None:
+            raw_extents, write_ms = raw_writer(record, payload_view)
+            ready_record = record.with_raw_extents(raw_extents).mark_ready()
+            mode = "tutti_raw"
+        else:
+            if self.kv_object_pool_io is None:
+                return False
+            write_ms = self.kv_object_pool_io.write_object(record, payload_view)
+            ready_record = record.mark_ready()
+            mode = "pool_file"
+        self.kv_object_metadata_store.put(ready_record)
+        logger.info(
+            "KV_OBJECT_STORE_PROFILE op=write_hca_deferred key=%s bytes=%d "
+            "mode=%s ranges=%d write_ms=%.3f total_ms=%.3f",
+            key.to_string(),
+            compact_nbytes,
+            mode,
+            len(selected_ranges),
+            write_ms,
+            (time.perf_counter() - start) * 1000.0,
+        )
+        return True
+
+    def _write_hca_slab_object(
+        self,
+        key: CacheEngineKey,
+        memory_obj: MemoryObj,
+        buffer: memoryview,
+        raw_writer: Optional[KVObjectRawWriter],
+    ) -> bool:
+        """Materialize the whole HCA group as one slab object."""
+        if (
+            self.kv_object_pool_layout is None
+            or self.kv_object_metadata_store is None
+        ):
+            return False
+        group_ranges = self._object_group_ranges_for_offset(memory_obj, 0)
+        if not group_ranges:
+            return False
+        klg_manager = (
+            self.metadata.kv_layer_groups_manager if self.metadata is not None else None
+        )
+        if klg_manager is None or not klg_manager.kv_layer_groups:
+            return False
+        dtypes = memory_obj.metadata.dtypes or []
+
+        slab_ranges: list[KVObjectByteRange] = []
+        for group_idx, group_range in group_ranges:
+            if group_idx >= len(klg_manager.kv_layer_groups):
+                continue
+            group = klg_manager.kv_layer_groups[group_idx]
+            dtype = dtypes[group_idx] if group_idx < len(dtypes) else group.dtype
+            role = self._kv_group_role(group, dtype)
+            if role == "hca_attention_kv":
+                slab_ranges.append(group_range)
+        if len(slab_ranges) != 1:
+            return False
+
+        slab_range = slab_ranges[0]
+        slab_nbytes = slab_range.length
+        if raw_writer is not None and not self.kv_object_payload_fits_tutti_staging(
+            slab_nbytes
+        ):
+            logger.warning(
+                "KV_OBJECT_STORE_PROFILE op=write_hca_slab key=%s status=skip "
+                "reason=staging_capacity bytes=%d staging_bytes=%s",
+                key.to_string(),
+                slab_nbytes,
+                self.kv_object_tutti_raw_staging_bytes,
+            )
+            return False
+
+        source_start = slab_range.target_offset
+        source_end = source_start + slab_nbytes
+        slab_payload = bytearray(slab_nbytes)
+        slab_payload[:] = buffer[source_start:source_end].tobytes()
+
+        object_id = self._key_to_object_id(key, role=_DSV4_HCA_SLAB_ROLE)
+        start = time.perf_counter()
+        existing = self.kv_object_metadata_store.get(object_id)
+        if existing is None:
+            if raw_writer is not None:
+                offset, end_offset, aligned_length = (
+                    self.kv_object_pool_layout.next_allocation_bounds(slab_nbytes)
+                )
+                if not self.kv_object_raw_region_covers(offset, aligned_length):
+                    logger.warning(
+                        "KV_OBJECT_STORE_PROFILE op=write_hca_slab key=%s "
+                        "status=skip reason=raw_region_full offset=%d end=%d "
+                        "aligned_bytes=%d",
+                        key.to_string(),
+                        offset,
+                        end_offset,
+                        aligned_length,
+                    )
+                    return False
+            record = self.kv_object_pool_layout.allocate(
+                object_id,
+                length=slab_nbytes,
+                shape=(slab_nbytes,),
+                dtype="torch.uint8",
+            )
+        else:
+            record = existing
+            if record.length != slab_nbytes:
+                if raw_writer is not None:
+                    offset, end_offset, aligned_length = (
+                        self.kv_object_pool_layout.next_allocation_bounds(slab_nbytes)
+                    )
+                    if not self.kv_object_raw_region_covers(offset, aligned_length):
+                        logger.warning(
+                            "KV_OBJECT_STORE_PROFILE op=write_hca_slab key=%s "
+                            "status=skip reason=raw_region_full offset=%d end=%d "
+                            "aligned_bytes=%d",
+                            key.to_string(),
+                            offset,
+                            end_offset,
+                            aligned_length,
+                        )
+                        return False
+                logger.info(
+                    "KV_OBJECT_STORE_PROFILE op=write_hca_slab key=%s "
+                    "status=reallocate reason=length_changed old=%d new=%d",
+                    key.to_string(),
+                    record.length,
+                    slab_nbytes,
+                )
+                record = self.kv_object_pool_layout.allocate(
+                    object_id,
+                    length=slab_nbytes,
+                    shape=(slab_nbytes,),
+                    dtype="torch.uint8",
+                )
+
+        payload_view = memoryview(slab_payload)
+        if raw_writer is not None:
+            raw_extents, write_ms = raw_writer(record, payload_view)
+            ready_record = record.with_raw_extents(raw_extents).mark_ready()
+            mode = "tutti_raw"
+        else:
+            if self.kv_object_pool_io is None:
+                return False
+            write_ms = self.kv_object_pool_io.write_object(record, payload_view)
+            ready_record = record.mark_ready()
+            mode = "pool_file"
+        self.kv_object_metadata_store.put(ready_record)
+        logger.info(
+            "KV_OBJECT_STORE_PROFILE op=write_hca_slab key=%s bytes=%d "
+            "mode=%s write_ms=%.3f total_ms=%.3f",
+            key.to_string(),
+            slab_nbytes,
+            mode,
+            write_ms,
+            (time.perf_counter() - start) * 1000.0,
+        )
+        return True
+
     def _object_group_ranges(
         self,
         memory_obj: MemoryObj,
         full_record: KVObjectRecord,
     ) -> list[tuple[int, KVObjectByteRange]]:
         """Derive per-group byte ranges for one stored chunk."""
+        return self._object_group_ranges_for_offset(memory_obj, full_record.offset)
+
+    def _object_group_ranges_for_offset(
+        self,
+        memory_obj: MemoryObj,
+        base_offset: int,
+    ) -> list[tuple[int, KVObjectByteRange]]:
+        """Derive per-group byte ranges from a logical base offset."""
         shapes = memory_obj.metadata.shapes
         dtypes = memory_obj.metadata.dtypes
         if shapes is None or dtypes is None or len(shapes) != len(dtypes):
             return []
         ranges: list[tuple[int, KVObjectByteRange]] = []
         target_offset = 0
-        current_offset = full_record.offset
+        current_offset = base_offset
         for group_idx, (shape, dtype) in enumerate(zip(shapes, dtypes, strict=True)):
             group_nbytes = shape.numel() * dtype.itemsize
             if group_nbytes > 0:
@@ -754,6 +1158,41 @@ class LocalDiskBackend(StorageBackendInterface):
                 strict=False,
             ):
                 specs.append((int(layer_id), role, byte_ranges))
+        return specs
+
+    def _object_group_view_specs(
+        self,
+        memory_obj: MemoryObj,
+        group_ranges: Sequence[tuple[int, KVObjectByteRange]],
+    ) -> list[tuple[str, list[KVObjectByteRange]]]:
+        """Return role-level whole-group logical views for object reads."""
+        klg_manager = (
+            self.metadata.kv_layer_groups_manager if self.metadata is not None else None
+        )
+        if klg_manager is None or not klg_manager.kv_layer_groups:
+            return []
+        dtypes = memory_obj.metadata.dtypes or []
+        specs: list[tuple[str, list[KVObjectByteRange]]] = []
+        for group_idx, group_range in group_ranges:
+            if group_idx >= len(klg_manager.kv_layer_groups):
+                continue
+            group = klg_manager.kv_layer_groups[group_idx]
+            dtype = dtypes[group_idx] if group_idx < len(dtypes) else group.dtype
+            role = self._kv_group_role(group, dtype)
+            if role != "hca_attention_kv":
+                continue
+            specs.append(
+                (
+                    _DSV4_HCA_SLAB_ROLE,
+                    [
+                        KVObjectByteRange(
+                            offset=group_range.offset,
+                            length=group_range.length,
+                            target_offset=0,
+                        )
+                    ],
+                )
+            )
         return specs
 
     def _split_group_range_by_layer(
@@ -1272,11 +1711,32 @@ class LocalDiskBackend(StorageBackendInterface):
             return False
         object_id = self._key_to_object_id(key)
         record = self.kv_object_metadata_store.get(object_id)
-        if record is None or record.state != KVObjectState.READY:
+        if self._ready_tutti_raw_record(record):
+            return True
+        return self._has_readable_hca_deferred_objects_unlocked(key)
+
+    def _has_readable_hca_deferred_objects_unlocked(
+        self,
+        key: CacheEngineKey,
+    ) -> bool:
+        """Return whether compact non-HCA and HCA slab raw objects are ready."""
+        if self.kv_object_metadata_store is None:
             return False
-        if not record.raw_extents:
-            return False
-        return self.kv_object_record_raw_readable(record)
+        compact = self.kv_object_metadata_store.get(
+            self._key_to_object_id(
+                key,
+                role=_DSV4_HCA_DEFERRED_RETRIEVE_ROLE,
+            )
+        )
+        slab = self.kv_object_metadata_store.get(
+            self._key_to_object_id(
+                key,
+                role=_DSV4_HCA_SLAB_ROLE,
+            )
+        )
+        return self._ready_tutti_raw_record(compact) and self._ready_tutti_raw_record(
+            slab
+        )
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -1464,16 +1924,64 @@ class LocalDiskBackend(StorageBackendInterface):
         object_id = self._key_to_object_id(key)
         raw_writer = (
             self.kv_object_tutti_raw_writer
-            if self.kv_object_tutti_raw_enabled
+            if self.kv_object_tutti_raw_cold_store_enabled
             else None
         )
-        if self.kv_object_tutti_raw_enabled and raw_writer is None:
+        if self.kv_object_tutti_raw_cold_store_enabled and raw_writer is None:
             self._log_kv_object_write_skip(
                 key,
                 reason="raw_writer_missing",
                 bytes_len=len(buffer),
             )
             return False
+        if raw_writer is not None and not self.kv_object_payload_fits_tutti_staging(
+            len(buffer)
+        ):
+            if not (
+                _env_flag("LMCACHE_DSV4_DEFER_HCA_TO_MOE")
+                and _env_flag("LMCACHE_HCA_ENABLE_OBJECT_SOURCE")
+            ):
+                self._log_kv_object_write_skip(
+                    key,
+                    reason="raw_staging_capacity",
+                    bytes_len=len(buffer),
+                )
+                return False
+            try:
+                with self.kv_object_store_lock:
+                    compact_written = self._write_hca_deferred_retrieve_object(
+                        key,
+                        memory_obj,
+                        buffer,
+                        raw_writer,
+                    )
+                    slab_written = self._write_hca_slab_object(
+                        key,
+                        memory_obj,
+                        buffer,
+                        raw_writer,
+                    )
+                elapsed_ms = (time.perf_counter() - start) * 1000.0
+                logger.info(
+                    "KV_OBJECT_STORE_PROFILE op=write key=%s bytes=%d "
+                    "status=hca_deferred_only compact=%s slab=%s "
+                    "staging_bytes=%s total_ms=%.3f",
+                    key.to_string(),
+                    len(buffer),
+                    compact_written,
+                    slab_written,
+                    self.kv_object_tutti_raw_staging_bytes,
+                    elapsed_ms,
+                )
+                return compact_written and slab_written
+            except Exception as exc:
+                logger.warning(
+                    "KV_OBJECT_STORE_PROFILE op=write key=%s "
+                    "status=hca_deferred_failed error=%s",
+                    key.to_string(),
+                    exc,
+                )
+                return False
         try:
             with self.kv_object_store_lock:
                 existing = self.kv_object_metadata_store.get(object_id)
@@ -1532,6 +2040,20 @@ class LocalDiskBackend(StorageBackendInterface):
                     ready_record,
                     memory_obj,
                 )
+                if self._write_hca_deferred_retrieve_object(
+                    key,
+                    memory_obj,
+                    buffer,
+                    raw_writer,
+                ):
+                    indexed_views += 1
+                if self._write_hca_slab_object(
+                    key,
+                    memory_obj,
+                    buffer,
+                    raw_writer,
+                ):
+                    indexed_views += 1
             elapsed_ms = (time.perf_counter() - start) * 1000.0
             logger.info(
                 "KV_OBJECT_STORE_PROFILE op=write key=%s bytes=%d "

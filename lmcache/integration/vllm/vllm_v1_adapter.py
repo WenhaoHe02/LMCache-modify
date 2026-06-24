@@ -5,9 +5,12 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from types import MethodType
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
+import gc
 import inspect
 import math
 import os
+import re
+import weakref
 
 # Third Party
 from vllm.config import (
@@ -64,7 +67,198 @@ logger = init_logger(__name__)
 
 _INDEXER_PREFETCH_MANAGER: Any = None
 _HCA_PREFETCH_MANAGER: Any = None
+_DEEPSEEK_DECODER_LAYER_CACHE: tuple[Any, ...] = ()
+_LMCACHE_DEEPSEEK_DECODER_LAYER_REGISTRY: Any = weakref.WeakSet()
+_DEEPSEEK_DECODER_REGISTRY_HOOK_INSTALLED: bool = False
+_HCA_ATTACH_ATTEMPTED: bool = False
 _OVERLAP_HOOK_ERROR_LOGGED: set[tuple[str, int, str]] = set()
+_SCHEDULER_HMA_INVALID_BLOCK_PATCH_INSTALLED: bool = False
+
+
+def _block_ids_at_index(block_id_groups: tuple[list[int], ...], idx: int) -> set[int]:
+    """Return every HMA group block ID present at a logical block index."""
+    block_ids: set[int] = set()
+    for group_block_ids in block_id_groups:
+        if idx < len(group_block_ids):
+            block_ids.add(int(group_block_ids[idx]))
+    return block_ids
+
+
+def _install_scheduler_hma_invalid_block_patch() -> None:
+    """Patch vLLM's KV-load failure path to handle hybrid KV cache groups."""
+    global _SCHEDULER_HMA_INVALID_BLOCK_PATCH_INSTALLED
+
+    if _SCHEDULER_HMA_INVALID_BLOCK_PATCH_INSTALLED:
+        return
+    try:
+        module = __import__(
+            "vllm.v1.core.sched.scheduler",
+            fromlist=["Scheduler"],
+        )
+    except ImportError:
+        return
+    scheduler_cls = getattr(module, "Scheduler", None)
+    if scheduler_cls is None:
+        return
+    if getattr(
+        scheduler_cls,
+        "_lmcache_hma_invalid_block_patch_installed",
+        False,
+    ):
+        _SCHEDULER_HMA_INVALID_BLOCK_PATCH_INSTALLED = True
+        return
+    original = getattr(
+        scheduler_cls,
+        "_update_requests_with_invalid_blocks",
+        None,
+    )
+    if original is None:
+        return
+
+    def _lmcache_update_requests_with_invalid_blocks(
+        self: Any,
+        requests: Iterable[Any],
+        invalid_block_ids: set[int],
+        num_scheduled_tokens: dict[str, int],
+        evict_blocks: bool = True,
+    ) -> tuple[set[str], int, set[int]]:
+        affected_req_ids: set[str] = set()
+        total_affected_tokens = 0
+        blocks_to_evict: set[int] = set()
+        marked_invalid_block_ids: set[int] = set()
+        for request in requests:
+            is_affected = False
+            marked_invalid_block = False
+            req_id = request.request_id
+            req_block_id_groups = self.kv_cache_manager.get_block_ids(req_id)
+            req_num_computed_tokens = (
+                request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
+            )
+            req_num_computed_blocks = (
+                req_num_computed_tokens + self.block_size - 1
+            ) // self.block_size
+
+            if len(req_block_id_groups) == 1:
+                req_block_ids = req_block_id_groups[0]
+                for idx, block_id in zip(
+                    range(req_num_computed_blocks),
+                    req_block_ids,
+                ):
+                    if block_id not in invalid_block_ids:
+                        continue
+
+                    is_affected = True
+
+                    if block_id in marked_invalid_block_ids:
+                        continue
+
+                    marked_invalid_block_ids.add(block_id)
+
+                    if marked_invalid_block:
+                        continue
+
+                    marked_invalid_block = True
+                    request.num_computed_tokens = idx * self.block_size
+                    total_affected_tokens += (
+                        req_num_computed_tokens - request.num_computed_tokens
+                    )
+
+                    if evict_blocks:
+                        blocks_to_evict.update(req_block_ids[idx:])
+            else:
+                for idx in range(req_num_computed_blocks):
+                    block_ids_at_idx = _block_ids_at_index(req_block_id_groups, idx)
+                    invalid_at_idx = block_ids_at_idx & invalid_block_ids
+                    if not invalid_at_idx:
+                        continue
+
+                    is_affected = True
+                    newly_marked = invalid_at_idx - marked_invalid_block_ids
+                    if not newly_marked:
+                        continue
+
+                    marked_invalid_block_ids.update(newly_marked)
+
+                    if marked_invalid_block:
+                        continue
+
+                    marked_invalid_block = True
+                    request.num_computed_tokens = idx * self.block_size
+                    total_affected_tokens += (
+                        req_num_computed_tokens - request.num_computed_tokens
+                    )
+
+                    if evict_blocks:
+                        for group_block_ids in req_block_id_groups:
+                            if idx < len(group_block_ids):
+                                blocks_to_evict.update(
+                                    int(block_id)
+                                    for block_id in group_block_ids[idx:]
+                                )
+
+            if is_affected:
+                if not marked_invalid_block:
+                    total_affected_tokens += (
+                        request.num_computed_tokens - req_num_computed_tokens
+                    )
+                    request.num_computed_tokens = req_num_computed_tokens
+
+                affected_req_ids.add(request.request_id)
+
+        return affected_req_ids, total_affected_tokens, blocks_to_evict
+
+    scheduler_cls._lmcache_original_update_requests_with_invalid_blocks = original
+    scheduler_cls._update_requests_with_invalid_blocks = (
+        _lmcache_update_requests_with_invalid_blocks
+    )
+    scheduler_cls._lmcache_hma_invalid_block_patch_installed = True
+    _SCHEDULER_HMA_INVALID_BLOCK_PATCH_INSTALLED = True
+    logger.info("LMCache installed vLLM HMA invalid-block scheduler patch")
+
+
+def _layer_idx_from_prefix(prefix: Any) -> int:
+    """Best-effort DeepSeek decoder layer id extraction from a vLLM prefix."""
+    if not isinstance(prefix, str):
+        return -1
+    match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", prefix)
+    if match is None:
+        return -1
+    return int(match.group(1))
+
+
+def _infer_decoder_layer_idx(decoder_layer: Any) -> int:
+    """Infer and cache the vLLM layer id on a DeepSeek decoder layer."""
+    layer_idx = getattr(decoder_layer, "layer_idx", -1)
+    if isinstance(layer_idx, int) and layer_idx >= 0:
+        return layer_idx
+
+    prefixes = [
+        getattr(decoder_layer, "prefix", None),
+    ]
+    attn = getattr(decoder_layer, "self_attn", None)
+    if attn is None:
+        attn = getattr(decoder_layer, "attn", None)
+    if attn is not None:
+        prefixes.extend(
+            [
+                getattr(attn, "prefix", None),
+                getattr(getattr(attn, "mla_attn", None), "prefix", None),
+                getattr(
+                    getattr(getattr(attn, "mla_attn", None), "mla_attn", None),
+                    "prefix",
+                    None,
+                ),
+            ]
+        )
+    for prefix in prefixes:
+        inferred = _layer_idx_from_prefix(prefix)
+        if inferred >= 0:
+            try:
+                setattr(decoder_layer, "layer_idx", inferred)
+            except Exception:
+                pass
+            return inferred
+    return -1
 
 
 def _env_flag(name: str) -> bool:
@@ -202,15 +396,27 @@ def _hca_active_prefire_enabled() -> bool:
 
 
 def _hca_overlap_lookahead() -> int:
-    """Return how many upcoming HCA layers each FFN-entry hook may fire."""
+    """Return how many near HCA layers each FFN-entry hook may fire.
+
+    The default is deliberately one layer: HCA I/O should live inside the
+    current FFN/MoE/communication window for the nearest upcoming HCA
+    attention. Larger lookahead is an explicit experiment because it can
+    consume NVMe, executor, pinned-buffer, and copy bandwidth needed by CSA or
+    by the layer whose attention deadline is nearest.
+    """
     return max(1, _env_int("LMCACHE_HCA_OVERLAP_LOOKAHEAD", 1))
+
+
+def _hca_prepare_lookahead() -> int:
+    """Return how many near HCA layers should be opportunistically drained."""
+    return max(1, _env_int("LMCACHE_HCA_PREPARE_LOOKAHEAD", _hca_overlap_lookahead()))
 
 
 def _hca_blocking_drain_enabled() -> bool:
     """Return whether final HCA attention drain should wait for pending I/O."""
     value = os.environ.get("LMCACHE_HCA_BLOCKING_DRAIN")
     if value is None:
-        return True
+        return False
     return value.lower() in {"1", "true", "yes", "on"}
 
 
@@ -253,7 +459,7 @@ def _deepseek_decoder_registries() -> list[Any]:
             "_DEEPSEEK_V4_DECODER_LAYER_REGISTRY",
         ),
     )
-    registries: list[Any] = []
+    registries: list[Any] = [_LMCACHE_DEEPSEEK_DECODER_LAYER_REGISTRY]
     for module_name, registry_name in registry_specs:
         try:
             module = __import__(module_name, fromlist=[registry_name])
@@ -263,6 +469,64 @@ def _deepseek_decoder_registries() -> list[Any]:
         if registry is not None:
             registries.append(registry)
     return registries
+
+
+def _install_deepseek_decoder_registry_hook() -> None:
+    """Register DeepSeek decoder layers constructed by vLLM in this process."""
+    global _DEEPSEEK_DECODER_REGISTRY_HOOK_INSTALLED
+
+    if _DEEPSEEK_DECODER_REGISTRY_HOOK_INSTALLED:
+        return
+    try:
+        module = __import__(
+            "vllm.model_executor.models.deepseek_v4",
+            fromlist=["DeepseekV4DecoderLayer"],
+        )
+    except ImportError:
+        return
+    module_registry = getattr(module, "_DEEPSEEK_V4_DECODER_LAYER_REGISTRY", None)
+    if module_registry is None:
+        module_registry = weakref.WeakSet()
+        try:
+            setattr(module, "_DEEPSEEK_V4_DECODER_LAYER_REGISTRY", module_registry)
+        except Exception:
+            module_registry = None
+    layer_cls = getattr(module, "DeepseekV4DecoderLayer", None)
+    if layer_cls is None:
+        return
+    if getattr(layer_cls, "_lmcache_decoder_registry_hook_installed", False):
+        _DEEPSEEK_DECODER_REGISTRY_HOOK_INSTALLED = True
+        return
+    original_init = getattr(layer_cls, "__init__", None)
+    if original_init is None:
+        return
+
+    def _lmcache_init(self: Any, *args: Any, **kwargs: Any) -> None:
+        original_init(self, *args, **kwargs)
+        prefix = kwargs.get("prefix")
+        if prefix is None and len(args) >= 2:
+            prefix = args[1]
+        layer_idx = _layer_idx_from_prefix(prefix)
+        if layer_idx >= 0:
+            try:
+                setattr(self, "layer_idx", layer_idx)
+            except Exception:
+                pass
+        try:
+            _LMCACHE_DEEPSEEK_DECODER_LAYER_REGISTRY.add(self)
+        except TypeError:
+            pass
+        if module_registry is not None:
+            try:
+                module_registry.add(self)
+            except TypeError:
+                pass
+
+    layer_cls._lmcache_original_init = original_init
+    layer_cls.__init__ = _lmcache_init
+    layer_cls._lmcache_decoder_registry_hook_installed = True
+    _DEEPSEEK_DECODER_REGISTRY_HOOK_INSTALLED = True
+    logger.info("LMCache installed DeepSeek decoder layer registry hook")
 
 
 def _decoder_csa_indexer(decoder_layer: Any) -> Any:
@@ -295,6 +559,88 @@ def _decoder_hca_attention(decoder_layer: Any) -> Any:
         if compress_ratio == 128 and isinstance(kv_cache, torch.Tensor):
             return candidate
     return None
+
+
+def _is_deepseek_decoder_layer_candidate(obj: Any) -> bool:
+    """Return whether ``obj`` looks like a live DeepSeek V4 decoder layer."""
+    try:
+        obj_type = type(obj)
+        type_name = getattr(obj_type, "__name__", "")
+        module_name = getattr(obj_type, "__module__", "")
+        is_deepseek_decoder_type = (
+            type_name == "DeepseekV4DecoderLayer"
+            and module_name == "vllm.model_executor.models.deepseek_v4"
+        )
+        if (
+            not is_deepseek_decoder_type
+            and "deepseek" not in module_name.lower()
+            and "deepseek" not in type_name.lower()
+        ):
+            return False
+        layer_id = _infer_decoder_layer_idx(obj)
+        if not isinstance(layer_id, int) or layer_id < 0:
+            return False
+        has_attention = getattr(obj, "self_attn", None) is not None or getattr(
+            obj,
+            "attn",
+            None,
+        ) is not None
+        if not has_attention:
+            return False
+        if is_deepseek_decoder_type:
+            return True
+        if not callable(getattr(obj, "hc_pre", None)):
+            return False
+        return getattr(obj, "hc_ffn_fn", None) is not None
+    except Exception:
+        return False
+
+
+def _deepseek_decoder_layers() -> list[Any]:
+    """Return live DeepSeek decoder layers, with a GC fallback for patched vLLM."""
+    global _DEEPSEEK_DECODER_LAYER_CACHE
+
+    if _DEEPSEEK_DECODER_LAYER_CACHE:
+        return list(_DEEPSEEK_DECODER_LAYER_CACHE)
+
+    decoder_layers: list[Any] = []
+    seen: set[int] = set()
+    source = "registry"
+    for registry in _deepseek_decoder_registries():
+        for decoder_layer in list(registry):
+            obj_id = id(decoder_layer)
+            if obj_id in seen:
+                continue
+            if not _is_deepseek_decoder_layer_candidate(decoder_layer):
+                continue
+            seen.add(obj_id)
+            decoder_layers.append(decoder_layer)
+
+    if not decoder_layers:
+        source = "gc"
+        try:
+            objects = gc.get_objects()
+        except Exception as exc:
+            logger.debug("Unable to scan GC for DeepSeek decoder layers: %r", exc)
+            objects = ()
+        for obj in objects:
+            obj_id = id(obj)
+            if obj_id in seen:
+                continue
+            if not _is_deepseek_decoder_layer_candidate(obj):
+                continue
+            seen.add(obj_id)
+            decoder_layers.append(obj)
+
+    decoder_layers.sort(key=lambda layer: getattr(layer, "layer_idx", -1))
+    if decoder_layers:
+        _DEEPSEEK_DECODER_LAYER_CACHE = tuple(decoder_layers)
+        logger.info(
+            "LMCache discovered %d DeepSeek decoder layers via %s fallback",
+            len(decoder_layers),
+            source,
+        )
+    return list(_DEEPSEEK_DECODER_LAYER_CACHE)
 
 
 def _same_callable(left: Any, right: Any) -> bool:
@@ -502,15 +848,27 @@ def _fire_decoder_ffn_overlap(
     if hca_manager is not None and isinstance(hca_targets, tuple) and hca_targets:
         try:
             hca_fired = getattr(hca_manager, "layer_fired_for_active_request", None)
-            if positions is not None:
-                for next_hca in hca_targets:
-                    if callable(hca_fired) and hca_fired(next_hca):
-                        continue
+            fire_layers = getattr(hca_manager, "fire_async_for_layers", None)
+            pending_targets = tuple(
+                next_hca
+                for next_hca in hca_targets
+                if not (callable(hca_fired) and hca_fired(next_hca))
+            )
+            if positions is not None and callable(fire_layers):
+                if pending_targets:
+                    fire_layers(pending_targets, positions)
+            elif positions is not None:
+                for next_hca in pending_targets:
                     hca_manager.fire_async_for_layer(next_hca, positions)
-            prepare_hca = getattr(hca_manager, "prepare_layer_async", None)
-            if callable(prepare_hca):
-                for next_hca in hca_targets:
-                    prepare_hca(next_hca)
+            prepare_hca_layers = getattr(hca_manager, "prepare_layers_async", None)
+            prepare_targets = hca_targets[:_hca_prepare_lookahead()]
+            if callable(prepare_hca_layers):
+                prepare_hca_layers(prepare_targets)
+            else:
+                prepare_hca = getattr(hca_manager, "prepare_layer_async", None)
+                if callable(prepare_hca):
+                    for next_hca in prepare_targets:
+                        prepare_hca(next_hca)
         except Exception as exc:
             _log_overlap_hook_error_once("HCA", int(layer_id), exc)
 
@@ -564,6 +922,8 @@ def _configure_decoder_csa_overlap(
 ) -> bool:
     decoder_layer._lmcache_indexer_prefetch_manager = manager
     decoder_layer._lmcache_next_csa_layer_id = next_csa_layer_id
+    if callable(getattr(decoder_layer, "_lmcache_fire_pre_ffn_overlap", None)):
+        return True
     return _install_decoder_hc_pre_overlap_hook(decoder_layer)
 
 
@@ -576,6 +936,8 @@ def _configure_decoder_hca_overlap(
     decoder_layer._lmcache_hca_prefetch_manager = manager
     decoder_layer._lmcache_next_hca_layer_id = next_hca_layer_id
     decoder_layer._lmcache_next_hca_layer_ids = next_hca_layer_ids
+    if callable(getattr(decoder_layer, "_lmcache_fire_pre_ffn_overlap", None)):
+        return True
     return _install_decoder_hc_pre_overlap_hook(decoder_layer)
 
 
@@ -670,15 +1032,7 @@ def _attach_indexer_prefetch() -> None:
         logger.warning("IndexerSSDManager is unavailable: %s", exc)
         return
 
-    decoder_layers: list[Any] = []
-    seen: set[int] = set()
-    for registry in _deepseek_decoder_registries():
-        for decoder_layer in list(registry):
-            obj_id = id(decoder_layer)
-            if obj_id in seen:
-                continue
-            seen.add(obj_id)
-            decoder_layers.append(decoder_layer)
+    decoder_layers = _deepseek_decoder_layers()
 
     if not decoder_layers:
         logger.warning(
@@ -790,9 +1144,11 @@ def _attach_hca_prefetch() -> None:
     This path may use CPU pinned memory only as a transient bounce buffer;
     pinned payloads must not be treated as cache residency or hit state.
     """
-    global _HCA_PREFETCH_MANAGER
+    global _HCA_ATTACH_ATTEMPTED, _HCA_PREFETCH_MANAGER
 
     if not _hca_prefetch_enabled():
+        return
+    if _HCA_PREFETCH_MANAGER is not None:
         return
     if not _hca_pinned_bounce_enabled():
         logger.info(
@@ -821,22 +1177,18 @@ def _attach_hca_prefetch() -> None:
         logger.warning("HCAPrefetchManager is unavailable: %s", exc)
         return
 
-    decoder_layers: list[Any] = []
-    seen: set[int] = set()
-    for registry in _deepseek_decoder_registries():
-        for decoder_layer in list(registry):
-            obj_id = id(decoder_layer)
-            if obj_id in seen:
-                continue
-            seen.add(obj_id)
-            decoder_layers.append(decoder_layer)
+    decoder_layers = _deepseek_decoder_layers()
 
     if not decoder_layers:
-        logger.warning(
-            "HCA prefetch requested, but no registered DeepSeek decoder "
-            "layers were found"
-        )
+        if not _HCA_ATTACH_ATTEMPTED:
+            logger.warning(
+                "HCA prefetch requested, but no registered DeepSeek decoder "
+                "layers were found"
+            )
+        _HCA_ATTACH_ATTEMPTED = True
         return
+
+    _HCA_ATTACH_ATTEMPTED = True
 
     hca_info: list[tuple[int, Any]] = []
     for decoder_layer in decoder_layers:
@@ -929,6 +1281,15 @@ def _attach_hca_prefetch() -> None:
         len(hca_layer_ids),
         store_dir,
     )
+
+
+def _ensure_hca_prefetch_attached() -> Any:
+    """Attach HCA prefetch lazily and return the active manager if available."""
+    global _HCA_PREFETCH_MANAGER
+
+    if _HCA_PREFETCH_MANAGER is None:
+        _attach_hca_prefetch()
+    return _HCA_PREFETCH_MANAGER
 
 
 @dataclass
@@ -1346,6 +1707,7 @@ class LMCacheConnectorV1Impl:
         role: KVConnectorRole,
         parent: KVConnectorBase_V1,
     ):
+        _install_scheduler_hma_invalid_block_patch()
         self._parent = parent
         self._vllm_config = vllm_config
         self._role = role
@@ -1406,6 +1768,8 @@ class LMCacheConnectorV1Impl:
         config: LMCacheEngineConfig,
     ) -> None:
         """Initialize connector-specific state variables."""
+        _install_deepseek_decoder_registry_hook()
+
         self.async_loading = config.enable_async_loading
         self.layerwise_retrievers: list[
             tuple[Generator[Optional[torch.Tensor], None, None], ReqMeta]
@@ -2055,12 +2419,11 @@ class LMCacheConnectorV1Impl:
             return
 
         csa_entries: list[tuple[int, Any]] = []
-        for registry in _deepseek_decoder_registries():
-            for decoder_layer in list(registry):
-                layer_id = getattr(decoder_layer, "layer_idx", -1)
-                indexer_op = _decoder_csa_indexer(decoder_layer)
-                if isinstance(layer_id, int) and layer_id >= 0 and indexer_op is not None:
-                    csa_entries.append((layer_id, indexer_op))
+        for decoder_layer in _deepseek_decoder_layers():
+            layer_id = getattr(decoder_layer, "layer_idx", -1)
+            indexer_op = _decoder_csa_indexer(decoder_layer)
+            if isinstance(layer_id, int) and layer_id >= 0 and indexer_op is not None:
+                csa_entries.append((layer_id, indexer_op))
 
         if not csa_entries:
             return
@@ -2158,7 +2521,7 @@ class LMCacheConnectorV1Impl:
         slot_mapping: torch.Tensor,
     ) -> None:
         """Seed HCA deterministic prefetch state after an LMCache prefix hit."""
-        manager = _HCA_PREFETCH_MANAGER
+        manager = _ensure_hca_prefetch_attached()
         if manager is None:
             return
         if lmcache_cached_tokens <= request.load_spec.vllm_cached_tokens:
@@ -2174,12 +2537,11 @@ class LMCacheConnectorV1Impl:
             return
 
         hca_entries: list[tuple[int, Any]] = []
-        for registry in _deepseek_decoder_registries():
-            for decoder_layer in list(registry):
-                layer_id = getattr(decoder_layer, "layer_idx", -1)
-                hca_layer = _decoder_hca_attention(decoder_layer)
-                if isinstance(layer_id, int) and layer_id >= 0 and hca_layer is not None:
-                    hca_entries.append((layer_id, hca_layer))
+        for decoder_layer in _deepseek_decoder_layers():
+            layer_id = getattr(decoder_layer, "layer_idx", -1)
+            hca_layer = _decoder_hca_attention(decoder_layer)
+            if isinstance(layer_id, int) and layer_id >= 0 and hca_layer is not None:
+                hca_entries.append((layer_id, hca_layer))
 
         if not hca_entries:
             return
@@ -2264,7 +2626,7 @@ class LMCacheConnectorV1Impl:
         slot_mapping: torch.Tensor,
     ) -> None:
         """Install current-request compressed slot maps for HCA prefetch."""
-        manager = _HCA_PREFETCH_MANAGER
+        manager = _ensure_hca_prefetch_attached()
         if manager is None or request.load_spec is None:
             return
         if lmcache_cached_tokens <= request.load_spec.vllm_cached_tokens:
@@ -2278,46 +2640,45 @@ class LMCacheConnectorV1Impl:
 
         compressed_slots_by_block_size: dict[int, torch.Tensor] = {}
         prepared = 0
-        for registry in _deepseek_decoder_registries():
-            for decoder_layer in list(registry):
-                layer_id = getattr(decoder_layer, "layer_idx", -1)
-                hca_layer = _decoder_hca_attention(decoder_layer)
-                if (
-                    not isinstance(layer_id, int)
-                    or layer_id < 0
-                    or hca_layer is None
-                ):
-                    continue
-                kv_cache = getattr(hca_layer, "kv_cache", None)
-                if not isinstance(kv_cache, torch.Tensor) or kv_cache.numel() == 0:
-                    continue
-                compress_ratio = int(getattr(hca_layer, "compress_ratio", 1))
-                if compress_ratio != 128:
-                    continue
-                compressed_seq_len = lmcache_cached_tokens // compress_ratio
-                if compressed_seq_len <= 0:
-                    continue
-                compressed_block_size = int(kv_cache.shape[1])
-                compressed_slots = compressed_slots_by_block_size.get(
-                    compressed_block_size
+        for decoder_layer in _deepseek_decoder_layers():
+            layer_id = getattr(decoder_layer, "layer_idx", -1)
+            hca_layer = _decoder_hca_attention(decoder_layer)
+            if (
+                not isinstance(layer_id, int)
+                or layer_id < 0
+                or hca_layer is None
+            ):
+                continue
+            kv_cache = getattr(hca_layer, "kv_cache", None)
+            if not isinstance(kv_cache, torch.Tensor) or kv_cache.numel() == 0:
+                continue
+            compress_ratio = int(getattr(hca_layer, "compress_ratio", 1))
+            if compress_ratio != 128:
+                continue
+            compressed_seq_len = lmcache_cached_tokens // compress_ratio
+            if compressed_seq_len <= 0:
+                continue
+            compressed_block_size = int(kv_cache.shape[1])
+            compressed_slots = compressed_slots_by_block_size.get(
+                compressed_block_size
+            )
+            if compressed_slots is None:
+                compressed_slots = _compressed_slot_mapping(
+                    slot_mapping,
+                    lmcache_cached_tokens,
+                    compress_ratio,
+                    compressed_block_size,
                 )
-                if compressed_slots is None:
-                    compressed_slots = _compressed_slot_mapping(
-                        slot_mapping,
-                        lmcache_cached_tokens,
-                        compress_ratio,
-                        compressed_block_size,
-                    )
-                    compressed_slots_by_block_size[compressed_block_size] = (
-                        compressed_slots
-                    )
-                if compressed_slots.numel() < compressed_seq_len:
-                    continue
-                active_slots = compressed_slots[:compressed_seq_len]
-                if bool((active_slots < 0).any().item()):
-                    continue
-                set_slots(layer_id, compressed_seq_len, active_slots)
-                prepared += 1
+                compressed_slots_by_block_size[compressed_block_size] = (
+                    compressed_slots
+                )
+            if compressed_slots.numel() < compressed_seq_len:
+                continue
+            active_slots = compressed_slots[:compressed_seq_len]
+            if bool((active_slots < 0).any().item()):
+                continue
+            set_slots(layer_id, compressed_seq_len, active_slots)
+            prepared += 1
         fired = 0
         fire_active = getattr(manager, "fire_active_request_layers", None)
         if (

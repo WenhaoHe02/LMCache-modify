@@ -13,8 +13,6 @@ from lmcache.logging import init_logger
 from lmcache.utils import EngineType, _lmcache_nvtx_annotate
 from lmcache.v1.compute.blend.utils import LMCBlenderBuilder
 from lmcache.v1.gpu_connector.utils import (
-    DiscoverableKVCache,
-    LayoutHints,
     assert_is_vllm_flash_attn_or_flash_infer,
     assert_is_vllm_mla_or_flash_attn_or_flash_infer,
     attempt_permute_to_contiguous_view,
@@ -29,6 +27,15 @@ from lmcache.v1.gpu_connector.utils import (
     get_tokens_per_layer,
     normalize_kv_and_discover_format,
 )
+
+try:
+    # First Party
+    from lmcache.v1.gpu_connector.utils import DiscoverableKVCache, LayoutHints
+except ImportError:
+    # Compatibility with older container images whose helper module exposes
+    # the accessors but not the annotation aliases.
+    DiscoverableKVCache = Any
+    LayoutHints = dict[str, Any]
 from lmcache.v1.kv_layer_groups import KVLayerGroupInfo, KVLayerGroupsManager
 from lmcache.v1.memory_management import GPUMemoryAllocator  # noqa: E501
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj
@@ -458,6 +465,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         self.group_tmp_buffer: Optional[list[torch.Tensor]] = None
         self.group_tmp_buffer_flat: Optional[torch.Tensor] = None
         self.group_tmp_buffer_offsets: list[int] = []
+        self.group_tmp_buffer_capacities: list[int] = []
         self.dsv4_optimized_kv = self._read_config_flag(
             "dsv4_optimized_kv",
             "LMCACHE_DSV4_OPTIMIZED_KV",
@@ -512,8 +520,28 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         ``layout_hints`` and the actual ``self.kvcaches`` tensors, so the
         serving-engine adapter stays agnostic to format.
         """
-        if self.init:
+        if self._kv_cache_pointers_ready():
             return
+        if self.init:
+            logger.warning(
+                "VLLMPagedMemGPUConnectorV3 had a stale KV-cache "
+                "initialization; rebuilding layout metadata"
+            )
+        self.init = False
+        self.group_kv_cache_pointers_on_gpu = None
+        self.group_tmp_buffer = None
+        self.group_tmp_buffer_flat = None
+        self.group_tmp_buffer_offsets = []
+        self.group_tmp_buffer_capacities = []
+        self._dsv4_layout_valid = None
+
+        klg_manager = self.metadata.kv_layer_groups_manager
+        if klg_manager is not None and not klg_manager.kv_layer_groups:
+            logger.warning(
+                "VLLMPagedMemGPUConnectorV3 found an empty KV layer-groups "
+                "manager; rebuilding from registered vLLM KV caches"
+            )
+            self.metadata.kv_layer_groups_manager = None
 
         self.gpu_kv_format, self.kvcaches = normalize_kv_and_discover_format(
             self.kvcaches, EngineType.VLLM, layout_hints=self.layout_hints
@@ -523,15 +551,24 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         self.page_buffer_size = self.num_blocks * self.block_size
         self.head_size = get_head_size(self.kvcaches, self.gpu_kv_format)
 
-        if self.metadata.kv_layer_groups_manager is None:
+        if (
+            self.metadata.kv_layer_groups_manager is None
+            or not self.metadata.kv_layer_groups_manager.kv_layer_groups
+        ):
             self.metadata.kv_layer_groups_manager = KVLayerGroupsManager(
                 self.kvcaches,
-                gpu_kv_format=self.gpu_kv_format,
-                num_blocks=self.num_blocks,
+                self.gpu_kv_format,
+                self.num_blocks,
                 layout_hints=self.layout_hints,
                 lmcache_logical_chunk_size=self.chunk_size,
             )
         klg_manager = self.metadata.kv_layer_groups_manager
+        if not klg_manager.kv_layer_groups:
+            logger.warning(
+                "VLLMPagedMemGPUConnectorV3 could not discover any KV "
+                "layer groups; deferring pointer initialization"
+            )
+            return
 
         if self.use_gpu:
             self.group_tmp_buffer_offsets = [0]
@@ -541,15 +578,32 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                 self.group_tmp_buffer_offsets.append(
                     self.group_tmp_buffer_offsets[-1] + byte_size
                 )
-            self.group_tmp_buffer_flat = torch.empty(
-                self.group_tmp_buffer_offsets[-1],
-                dtype=torch.uint8,
-                device=self.device,
-            )
-            self.group_tmp_buffer = [
-                self._group_tmp_view(group_idx)
-                for group_idx in range(len(klg_manager.kv_layer_groups))
-            ]
+            try:
+                self.group_tmp_buffer_flat = torch.empty(
+                    self.group_tmp_buffer_offsets[-1],
+                    dtype=torch.uint8,
+                    device=self.device,
+                )
+                self.group_tmp_buffer_capacities = [
+                    self.group_tmp_buffer_offsets[idx + 1]
+                    - self.group_tmp_buffer_offsets[idx]
+                    for idx in range(len(klg_manager.kv_layer_groups))
+                ]
+                self.group_tmp_buffer = [
+                    self._group_tmp_view(group_idx)
+                    for group_idx in range(len(klg_manager.kv_layer_groups))
+                ]
+            except torch.OutOfMemoryError:
+                logger.warning(
+                    "VLLMPagedMemGPUConnectorV3 could not allocate %d bytes "
+                    "for optional GPU staging; continuing with direct CPU "
+                    "memory transfers",
+                    self.group_tmp_buffer_offsets[-1],
+                )
+                self.group_tmp_buffer = None
+                self.group_tmp_buffer_flat = None
+                self.group_tmp_buffer_offsets = []
+                self.group_tmp_buffer_capacities = []
 
         self.group_kv_cache_pointers_on_gpu = []
         for group in klg_manager.kv_layer_groups:
@@ -568,7 +622,28 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
     def register_kv_caches(self, kvcaches: list[torch.Tensor]) -> None:
         """Register vLLM KV cache tensors and discover heterogeneous groups."""
         self.kvcaches = kvcaches
+        if not self._kv_cache_pointers_ready():
+            self.init = False
         self._initialize_kv_cache_pointers()
+
+    def initialize_kvcaches_ptr(self, **kwargs: Any) -> None:
+        """Register per-request KV cache tensors and discover layer groups."""
+        super().initialize_kvcaches_ptr(**kwargs)
+        if self.kvcaches is not None:
+            self._initialize_kv_cache_pointers()
+
+    def _kv_cache_pointers_ready(self) -> bool:
+        """Return whether cached pointer metadata matches non-empty groups."""
+        if not self.init or self.kvcaches is None:
+            return False
+        klg_manager = self.metadata.kv_layer_groups_manager
+        if klg_manager is None or not klg_manager.kv_layer_groups:
+            return False
+        return (
+            self.group_kv_cache_pointers_on_gpu is not None
+            and len(self.group_kv_cache_pointers_on_gpu)
+            == len(klg_manager.kv_layer_groups)
+        )
 
     @staticmethod
     def _read_env_flag(name: str) -> bool:
@@ -1039,12 +1114,71 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
             shape = self._group_shape_for_tokens(group, self.chunk_size)
         byte_size = shape.numel() * group.dtype.itemsize
         if byte_size > group_capacity:
-            raise ValueError(
-                f"temporary buffer for KV group {group_idx} is too small: "
-                f"need {byte_size} bytes, capacity {group_capacity} bytes"
-            )
+            self._ensure_group_tmp_capacity(group_idx, byte_size)
+            start = self.group_tmp_buffer_offsets[group_idx]
+            group_capacity = self.group_tmp_buffer_offsets[group_idx + 1] - start
+            if byte_size > group_capacity:
+                raise ValueError(
+                    f"temporary buffer for KV group {group_idx} is too small: "
+                    f"need {byte_size} bytes, capacity {group_capacity} bytes"
+                )
         end = start + byte_size
         return self.group_tmp_buffer_flat[start:end].view(group.dtype).view(shape)
+
+    def _group_tmp_can_hold(self, group_idx: int, shape: torch.Size) -> bool:
+        """Return whether the fixed GPU staging buffer can hold ``shape``."""
+        assert self.metadata.kv_layer_groups_manager is not None
+        if self.group_tmp_buffer_flat is None:
+            return False
+        if not self.group_tmp_buffer_capacities:
+            return False
+        group = self.metadata.kv_layer_groups_manager.kv_layer_groups[group_idx]
+        byte_size = shape.numel() * group.dtype.itemsize
+        return byte_size <= self.group_tmp_buffer_capacities[group_idx]
+
+    def _ensure_group_tmp_capacity(self, group_idx: int, byte_size: int) -> None:
+        """Grow the flat temporary GPU buffer so one group can hold a shape."""
+        assert self.group_tmp_buffer_flat is not None
+        assert self.metadata.kv_layer_groups_manager is not None
+        num_groups = len(self.metadata.kv_layer_groups_manager.kv_layer_groups)
+        if not self.group_tmp_buffer_capacities:
+            self.group_tmp_buffer_capacities = [
+                self.group_tmp_buffer_offsets[idx + 1]
+                - self.group_tmp_buffer_offsets[idx]
+                for idx in range(num_groups)
+            ]
+        if byte_size <= self.group_tmp_buffer_capacities[group_idx]:
+            return
+        new_capacities = list(self.group_tmp_buffer_capacities)
+        new_capacities[group_idx] = byte_size
+        new_offsets = [0]
+        for capacity in new_capacities:
+            new_offsets.append(new_offsets[-1] + capacity)
+        new_flat = torch.empty(
+            new_offsets[-1],
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        for idx in range(num_groups):
+            old_start = self.group_tmp_buffer_offsets[idx]
+            old_end = self.group_tmp_buffer_offsets[idx + 1]
+            new_start = new_offsets[idx]
+            new_flat[new_start : new_start + old_end - old_start].copy_(
+                self.group_tmp_buffer_flat[old_start:old_end],
+                non_blocking=True,
+            )
+        self.group_tmp_buffer_flat = new_flat
+        self.group_tmp_buffer_offsets = new_offsets
+        self.group_tmp_buffer_capacities = new_capacities
+        self.group_tmp_buffer = [
+            self._group_tmp_view(idx) for idx in range(num_groups)
+        ]
+        logger.info(
+            "VLLMPagedMemGPUConnectorV3 grew temporary buffer for KV group %d "
+            "to %d bytes",
+            group_idx,
+            byte_size,
+        )
 
     @staticmethod
     def _normalize_hma_block_ids(block_ids: Any) -> tuple[list[int], ...]:
@@ -1324,7 +1458,10 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                     **kwargs,
                 ):
                     continue
-                if self.use_gpu:
+                if self.use_gpu and self._group_tmp_can_hold(
+                    i,
+                    memory_obj_tensor.shape,
+                ):
                     tmp_tensor = self._group_tmp_view(i, memory_obj_tensor.shape)
                     tmp_tensor.copy_(memory_obj_tensor, non_blocking=True)
                     memory_obj_tensor = tmp_tensor
@@ -1396,8 +1533,10 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                 if dst_tensor.numel() == 0:
                     continue
                 memory_obj_tensor = dst_tensor
-                if self.use_gpu:
+                staged = False
+                if self.use_gpu and self._group_tmp_can_hold(i, dst_tensor.shape):
                     memory_obj_tensor = self._group_tmp_view(i, dst_tensor.shape)
+                    staged = True
                 hma_block_ids = self._hma_block_ids_for_group(
                     i,
                     start,
@@ -1420,8 +1559,11 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                     block_ids,
                     lmc_ops.TransferDirection.D2H,
                 )
-                if self.use_gpu:
+                if staged:
                     dst_tensor.copy_(memory_obj_tensor, non_blocking=True)
+
+        if not memory_obj.raw_tensor.is_cuda:
+            self.store_stream.synchronize()
 
         if not memory_obj.raw_tensor.is_cuda:
             # Force a synchronize if the target buffer is NOT CUDA device

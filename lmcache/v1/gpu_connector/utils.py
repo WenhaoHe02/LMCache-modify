@@ -20,10 +20,22 @@ from typing import (
 import torch
 
 # First Party
-from lmcache import torch_device_type
 from lmcache.logging import init_logger
 from lmcache.utils import EngineType
 from lmcache.v1.config import LMCacheEngineConfig
+
+try:
+    # First Party
+    from lmcache import torch_device_type
+except ImportError:
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch_device_type = "xpu"
+    elif hasattr(torch, "hpu") and torch.hpu.is_available():
+        torch_device_type = "hpu"
+    elif torch.cuda.is_available():
+        torch_device_type = "cuda"
+    else:
+        torch_device_type = "cpu"
 
 if TYPE_CHECKING:
     # First Party

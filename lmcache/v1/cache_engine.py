@@ -31,7 +31,18 @@ import time
 import torch
 
 # First Party
-from lmcache import torch_dev, torch_device_type
+try:
+    # First Party
+    from lmcache import torch_dev, torch_device_type
+except ImportError:
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        torch_dev, torch_device_type = torch.xpu, "xpu"
+    elif hasattr(torch, "hpu") and torch.hpu.is_available():
+        torch_dev, torch_device_type = torch.hpu, "hpu"
+    elif torch.cuda.is_available():
+        torch_dev, torch_device_type = torch.cuda, "cuda"
+    else:
+        torch_dev, torch_device_type = torch, "cpu"
 from lmcache.logging import init_logger
 from lmcache.observability import LMCacheStatsLogger, LMCStatsMonitor
 from lmcache.usage_context import InitializeUsageContext
@@ -69,6 +80,8 @@ from lmcache.v1.token_database import (
 )
 
 logger = init_logger(__name__)
+
+_DSV4_HCA_DEFERRED_RETRIEVE_ROLE = "hca_deferred_retrieve"
 
 # Type aliases for processed chunks
 # (cache_key, memory_obj, start_index, end_index)
@@ -438,6 +451,34 @@ class LMCacheEngine:
         register = getattr(self.gpu_connector, "register_kv_caches", None)
         if callable(register) and "kvcaches" in kwargs:
             register(kwargs["kvcaches"])
+        initialize_kvcaches_ptr = getattr(
+            self.gpu_connector,
+            "initialize_kvcaches_ptr",
+            None,
+        )
+        if callable(initialize_kvcaches_ptr):
+            initialize_kvcaches_ptr(**kwargs)
+        self._sync_connector_kv_layer_groups()
+
+    def _sync_connector_kv_layer_groups(self) -> None:
+        """Mirror discovered connector KV groups into engine metadata."""
+        if self.gpu_connector is None:
+            return
+        connector_metadata = getattr(self.gpu_connector, "metadata", None)
+        connector_manager = getattr(
+            connector_metadata,
+            "kv_layer_groups_manager",
+            None,
+        )
+        if connector_manager is None or not connector_manager.kv_layer_groups:
+            return
+        if self.metadata.kv_layer_groups_manager is connector_manager:
+            return
+        self.metadata.kv_layer_groups_manager = connector_manager
+        logger.info(
+            "LMCacheEngine synced KV layer groups from GPU connector: groups=%d",
+            connector_manager.num_groups,
+        )
 
     def mark_init_failed(self, reason: str = "") -> None:
         """
@@ -761,6 +802,11 @@ class LMCacheEngine:
             fiemap_ms = (time.perf_counter() - fiemap_start) * 1000.0
             if (
                 disk_backend.kv_object_tutti_raw_enabled
+                and getattr(
+                    disk_backend,
+                    "kv_object_tutti_raw_cold_store_enabled",
+                    disk_backend.kv_object_tutti_raw_enabled,
+                )
                 and disk_backend.kv_object_tutti_raw_region_path
             ):
                 raw_region_start = time.perf_counter()
@@ -870,6 +916,11 @@ class LMCacheEngine:
             if (
                 isinstance(disk_backend, LocalDiskBackend)
                 and disk_backend.kv_object_tutti_raw_enabled
+                and getattr(
+                    disk_backend,
+                    "kv_object_tutti_raw_cold_store_enabled",
+                    disk_backend.kv_object_tutti_raw_enabled,
+                )
             ):
                 if (
                     disk_backend.kv_object_tutti_raw_base_lba <= 0
@@ -998,6 +1049,11 @@ class LMCacheEngine:
         read_ranges_per_key: Optional[
             List[Optional[Tuple[KVObjectByteRange, ...]]]
         ] = None,
+        kv_object_roles: Optional[List[str]] = None,
+        kv_object_layer_ids: Optional[List[int]] = None,
+        on_batch_loaded: Optional[
+            Callable[[int, List[Optional[MemoryObj]]], None]
+        ] = None,
     ) -> List[Optional[MemoryObj]]:
         """Fast-path disk load via GPU-direct NVMe (Tutti).
 
@@ -1019,6 +1075,13 @@ class LMCacheEngine:
                 to the selected object record.  This is used by HCA-deferred
                 DSv4 retrieval to read non-HCA groups without requiring the
                 retained groups to form a prefix of the full object payload.
+            kv_object_roles: Optional per-key object-store roles to read
+                instead of the default chunk-level ``full`` object.
+            kv_object_layer_ids: Optional per-key object-store layer ids paired
+                with ``kv_object_roles``.
+            on_batch_loaded: Optional callback invoked after each Tutti staging
+                batch is read. When supplied, memory objects are staging views
+                that must be consumed before the callback returns.
 
         Returns:
             List of MemoryObj (GPU-resident TensorMemoryObj) or None per key.
@@ -1060,7 +1123,11 @@ class LMCacheEngine:
 
         original_key_count = len(keys)
         tutti_shapes_per_key = shapes_per_key
-        kv_object_records = disk_backend.get_kv_object_records(keys)
+        kv_object_records = disk_backend.get_kv_object_records(
+            keys,
+            layer_ids=kv_object_layer_ids,
+            roles=kv_object_roles,
+        )
         pad_missing_objects = 0
         if (
             disk_backend.kv_object_store_enabled
@@ -1070,7 +1137,6 @@ class LMCacheEngine:
             for index, record in enumerate(kv_object_records):
                 if (
                     record is None
-                    or not record.raw_extents
                     or not disk_backend.kv_object_record_raw_readable(record)
                 ):
                     first_unreadable = index
@@ -1374,6 +1440,7 @@ class LMCacheEngine:
                 shapes_per_key=tutti_shapes_per_key,
                 file_offsets=tutti_file_offsets,
                 read_ranges_per_key=tutti_read_ranges,
+                on_batch_loaded=on_batch_loaded,
             )
         except Exception:
             logger.exception(
@@ -1395,19 +1462,36 @@ class LMCacheEngine:
                 return fallback_results
             return [None] * original_key_count
         load_ms = (time.perf_counter() - load_start) * 1000.0
-        loaded = sum(1 for result in results if result is not None)
-        total_bytes = sum(
-            result.get_size() for result in results if result is not None
+        streaming = on_batch_loaded is not None
+        loaded = (
+            len(keys)
+            if streaming
+            else sum(1 for result in results if result is not None)
+        )
+        total_bytes = (
+            sum(
+                self._shape_nbytes(shape, dtype)
+                for meta in disk_metas
+                if meta is not None
+                for shape, dtype in zip(
+                    meta.shapes or [meta.shape],
+                    meta.dtypes or [meta.dtype],
+                    strict=True,
+                )
+            )
+            if streaming
+            else sum(result.get_size() for result in results if result is not None)
         )
         logger.info(
             "TUTTI_PROFILE batched_get keys=%d loaded=%d size_mb=%.3f "
-            "metadata_ms=%.3f load_hbm_ms=%.3f total_ms=%.3f",
+            "metadata_ms=%.3f load_hbm_ms=%.3f total_ms=%.3f streaming=%s",
             len(keys),
             loaded,
             total_bytes / 1024**2,
             metadata_ms,
             load_ms,
             (time.perf_counter() - profile_start) * 1000.0,
+            streaming,
         )
         if pad_missing_objects:
             results.extend([None] * pad_missing_objects)
@@ -1785,13 +1869,28 @@ class LMCacheEngine:
             )
             # TODO: we implicitly rely on batched_put to call ref_count_down
             # this management should be done in a cleaner way
-            self.storage_manager.batched_put(
-                keys,
-                memory_objs,
-                transfer_spec=transfer_spec,
-                location=self.store_location,
-                on_complete_callback=tutti_warmup_callback,
-            )
+            try:
+                self.storage_manager.batched_put(
+                    keys,
+                    memory_objs,
+                    transfer_spec=transfer_spec,
+                    location=self.store_location,
+                    on_complete_callback=tutti_warmup_callback,
+                )
+            except TypeError as exc:
+                if "on_complete_callback" not in str(exc):
+                    raise
+                logger.warning(
+                    "StorageManager.batched_put does not support "
+                    "on_complete_callback; continuing without Tutti store "
+                    "completion callback"
+                )
+                self.storage_manager.batched_put(
+                    keys,
+                    memory_objs,
+                    transfer_spec=transfer_spec,
+                    location=self.store_location,
+                )
 
         self.stats_monitor.on_store_finished(
             store_stats,
@@ -1895,6 +1994,23 @@ class LMCacheEngine:
         )
         disk_keys = block_mapping["LocalDiskBackend"]
         records = disk_backend.get_kv_object_records(disk_keys)
+        use_hca_deferred_compact = False
+        hca_deferred_readable_limit: Optional[int] = None
+        if self._dsv4_hca_defer_requested(total_tokens):
+            compact_records = disk_backend.get_kv_object_records(
+                disk_keys,
+                roles=[_DSV4_HCA_DEFERRED_RETRIEVE_ROLE] * len(disk_keys),
+            )
+            disk_blocks = chunk_info_list[
+                preceding_hit_chunks : preceding_hit_chunks + len(disk_keys)
+            ]
+            hca_deferred_readable_limit = self._dsv4_hca_deferred_prefix_len(
+                disk_blocks,
+                disk_backend,
+                manager=self._dsv4_hca_object_source_manager(),
+            )
+            records = compact_records
+            use_hca_deferred_compact = True
         readable = 0
         staging_bytes = (
             int(self._tutti_config["slot_mb"])
@@ -1905,6 +2021,17 @@ class LMCacheEngine:
         for index, (key, record) in enumerate(
             zip(disk_keys, records, strict=True)
         ):
+            if (
+                hca_deferred_readable_limit is not None
+                and index >= hca_deferred_readable_limit
+            ):
+                logger.info(
+                    "TUTTI_OBJECT_STORE_PROFILE op=lookup_filter status=miss "
+                    "index=%d key=%s reason=hca_deferred_objects",
+                    index,
+                    key.to_string(),
+                )
+                break
             if record is None:
                 logger.info(
                     "TUTTI_OBJECT_STORE_PROFILE op=lookup_filter status=miss "
@@ -1913,18 +2040,11 @@ class LMCacheEngine:
                     key.to_string(),
                 )
                 break
-            if not record.raw_extents:
-                logger.info(
-                    "TUTTI_OBJECT_STORE_PROFILE op=lookup_filter status=miss "
-                    "index=%d key=%s reason=no_raw_extents",
-                    index,
-                    key.to_string(),
-                )
-                break
             read_record = self._tutti_lookup_read_record(
                 chunk_info_list[preceding_hit_chunks + index],
                 record,
                 total_tokens,
+                hca_deferred_compact=use_hca_deferred_compact,
             )
             if read_record is None:
                 logger.info(
@@ -2001,6 +2121,8 @@ class LMCacheEngine:
         chunk_info: tuple[int, int, CacheEngineKey],
         record: KVObjectRecord,
         total_tokens: int,
+        *,
+        hca_deferred_compact: bool = False,
     ) -> Optional[KVObjectRecord]:
         """Return the object record shape-adjusted the same way retrieve will read."""
         start, end, _key = chunk_info
@@ -2013,9 +2135,10 @@ class LMCacheEngine:
             start,
             end,
             total_tokens,
+            require_sector_readable=not hca_deferred_compact,
         )
         read_record = record
-        if read_ranges is not None:
+        if read_ranges is not None and not hca_deferred_compact:
             try:
                 read_record = record.with_byte_ranges(
                     tuple(
@@ -2036,7 +2159,7 @@ class LMCacheEngine:
         if requested_nbytes <= 0:
             return None
         if requested_nbytes < read_record.length:
-            if read_ranges is not None:
+            if read_ranges is not None and not hca_deferred_compact:
                 return None
             return self._kv_object_prefix_view(read_record, requested_nbytes)
         if requested_nbytes > read_record.length:
@@ -2085,6 +2208,15 @@ class LMCacheEngine:
             return None
         return fitted
 
+    def _dsv4_hca_defer_requested(self, total_tokens: int) -> bool:
+        """Return whether this request should use HCA-deferred retrieval."""
+        if not _env_flag("LMCACHE_DSV4_DEFER_HCA_TO_MOE"):
+            return False
+        if not _env_flag("LMCACHE_HCA_ENABLE_OBJECT_SOURCE"):
+            return False
+        max_tokens = _env_int("LMCACHE_DSV4_DEFER_HCA_MAX_TOKENS", 0)
+        return max_tokens <= 0 or total_tokens <= max_tokens
+
     def _dsv4_store_shapes_for_range(
         self,
         shapes: list[torch.Size],
@@ -2116,15 +2248,10 @@ class LMCacheEngine:
 
     def _dsv4_hca_defer_retrieve_enabled(self, total_tokens: int) -> bool:
         """Return whether retrieve should leave HCA payloads for overlap."""
-        if not _env_flag("LMCACHE_DSV4_DEFER_HCA_TO_MOE"):
-            return False
-        if not _env_flag("LMCACHE_HCA_ENABLE_OBJECT_SOURCE"):
+        if not self._dsv4_hca_defer_requested(total_tokens):
             return False
         manager = self._dsv4_hca_object_source_manager()
-        if manager is None:
-            return False
-        max_tokens = _env_int("LMCACHE_DSV4_DEFER_HCA_MAX_TOKENS", 0)
-        return max_tokens <= 0 or total_tokens <= max_tokens
+        return manager is not None
 
     def _dsv4_hca_object_source_manager(self) -> Any | None:
         """Return the active HCA manager when object-source reads are enabled."""
@@ -2186,6 +2313,36 @@ class LMCacheEngine:
             return connector_pairs
         return tuple((layer_id, layer_id) for layer_id in registered)
 
+    def _dsv4_hca_slab_layer_index_map(
+        self,
+        layer_pairs: tuple[tuple[int, int], ...],
+    ) -> dict[int, tuple[int, int]]:
+        """Return manager layer id to ``(slab_index, slab_layers)`` mapping."""
+        klg_manager = self.metadata.kv_layer_groups_manager
+        if klg_manager is None or not klg_manager.kv_layer_groups:
+            return {}
+        dtypes = self.metadata.get_dtypes()
+        result: dict[int, tuple[int, int]] = {}
+        for group, dtype in zip(
+            klg_manager.kv_layer_groups,
+            dtypes,
+            strict=False,
+        ):
+            if self._dsv4_group_role(group, dtype) != "hca_attention_kv":
+                continue
+            group_layer_ids = tuple(int(layer_id) for layer_id in group.layer_indices)
+            layer_index_by_id = {
+                object_layer_id: index
+                for index, object_layer_id in enumerate(group_layer_ids)
+            }
+            num_layers = len(group_layer_ids)
+            for manager_layer_id, object_layer_id in layer_pairs:
+                slab_index = layer_index_by_id.get(int(object_layer_id))
+                if slab_index is None:
+                    continue
+                result[int(manager_layer_id)] = (slab_index, num_layers)
+        return result
+
     def _dsv4_hca_object_source_available(
         self,
         blocks: list[tuple[CacheEngineKey, int, int]],
@@ -2197,7 +2354,23 @@ class LMCacheEngine:
         layer_pairs = self._dsv4_hca_object_source_layer_pairs(manager, **kwargs)
         if not blocks or not layer_pairs:
             return False
-        keys = [key for key, _, _ in blocks]
+        keys = [key for key, _start, _end in blocks]
+        slab_records = disk_backend.get_kv_object_records(
+            keys,
+            roles=["hca_attention_kv_slab"] * len(keys),
+        )
+        slab_map = self._dsv4_hca_slab_layer_index_map(layer_pairs)
+        if (
+            slab_map
+            and len(slab_map) == len(layer_pairs)
+            and slab_records
+            and all(record is not None for record in slab_records)
+        ):
+            for record in slab_records:
+                if not self._dsv4_kv_object_record_readable(disk_backend, record):
+                    break
+            else:
+                return True
         for _manager_layer_id, object_layer_id in layer_pairs:
             records = disk_backend.get_kv_object_records(
                 keys,
@@ -2215,7 +2388,123 @@ class LMCacheEngine:
                     else sum(1 for record in records if record is None),
                 )
                 return False
+            if any(
+                not self._dsv4_kv_object_record_readable(disk_backend, record)
+                for record in records
+            ):
+                logger.info(
+                    "HCAPrefetchManager: HCA object-source unavailable "
+                    "object_layer=%d blocks=%d reason=not_tutti_readable",
+                    object_layer_id,
+                    len(blocks),
+                )
+                return False
         return True
+
+    @staticmethod
+    def _dsv4_kv_object_record_readable(
+        disk_backend: Any,
+        record: Optional[KVObjectRecord],
+    ) -> bool:
+        """Return whether ``record`` is usable by the active object read path."""
+        if record is None:
+            return False
+        is_readable = getattr(disk_backend, "kv_object_record_raw_readable", None)
+        if callable(is_readable):
+            return bool(is_readable(record))
+        return True
+
+    def _dsv4_hca_deferred_retrieve_available(
+        self,
+        blocks: list[tuple[CacheEngineKey, int, int]],
+        disk_backend: Any,
+    ) -> bool:
+        """Return whether compact non-HCA retrieve objects are ready."""
+        if not blocks:
+            return False
+        keys = [key for key, _start, _end in blocks]
+        records = disk_backend.get_kv_object_records(
+            keys,
+            roles=[_DSV4_HCA_DEFERRED_RETRIEVE_ROLE] * len(keys),
+        )
+        if not records or any(record is None for record in records):
+            logger.info(
+                "HCAPrefetchManager: compact HCA-deferred retrieve unavailable "
+                "blocks=%d missing=%d",
+                len(blocks),
+                len(blocks)
+                if not records
+                else sum(1 for record in records if record is None),
+            )
+            return False
+        for record in records:
+            if not self._dsv4_kv_object_record_readable(disk_backend, record):
+                logger.info(
+                    "HCAPrefetchManager: compact HCA-deferred retrieve "
+                    "unavailable reason=not_tutti_readable blocks=%d",
+                    len(blocks),
+                )
+                return False
+        return True
+
+    def _dsv4_hca_deferred_prefix_len(
+        self,
+        blocks: list[tuple[int, int, CacheEngineKey]],
+        disk_backend: Any,
+        *,
+        manager: Any | None = None,
+        **kwargs: Any,
+    ) -> int:
+        """Return the contiguous prefix serviceable by HCA-deferred objects."""
+        if not blocks:
+            return 0
+        keys = [key for _start, _end, key in blocks]
+        compact_records = disk_backend.get_kv_object_records(
+            keys,
+            roles=[_DSV4_HCA_DEFERRED_RETRIEVE_ROLE] * len(keys),
+        )
+        slab_records = disk_backend.get_kv_object_records(
+            keys,
+            roles=["hca_attention_kv_slab"] * len(keys),
+        )
+        layer_pairs = (
+            self._dsv4_hca_object_source_layer_pairs(manager, **kwargs)
+            if manager is not None
+            else ()
+        )
+        per_layer_records = [
+            disk_backend.get_kv_object_records(
+                keys,
+                layer_ids=[object_layer_id] * len(keys),
+                roles=["hca_attention_kv"] * len(keys),
+            )
+            for _manager_layer_id, object_layer_id in layer_pairs
+        ]
+        readable = 0
+        for index, _block in enumerate(blocks):
+            compact = (
+                compact_records[index] if index < len(compact_records) else None
+            )
+            if not self._dsv4_kv_object_record_readable(disk_backend, compact):
+                break
+            slab = slab_records[index] if index < len(slab_records) else None
+            if self._dsv4_kv_object_record_readable(disk_backend, slab):
+                readable += 1
+                continue
+            if not per_layer_records:
+                break
+            if all(
+                index < len(records)
+                and self._dsv4_kv_object_record_readable(
+                    disk_backend,
+                    records[index],
+                )
+                for records in per_layer_records
+            ):
+                readable += 1
+                continue
+            break
+        return readable
 
     def _dsv4_register_hca_object_sources(
         self,
@@ -2223,68 +2512,153 @@ class LMCacheEngine:
         manager: Any,
         disk_backend: Any,
         **kwargs: Any,
-    ) -> None:
+    ) -> int:
         """Register per-layer object-source chunks for HCA overlap."""
         if self._tutti_loader is None or not blocks:
-            return
+            return 0
         layer_pairs = self._dsv4_hca_object_source_layer_pairs(manager, **kwargs)
         if not layer_pairs:
-            return
+            return 0
         try:
             from lmcache.v1.gpu_connector.tutti_direct_loader import LbaRecord
             from lmcache.v1.hca_prefetch_manager import HCAObjectChunk
         except ImportError:
-            return
+            return 0
 
-        keys = [key for key, _, _ in blocks]
+        keys = [key for key, _start, _end in blocks]
         object_source_entries = []
         combined_raw_lba_cache: dict[str, list[LbaRecord]] = {}
-        for manager_layer_id, object_layer_id in layer_pairs:
-            records = disk_backend.get_kv_object_records(
-                keys,
-                layer_ids=[object_layer_id] * len(keys),
-                roles=["hca_attention_kv"] * len(keys),
+        slab_records = disk_backend.get_kv_object_records(
+            keys,
+            roles=["hca_attention_kv_slab"] * len(keys),
+        )
+        slab_map = self._dsv4_hca_slab_layer_index_map(layer_pairs)
+        use_slab_records = (
+            slab_map
+            and len(slab_map) == len(layer_pairs)
+            and slab_records
+            and all(record is not None for record in slab_records)
+            and all(
+                self._dsv4_kv_object_record_readable(disk_backend, record)
+                for record in slab_records
             )
-            source_chunks = []
+        )
+        if use_slab_records:
+            slab_chunks_by_layer: dict[int, list[HCAObjectChunk]] = {}
             raw_lba_cache: dict[str, list[LbaRecord]] = {}
-            for (key, start, end), record in zip(blocks, records, strict=True):
-                if record is None:
-                    source_chunks = []
-                    break
-                path = disk_backend.kv_object_data_path(record)
-                if path is None:
-                    source_chunks = []
-                    break
-                source_chunks.append(
-                    HCAObjectChunk(
-                        start_row_id=start // 128,
-                        rows=max(0, (end - start) // 128),
-                        key=key,
-                        path=path,
-                        record=record,
-                    )
-                )
-                if record.raw_extents:
-                    raw_lba_cache.setdefault(path, []).extend(
-                        LbaRecord(
-                            file_offset=file_offset,
-                            slba=slba,
-                            n_sectors=n_sectors,
+            for manager_layer_id, _object_layer_id in layer_pairs:
+                slab_index, slab_layers = slab_map[int(manager_layer_id)]
+                source_chunks = []
+                for (key, start, end), record in zip(
+                    blocks,
+                    slab_records,
+                    strict=True,
+                ):
+                    if not self._dsv4_kv_object_record_readable(
+                        disk_backend,
+                        record,
+                    ):
+                        source_chunks = []
+                        break
+                    path = disk_backend.kv_object_data_path(record)
+                    if path is None:
+                        source_chunks = []
+                        break
+                    source_chunks.append(
+                        HCAObjectChunk(
+                            start_row_id=start // 128,
+                            rows=max(0, (end - start) // 128),
+                            key=key,
+                            path=path,
+                            record=record,
+                            slab_layer_index=slab_index,
+                            slab_num_layers=slab_layers,
                         )
-                        for file_offset, slba, n_sectors in record.raw_extents
                     )
-            if not source_chunks:
-                continue
-            for path, records_for_path in raw_lba_cache.items():
-                combined_raw_lba_cache.setdefault(path, []).extend(records_for_path)
-            object_source_entries.append(
-                (
-                    manager_layer_id,
-                    source_chunks,
-                    self._tutti_loader,
-                    self._tutti_warmup_lock,
+                    if record.raw_extents:
+                        raw_lba_cache.setdefault(path, []).extend(
+                            LbaRecord(
+                                file_offset=file_offset,
+                                slba=slba,
+                                n_sectors=n_sectors,
+                            )
+                            for file_offset, slba, n_sectors in record.raw_extents
+                        )
+                if source_chunks:
+                    slab_chunks_by_layer[int(manager_layer_id)] = source_chunks
+            if len(slab_chunks_by_layer) == len(layer_pairs):
+                for path, records_for_path in raw_lba_cache.items():
+                    combined_raw_lba_cache.setdefault(path, []).extend(
+                        records_for_path
+                    )
+                for manager_layer_id, source_chunks in slab_chunks_by_layer.items():
+                    object_source_entries.append(
+                        (
+                            manager_layer_id,
+                            source_chunks,
+                            self._tutti_loader,
+                            self._tutti_warmup_lock,
+                        )
+                    )
+                logger.info(
+                    "HCAPrefetchManager: registered HCA slab object-source "
+                    "chunks layers=%d blocks=%d",
+                    len(object_source_entries),
+                    len(blocks),
                 )
-            )
+
+        if not object_source_entries:
+            for manager_layer_id, object_layer_id in layer_pairs:
+                records = disk_backend.get_kv_object_records(
+                    keys,
+                    layer_ids=[object_layer_id] * len(keys),
+                    roles=["hca_attention_kv"] * len(keys),
+                )
+                source_chunks = []
+                raw_lba_cache: dict[str, list[LbaRecord]] = {}
+                for (key, start, end), record in zip(blocks, records, strict=True):
+                    if not self._dsv4_kv_object_record_readable(
+                        disk_backend,
+                        record,
+                    ):
+                        source_chunks = []
+                        break
+                    path = disk_backend.kv_object_data_path(record)
+                    if path is None:
+                        source_chunks = []
+                        break
+                    source_chunks.append(
+                        HCAObjectChunk(
+                            start_row_id=start // 128,
+                            rows=max(0, (end - start) // 128),
+                            key=key,
+                            path=path,
+                            record=record,
+                        )
+                    )
+                    if record.raw_extents:
+                        raw_lba_cache.setdefault(path, []).extend(
+                            LbaRecord(
+                                file_offset=file_offset,
+                                slba=slba,
+                                n_sectors=n_sectors,
+                            )
+                            for file_offset, slba, n_sectors in record.raw_extents
+                        )
+                if not source_chunks:
+                    continue
+                for path, records_for_path in raw_lba_cache.items():
+                    combined_raw_lba_cache.setdefault(path, []).extend(
+                        records_for_path
+                    )
+                object_source_entries.append(
+                    (
+                        manager_layer_id,
+                        source_chunks,
+                        self._tutti_loader,
+                        self._tutti_warmup_lock,
+                    )
+                )
         registered_layers = 0
         replace_sources = getattr(manager, "replace_object_sources", None)
         if object_source_entries and callable(replace_sources):
@@ -2324,6 +2698,7 @@ class LMCacheEngine:
                 len(blocks),
                 len(layer_pairs),
             )
+        return registered_layers
 
     def _dsv4_retrieve_view_for_range(
         self,
@@ -2332,6 +2707,8 @@ class LMCacheEngine:
         start: int,
         end: int,
         total_tokens: int,
+        *,
+        require_sector_readable: bool = True,
     ) -> tuple[list[torch.Size], Optional[Tuple[KVObjectByteRange, ...]]]:
         """Return retrieve shapes and compact object ranges for one chunk.
 
@@ -2388,7 +2765,10 @@ class LMCacheEngine:
         if not read_ranges:
             return stored_shapes, None
         compact_ranges = tuple(read_ranges)
-        if not _raw_ranges_sector_readable(compact_ranges, target_offset):
+        if require_sector_readable and not _raw_ranges_sector_readable(
+            compact_ranges,
+            target_offset,
+        ):
             logger.info(
                 "HCAPrefetchManager: skip compact HCA-deferred retrieve "
                 "start=%d end=%d compact_bytes=%d reason=unaligned_ranges",
@@ -3594,6 +3974,7 @@ class LMCacheEngine:
             read_ranges_per_key: Optional[
                 List[Optional[Tuple[KVObjectByteRange, ...]]]
             ] = None
+            kv_object_roles: Optional[List[str]] = None
 
             if location == "LocalDiskBackend" and self._tutti_config is not None:
                 if self._ensure_tutti_loader(keys):
@@ -3612,34 +3993,155 @@ class LMCacheEngine:
                                 **kwargs,
                             )
                         ):
-                            retrieve_views = [
-                                self._dsv4_retrieve_view_for_range(
-                                    self.metadata.get_shapes(end - start),
-                                    self.metadata.get_dtypes(),
-                                    start,
-                                    end,
-                                    total_tokens,
+                            registered_hca_layers = (
+                                self._dsv4_register_hca_object_sources(
+                                    blocks,
+                                    manager,
+                                    disk_backend,
+                                    **kwargs,
                                 )
-                                for _, start, end in blocks
-                            ]
-                            shapes_per_key = [
-                                shapes for shapes, _read_ranges in retrieve_views
-                            ]
-                            read_ranges_per_key = [
-                                read_ranges
-                                for _shapes, read_ranges in retrieve_views
-                            ]
-                            self._dsv4_register_hca_object_sources(
-                                blocks,
-                                manager,
-                                disk_backend,
+                            )
+                            if registered_hca_layers > 0:
+                                use_hca_deferred_compact = (
+                                    self._dsv4_hca_deferred_retrieve_available(
+                                        blocks,
+                                        disk_backend,
+                                    )
+                                )
+                                retrieve_views = [
+                                    self._dsv4_retrieve_view_for_range(
+                                        self.metadata.get_shapes(end - start),
+                                        self.metadata.get_dtypes(),
+                                        start,
+                                        end,
+                                        total_tokens,
+                                        require_sector_readable=not (
+                                            use_hca_deferred_compact
+                                        ),
+                                    )
+                                    for _, start, end in blocks
+                                ]
+                                shapes_per_key = [
+                                    shapes
+                                    for shapes, _read_ranges in retrieve_views
+                                ]
+                                if use_hca_deferred_compact:
+                                    kv_object_roles = [
+                                        _DSV4_HCA_DEFERRED_RETRIEVE_ROLE
+                                    ] * len(blocks)
+                                    read_ranges_per_key = None
+                                    logger.info(
+                                        "HCAPrefetchManager: using compact "
+                                        "HCA-deferred retrieve objects blocks=%d "
+                                        "registered_layers=%d",
+                                        len(blocks),
+                                        registered_hca_layers,
+                                    )
+                                else:
+                                    read_ranges_per_key = [
+                                        read_ranges
+                                        for _shapes, read_ranges in retrieve_views
+                                    ]
+                    stream_tutti_retrieve = (
+                        self.gpu_connector is not None
+                        and not self.save_only_first_rank
+                        and not _env_flag(
+                            "LMCACHE_TUTTI_DISABLE_STREAMING_RETRIEVE"
+                        )
+                    )
+                    streaming_consumed = False
+                    streaming_failed = False
+                    streamed_blocks = 0
+
+                    def _consume_tutti_batch(
+                        batch_start: int,
+                        batch_results: List[Optional[MemoryObj]],
+                    ) -> None:
+                        nonlocal last_failed_block_start
+                        nonlocal streaming_consumed, streaming_failed
+                        nonlocal streamed_blocks, tot_kv_size
+
+                        streaming_consumed = True
+                        batch_memory_objs: List[MemoryObj] = []
+                        batch_starts: List[int] = []
+                        batch_ends: List[int] = []
+                        batch_sizes: List[int] = []
+                        for offset, memory_obj in enumerate(batch_results):
+                            block_index = batch_start + offset
+                            if block_index >= len(blocks):
+                                if memory_obj is not None:
+                                    memory_obj.ref_count_down()
+                                continue
+                            _key, start, end = blocks[block_index]
+                            if streaming_failed or memory_obj is None:
+                                if memory_obj is not None:
+                                    memory_obj.ref_count_down()
+                                if not streaming_failed:
+                                    logger.warning(
+                                        "The cache block is in the storage, "
+                                        "but it can't be retrieved"
+                                    )
+                                    if (
+                                        last_failed_block_start is None
+                                        or last_failed_block_start > start
+                                    ):
+                                        last_failed_block_start = start
+                                    streaming_failed = True
+                                continue
+                            batch_memory_objs.append(memory_obj)
+                            batch_starts.append(start)
+                            batch_ends.append(end)
+                            batch_sizes.append(memory_obj.get_size())
+
+                        if not batch_memory_objs:
+                            return
+                        try:
+                            self.gpu_connector.batched_to_gpu(
+                                batch_memory_objs,
+                                batch_starts,
+                                batch_ends,
                                 **kwargs,
                             )
+                        finally:
+                            for memory_obj in batch_memory_objs:
+                                memory_obj.ref_count_down()
+                        for start, end, size in zip(
+                            batch_starts,
+                            batch_ends,
+                            batch_sizes,
+                            strict=True,
+                        ):
+                            ret_mask[start:end] = True
+                            tot_kv_size += size
+                            streamed_blocks += 1
+
                     memory_objs = self._tutti_batched_get(
                         keys,
                         shapes_per_key=shapes_per_key,
                         read_ranges_per_key=read_ranges_per_key,
+                        kv_object_roles=kv_object_roles,
+                        on_batch_loaded=(
+                            _consume_tutti_batch
+                            if stream_tutti_retrieve
+                            else None
+                        ),
                     )
+                    if streaming_consumed:
+                        if not streaming_failed and streamed_blocks < len(blocks):
+                            missing_start = blocks[streamed_blocks][1]
+                            if (
+                                last_failed_block_start is None
+                                or last_failed_block_start > missing_start
+                            ):
+                                last_failed_block_start = missing_start
+                        logger.info(
+                            "TUTTI_PROFILE streaming_retrieve blocks=%d/%d "
+                            "failed=%s",
+                            streamed_blocks,
+                            len(blocks),
+                            streaming_failed,
+                        )
+                        continue
                 elif self._tutti_can_cpu_fallback:
                     memory_objs = self.storage_manager.batched_get(
                         keys=keys,
