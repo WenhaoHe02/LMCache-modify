@@ -3342,12 +3342,18 @@ class LMCacheEngine:
         mask: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> Generator[Optional[torch.Tensor], None, None]:
-        """Retrieve DSv4 KV objects layer-by-layer via a single batched NVMe read.
+        """Retrieve DSv4 KV objects layer-by-layer via per-layer NVMe reads.
 
-        Issues ONE ``_tutti_batched_get`` call covering all transformer layers
-        in a background thread, then scatters each layer's data into vLLM KV
-        slots as the per-layer forward hooks fire.  This avoids the null-stream
-        serialisation that occurs when each layer issues its own Tutti batch.
+        Issues one ``_tutti_batched_get`` call per transformer layer.  A
+        rolling lookahead (env ``LMCACHE_DSV4_TUTTI_LAYERWISE_LOOKAHEAD``,
+        default 4) pre-submits upcoming layers to a thread pool so that I/O
+        for layer N+k is in-flight while layer N's scatter executes.
+
+        Running the full batch in a single background call while the vLLM
+        forward is active causes null-stream contention between the background
+        synchronize and the forward CUDA kernels, increasing TTFT by ~10×.
+        The per-layer approach avoids this: each layer's I/O completes before
+        or shortly after the corresponding forward hook fires.
         """
         if not self.is_healthy():
             logger.warning("LMCache is unhealthy, skipping DSv4 layer retrieve")
@@ -3441,17 +3447,27 @@ class LMCacheEngine:
         def _zero_shapes_like(shapes: list[torch.Size]) -> list[torch.Size]:
             return [self._zero_token_shape(shape) for shape in shapes]
 
-        # Build ONE flat batch covering ALL (layer × group × block) entries.
-        # A single _tutti_batched_get call avoids the null-stream serialisation
-        # that occurs when each layer issues its own Tutti batch on stream_ptr=0.
-        flat_keys: list[CacheEngineKey] = []
-        flat_roles: list[str] = []
-        flat_obj_layer_ids: list[int] = []
-        flat_shapes: list[list[torch.Size]] = []
-        # (layer_id, group_idx, object_layer_id, role, start, end) per flat entry
-        flat_meta: list[tuple[int, int, int, str, int, int]] = []
-
+        # Build per-layer batches.
+        # per_layer_batches[layer_id] = (keys, shapes, roles, obj_layer_ids, meta)
+        # meta entries are (group_idx, object_layer_id, role, start, end) — same
+        # order as keys so results can be re-associated by zip.
+        per_layer_batches: dict[
+            int,
+            tuple[
+                list[CacheEngineKey],
+                list[list[torch.Size]],
+                list[str],
+                list[int],
+                list[tuple[int, int, str, int, int]],
+            ],
+        ] = {}
+        total_keys = 0
         for layer_id in range(self.num_layers):
+            lkeys: list[CacheEngineKey] = []
+            lshapes: list[list[torch.Size]] = []
+            lroles: list[str] = []
+            lobj_ids: list[int] = []
+            lmeta: list[tuple[int, int, str, int, int]] = []
             for group_idx, object_layer_id, role in specs_by_layer.get(layer_id, []):
                 for start, end, key in blocks:
                     stored_shapes = self._dsv4_store_shapes_for_range(
@@ -3472,46 +3488,64 @@ class LMCacheEngine:
                             *[int(v) for v in group_shape[3:]],
                         ]
                     )
-                    layer_shapes = _zero_shapes_like(stored_shapes)
-                    layer_shapes[group_idx] = layer_shape
-                    flat_keys.append(key)
-                    flat_roles.append(role)
-                    flat_obj_layer_ids.append(object_layer_id)
-                    flat_shapes.append(layer_shapes)
-                    flat_meta.append(
-                        (layer_id, group_idx, object_layer_id, role, start, end)
-                    )
+                    key_shapes = _zero_shapes_like(stored_shapes)
+                    key_shapes[group_idx] = layer_shape
+                    lkeys.append(key)
+                    lshapes.append(key_shapes)
+                    lroles.append(role)
+                    lobj_ids.append(object_layer_id)
+                    lmeta.append((group_idx, object_layer_id, role, start, end))
+            if lkeys:
+                per_layer_batches[layer_id] = (lkeys, lshapes, lroles, lobj_ids, lmeta)
+                total_keys += len(lkeys)
 
         logger.info(
             "DSV4_LAYERWISE_TUTTI start layers=%d blocks=%d tokens=%d keys=%d",
             len(specs_by_layer),
             len(blocks),
             len(tokens),
-            len(flat_keys),
+            total_keys,
         )
 
-        if not flat_keys:
+        if not per_layer_batches:
             yield ret_mask.sum()
             yield None
             for lid in range(self.num_layers):
                 yield ret_mask if lid == self.num_layers - 1 else None
             return
 
-        # Single background worker: ONE big NVMe read for all layers at once.
+        workers = int(
+            os.environ.get("LMCACHE_DSV4_TUTTI_LAYERWISE_WORKERS", "1")
+        )
+        lookahead = int(
+            os.environ.get("LMCACHE_DSV4_TUTTI_LAYERWISE_LOOKAHEAD", "4")
+        )
         if self._dsv4_layerwise_executor is None:
             self._dsv4_layerwise_executor = ThreadPoolExecutor(
-                max_workers=1,
-                thread_name_prefix="dsv4-tutti-bulk",
+                max_workers=workers,
+                thread_name_prefix="dsv4-tutti-layer",
             )
-        io_t0 = time.perf_counter()
-        io_future: Future = self._dsv4_layerwise_executor.submit(
-            self._tutti_batched_get,
-            flat_keys,
-            flat_shapes,       # shapes_per_key positional arg
-            None,              # read_ranges_per_key
-            flat_roles,        # kv_object_roles
-            flat_obj_layer_ids,  # kv_object_layer_ids
-        )
+
+        layer_futures: dict[int, Future] = {}
+
+        def _submit_layer(lid: int) -> None:
+            if lid >= self.num_layers or lid in layer_futures:
+                return
+            if lid not in per_layer_batches:
+                return
+            lkeys, lshapes, lroles, lobj_ids, _ = per_layer_batches[lid]
+            layer_futures[lid] = self._dsv4_layerwise_executor.submit(
+                self._tutti_batched_get,
+                lkeys,
+                lshapes,
+                None,      # read_ranges_per_key
+                lroles,    # kv_object_roles
+                lobj_ids,  # kv_object_layer_ids
+            )
+
+        # Pre-submit first `lookahead` layers before forward starts.
+        for lid in range(min(lookahead, self.num_layers)):
+            _submit_layer(lid)
 
         pending_releases: list[tuple[torch.cuda.Event, list[MemoryObj]]] = []
 
@@ -3531,93 +3565,97 @@ class LMCacheEngine:
                     pending.append((event, objs))
             pending_releases[:] = pending
 
-        # Protocol primes: yield control so vLLM forward can start while I/O runs.
+        # Protocol primes.
         yield ret_mask.sum()
         yield None
 
-        # Wait for the single big I/O batch to complete.
-        all_memory_objs = io_future.result()
-        io_ms = (time.perf_counter() - io_t0) * 1000.0
-        logger.info(
-            "DSV4_LAYERWISE_TUTTI io_done io_ms=%.3f keys=%d",
-            io_ms,
-            len(flat_keys),
-        )
-
-        # Reorganize flat results by (layer_id, group_idx).
-        # layer_data[layer_id][group_idx] = {obj_layer_id, role, entries[(start,end,obj)]}
-        layer_data: dict[int, dict[int, dict]] = {}
-        for (layer_id, group_idx, object_layer_id, role, start, end), memory_obj in zip(
-            flat_meta, all_memory_objs
-        ):
-            if layer_id not in layer_data:
-                layer_data[layer_id] = {}
-            if group_idx not in layer_data[layer_id]:
-                layer_data[layer_id][group_idx] = {
-                    "object_layer_id": object_layer_id,
-                    "role": role,
-                    "entries": [],
-                }
-            layer_data[layer_id][group_idx]["entries"].append((start, end, memory_obj))
-
         try:
             for layer_id in range(self.num_layers):
+                # Advance lookahead window before blocking on current layer.
+                _submit_layer(layer_id + lookahead)
+
                 transfer_t0 = time.perf_counter()
                 loaded_groups = 0
+                wait_ms = 0.0
 
-                for group_idx, gdata in layer_data.get(layer_id, {}).items():
-                    object_layer_id = gdata["object_layer_id"]
-                    role = gdata["role"]
-                    entries = gdata["entries"]
+                if layer_id in layer_futures:
+                    wait_t0 = time.perf_counter()
+                    memory_objs = layer_futures.pop(layer_id).result()
+                    wait_ms = (time.perf_counter() - wait_t0) * 1000.0
 
-                    usable_objs: list[MemoryObj] = []
-                    usable_starts: list[int] = []
-                    usable_ends: list[int] = []
-                    ok = True
-                    for start, end, memory_obj in entries:
+                    _, _, _, _, lmeta = per_layer_batches[layer_id]
+
+                    # Reconstruct per-group entries from flat results.
+                    group_entries: dict[int, dict] = {}
+                    for (
+                        group_idx,
+                        object_layer_id,
+                        role,
+                        start,
+                        end,
+                    ), memory_obj in zip(lmeta, memory_objs):
+                        if group_idx not in group_entries:
+                            group_entries[group_idx] = {
+                                "object_layer_id": object_layer_id,
+                                "role": role,
+                                "objs": [],
+                                "starts": [],
+                                "ends": [],
+                                "ok": True,
+                            }
+                        gd = group_entries[group_idx]
+                        if not gd["ok"]:
+                            if memory_obj is not None:
+                                memory_obj.ref_count_down()
+                            continue
                         if memory_obj is None:
                             ret_mask[start:] = False
-                            ok = False
-                            break
-                        usable_objs.append(memory_obj)
-                        usable_starts.append(start)
-                        usable_ends.append(end)
+                            gd["ok"] = False
+                            _release_memory_objs(gd["objs"])
+                            gd["objs"] = []
+                        else:
+                            gd["objs"].append(memory_obj)
+                            gd["starts"].append(start)
+                            gd["ends"].append(end)
 
-                    if not ok or len(usable_objs) != len(entries):
-                        _release_memory_objs(usable_objs)
-                        logger.warning(
-                            "DSV4_LAYERWISE_TUTTI miss layer=%d role=%s group=%d",
-                            layer_id,
-                            role,
-                            group_idx,
-                        )
-                        continue
-
-                    release_now = True
-                    try:
-                        event = layer_to_gpu(
-                            layer_id,
-                            group_idx,
-                            object_layer_id,
-                            usable_objs,
-                            usable_starts,
-                            usable_ends,
-                            **kwargs,
-                        )
-                        if isinstance(event, torch.cuda.Event):
-                            pending_releases.append((event, usable_objs))
-                            release_now = False
-                        loaded_groups += 1
-                    finally:
-                        if release_now:
-                            _release_memory_objs(usable_objs)
+                    for group_idx, gd in group_entries.items():
+                        if not gd["ok"] or not gd["objs"]:
+                            if gd["ok"]:
+                                logger.warning(
+                                    "DSV4_LAYERWISE_TUTTI miss layer=%d"
+                                    " role=%s group=%d",
+                                    layer_id,
+                                    gd["role"],
+                                    group_idx,
+                                )
+                            continue
+                        release_now = True
+                        try:
+                            event = layer_to_gpu(
+                                layer_id,
+                                group_idx,
+                                gd["object_layer_id"],
+                                gd["objs"],
+                                gd["starts"],
+                                gd["ends"],
+                                **kwargs,
+                            )
+                            if isinstance(event, torch.cuda.Event):
+                                pending_releases.append((event, gd["objs"]))
+                                release_now = False
+                            loaded_groups += 1
+                        finally:
+                            if release_now:
+                                _release_memory_objs(gd["objs"])
 
                 _release_ready_memory_objs()
                 transfer_ms = (time.perf_counter() - transfer_t0) * 1000.0
                 logger.info(
-                    "DSV4_LAYERWISE_TUTTI layer=%d groups=%d transfer_ms=%.3f",
+                    "DSV4_LAYERWISE_TUTTI layer=%d groups=%d"
+                    " wait_ms=%.3f transfer_ms=%.3f",
                     layer_id,
                     loaded_groups,
+                    wait_ms,
                     transfer_ms,
                 )
                 if layer_id == self.num_layers - 1:
