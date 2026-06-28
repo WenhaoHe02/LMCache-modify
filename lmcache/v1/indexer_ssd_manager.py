@@ -206,6 +206,10 @@ _PREFILL_OVERLAP_PROFILE_LIMIT: int = max(
 _PREFILL_OVERLAP_READ_LIMIT: int = max(
     1, _env_int("LMCACHE_INDEXER_PREFILL_OVERLAP_READ_LIMIT", 256)
 )
+_PROXY_ASYNC_ENABLED = _env_flag("LMCACHE_INDEXER_PROXY_ASYNC")
+_PROXY_ASYNC_WORKERS = max(
+    1, _env_int("LMCACHE_INDEXER_PROXY_ASYNC_WORKERS", 2)
+)
 
 
 def _timing_enabled() -> bool:
@@ -667,6 +671,9 @@ class IndexerSSDManager:
 
         # Async I/O
         self._executor = ThreadPoolExecutor(max_workers=io_workers)
+        self._proxy_executor: Optional[ThreadPoolExecutor] = None
+        if _PROXY_ASYNC_ENABLED:
+            self._proxy_executor = ThreadPoolExecutor(max_workers=_PROXY_ASYNC_WORKERS)
         self._lock = threading.Lock()
         # pending async read results: layer_id → list of (token_id, Future[bytes])
         self._pending: Dict[int, List[Tuple[int, "Future[bytes]"]]] = {
@@ -703,6 +710,9 @@ class IndexerSSDManager:
         self._drain_futures: Dict[int, Optional[Future[None]]] = {
             lid: None for lid in csa_layer_ids
         }
+        self._proxy_futures: Dict[int, List[Future[None]]] = {
+            lid: [] for lid in csa_layer_ids
+        }
         self._direct_seed_tail_buffers: Dict[int, List[Tuple[int, torch.Tensor]]] = {
             lid: [] for lid in csa_layer_ids
         }
@@ -737,12 +747,15 @@ class IndexerSSDManager:
         self._timing_seen = 0
         logger.info(
             "IndexerSSDManager: config residual_proxy=%s reuse_prefetch=%s "
-            "decode_prefetch=%s prefill_proxy=%s prefill_rows=%d",
+            "decode_prefetch=%s prefill_proxy=%s prefill_rows=%d "
+            "proxy_async=%s proxy_async_workers=%d",
             _RESIDUAL_PROXY_ENABLED,
             self.reuse_prefetch_enabled(),
             _DECODE_PREFETCH_ENABLED,
             _PREFILL_RESIDUAL_PROXY_ENABLED,
             _PREFILL_PROXY_ROWS,
+            _PROXY_ASYNC_ENABLED,
+            _PROXY_ASYNC_WORKERS,
         )
 
     @staticmethod
@@ -1121,6 +1134,43 @@ class IndexerSSDManager:
             if run_native_proxy:
                 t_proxy0 = time.perf_counter()
                 try:
+                    if self._should_run_proxy_async(proxy_state):
+                        if self._submit_residual_proxy_topk_async(
+                            layer_id,
+                            proxy_state,
+                            positions,
+                            llama_4_scaling,
+                            topk_tail_rows=topk_tail_rows,
+                            is_prefill_proxy=is_prefill_proxy,
+                            fire_start=t0,
+                        ):
+                            proxy_ms = (time.perf_counter() - t_proxy0) * 1000.0
+                            self._log_timing(
+                                "prefill_fire_async"
+                                if is_prefill_proxy
+                                else "fire_async",
+                                layer_id,
+                                total_ms=f"{(time.perf_counter() - t0) * 1000.0:.3f}",
+                                proxy_ms=f"{proxy_ms:.3f}",
+                                filter_ms="0.000",
+                                submit_ms="0.000",
+                                prev=0,
+                                missing=0,
+                                mode="proxy_async_submit",
+                            )
+                            prev = self._prev_topk.get(layer_id)
+                            if prev is None:
+                                return
+                            self._submit_predicted_reads(
+                                layer_id,
+                                prev,
+                                cursor,
+                                is_prefill_proxy=is_prefill_proxy,
+                                fire_start=t0,
+                                proxy_ms=proxy_ms,
+                                mode="proxy_async_prev_fallback",
+                            )
+                            return
                     prev = self._residual_proxy_topk(
                         layer_id,
                         proxy_state,
@@ -1147,77 +1197,14 @@ class IndexerSSDManager:
         if prev is None:
             self._last_proxy_topk[layer_id] = None
             prev = self._prev_topk.get(layer_id)
-        if prev is None:
-            if layer_id not in self._debug_fire_no_prev_logged:
-                self._debug_fire_no_prev_logged.add(layer_id)
-                logger.debug(
-                    "IndexerSSDManager: fire_async_for_layer layer %d has no "
-                    "previous topk yet",
-                    layer_id,
-                )
-            return
-        t_filter0 = time.perf_counter()
-        prev = [tid for tid in prev if 0 <= tid < cursor]
-        if not prev:
-            return
-        pool = self._pools[layer_id]
-        store = self._stores[layer_id]
-        with self._lock:
-            pending_token_ids = set(self._inflight_tokens[layer_id])
-        missing = [
-            tid
-            for tid in prev
-            if not pool.contains(tid) and tid not in pending_token_ids
-        ]
-        filter_ms = (time.perf_counter() - t_filter0) * 1000.0
-        if not missing:
-            if layer_id not in self._debug_fire_active_logged:
-                self._debug_fire_active_logged.add(layer_id)
-                logger.debug(
-                    "IndexerSSDManager: fire_async_for_layer layer %d active, "
-                    "prev_topk=%d, all already resident",
-                    layer_id,
-                    len(prev),
-                )
-            self._log_timing(
-                "prefill_fire_async" if is_prefill_proxy else "fire_async",
-                layer_id,
-                total_ms=f"{(time.perf_counter() - t0) * 1000.0:.3f}",
-                proxy_ms=f"{proxy_ms:.3f}",
-                filter_ms=f"{filter_ms:.3f}",
-                submit_ms="0.000",
-                prev=len(prev),
-                missing=0,
-            )
-            return
-        if layer_id not in self._debug_fire_active_logged:
-            self._debug_fire_active_logged.add(layer_id)
-            logger.debug(
-                "IndexerSSDManager: fire_async_for_layer layer %d active, "
-                "prev_topk=%d, missing=%d",
-                layer_id,
-                len(prev),
-                len(missing),
-            )
-        t_submit0 = time.perf_counter()
-        futures = [
-            (tid, self._executor.submit(store.read_token, tid))
-            for tid in missing
-        ]
-        submit_ms = (time.perf_counter() - t_submit0) * 1000.0
-        with self._lock:
-            self._pending[layer_id].extend(futures)
-            self._inflight_tokens[layer_id].update(tid for tid, _ in futures)
-        self.prepare_layer_async(layer_id)
-        self._log_timing(
-            "prefill_fire_async" if is_prefill_proxy else "fire_async",
+        self._submit_predicted_reads(
             layer_id,
-            total_ms=f"{(time.perf_counter() - t0) * 1000.0:.3f}",
-            proxy_ms=f"{proxy_ms:.3f}",
-            filter_ms=f"{filter_ms:.3f}",
-            submit_ms=f"{submit_ms:.3f}",
-            prev=len(prev),
-            missing=len(missing),
+            prev,
+            cursor,
+            is_prefill_proxy=is_prefill_proxy,
+            fire_start=t0,
+            proxy_ms=proxy_ms,
+            mode="sync",
         )
 
     def prepare_layer_async(self, layer_id: int) -> None:
@@ -1343,6 +1330,272 @@ class IndexerSSDManager:
             submitted=len(futures),
         )
 
+    def _should_run_proxy_async(self, proxy_state: torch.Tensor) -> bool:
+        """Return whether residual-proxy top-k should use async completion."""
+        return (
+            _PROXY_ASYNC_ENABLED
+            and self._proxy_executor is not None
+            and proxy_state.is_cuda
+            and torch.cuda.is_available()
+        )
+
+    def _submit_predicted_reads(
+        self,
+        layer_id: int,
+        prev: Optional[List[int]],
+        cursor: int,
+        *,
+        is_prefill_proxy: bool,
+        fire_start: float,
+        proxy_ms: float,
+        mode: str,
+    ) -> bool:
+        """Filter predicted token IDs and submit missing CSA SSD reads.
+
+        Args:
+            layer_id: CSA layer for which reads should be submitted.
+            prev: Predicted token IDs, or ``None`` when no prediction exists.
+            cursor: Exclusive upper bound for initialized token IDs.
+            is_prefill_proxy: Whether the caller is a prefill proxy path.
+            fire_start: Start timestamp for timing diagnostics.
+            proxy_ms: Time already spent computing/submitting proxy work.
+            mode: Short label recorded in timing logs.
+
+        Returns:
+            True when the prediction was usable, even if all tokens were
+            already resident; False when no prediction existed.
+        """
+        if prev is None:
+            self._last_proxy_topk[layer_id] = None
+            if layer_id not in self._debug_fire_no_prev_logged:
+                self._debug_fire_no_prev_logged.add(layer_id)
+                logger.debug(
+                    "IndexerSSDManager: fire_async_for_layer layer %d has no "
+                    "previous topk yet",
+                    layer_id,
+                )
+            return False
+
+        t_filter0 = time.perf_counter()
+        filtered = [tid for tid in prev if 0 <= tid < cursor]
+        if not filtered:
+            return True
+        pool = self._pools[layer_id]
+        store = self._stores[layer_id]
+        with self._lock:
+            pending_token_ids = set(self._inflight_tokens[layer_id])
+        missing = [
+            tid
+            for tid in filtered
+            if not pool.contains(tid) and tid not in pending_token_ids
+        ]
+        filter_ms = (time.perf_counter() - t_filter0) * 1000.0
+        if not missing:
+            if layer_id not in self._debug_fire_active_logged:
+                self._debug_fire_active_logged.add(layer_id)
+                logger.debug(
+                    "IndexerSSDManager: fire_async_for_layer layer %d active, "
+                    "prev_topk=%d, all already resident",
+                    layer_id,
+                    len(filtered),
+                )
+            self._log_timing(
+                "prefill_fire_async" if is_prefill_proxy else "fire_async",
+                layer_id,
+                total_ms=f"{(time.perf_counter() - fire_start) * 1000.0:.3f}",
+                proxy_ms=f"{proxy_ms:.3f}",
+                filter_ms=f"{filter_ms:.3f}",
+                submit_ms="0.000",
+                prev=len(filtered),
+                missing=0,
+                mode=mode,
+            )
+            return True
+        if layer_id not in self._debug_fire_active_logged:
+            self._debug_fire_active_logged.add(layer_id)
+            logger.debug(
+                "IndexerSSDManager: fire_async_for_layer layer %d active, "
+                "prev_topk=%d, missing=%d",
+                layer_id,
+                len(filtered),
+                len(missing),
+            )
+
+        t_submit0 = time.perf_counter()
+        futures = [
+            (tid, self._executor.submit(store.read_token, tid))
+            for tid in missing
+        ]
+        submit_ms = (time.perf_counter() - t_submit0) * 1000.0
+        with self._lock:
+            self._pending[layer_id].extend(futures)
+            self._inflight_tokens[layer_id].update(tid for tid, _ in futures)
+        self.prepare_layer_async(layer_id)
+        self._log_timing(
+            "prefill_fire_async" if is_prefill_proxy else "fire_async",
+            layer_id,
+            total_ms=f"{(time.perf_counter() - fire_start) * 1000.0:.3f}",
+            proxy_ms=f"{proxy_ms:.3f}",
+            filter_ms=f"{filter_ms:.3f}",
+            submit_ms=f"{submit_ms:.3f}",
+            prev=len(filtered),
+            missing=len(missing),
+            mode=mode,
+        )
+        return True
+
+    def _submit_residual_proxy_topk_async(
+        self,
+        layer_id: int,
+        residual_f: torch.Tensor,
+        positions: torch.Tensor,
+        llama_4_scaling: Optional[torch.Tensor],
+        *,
+        topk_tail_rows: Optional[int],
+        is_prefill_proxy: bool,
+        fire_start: float,
+    ) -> bool:
+        """Submit residual-proxy top-k work on a side stream.
+
+        The CUDA work is enqueued immediately, then a background thread waits
+        on the recorded event, copies top-k IDs to CPU, and submits missing SSD
+        reads. This keeps the decoder hook from synchronizing on
+        ``valid.cpu().tolist()`` while MoE/FFN can continue on the default
+        stream.
+        """
+        proxy_executor = self._proxy_executor
+        if proxy_executor is None:
+            return False
+        decoder_layer = self._decoder_layers.get(layer_id)
+        if decoder_layer is None or not self._is_deepseek_v4_layer(decoder_layer):
+            return False
+        device_index = (
+            int(residual_f.device.index)
+            if residual_f.device.index is not None
+            else int(torch.cuda.current_device())
+        )
+        with torch.cuda.device(device_index):
+            proxy_stream = torch.cuda.Stream()
+            current_stream = torch.cuda.current_stream()
+            proxy_stream.wait_stream(current_stream)
+            try:
+                with torch.no_grad():
+                    with torch.cuda.stream(proxy_stream):
+                        residual_f.record_stream(proxy_stream)
+                        positions.record_stream(proxy_stream)
+                        topk_buf, num_rows = self._residual_proxy_topk_gpu(
+                            layer_id,
+                            decoder_layer,
+                            residual_f,
+                            positions,
+                            llama_4_scaling,
+                            topk_tail_rows=topk_tail_rows,
+                        )
+                        selected_topk = _tail_topk_rows(
+                            topk_buf,
+                            num_rows,
+                            topk_tail_rows,
+                        )
+                        valid = selected_topk.reshape(-1)
+                        valid = valid[valid >= 0]
+                        valid_cpu = torch.empty(
+                            (int(valid.numel()),),
+                            dtype=valid.dtype,
+                            device="cpu",
+                            pin_memory=True,
+                        )
+                        valid_cpu.copy_(valid, non_blocking=True)
+                        event = torch.cuda.Event()
+                        event.record(proxy_stream)
+            except Exception:
+                logger.debug(
+                    "IndexerSSDManager: async residual proxy submit failed "
+                    "for layer %d",
+                    layer_id,
+                    exc_info=True,
+                )
+                return False
+
+        cursor = self._decode_cursor.get(layer_id, 0)
+        future = proxy_executor.submit(
+            self._finish_residual_proxy_topk_async,
+            layer_id,
+            valid_cpu,
+            event,
+            cursor,
+            is_prefill_proxy,
+            fire_start,
+        )
+        with self._lock:
+            self._proxy_futures[layer_id].append(future)
+
+        def _clear_done(done_future: Future[None]) -> None:
+            try:
+                done_future.result()
+            except Exception:
+                logger.exception(
+                    "IndexerSSDManager: async residual proxy failed for layer %d",
+                    layer_id,
+                )
+            with self._lock:
+                futures = self._proxy_futures.get(layer_id)
+                if futures is not None and done_future in futures:
+                    futures.remove(done_future)
+
+        future.add_done_callback(_clear_done)
+        return True
+
+    def _finish_residual_proxy_topk_async(
+        self,
+        layer_id: int,
+        valid_cpu: torch.Tensor,
+        event: Any,
+        cursor: int,
+        is_prefill_proxy: bool,
+        fire_start: float,
+    ) -> None:
+        """Finish side-stream residual proxy and submit predicted reads."""
+        t0 = time.perf_counter()
+        event.synchronize()
+        token_ids = self._token_ids_from_cpu_topk(valid_cpu)
+        proxy_ms = (time.perf_counter() - t0) * 1000.0
+        self._last_proxy_topk[layer_id] = token_ids
+        if not token_ids:
+            self._log_residual_proxy_skip(layer_id, "empty_token_ids")
+            return
+        if layer_id not in self._debug_residual_proxy_logged:
+            self._debug_residual_proxy_logged.add(layer_id)
+            logger.info(
+                "IndexerSSDManager: residual_proxy layer %d spec_tokens=%d "
+                "mode=async",
+                layer_id,
+                len(token_ids),
+            )
+        self._submit_predicted_reads(
+            layer_id,
+            token_ids,
+            cursor,
+            is_prefill_proxy=is_prefill_proxy,
+            fire_start=fire_start,
+            proxy_ms=proxy_ms,
+            mode="proxy_async_finish",
+        )
+
+    @staticmethod
+    def _token_ids_from_cpu_topk(valid_cpu: torch.Tensor) -> List[int]:
+        """Convert a CPU top-k tensor to a de-duplicated token-id list."""
+        token_ids: List[int] = []
+        seen: Set[int] = set()
+        for tid in valid_cpu.tolist():
+            tid_int = int(tid)
+            if tid_int in seen:
+                continue
+            seen.add(tid_int)
+            token_ids.append(tid_int)
+            if len(token_ids) >= 1024:
+                break
+        return token_ids
+
     def _residual_proxy_topk(
         self,
         layer_id: int,
@@ -1364,44 +1617,18 @@ class IndexerSSDManager:
             return None
 
         with torch.no_grad():
-            proxy_hidden = self._v4_attention_proxy_hidden(decoder_layer, residual_f)
-            qr, kv_score, weights, indexer, rotary_emb = self._v4_indexer_inputs(
+            topk_buf, num_rows = self._residual_proxy_topk_gpu(
+                layer_id,
                 decoder_layer,
-                proxy_hidden,
+                residual_f,
+                positions,
+                llama_4_scaling,
+                topk_tail_rows=topk_tail_rows,
             )
-            indexer_op = getattr(indexer, "indexer_op", None)
-            if indexer_op is None:
-                self._log_residual_proxy_skip(layer_id, "indexer_op_missing")
-                return None
-            old_ssd_manager = getattr(indexer_op, "ssd_manager", None)
-            indexer_op.ssd_manager = None
-            saved_cache_rows = self._save_v4_proxy_cache_rows(indexer, indexer_op)
-            try:
-                indexer(proxy_hidden, qr, kv_score, weights, positions, rotary_emb)
-            finally:
-                self._restore_cache_rows(saved_cache_rows)
-                indexer_op.ssd_manager = old_ssd_manager
-            topk_buf = getattr(indexer_op, "topk_indices_buffer", None)
-            if topk_buf is None:
-                self._log_residual_proxy_skip(layer_id, "topk_buffer_missing")
-                return None
-            selected_topk = _tail_topk_rows(
-                topk_buf,
-                int(proxy_hidden.shape[0]),
-                topk_tail_rows,
-            )
+            selected_topk = _tail_topk_rows(topk_buf, num_rows, topk_tail_rows)
             valid = selected_topk.reshape(-1)
             valid = valid[valid >= 0]
-            token_ids = []
-            seen: Set[int] = set()
-            for tid in valid.cpu().tolist():
-                tid_int = int(tid)
-                if tid_int in seen:
-                    continue
-                seen.add(tid_int)
-                token_ids.append(tid_int)
-                if len(token_ids) >= 1024:
-                    break
+            token_ids = self._token_ids_from_cpu_topk(valid.cpu())
         if not token_ids:
             self._log_residual_proxy_skip(layer_id, "empty_token_ids")
         if layer_id not in self._debug_residual_proxy_logged:
@@ -1412,6 +1639,41 @@ class IndexerSSDManager:
                 len(token_ids),
             )
         return token_ids
+
+    def _residual_proxy_topk_gpu(
+        self,
+        layer_id: int,
+        decoder_layer: Any,
+        residual_f: torch.Tensor,
+        positions: torch.Tensor,
+        llama_4_scaling: Optional[torch.Tensor],
+        *,
+        topk_tail_rows: Optional[int],
+    ) -> tuple[torch.Tensor, int]:
+        """Run the V4 proxy indexer and return the GPU top-k buffer."""
+        del llama_4_scaling, topk_tail_rows
+        proxy_hidden = self._v4_attention_proxy_hidden(decoder_layer, residual_f)
+        qr, kv_score, weights, indexer, rotary_emb = self._v4_indexer_inputs(
+            decoder_layer,
+            proxy_hidden,
+        )
+        indexer_op = getattr(indexer, "indexer_op", None)
+        if indexer_op is None:
+            self._log_residual_proxy_skip(layer_id, "indexer_op_missing")
+            raise RuntimeError("DeepSeek V4 CSA indexer_op is missing")
+        old_ssd_manager = getattr(indexer_op, "ssd_manager", None)
+        indexer_op.ssd_manager = None
+        saved_cache_rows = self._save_v4_proxy_cache_rows(indexer, indexer_op)
+        try:
+            indexer(proxy_hidden, qr, kv_score, weights, positions, rotary_emb)
+        finally:
+            self._restore_cache_rows(saved_cache_rows)
+            indexer_op.ssd_manager = old_ssd_manager
+        topk_buf = getattr(indexer_op, "topk_indices_buffer", None)
+        if topk_buf is None:
+            self._log_residual_proxy_skip(layer_id, "topk_buffer_missing")
+            raise RuntimeError("DeepSeek V4 CSA topk buffer is missing")
+        return topk_buf, int(proxy_hidden.shape[0])
 
     @staticmethod
     def _is_deepseek_v4_layer(decoder_layer: Any) -> bool:
@@ -1577,10 +1839,14 @@ class IndexerSSDManager:
             block_table: ``[1, num_blocks]`` int32 on CUDA.
         """
         t0 = time.perf_counter()
+        proxy_wait_ms = 0.0
         ready_ms = 0.0
         drain_ms = 0.0
         sync_ms = 0.0
         waited_ready = False
+        t_proxy0 = time.perf_counter()
+        self._wait_proxy_futures(layer_id)
+        proxy_wait_ms = (time.perf_counter() - t_proxy0) * 1000.0
         with self._lock:
             ready_fut = self._ready_futures.get(layer_id)
             drain_fut = self._drain_futures.get(layer_id)
@@ -1626,6 +1892,7 @@ class IndexerSSDManager:
             "prepare_pool",
             layer_id,
             total_ms=f"{(time.perf_counter() - t0) * 1000.0:.3f}",
+            proxy_wait_ms=f"{proxy_wait_ms:.3f}",
             ready_ms=f"{ready_ms:.3f}",
             drain_ms=f"{drain_ms:.3f}",
             sync_ms=f"{sync_ms:.3f}",
@@ -1633,6 +1900,13 @@ class IndexerSSDManager:
             valid_slots=int((pool.pool_ids >= 0).sum().item()),
         )
         return pool.pool_tensor, pool.block_table
+
+    def _wait_proxy_futures(self, layer_id: int) -> None:
+        """Wait for side-stream residual proxy work targeting ``layer_id``."""
+        with self._lock:
+            futures = list(self._proxy_futures.get(layer_id, ()))
+        for future in futures:
+            future.result(timeout=self._prefill_ready_timeout_s)
 
     def pool_ids_for_layer(self, layer_id: int) -> torch.Tensor:
         """Return pool_ids tensor [pool_size] int64 for *layer_id*.
@@ -2492,10 +2766,13 @@ class IndexerSSDManager:
                 self._inflight_tokens[lid].clear()
                 self._ready_futures[lid] = None
                 self._drain_futures[lid] = None
+                self._proxy_futures[lid] = []
                 self._decode_cursor[lid] = 0
 
     def close(self) -> None:
         """Shut down I/O thread pool and close SSD files."""
+        if self._proxy_executor is not None:
+            self._proxy_executor.shutdown(wait=True)
         self._executor.shutdown(wait=True)
         for store in self._stores.values():
             store.close()

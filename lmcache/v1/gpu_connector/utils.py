@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: Apache-2.0
+﻿# SPDX-License-Identifier: Apache-2.0
 # This module is the single layer that performs format-dispatched raw
 # indexing on DiscoverableKVCache values (kv_caches.shape[i],
 # kv_caches[0][j]); the gpu_kv_format argument is the proof the
@@ -46,6 +46,10 @@ import lmcache.c_ops as lmc_ops
 
 logger = init_logger(__name__)
 
+GPUKV_FORMAT_NB_NL_TWO_NH_BS_HS = getattr(
+    lmc_ops.GPUKVFormat, "NB_NL_TWO_NH_BS_HS", None
+)
+
 # Canonical recursive type consumed by :func:`normalize_kv_and_discover_format`
 # and the downstream format-aware helpers. A value is either a single
 # :class:`torch.Tensor` (e.g. vLLM cross-layer, TRT-LLM) or a list of
@@ -56,7 +60,7 @@ logger = init_logger(__name__)
 DiscoverableKVCache = Union[torch.Tensor, list["DiscoverableKVCache"]]
 
 # Error message for accessing non-existent attributes in GPU KV Cache.
-# Parenthesized so Python actually concatenates the three string literals —
+# Parenthesized so Python actually concatenates the three string literals 鈥?
 # adjacent literals on *separate lines* at module scope do NOT concatenate
 # implicitly; without the parens, only the first fragment survives and the
 # {format} placeholder is lost.
@@ -72,13 +76,13 @@ class LayoutHints(TypedDict, total=False):
     registration (``REGISTER_KV_CACHE``).
 
     Serving engines may pass a plain ``dict`` that satisfies this
-    schema — importing this type is optional.
+    schema 鈥?importing this type is optional.
 
     Keys:
         kv_layout: Physical ordering of the KV cache dimensions.
-            ``"NHD"`` — heads after block-size (default for most
+            ``"NHD"`` 鈥?heads after block-size (default for most
             vLLM builds).
-            ``"HND"`` — heads before block-size (``VLLM_KV_CACHE_LAYOUT=HND``).
+            ``"HND"`` 鈥?heads before block-size (``VLLM_KV_CACHE_LAYOUT=HND``).
         num_kv_heads: Number of KV heads per layer. Used by TRT-LLM to
             reshape its 4-D pool tensor into the canonical 6-D form.
         tokens_per_block: Tokens per paged block. Used by TRT-LLM (same).
@@ -175,12 +179,12 @@ def _validate_dim0_padded_layout(tensor: torch.Tensor) -> int:
 
     The accepted layout requires:
 
-    * ``stride[-1] == 1`` and ``stride[-2] == shape[-1]`` — each block
+    * ``stride[-1] == 1`` and ``stride[-2] == shape[-1]`` 鈥?each block
       row is internally tightly packed.
     * Every interior dim ``i`` satisfies
-      ``stride[i] == prod(shape[i+1:])`` — only dim-0 may carry
+      ``stride[i] == prod(shape[i+1:])`` 鈥?only dim-0 may carry
       padding, with ``stride[0] >= prod(shape[1:])``.
-    * ``storage_offset == 0`` — no slice/narrow base shift.
+    * ``storage_offset == 0`` 鈥?no slice/narrow base shift.
 
     Callers must pass the stride-sorted permuted view (not the original
     tensor): for tensors that are both permuted and dim-0-padded, the
@@ -203,7 +207,7 @@ def _validate_dim0_padded_layout(tensor: torch.Tensor) -> int:
     def _fail(reason: str) -> None:
         raise ValueError(
             "attempt_permute_to_contiguous_view: tensor is non-contiguous "
-            f"and not a supported (dim-0 padding only) layout — {reason}. "
+            f"and not a supported (dim-0 padding only) layout 鈥?{reason}. "
             f"shape={shape}, stride={stride}, "
             f"storage_offset={storage_offset}, numel={int(tensor.numel())}, "
             f"storage_nbytes={int(tensor.untyped_storage().nbytes())}, "
@@ -262,14 +266,14 @@ def assert_contiguous(tensor: torch.Tensor) -> None:
 def is_cross_layer_format(gpu_kv_format: "lmc_ops.GPUKVFormat") -> bool:
     """Return ``True`` if *gpu_kv_format* stores all layers in one tensor.
 
-    Cross-layer formats — ``NB_NL_TWO_BS_NH_HS`` (vLLM, NHD) and
-    ``NB_NL_TWO_NH_BS_HS`` (TRT-LLM, HND) — are represented as a single
+    Cross-layer formats 鈥?``NB_NL_TWO_BS_NH_HS`` (vLLM, NHD) and
+    ``NB_NL_TWO_NH_BS_HS`` (TRT-LLM, HND) 鈥?are represented as a single
     bare :class:`torch.Tensor` rather than a list-of-tensors keyed by
     layer index.
     """
     return gpu_kv_format in (
         lmc_ops.GPUKVFormat.NB_NL_TWO_BS_NH_HS,
-        lmc_ops.GPUKVFormat.NB_NL_TWO_NH_BS_HS,
+        GPUKV_FORMAT_NB_NL_TWO_NH_BS_HS,
     )
 
 
@@ -319,7 +323,7 @@ def get_gpu_kv_shape_description(gpu_kv_format: "lmc_ops.GPUKVFormat") -> str:
         lmc_ops.GPUKVFormat.NL_X_NBBS_ONE_HS: "NL x [PBS, 1, HS]",
         lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS: "NL x [2, NB, NH, BS, HS]",
         lmc_ops.GPUKVFormat.NL_X_NB_TWO_NH_BS_HS: "NL x [NB, 2, NH, BS, HS]",
-        lmc_ops.GPUKVFormat.NB_NL_TWO_NH_BS_HS: "[NB, NL, 2, NH, BS, HS]",
+        GPUKV_FORMAT_NB_NL_TWO_NH_BS_HS: "[NB, NL, 2, NH, BS, HS]",
     }
     return _SHAPE_DESCRIPTIONS.get(gpu_kv_format, f"Unknown ({gpu_kv_format})")
 
@@ -341,7 +345,7 @@ def get_attention_backend(gpu_kv_format: "lmc_ops.GPUKVFormat") -> str:
         lmc_ops.GPUKVFormat.NL_X_NB_TWO_NH_BS_HS: (
             "vLLM non-MLA flash infer (HND layout)"
         ),
-        lmc_ops.GPUKVFormat.NB_NL_TWO_NH_BS_HS: "TRT-LLM cross-layer (HND layout)",
+        GPUKV_FORMAT_NB_NL_TWO_NH_BS_HS: "TRT-LLM cross-layer (HND layout)",
     }
     return _ATTENTION_BACKENDS.get(gpu_kv_format, f"Unknown ({gpu_kv_format})")
 
@@ -404,7 +408,7 @@ def get_concrete_gpu_kv_shape(
         bs = get_block_size(kv_caches, fmt)
         return f"{nl} x [{nb}, 2, {nh}, {bs}, {hs}]"
 
-    if fmt == F.NB_NL_TWO_NH_BS_HS:
+    if fmt == GPUKV_FORMAT_NB_NL_TWO_NH_BS_HS:
         nb = get_num_blocks(kv_caches, fmt)
         nh = get_num_heads(kv_caches, fmt)
         bs = get_block_size(kv_caches, fmt)
@@ -436,7 +440,7 @@ def _list_depth_tensor_dim(kv_caches: DiscoverableKVCache) -> tuple[int, int]:
         kv_caches: A :data:`DiscoverableKVCache` value.
 
     Returns:
-        ``(list_depth, tensor_ndim)`` — the number of list-wrapping
+        ``(list_depth, tensor_ndim)`` 鈥?the number of list-wrapping
         layers (0 for a bare tensor, 1 for a flat list, 2 for nested
         lists) and the ``ndim`` of the innermost tensor.
 
@@ -464,7 +468,7 @@ def normalize_kv_and_discover_format(
     Performs (in order):
       1. ``attempt_permute_to_contiguous_view``: stride-based dim
          permutation so ``.shape`` reflects the physical (not
-         permuted-logical) layout — critical for HND vs NHD detection.
+         permuted-logical) layout 鈥?critical for HND vs NHD detection.
          No-op if already contiguous; raises for non-permutation sources
          of non-contiguity (slicing, ``as_strided``).
       2. Format detection by descending list-wrapping and inspecting the
@@ -480,7 +484,7 @@ def normalize_kv_and_discover_format(
 
     Returns:
         ``(gpu_kv_format, normalized_kv_caches)``. Callers must use the
-        returned tensor structure for subsequent operations — it shares
+        returned tensor structure for subsequent operations 鈥?it shares
         storage with the input but may be a permuted view.
 
     Please see csrc/mem_kernels.cuh for the naming schema of the GPUKVFormat.
@@ -536,7 +540,7 @@ def normalize_kv_and_discover_format(
 
     if serving_engine == EngineType.TRTLLM:
         if list_depth == 0 and tensor_dim == 6:
-            detected_format = lmc_ops.GPUKVFormat.NB_NL_TWO_NH_BS_HS
+            detected_format = GPUKV_FORMAT_NB_NL_TWO_NH_BS_HS
     elif serving_engine == EngineType.VLLM:
         kv_layout = layout_hints.get("kv_layout")
         # NOTE: vLLM's CPU attention backend stores KV cache in HND layout.
@@ -600,7 +604,7 @@ def get_num_layers(
     """
     if gpu_kv_format in (
         lmc_ops.GPUKVFormat.NB_NL_TWO_BS_NH_HS,
-        lmc_ops.GPUKVFormat.NB_NL_TWO_NH_BS_HS,
+        GPUKV_FORMAT_NB_NL_TWO_NH_BS_HS,
     ):
         return kv_caches.shape[1]
     elif gpu_kv_format in (
@@ -627,20 +631,20 @@ def get_num_blocks(
     """
     if gpu_kv_format in (
         lmc_ops.GPUKVFormat.NB_NL_TWO_BS_NH_HS,
-        lmc_ops.GPUKVFormat.NB_NL_TWO_NH_BS_HS,
+        GPUKV_FORMAT_NB_NL_TWO_NH_BS_HS,
     ):
         return kv_caches.shape[0]
     elif gpu_kv_format in (
         lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
         lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS,
     ):
-        # [2, num_blocks, ...] — shape[1] is num_blocks
+        # [2, num_blocks, ...] 鈥?shape[1] is num_blocks
         return kv_caches[0].shape[1]
     elif gpu_kv_format in (
         lmc_ops.GPUKVFormat.NL_X_NB_TWO_BS_NH_HS,
         lmc_ops.GPUKVFormat.NL_X_NB_TWO_NH_BS_HS,
     ):
-        # [num_blocks, 2, ...] — shape[0] is num_blocks
+        # [num_blocks, 2, ...] 鈥?shape[0] is num_blocks
         return kv_caches[0].shape[0]
     elif gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_NB_BS_HS:
         return kv_caches[0].shape[0]
@@ -667,20 +671,20 @@ def get_block_size(
     """
     if gpu_kv_format == lmc_ops.GPUKVFormat.NB_NL_TWO_BS_NH_HS:
         return kv_caches.shape[3]
-    elif gpu_kv_format == lmc_ops.GPUKVFormat.NB_NL_TWO_NH_BS_HS:
-        # HND cross-layer: [NB, NL, 2, NH, BS, HS] — block_size at shape[4]
+    elif gpu_kv_format == GPUKV_FORMAT_NB_NL_TWO_NH_BS_HS:
+        # HND cross-layer: [NB, NL, 2, NH, BS, HS] 鈥?block_size at shape[4]
         return kv_caches.shape[4]
     elif gpu_kv_format in (
         lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
         lmc_ops.GPUKVFormat.NL_X_NB_TWO_BS_NH_HS,
     ):
-        # NHD: [..., BS, NH, HS] — block_size at shape[2]
+        # NHD: [..., BS, NH, HS] 鈥?block_size at shape[2]
         return kv_caches[layer_idx].shape[2]
     elif gpu_kv_format in (
         lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS,
         lmc_ops.GPUKVFormat.NL_X_NB_TWO_NH_BS_HS,
     ):
-        # HND: [..., NH, BS, HS] — block_size at shape[3]
+        # HND: [..., NH, BS, HS] 鈥?block_size at shape[3]
         return kv_caches[layer_idx].shape[3]
     elif gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_NB_BS_HS:
         return kv_caches[layer_idx].shape[1]
@@ -701,7 +705,7 @@ def get_page_buffer_size(
     if gpu_kv_format == lmc_ops.GPUKVFormat.NB_NL_TWO_BS_NH_HS:
         # [num_blocks, num_layers, 2, block_size, num_heads, head_size]
         return kv_caches.shape[0] * kv_caches.shape[3]
-    elif gpu_kv_format == lmc_ops.GPUKVFormat.NB_NL_TWO_NH_BS_HS:
+    elif gpu_kv_format == GPUKV_FORMAT_NB_NL_TWO_NH_BS_HS:
         # [num_blocks, num_layers, 2, num_heads, block_size, head_size]
         return kv_caches.shape[0] * kv_caches.shape[4]
     elif gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS:
@@ -741,20 +745,20 @@ def get_num_heads(
     """
     if gpu_kv_format == lmc_ops.GPUKVFormat.NB_NL_TWO_BS_NH_HS:
         return kv_caches.shape[4]  # global for cross-layer
-    elif gpu_kv_format == lmc_ops.GPUKVFormat.NB_NL_TWO_NH_BS_HS:
-        # HND cross-layer: [NB, NL, 2, NH, BS, HS] — num_heads at shape[3]
+    elif gpu_kv_format == GPUKV_FORMAT_NB_NL_TWO_NH_BS_HS:
+        # HND cross-layer: [NB, NL, 2, NH, BS, HS] 鈥?num_heads at shape[3]
         return kv_caches.shape[3]
     elif gpu_kv_format in (
         lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
         lmc_ops.GPUKVFormat.NL_X_NB_TWO_BS_NH_HS,
     ):
-        # NHD: [..., BS, NH, HS] — num_heads at shape[3]
+        # NHD: [..., BS, NH, HS] 鈥?num_heads at shape[3]
         return kv_caches[layer_idx].shape[3]
     elif gpu_kv_format in (
         lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS,
         lmc_ops.GPUKVFormat.NL_X_NB_TWO_NH_BS_HS,
     ):
-        # HND: [..., NH, BS, HS] — num_heads at shape[2]
+        # HND: [..., NH, BS, HS] 鈥?num_heads at shape[2]
         return kv_caches[layer_idx].shape[2]
     elif gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_NB_BS_HS:
         # MLA: heads are absorbed into hidden dim, so num_heads = 1
@@ -777,20 +781,20 @@ def get_hidden_dim_size(
     """
     if gpu_kv_format == lmc_ops.GPUKVFormat.NB_NL_TWO_BS_NH_HS:
         return kv_caches.shape[4] * kv_caches.shape[5]
-    elif gpu_kv_format == lmc_ops.GPUKVFormat.NB_NL_TWO_NH_BS_HS:
-        # HND cross-layer: [NB, NL, 2, NH, BS, HS] — hidden = NH * HS
+    elif gpu_kv_format == GPUKV_FORMAT_NB_NL_TWO_NH_BS_HS:
+        # HND cross-layer: [NB, NL, 2, NH, BS, HS] 鈥?hidden = NH * HS
         return kv_caches.shape[3] * kv_caches.shape[5]
     elif gpu_kv_format in (
         lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
         lmc_ops.GPUKVFormat.NL_X_NB_TWO_BS_NH_HS,
     ):
-        # NHD: [..., NH, HS] — hidden_dim = shape[3] * shape[4]
+        # NHD: [..., NH, HS] 鈥?hidden_dim = shape[3] * shape[4]
         return kv_caches[layer_idx].shape[3] * kv_caches[layer_idx].shape[4]
     elif gpu_kv_format in (
         lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS,
         lmc_ops.GPUKVFormat.NL_X_NB_TWO_NH_BS_HS,
     ):
-        # HND: [..., NH, BS, HS] — hidden_dim = NH * HS = shape[2] * shape[4]
+        # HND: [..., NH, BS, HS] 鈥?hidden_dim = NH * HS = shape[2] * shape[4]
         return kv_caches[layer_idx].shape[2] * kv_caches[layer_idx].shape[4]
     elif gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_NB_BS_HS:
         return kv_caches[layer_idx].shape[2]
@@ -812,7 +816,7 @@ def get_head_size(
     """
     if gpu_kv_format in (
         lmc_ops.GPUKVFormat.NB_NL_TWO_BS_NH_HS,
-        lmc_ops.GPUKVFormat.NB_NL_TWO_NH_BS_HS,
+        GPUKV_FORMAT_NB_NL_TWO_NH_BS_HS,
     ):
         return kv_caches.shape[5]
     elif gpu_kv_format in (
@@ -843,7 +847,7 @@ def get_tokens_per_layer(
     if gpu_kv_format == lmc_ops.GPUKVFormat.NB_NL_TWO_BS_NH_HS:
         # [num_blocks, num_layers, 2, block_size, num_heads, head_size]
         return kv_caches.shape[0] * kv_caches.shape[3]
-    elif gpu_kv_format == lmc_ops.GPUKVFormat.NB_NL_TWO_NH_BS_HS:
+    elif gpu_kv_format == GPUKV_FORMAT_NB_NL_TWO_NH_BS_HS:
         # [num_blocks, num_layers, 2, num_heads, block_size, head_size]
         return kv_caches.shape[0] * kv_caches.shape[4]
     elif gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS:
@@ -852,7 +856,7 @@ def get_tokens_per_layer(
         return k_cache_shape[0] * k_cache_shape[1]
     elif gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS:
         # list[num_layers] of [2, num_blocks, num_heads, block_size, head_size]
-        # k_cache = kv_caches[0][0] → (NB, NH, BS, HS); tokens = NB * BS
+        # k_cache = kv_caches[0][0] 鈫?(NB, NH, BS, HS); tokens = NB * BS
         k_cache_shape = kv_caches[0][0].shape
         return k_cache_shape[0] * k_cache_shape[2]
     elif gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_NB_TWO_BS_NH_HS:
@@ -861,7 +865,7 @@ def get_tokens_per_layer(
         return k_cache_shape[0] * k_cache_shape[1]
     elif gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_NB_TWO_NH_BS_HS:
         # list[num_layers] of [num_blocks, 2, num_heads, block_size, head_size]
-        # k_cache = kv_caches[0][:, 0] → (NB, NH, BS, HS); tokens = NB * BS
+        # k_cache = kv_caches[0][:, 0] 鈫?(NB, NH, BS, HS); tokens = NB * BS
         k_cache_shape = kv_caches[0][:, 0].shape
         return k_cache_shape[0] * k_cache_shape[2]
     elif gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_NB_BS_HS:
@@ -892,7 +896,7 @@ def get_elements_per_layer(
         num_heads = kv_caches.shape[4]
         head_size = kv_caches.shape[5]
         return num_blocks * 2 * block_size * num_heads * head_size
-    elif gpu_kv_format == lmc_ops.GPUKVFormat.NB_NL_TWO_NH_BS_HS:
+    elif gpu_kv_format == GPUKV_FORMAT_NB_NL_TWO_NH_BS_HS:
         # [num_blocks, num_layers, 2, num_heads, block_size, head_size]
         num_blocks = kv_caches.shape[0]
         num_heads = kv_caches.shape[3]
@@ -903,14 +907,14 @@ def get_elements_per_layer(
         lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
         lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS,
     ):
-        # [2, num_blocks, ...] — k_cache is kv_caches[0][0]
+        # [2, num_blocks, ...] 鈥?k_cache is kv_caches[0][0]
         k_cache_shape = kv_caches[0][0].shape
         return k_cache_shape.numel() * 2
     elif gpu_kv_format in (
         lmc_ops.GPUKVFormat.NL_X_NB_TWO_BS_NH_HS,
         lmc_ops.GPUKVFormat.NL_X_NB_TWO_NH_BS_HS,
     ):
-        # [num_blocks, 2, ...] — k_cache is kv_caches[0][:, 0]
+        # [num_blocks, 2, ...] 鈥?k_cache is kv_caches[0][:, 0]
         k_cache_shape = kv_caches[0][:, 0].shape
         return k_cache_shape.numel() * 2
     elif gpu_kv_format == lmc_ops.GPUKVFormat.NL_X_NB_BS_HS:
@@ -947,7 +951,7 @@ def is_hnd(gpu_kv_format: "lmc_ops.GPUKVFormat") -> bool:
     return gpu_kv_format in (
         lmc_ops.GPUKVFormat.NL_X_TWO_NB_NH_BS_HS,
         lmc_ops.GPUKVFormat.NL_X_NB_TWO_NH_BS_HS,
-        lmc_ops.GPUKVFormat.NB_NL_TWO_NH_BS_HS,
+        GPUKV_FORMAT_NB_NL_TWO_NH_BS_HS,
     )
 
 
@@ -997,7 +1001,7 @@ def get_dtype(
     """
     if gpu_kv_format in (
         lmc_ops.GPUKVFormat.NB_NL_TWO_BS_NH_HS,
-        lmc_ops.GPUKVFormat.NB_NL_TWO_NH_BS_HS,
+        GPUKV_FORMAT_NB_NL_TWO_NH_BS_HS,
     ):
         return kv_caches.dtype
     elif gpu_kv_format in (
@@ -1027,7 +1031,7 @@ def get_group_data_ptrs(
     caller. Three buckets, mirroring the kernel dispatch in
     ``csrc/mp_mem_kernels.cu:160-169``:
 
-    - Per-layer list formats: ``[p_{i0}, p_{i1}, ..., p_{iN}]`` — one
+    - Per-layer list formats: ``[p_{i0}, p_{i1}, ..., p_{iN}]`` 鈥?one
       pointer per requested layer, in the given order.
     - ``TWO_X_NL_X_NBBS_NH_HS`` (SGLang MHA): K's grouped first,
       then V's: ``[K_{i0}, ..., K_{iN}, V_{i0}, ..., V_{iN}]``.
@@ -1049,7 +1053,7 @@ def get_group_data_ptrs(
         ValueError: If *gpu_kv_format* is not recognized.
     """
     F = lmc_ops.GPUKVFormat
-    if gpu_kv_format in (F.NB_NL_TWO_BS_NH_HS, F.NB_NL_TWO_NH_BS_HS):
+    if gpu_kv_format in (F.NB_NL_TWO_BS_NH_HS, GPUKV_FORMAT_NB_NL_TWO_NH_BS_HS):
         tensor = cast(torch.Tensor, kv_caches)
         return [tensor.data_ptr()]
     if gpu_kv_format == F.TWO_X_NL_X_NBBS_NH_HS:
@@ -1093,7 +1097,7 @@ def get_device(kv_caches: DiscoverableKVCache) -> torch.device:
 # axis on dim-0, but no real serving engine emits a padded layout of
 # that format yet, and supporting it would require: (a) deciding
 # (without a ground-truth example) which axis carries the padding
-# — NB boundary vs K↔V offset — and (b) a coordinated change in
+# 鈥?NB boundary vs K鈫擵 offset 鈥?and (b) a coordinated change in
 # ``attempt_permute_to_contiguous_view`` to let interior-dim padding
 # through for that one format. Rather than ship an unverifiable code
 # path, we keep ``NL_X_NB_TWO_BS_NH_HS`` out of this set, which means
@@ -1154,7 +1158,7 @@ def resolve_block_stride_and_log_layout(
         # - Other formats: ``kv_caches`` is already a per-layer list.
         if gpu_kv_format in (
             lmc_ops.GPUKVFormat.NB_NL_TWO_BS_NH_HS,
-            lmc_ops.GPUKVFormat.NB_NL_TWO_NH_BS_HS,
+            GPUKV_FORMAT_NB_NL_TWO_NH_BS_HS,
         ):
             if not isinstance(kv_caches, torch.Tensor):
                 raise TypeError(
@@ -1255,7 +1259,7 @@ def make_page_buffer_shape_desc(
             sharing a row width with a larger group in the same pool);
             otherwise downstream transfer kernels will skip into
             padding and corrupt data. Leave as ``None`` for unpadded
-            pools — the kernel's ``per_block_stride()`` fallback
+            pools 鈥?the kernel's ``per_block_stride()`` fallback
             (block_stride_elems <= 0) will reconstruct the tight
             stride from ``kv_size`` and ``scalars_per_block`` itself,
             so we don't duplicate that arithmetic on the Python side.

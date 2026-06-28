@@ -497,6 +497,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         self._layer_name_to_vllm_group: dict[str, int] = {}
         self._vllm_group_block_sizes: tuple[int, ...] = ()
         self._hma_layout_logged = False
+        self._single_layer_ptr_cache: dict[tuple[int, int], torch.Tensor] = {}
 
         self.store_stream = torch.cuda.Stream()
         self.load_stream = torch.cuda.Stream()
@@ -606,6 +607,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                 self.group_tmp_buffer_capacities = []
 
         self.group_kv_cache_pointers_on_gpu = []
+        self._single_layer_ptr_cache = {}
         for group in klg_manager.kv_layer_groups:
             ptrs = get_group_data_ptrs(
                 self.kvcaches, self.gpu_kv_format, group.layer_indices
@@ -943,6 +945,50 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                     for layer_idx in group.layer_indices
                 )
         return tuple(dict.fromkeys(layer_ids))
+
+    def dsv4_layer_object_specs(
+        self,
+        **kwargs: object,
+    ) -> tuple[tuple[int, int, int, str], ...]:
+        """Return DSv4 per-transformer-layer object views.
+
+        Each tuple is ``(transformer_layer_id, group_idx, object_layer_id,
+        role)``.  The cache engine uses this to fetch one transformer's KV
+        layer from the existing multi-group KV-object store without enabling
+        LMCache's legacy layerwise storage format.
+        """
+        self._update_hma_metadata(**kwargs)
+        if not self._dsv4_optimized_layout_is_valid():
+            return ()
+        assert self.metadata.kv_layer_groups_manager is not None
+        specs: list[tuple[int, int, int, str]] = []
+        for group_idx, group in enumerate(
+            self.metadata.kv_layer_groups_manager.kv_layer_groups
+        ):
+            role = self._dsv4_group_role(group)
+            if role == "unknown":
+                continue
+            resolved = self._dsv4_layer_ids_for_group(group)
+            if len(resolved) == len(group.layer_indices):
+                specs.extend(
+                    (
+                        int(transformer_layer_id),
+                        int(group_idx),
+                        int(object_layer_id),
+                        role,
+                    )
+                    for transformer_layer_id, object_layer_id in zip(
+                        resolved,
+                        group.layer_indices,
+                        strict=True,
+                    )
+                )
+            else:
+                specs.extend(
+                    (int(layer_idx), int(group_idx), int(layer_idx), role)
+                    for layer_idx in group.layer_indices
+                )
+        return tuple(dict.fromkeys(specs))
 
     def _prepare_csa_direct_seed_for_group(
         self,
@@ -1396,6 +1442,125 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
             self.gpu_kv_format,
             skip_prefix_n_blocks,
         )
+
+    def _single_layer_shape_desc(
+        self,
+        group: KVLayerGroupInfo,
+    ) -> "lmc_ops.PageBufferShapeDesc":
+        desc = lmc_ops.PageBufferShapeDesc()
+        desc.kv_size = group.shape_desc.kv_size
+        desc.nl = 1
+        desc.nb = group.shape_desc.nb
+        desc.bs = group.shape_desc.bs
+        desc.nh = group.shape_desc.nh
+        desc.hs = group.shape_desc.hs
+        desc.element_size = group.shape_desc.element_size
+        desc.block_stride_elems = group.shape_desc.block_stride_elems
+        return desc
+
+    def _single_layer_ptrs(
+        self,
+        group_idx: int,
+        object_layer_id: int,
+    ) -> torch.Tensor:
+        cache_key = (int(group_idx), int(object_layer_id))
+        cached = self._single_layer_ptr_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        assert self.kvcaches is not None
+        ptrs = get_group_data_ptrs(
+            self.kvcaches,
+            self.gpu_kv_format,
+            [int(object_layer_id)],
+        )
+        cpu = torch.empty(len(ptrs), dtype=torch.int64, device="cpu")
+        cpu.numpy()[:] = ptrs
+        gpu = torch.empty(len(ptrs), dtype=torch.int64, device=self.device)
+        gpu.copy_(cpu)
+        self._single_layer_ptr_cache[cache_key] = gpu
+        return gpu
+
+    def dsv4_layer_to_gpu(
+        self,
+        transformer_layer_id: int,
+        group_idx: int,
+        object_layer_id: int,
+        memory_objs: list[MemoryObj],
+        starts: list[int],
+        ends: list[int],
+        **kwargs: object,
+    ) -> torch.cuda.Event:
+        """Transfer one DSv4 transformer-layer object view into vLLM KV cache."""
+        if not memory_objs:
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(device=self.device))
+            return event
+        slot_mapping = kwargs.get("slot_mapping")
+        if not isinstance(slot_mapping, torch.Tensor):
+            raise ValueError("'slot_mapping' should be provided for layer transfer")
+        self.initialize_kvcaches_ptr(**kwargs)
+        assert self.kvcaches is not None
+        assert self.kvcaches[0].device == self.device
+        self._initialize_kv_cache_pointers()
+        assert self.metadata.kv_layer_groups_manager is not None
+        group = self.metadata.kv_layer_groups_manager.kv_layer_groups[group_idx]
+        shape_desc = self._single_layer_shape_desc(group)
+        layer_ptrs = self._single_layer_ptrs(group_idx, object_layer_id)
+        with torch.cuda.stream(self.load_stream):
+            for memory_obj, start, end in zip(
+                memory_objs,
+                starts,
+                ends,
+                strict=False,
+            ):
+                memory_tensor = memory_obj.get_tensor(group_idx)
+                if memory_tensor is None or memory_tensor.numel() == 0:
+                    continue
+                hma_block_ids = self._hma_block_ids_for_group(
+                    group_idx,
+                    start,
+                    end,
+                    **kwargs,
+                )
+                if hma_block_ids is None:
+                    block_ids = self._slot_mapping_to_block_ids(
+                        slot_mapping,
+                        start,
+                        end,
+                    )
+                    logical_block_size = int(
+                        self.layout_hints.get(
+                            "inference_engine_logical_block_size",
+                            self.block_size,
+                        )
+                    )
+                else:
+                    block_ids, logical_block_size = hma_block_ids
+                vllm_cached = kwargs.get("vllm_cached_tokens", 0)
+                skip_prefix_n_tokens = min(
+                    end - start,
+                    max(0, int(vllm_cached) - start),
+                )
+                if skip_prefix_n_tokens % logical_block_size != 0:
+                    raise ValueError(
+                        f"skip_prefix_n_tokens {skip_prefix_n_tokens} is not "
+                        f"aligned to block size {logical_block_size}"
+                    )
+                lmc_ops.multi_layer_block_kv_transfer(
+                    layer_ptrs,
+                    [memory_tensor.data_ptr()],
+                    block_ids,
+                    self.device,
+                    lmc_ops.TransferDirection.H2D,
+                    shape_desc,
+                    group.physical_chunk_size,
+                    self.gpu_kv_format,
+                    skip_prefix_n_tokens // logical_block_size,
+                )
+            event = torch.cuda.Event()
+            event.record(self.load_stream)
+        torch.cuda.current_stream(device=self.device).wait_event(event)
+        return event
 
     @_lmcache_nvtx_annotate
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):

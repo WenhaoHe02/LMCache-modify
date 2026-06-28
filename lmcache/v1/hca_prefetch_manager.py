@@ -379,6 +379,8 @@ class HCAPrefetchManager:
         self._active_slots: dict[int, torch.Tensor] = {}
         self._active_fire_plans: dict[int, tuple[list[int], list[int]]] = {}
         self._active_fired_layers: set[int] = set()
+        self._active_request_suspended = False
+        self._ready_layers: set[int] = set()
         self._memory_backing: dict[int, dict[int, HCAMemoryRange]] = {}
         self._memory_backed_layers: set[int] = set()
         self._object_sources: dict[int, HCAObjectSource] = {}
@@ -391,6 +393,9 @@ class HCAPrefetchManager:
         self._debug_object_submit_logged: set[int] = set()
         self._debug_expire_logged: set[int] = set()
         self._memory_backing_enabled = _env_flag("LMCACHE_HCA_ENABLE_MEMORY_BACKING")
+        self._gpu_backing_enabled = _env_flag("LMCACHE_HCA_ENABLE_GPU_BACKING")
+        self._gpu_backing_rows: dict[int, torch.Tensor] = {}
+        self._gpu_backing_end: dict[int, int] = {}
         self._timing_enabled = _env_flag("LMCACHE_HCA_TIMING") or _env_flag(
             "LMCACHE_INDEXER_TIMING"
         )
@@ -409,11 +414,12 @@ class HCAPrefetchManager:
         )
         logger.info(
             "HCAPrefetchManager: blocking_drain=%s async_hbm_drain=%s "
-            "gpu_ordered_drain=%s object_source=%s",
+            "gpu_ordered_drain=%s object_source=%s gpu_backing=%s",
             self._blocking_drain,
             self._async_hbm_drain,
             self._gpu_ordered_drain,
             self._object_source_enabled,
+            self._gpu_backing_enabled,
         )
         global _ACTIVE_MANAGER
         _ACTIVE_MANAGER = self
@@ -763,16 +769,26 @@ class HCAPrefetchManager:
 
         timing = self._timing_enabled
         t0 = time.perf_counter() if timing else 0.0
-        t_cpu0 = time.perf_counter() if timing else 0.0
-        tensor_cpu = memory_tensor.detach()
-        if tensor_cpu.device.type != "cpu":
-            tensor_cpu = tensor_cpu.to(device="cpu", non_blocking=False)
-        cpu_ms = (time.perf_counter() - t_cpu0) * 1000.0 if timing else 0.0
-        t_contig0 = time.perf_counter() if timing else 0.0
-        tensor_cpu = tensor_cpu.contiguous()
-        contiguous_ms = (
-            (time.perf_counter() - t_contig0) * 1000.0 if timing else 0.0
+        gpu_backed = (
+            self._gpu_backing_enabled
+            and memory_tensor.is_cuda
         )
+        if gpu_backed:
+            tensor_gpu = memory_tensor.detach().contiguous()
+            cpu_ms = 0.0
+            contiguous_ms = 0.0
+            tensor_cpu = None
+        else:
+            t_cpu0 = time.perf_counter() if timing else 0.0
+            tensor_cpu = memory_tensor.detach()
+            if tensor_cpu.device.type != "cpu":
+                tensor_cpu = tensor_cpu.to(device="cpu", non_blocking=False)
+            cpu_ms = (time.perf_counter() - t_cpu0) * 1000.0 if timing else 0.0
+            t_contig0 = time.perf_counter() if timing else 0.0
+            tensor_cpu = tensor_cpu.contiguous()
+            contiguous_ms = (
+                (time.perf_counter() - t_contig0) * 1000.0 if timing else 0.0
+            )
 
         seeded = 0
         reshape_ms = 0.0
@@ -790,7 +806,11 @@ class HCAPrefetchManager:
                     f"{state.compress_ratio}"
                 )
             t_reshape0 = time.perf_counter() if timing else 0.0
-            layer_rows = tensor_cpu[
+            if gpu_backed:
+                source_tensor = tensor_gpu
+            else:
+                source_tensor = tensor_cpu
+            layer_rows = source_tensor[
                 :,
                 group_layer_idx,
                 :rows_to_seed,
@@ -807,7 +827,25 @@ class HCAPrefetchManager:
                     f"{state.row_bytes} bytes"
                 )
             t_write0 = time.perf_counter() if timing else 0.0
-            if memory_backed:
+            if gpu_backed:
+                flat_rows_u8 = flat_rows.view(torch.uint8).reshape(
+                    rows_to_seed, state.row_bytes
+                )
+                self._ensure_gpu_backing(
+                    state,
+                    flat_rows_u8.device,
+                    start_row + rows_to_seed,
+                )
+                gpu_buf = self._gpu_backing_rows[int(layer_id)]
+                gpu_buf[start_row : start_row + rows_to_seed].copy_(
+                    flat_rows_u8, non_blocking=True
+                )
+                with self._lock:
+                    self._gpu_backing_end[int(layer_id)] = max(
+                        self._gpu_backing_end.get(int(layer_id), 0),
+                        start_row + rows_to_seed,
+                    )
+            elif memory_backed:
                 with self._lock:
                     if start_row == 0:
                         self._memory_backing[int(layer_id)] = {}
@@ -866,6 +904,23 @@ class HCAPrefetchManager:
             self._active_slots.clear()
             self._active_fire_plans.clear()
             self._active_fired_layers.clear()
+            self._active_request_suspended = False
+
+    def suspend_active_request(self) -> None:
+        """Disable HCA fire/drain work for the current active request."""
+        self._release_completed_copies(blocking=False)
+        with self._lock:
+            self._active_slots.clear()
+            self._active_fire_plans.clear()
+            self._active_fired_layers.clear()
+            self._ready_layers.clear()
+            self._pending.clear()
+            self._active_request_suspended = True
+
+    def active_request_suspended(self) -> bool:
+        """Return whether current-request HCA fire/drain work is suspended."""
+        with self._lock:
+            return self._active_request_suspended
 
     def set_active_request_slots(
         self,
@@ -909,6 +964,8 @@ class HCAPrefetchManager:
         Returns:
             Number of layers with a non-empty plan submitted or already covered.
         """
+        if self.active_request_suspended():
+            return 0
         prefire_limit = max(0, _env_int("LMCACHE_HCA_ACTIVE_PREFIRE_LIMIT", 0))
         layer_ids = []
         for layer_id in sorted(self._active_fire_plans):
@@ -937,6 +994,8 @@ class HCAPrefetchManager:
 
     def fire_for_seq_len(self, layer_id: int, seq_len: int) -> None:
         """Fire deterministic HCA reads for a prefix length."""
+        if self.active_request_suspended():
+            return
         state = self._layers.get(layer_id)
         if state is None or seq_len <= 0 or state.initialized_rows <= 0:
             return
@@ -956,6 +1015,8 @@ class HCAPrefetchManager:
                 the deterministic compressed row range. This works for both
                 prefill-hit chunks and one-token decode.
         """
+        if self.active_request_suspended():
+            return
         state = self._layers.get(layer_id)
         if state is None:
             return
@@ -1010,6 +1071,8 @@ class HCAPrefetchManager:
         Returns:
             Number of layers that were submitted or already covered.
         """
+        if self.active_request_suspended():
+            return 0
         ordered_layer_ids = tuple(dict.fromkeys(int(v) for v in layer_ids))
         if not ordered_layer_ids:
             return 0
@@ -1086,6 +1149,7 @@ class HCAPrefetchManager:
                         )
                     self._pending.setdefault(layer_id, []).extend(pending_reads)
                     self._active_fired_layers.add(layer_id)
+                self._attach_ready_callbacks(layer_id, pending_reads)
                 continue
             if layer_id in fallback_layers:
                 fired = self._fire_rows(layer_id, state, row_ids)
@@ -1136,6 +1200,24 @@ class HCAPrefetchManager:
                 )
             return True
 
+        if self._gpu_backing_enabled:
+            t_gpu0 = time.perf_counter() if timing else 0.0
+            if self._fire_via_gpu_backing(layer_id, state, missing):
+                if timing and t0 is not None:
+                    self._log_timing(
+                        "fire",
+                        layer_id,
+                        total_ms=f"{(time.perf_counter() - t0) * 1000.0:.3f}",
+                        slots_ms=f"{slots_ms:.3f}",
+                        filter_ms=f"{filter_ms:.3f}",
+                        submit_ms=f"{(time.perf_counter() - t_gpu0) * 1000.0:.3f}",
+                        rows=len(row_ids),
+                        missing=len(missing),
+                        pending=0,
+                        mode="gpu_backing",
+                    )
+                return True
+
         t_submit0 = time.perf_counter() if timing else 0.0
         pending_reads = self._build_pending_reads(state, missing)
         with self._lock:
@@ -1148,6 +1230,7 @@ class HCAPrefetchManager:
                     )
                 )
             self._pending.setdefault(layer_id, []).extend(pending_reads)
+        self._attach_ready_callbacks(layer_id, pending_reads)
         submit_ms = (time.perf_counter() - t_submit0) * 1000.0 if timing else 0.0
         if missing and layer_id not in self._debug_fire_logged:
             self._debug_fire_logged.add(layer_id)
@@ -1233,12 +1316,16 @@ class HCAPrefetchManager:
             layer_id: Target HCA layer whose pending reads should be drained
                 from the caller's CUDA context when their I/O futures are ready.
         """
+        if self.active_request_suspended():
+            return
         if not self._async_hbm_drain:
             return
         if layer_id not in self._layers:
             return
         self._release_completed_copies(layer_id, blocking=False)
         if not self._has_ready_pending(layer_id):
+            with self._lock:
+                self._ready_layers.discard(layer_id)
             return
         self._drain_for_layer_once(
             layer_id,
@@ -1254,6 +1341,8 @@ class HCAPrefetchManager:
                 drained from the caller's CUDA context when their I/O futures
                 are already complete.
         """
+        if self.active_request_suspended():
+            return
         if not self._async_hbm_drain:
             return
         if not layer_ids:
@@ -1274,6 +1363,57 @@ class HCAPrefetchManager:
                 synchronize_copy=False,
             )
 
+    def prepare_active_request_layers(self, limit: int = 0) -> int:
+        """Enqueue ready copy-back work for layers already fired in this request.
+
+        Args:
+            limit: Maximum number of fired layers to inspect. ``0`` means all
+                fired layers.
+
+        Returns:
+            Number of fired layers considered for opportunistic copy-back.
+        """
+        if self.active_request_suspended():
+            return 0
+        if not self._async_hbm_drain:
+            return 0
+        with self._lock:
+            layer_ids = sorted(self._active_fired_layers)
+        if limit > 0:
+            layer_ids = layer_ids[:limit]
+        if not layer_ids:
+            return 0
+        self.prepare_layers_async(layer_ids)
+        return len(layer_ids)
+
+    def prepare_ready_layers(self, limit: int = 0) -> int:
+        """Enqueue copy-back for HCA layers whose read futures completed.
+
+        I/O worker callbacks only mark layer IDs as ready; this method is
+        called from the model thread and is the only place that launches CUDA
+        scatter work for those completions.
+
+        Args:
+            limit: Maximum number of ready layers to drain. ``0`` means all.
+
+        Returns:
+            Number of ready layers considered for copy-back.
+        """
+        if self.active_request_suspended():
+            return 0
+        if not self._async_hbm_drain:
+            return 0
+        with self._lock:
+            layer_ids = sorted(self._ready_layers)
+            if limit > 0:
+                layer_ids = layer_ids[:limit]
+            for layer_id in layer_ids:
+                self._ready_layers.discard(layer_id)
+        if not layer_ids:
+            return 0
+        self.prepare_layers_async(layer_ids)
+        return len(layer_ids)
+
     def drain_for_layer(self, layer_id: int, blocking: bool | None = None) -> None:
         """Drain pending HCA reads into the target layer's vLLM KV cache.
 
@@ -1282,6 +1422,8 @@ class HCAPrefetchManager:
             blocking: Override for whether this drain should wait for pending
                 reads. ``None`` uses the manager's configured default.
         """
+        if self.active_request_suspended():
+            return
         with self._lock:
             drain_future = self._drain_futures.get(layer_id)
         if drain_future is not None:
@@ -1291,6 +1433,7 @@ class HCAPrefetchManager:
                     self._drain_futures[layer_id] = None
         effective_blocking = self._blocking_drain if blocking is None else blocking
         gpu_ordered = self._async_hbm_drain and self._gpu_ordered_drain
+        self._release_completed_copies(layer_id, blocking=False)
         with self._lock:
             has_pending = bool(self._pending.get(layer_id))
             has_copy_work = bool(self._copy_releases.get(layer_id))
@@ -1303,7 +1446,8 @@ class HCAPrefetchManager:
         )
         if not effective_blocking:
             self._expire_pending_reads_for_layer(layer_id)
-        if gpu_ordered and self._order_pending_copies_on_current_stream(layer_id):
+        if gpu_ordered:
+            self._order_pending_copies_on_current_stream(layer_id)
             self._release_completed_copies(layer_id, blocking=False)
         else:
             self._release_completed_copies(layer_id, blocking=effective_blocking)
@@ -1510,6 +1654,27 @@ class HCAPrefetchManager:
 
         return _release_expired
 
+    def _attach_ready_callbacks(
+        self,
+        layer_id: int,
+        pending_reads: Sequence[HCAPendingRead],
+    ) -> None:
+        """Mark ``layer_id`` ready when pending HCA I/O futures complete."""
+        if not pending_reads:
+            return
+        for pending_read in pending_reads:
+            pending_read.future.add_done_callback(
+                lambda _future, ready_layer_id=layer_id: self._mark_layer_ready(
+                    ready_layer_id
+                )
+            )
+
+    def _mark_layer_ready(self, layer_id: int) -> None:
+        """Record that a layer has completed reads awaiting model-thread drain."""
+        with self._lock:
+            if layer_id in self._layers and self._pending.get(layer_id):
+                self._ready_layers.add(layer_id)
+
     @staticmethod
     def _buffer_obj_from_pending_result(pending_read: HCAPendingRead) -> Any | None:
         """Return the ref-counted buffer object held by a completed pending read."""
@@ -1593,12 +1758,20 @@ class HCAPrefetchManager:
                     )
 
     def _order_pending_copies_on_current_stream(self, layer_id: int) -> bool:
-        """Make the current CUDA stream wait for pending HCA copy-back events."""
+        """Order pending HCA copy-back before the current CUDA stream.
+
+        GPU-ordered drain must not release staging buffers immediately after
+        ``current_stream.wait_event(copy_event)``. The wait only enqueues a GPU
+        dependency; CPU execution continues. This method therefore replaces
+        each copy event with a release event recorded on the current stream
+        after the wait, letting non-blocking release polling retire buffers once
+        attention has passed the dependency.
+        """
         state = self._layers.get(layer_id)
         if state is None or not state.kv_cache.is_cuda or not torch.cuda.is_available():
             return False
         with self._lock:
-            pending = list(self._copy_releases.get(layer_id, ()))
+            pending = self._copy_releases.pop(layer_id, [])
         if not pending:
             return False
         device = state.kv_cache.device
@@ -1607,10 +1780,16 @@ class HCAPrefetchManager:
             if device.index is not None
             else int(torch.cuda.current_device())
         )
+        ordered: list[tuple[Any, list[Any]]] = []
         with torch.cuda.device(device_index):
             current_stream = torch.cuda.current_stream()
-            for event, _release_objs in pending:
+            for event, release_objs in pending:
                 current_stream.wait_event(event)
+                release_event = torch.cuda.Event()
+                release_event.record(current_stream)
+                ordered.append((release_event, release_objs))
+        with self._lock:
+            self._copy_releases.setdefault(layer_id, []).extend(ordered)
         return True
 
     @staticmethod
@@ -1622,6 +1801,114 @@ class HCAPrefetchManager:
                     memory_obj.ref_count_down()
             return
         buffer_obj.ref_count_down()
+
+    def _ensure_gpu_backing(
+        self,
+        state: HCALayerState,
+        device: torch.device,
+        required_rows: int,
+    ) -> None:
+        """Lazily allocate a per-layer HBM-resident HCA row buffer.
+
+        Args:
+            state: HCA layer state whose row data should live in HBM.
+            device: CUDA device to host the backing buffer.
+            required_rows: Minimum number of compressed rows the buffer must
+                cover; used to size the lazy allocation.
+        """
+        layer_id = state.layer_id
+        with self._lock:
+            existing = self._gpu_backing_rows.get(layer_id)
+        if existing is not None and existing.shape[0] >= required_rows:
+            return
+        target_rows = max(required_rows, self._max_seq_len // state.compress_ratio)
+        target_rows = max(target_rows, required_rows)
+        if existing is not None and existing.shape[0] >= target_rows:
+            return
+        if device.type != "cuda":
+            return
+        new_buf = torch.empty(
+            (target_rows, state.row_bytes),
+            dtype=torch.uint8,
+            device=device,
+        )
+        if existing is not None:
+            new_buf[: existing.shape[0]].copy_(existing, non_blocking=True)
+        with self._lock:
+            self._gpu_backing_rows[layer_id] = new_buf
+
+    def _gpu_backed_end_row(self, layer_id: int) -> int:
+        """Return the exclusive end row currently populated in GPU backing."""
+        with self._lock:
+            return int(self._gpu_backing_end.get(layer_id, 0))
+
+    def _fire_via_gpu_backing(
+        self,
+        layer_id: int,
+        state: HCALayerState,
+        missing: list[tuple[int, int]],
+    ) -> bool:
+        """Fast-path fire: scatter from HBM-resident HCA rows into KV slots.
+
+        Args:
+            layer_id: Target HCA layer id.
+            state: Layer state with HBM-resident gpu_rows backing.
+            missing: Row id / slot id pairs that still need KV scatter.
+
+        Returns:
+            ``True`` when all missing rows were scattered through HBM-to-HBM
+            copy on the drain stream and the row ids were registered as
+            resident; ``False`` if the backing buffer does not cover the
+            requested rows (caller falls back to the pinned-slab path).
+        """
+        if not missing:
+            return True
+        end_row = self._gpu_backed_end_row(layer_id)
+        if end_row <= 0:
+            return False
+        max_row = -1
+        for row_id, _slot_id in missing:
+            if row_id > max_row:
+                max_row = row_id
+        if max_row >= end_row:
+            return False
+        with self._lock:
+            gpu_buf = self._gpu_backing_rows.get(layer_id)
+        if gpu_buf is None:
+            return False
+        if not state.kv_cache.is_cuda:
+            return False
+        if state.kv_cache.dtype != torch.uint8:
+            return False
+
+        device = state.kv_cache.device
+        row_ids_list = [row_id for row_id, _slot_id in missing]
+        slot_ids_list = [slot_id for _row_id, slot_id in missing]
+        device_index = int(device.index) if device.index is not None else 0
+        with torch.cuda.device(device_index):
+            row_ids_tensor = torch.tensor(
+                row_ids_list, dtype=torch.long, device=device
+            )
+            src = gpu_buf.index_select(0, row_ids_tensor)
+            if state.kv_cache.is_contiguous():
+                slot_tensor = torch.tensor(
+                    slot_ids_list, dtype=torch.long, device=device
+                )
+                flat_kv = state.kv_cache.reshape(
+                    state.kv_cache.shape[0] * state.block_size, -1
+                )
+                flat_kv.index_copy_(0, slot_tensor, src)
+            else:
+                self._write_row_major_to_kv_cache(
+                    state,
+                    slot_ids_list,
+                    src,
+                    len(slot_ids_list),
+                )
+        with self._lock:
+            resident = self._resident_hbm.setdefault(layer_id, set())
+            resident.update(row_id for row_id, _slot_id in missing)
+        return True
 
     @staticmethod
     def _dedupe_lba_cache(records_by_path: dict[str, list[Any]]) -> dict[str, list[Any]]:

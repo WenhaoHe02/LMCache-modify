@@ -10,6 +10,7 @@ import inspect
 import math
 import os
 import re
+import time
 import weakref
 
 # Third Party
@@ -73,6 +74,65 @@ _DEEPSEEK_DECODER_REGISTRY_HOOK_INSTALLED: bool = False
 _HCA_ATTACH_ATTEMPTED: bool = False
 _OVERLAP_HOOK_ERROR_LOGGED: set[tuple[str, int, str]] = set()
 _SCHEDULER_HMA_INVALID_BLOCK_PATCH_INSTALLED: bool = False
+_TTFT_PROFILE_FORWARD_LOGGED: set[tuple[str, int]] = set()
+_TTFT_PROFILE_HC_PRE_LOGGED: set[tuple[str, int]] = set()
+_DSV4_TUTTI_LAYERWISE_ADAPTERS: Any = weakref.WeakSet()
+
+
+def _ttft_profile_enabled() -> bool:
+    """Return whether request-level TTFT stage markers should be logged."""
+    value = os.environ.get("LMCACHE_TTFT_STAGE_PROFILE", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _dsv4_tutti_layerwise_ttft_enabled() -> bool:
+    """Return whether DSv4 Tutti TTFT layerwise restore is enabled."""
+    value = os.environ.get("LMCACHE_DSV4_TUTTI_LAYERWISE_TTFT", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _ttft_profile_request_id() -> str:
+    """Return the best-effort active request id for TTFT stage markers."""
+    try:
+        manager = _get_current_lmcache_connector_metadata()
+    except Exception:
+        manager = None
+    requests = getattr(manager, "requests", ()) if manager is not None else ()
+    for request in requests:
+        req_id = getattr(request, "req_id", None)
+        if req_id:
+            return str(req_id)
+    return "unknown"
+
+
+def _advance_dsv4_tutti_layerwise(layer_id: int) -> None:
+    """Advance env-gated DSv4 Tutti layerwise restore at decoder layer entry."""
+    if not _dsv4_tutti_layerwise_ttft_enabled():
+        return
+    for adapter in list(_DSV4_TUTTI_LAYERWISE_ADAPTERS):
+        if not getattr(adapter, "_dsv4_tutti_layerwise_hook_active", False):
+            continue
+        if not getattr(adapter, "layerwise_retrievers", None):
+            continue
+        if int(getattr(adapter, "current_layer", -1)) != int(layer_id):
+            continue
+        try:
+            adapter.wait_for_layer_load(f"model.layers.{layer_id}")
+        except StopIteration:
+            logger.exception(
+                "DSv4 Tutti layerwise retriever ended early at layer %d",
+                layer_id,
+            )
+            adapter.layerwise_retrievers = []
+            adapter._dsv4_tutti_layerwise_hook_active = False
+        except Exception:
+            logger.exception(
+                "DSv4 Tutti layerwise restore failed at layer %d",
+                layer_id,
+            )
+            adapter.layerwise_retrievers = []
+            adapter._dsv4_tutti_layerwise_hook_active = False
+            raise
 
 
 def _block_ids_at_index(block_id_groups: tuple[list[int], ...], idx: int) -> set[int]:
@@ -418,6 +478,12 @@ def _hca_blocking_drain_enabled() -> bool:
     if value is None:
         return False
     return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _hca_skip_retrieve_ttft_drain_enabled() -> bool:
+    """Return whether full-hit TTFT should skip duplicate HCA active drains."""
+    value = os.environ.get("LMCACHE_HCA_SKIP_RETRIEVE_TTFT_DRAIN")
+    return value is not None and value.lower() in {"1", "true", "yes", "on"}
 
 
 def _vllm_kv_reuse_seed_enabled() -> bool:
@@ -785,6 +851,22 @@ def _install_decoder_forward_position_hook(decoder_layer: Any) -> bool:
             args,
             kwargs,
         )
+        if _ttft_profile_enabled():
+            req_id = _ttft_profile_request_id()
+            layer_id = int(getattr(self, "layer_idx", -1))
+            key = (req_id, layer_id)
+            if key not in _TTFT_PROFILE_FORWARD_LOGGED:
+                _TTFT_PROFILE_FORWARD_LOGGED.add(key)
+                logger.info(
+                    "LMCACHE_TTFT_STAGE req_id=%s event=decoder_forward_enter "
+                    "layer=%d t=%.9f",
+                    req_id,
+                    layer_id,
+                    time.perf_counter(),
+                )
+        layer_id = int(getattr(self, "layer_idx", -1))
+        if layer_id >= 0:
+            _advance_dsv4_tutti_layerwise(layer_id)
         try:
             return original_forward(*args, **kwargs)
         finally:
@@ -847,6 +929,12 @@ def _fire_decoder_ffn_overlap(
     hca_targets = getattr(decoder_layer, "_lmcache_next_hca_layer_ids", ())
     if hca_manager is not None and isinstance(hca_targets, tuple) and hca_targets:
         try:
+            prepare_ready = getattr(hca_manager, "prepare_ready_layers", None)
+            if callable(prepare_ready):
+                prepare_ready(_hca_prepare_lookahead())
+            prepare_active = getattr(hca_manager, "prepare_active_request_layers", None)
+            if callable(prepare_active):
+                prepare_active(_hca_prepare_lookahead())
             hca_fired = getattr(hca_manager, "layer_fired_for_active_request", None)
             fire_layers = getattr(hca_manager, "fire_async_for_layers", None)
             pending_targets = tuple(
@@ -894,6 +982,19 @@ def _install_decoder_hc_pre_overlap_hook(decoder_layer: Any) -> bool:
             args,
             kwargs,
         ):
+            if _ttft_profile_enabled():
+                req_id = _ttft_profile_request_id()
+                layer_id = int(getattr(self, "layer_idx", -1))
+                key = (req_id, layer_id)
+                if key not in _TTFT_PROFILE_HC_PRE_LOGGED:
+                    _TTFT_PROFILE_HC_PRE_LOGGED.add(key)
+                    logger.info(
+                        "LMCACHE_TTFT_STAGE req_id=%s event=hc_pre_enter "
+                        "layer=%d t=%.9f",
+                        req_id,
+                        layer_id,
+                        time.perf_counter(),
+                    )
             positions = _positions_from_source(
                 getattr(self, "_lmcache_forward_position_source", None),
                 hidden_states,
@@ -958,6 +1059,9 @@ def _install_hca_attention_drain_hook(
     def _lmcache_hca_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
         active_manager = getattr(self, "_lmcache_hca_prefetch_manager", manager)
         active_layer_id = getattr(self, "_lmcache_hca_layer_id", layer_id)
+        prepare_ready = getattr(active_manager, "prepare_ready_layers", None)
+        if callable(prepare_ready):
+            prepare_ready(_hca_prepare_lookahead())
         drain = getattr(active_manager, "drain_for_layer", None)
         if callable(drain):
             drain(
@@ -1824,6 +1928,7 @@ class LMCacheConnectorV1Impl:
             vllm_config.parallel_config
         )
         self.current_layer = 0
+        self._dsv4_tutti_layerwise_hook_active = False
 
         self.force_skip_save = bool(os.environ.get("LMCACHE_FORCE_SKIP_SAVE", False))
         self._requests_priority: dict[str, int] = {}
@@ -2083,6 +2188,8 @@ class LMCacheConnectorV1Impl:
             forward_context (ForwardContext): the forward context.
             **kwargs: additional arguments for the load operation
         """
+        start_load_profile_enabled = _ttft_profile_enabled()
+        start_load_t0 = time.perf_counter() if start_load_profile_enabled else 0.0
         self.current_layer = 0
 
         if len(self.kv_caches) == 0:
@@ -2125,6 +2232,11 @@ class LMCacheConnectorV1Impl:
             if request.load_spec is None or not request.load_spec.can_load:
                 continue
 
+            request_profile_t0 = (
+                time.perf_counter() if start_load_profile_enabled else 0.0
+            )
+            retrieve_ms = 0.0
+            post_retrieve_ms = 0.0
             tokens = request.token_ids
             # TODO: have a pre-allocated buffer to hold the slot_mappings
             slot_mapping = request.slot_mapping.to(self.device)
@@ -2140,7 +2252,44 @@ class LMCacheConnectorV1Impl:
 
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
             hma_kwargs = self._hma_transfer_kwargs(request)
-            if self.use_layerwise:
+            use_dsv4_tutti_layerwise = (
+                _dsv4_tutti_layerwise_ttft_enabled()
+                and request.load_spec.vllm_cached_tokens == 0
+                and lmcache_cached_tokens > 0
+                and hasattr(self.lmcache_engine, "retrieve_dsv4_tutti_layers")
+            )
+            if use_dsv4_tutti_layerwise:
+                retrieve_t0 = time.perf_counter() if start_load_profile_enabled else 0.0
+                layerwise_retriever = self.lmcache_engine.retrieve_dsv4_tutti_layers(
+                    tokens[:lmcache_cached_tokens],
+                    token_mask[:lmcache_cached_tokens],
+                    kvcaches=kvcaches,
+                    slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                    vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                    request_configs=request.request_configs,
+                    req_id=request.req_id,
+                    **hma_kwargs,
+                )
+                next(layerwise_retriever)
+                next(layerwise_retriever)
+                self.layerwise_retrievers.append((layerwise_retriever, request))
+                self._dsv4_tutti_layerwise_hook_active = True
+                try:
+                    _DSV4_TUTTI_LAYERWISE_ADAPTERS.add(self)
+                except TypeError:
+                    pass
+                if start_load_profile_enabled:
+                    retrieve_ms = (time.perf_counter() - retrieve_t0) * 1000.0
+                    logger.info(
+                        "LMCACHE_TTFT_STAGE req_id=%s "
+                        "event=start_load_layerwise_prime total_ms=%.3f "
+                        "tokens=%d t=%.9f",
+                        request.req_id,
+                        retrieve_ms,
+                        len(tokens),
+                        time.perf_counter(),
+                    )
+            elif self.use_layerwise:
                 if idx == last_idx:
                     sync = True
                 else:
@@ -2170,6 +2319,7 @@ class LMCacheConnectorV1Impl:
                     next(layerwise_retriever)
                     self.layerwise_retrievers.append((layerwise_retriever, request))
             else:
+                retrieve_t0 = time.perf_counter() if start_load_profile_enabled else 0.0
                 ret_token_mask = self.lmcache_engine.retrieve(
                     tokens[:lmcache_cached_tokens],
                     token_mask[:lmcache_cached_tokens],
@@ -2180,8 +2330,13 @@ class LMCacheConnectorV1Impl:
                     req_id=request.req_id,
                     **hma_kwargs,
                 )
+                if start_load_profile_enabled:
+                    retrieve_ms = (time.perf_counter() - retrieve_t0) * 1000.0
 
                 # Check the result
+                post_retrieve_t0 = (
+                    time.perf_counter() if start_load_profile_enabled else 0.0
+                )
                 num_retrieved_tokens = ret_token_mask.sum().item()
                 num_expected_tokens = (
                     lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
@@ -2209,11 +2364,33 @@ class LMCacheConnectorV1Impl:
                     )
                     self._invalid_block_ids.update(missing_blocks)
                 else:
-                    self._prepare_hca_active_slots(
-                        request,
-                        lmcache_cached_tokens,
-                        request.slot_mapping,
+                    skip_hca_retrieve_drain = (
+                        _hca_skip_retrieve_ttft_drain_enabled()
+                        and request.load_spec.vllm_cached_tokens == 0
+                        and num_retrieved_tokens == num_expected_tokens
+                        and num_expected_tokens > 0
                     )
+                    if skip_hca_retrieve_drain:
+                        manager = _ensure_hca_prefetch_attached()
+                        suspend_active = (
+                            getattr(manager, "suspend_active_request", None)
+                            if manager is not None
+                            else None
+                        )
+                        if callable(suspend_active):
+                            suspend_active()
+                        logger.info(
+                            "HCAPrefetchManager: skip active HCA prefetch for "
+                            "LMCache retrieve TTFT request=%s tokens=%d",
+                            request.req_id,
+                            num_expected_tokens,
+                        )
+                    else:
+                        self._prepare_hca_active_slots(
+                            request,
+                            lmcache_cached_tokens,
+                            request.slot_mapping,
+                        )
                     self._maybe_seed_indexer_reuse_prefetch(
                         request,
                         lmcache_cached_tokens,
@@ -2230,6 +2407,30 @@ class LMCacheConnectorV1Impl:
                             "deprecated for DSv4 CSA reuse; HCA VLLM-KV "
                             "seed remains opt-in for ablation"
                         )
+                if start_load_profile_enabled:
+                    post_retrieve_ms = (
+                        time.perf_counter() - post_retrieve_t0
+                    ) * 1000.0
+                    logger.info(
+                        "LMCACHE_TTFT_STAGE req_id=%s event=start_load_request "
+                        "retrieve_ms=%.3f post_retrieve_ms=%.3f total_ms=%.3f "
+                        "tokens=%d retrieved=%d expected=%d t=%.9f",
+                        request.req_id,
+                        retrieve_ms,
+                        post_retrieve_ms,
+                        (time.perf_counter() - request_profile_t0) * 1000.0,
+                        len(tokens),
+                        int(num_retrieved_tokens),
+                        int(num_expected_tokens),
+                        time.perf_counter(),
+                    )
+        if start_load_profile_enabled:
+            logger.info(
+                "LMCACHE_TTFT_STAGE event=start_load_total total_ms=%.3f "
+                "t=%.9f",
+                (time.perf_counter() - start_load_t0) * 1000.0,
+                time.perf_counter(),
+            )
 
     def record_failed_blocks(
         self,
@@ -2687,6 +2888,9 @@ class LMCacheConnectorV1Impl:
             and _hca_active_prefire_enabled()
         ):
             fired = int(fire_active())
+            prepare_active = getattr(manager, "prepare_active_request_layers", None)
+            if callable(prepare_active):
+                prepare_active(_hca_prepare_lookahead())
         if prepared > 0:
             logger.debug(
                 "HCAPrefetchManager: prepared active slot maps for %d HCA "
@@ -2714,12 +2918,23 @@ class LMCacheConnectorV1Impl:
 
         # Wait for the layer to be loaded
         for layerwise_retriever, request in self.layerwise_retrievers:
+            profile_t0 = time.perf_counter() if _ttft_profile_enabled() else 0.0
             ret_token_mask = next(layerwise_retriever)
+            if _ttft_profile_enabled():
+                logger.info(
+                    "LMCACHE_TTFT_STAGE req_id=%s event=wait_for_layer_load "
+                    "layer=%d layer_name=%s total_ms=%.3f t=%.9f",
+                    request.req_id,
+                    self.current_layer,
+                    layer_name,
+                    (time.perf_counter() - profile_t0) * 1000.0,
+                    time.perf_counter(),
+                )
 
-            if self.current_layer == self.num_layers - 1:
-                assert ret_token_mask is not None
+            if ret_token_mask is not None:
                 num_retrieved_tokens = ret_token_mask.sum().item()
                 logger.info(f"Retrieved {num_retrieved_tokens} tokens")
+                self._dsv4_tutti_layerwise_hook_active = False
 
         if self.layerwise_retrievers:
             self.current_layer += 1
@@ -2746,7 +2961,7 @@ class LMCacheConnectorV1Impl:
         """
         assert self.lmcache_engine is not None
 
-        if not self.use_layerwise:
+        if not self.use_layerwise and not self.layerwise_retrievers:
             return
 
         if self.kv_role == "kv_consumer":
