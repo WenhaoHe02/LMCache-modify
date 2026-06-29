@@ -1069,8 +1069,120 @@ def _compressed_slot_mapping(
     return compressed_slots
 
 
-def _attach_indexer_prefetch() -> None:
-    """Attach SSD-backed CSA indexer prefetch when enabled by environment."""
+def _indexer_tutti_backend_enabled() -> bool:
+    """Return whether the CSA indexer should use the Tutti GPU-direct backend.
+
+    Default is off; the legacy per-layer ``.bin`` file backend is preserved
+    until the operator opts in by setting ``LMCACHE_INDEXER_TUTTI_BACKEND=1``.
+    """
+    value = os.environ.get("LMCACHE_INDEXER_TUTTI_BACKEND", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _maybe_build_indexer_tutti_storage(
+    tutti_loader: Optional[Any],
+    csa_layer_ids: List[int],
+    token_bytes: int,
+    max_seq_len: int,
+) -> Optional[Any]:
+    """Build a :class:`TuttiIndexerStorage` if the Tutti backend is requested.
+
+    Args:
+        tutti_loader: Active :class:`TuttiDirectLoader`.  When ``None``, the
+            file backend is used regardless of the env flag.
+        csa_layer_ids: Sorted CSA layer ids.
+        token_bytes: Bytes per logical token K vector.
+        max_seq_len: Logical token capacity per layer.
+
+    Returns:
+        A configured :class:`TuttiIndexerStorage` when all of the following
+        hold: the env flag is on, ``tutti_loader`` is non-None, and a raw
+        region path is configured via ``LMCACHE_INDEXER_TUTTI_RAW_REGION_PATH``.
+        Returns ``None`` otherwise; callers fall back to the file backend.
+    """
+    if not _indexer_tutti_backend_enabled():
+        return None
+    if tutti_loader is None:
+        logger.warning(
+            "LMCACHE_INDEXER_TUTTI_BACKEND is set but no Tutti loader is "
+            "available; falling back to the file backend"
+        )
+        return None
+    raw_region_path = os.environ.get("LMCACHE_INDEXER_TUTTI_RAW_REGION_PATH", "")
+    if not raw_region_path:
+        logger.warning(
+            "LMCACHE_INDEXER_TUTTI_BACKEND is set but "
+            "LMCACHE_INDEXER_TUTTI_RAW_REGION_PATH is empty; falling back to "
+            "the file backend"
+        )
+        return None
+    try:
+        from lmcache.v1.gpu_connector.tutti_direct_loader import FiemapHelper
+        from lmcache.v1.indexer_tutti_backend import TuttiIndexerStorage
+    except ImportError as exc:
+        logger.warning(
+            "Tutti indexer backend unavailable: %s; falling back to file backend",
+            exc,
+        )
+        return None
+
+    try:
+        lba_records = FiemapHelper.query_extents(raw_region_path)
+    except Exception as exc:
+        logger.warning(
+            "Failed to query FIEMAP for indexer raw region %s: %s; falling "
+            "back to file backend",
+            raw_region_path,
+            exc,
+        )
+        return None
+    if not lba_records:
+        logger.warning(
+            "Indexer raw region %s reported no LBA extents; falling back to "
+            "file backend",
+            raw_region_path,
+        )
+        return None
+
+    raw_extents = [
+        (int(record.file_offset), int(record.slba), int(record.n_sectors))
+        for record in lba_records
+    ]
+    rank_suffix = os.environ.get("LOCAL_RANK") or os.environ.get("RANK") or "0"
+    synthetic_path = f"tutti://csa_indexer_rank_{rank_suffix}"
+
+    try:
+        storage = TuttiIndexerStorage(
+            tutti_loader=tutti_loader,
+            raw_region_path=synthetic_path,
+            raw_region_extents=raw_extents,
+            layer_ids=csa_layer_ids,
+            token_bytes=token_bytes,
+            max_seq_len=max_seq_len,
+        )
+    except ValueError as exc:
+        logger.warning(
+            "Failed to construct TuttiIndexerStorage from %s: %s; falling "
+            "back to file backend",
+            raw_region_path,
+            exc,
+        )
+        return None
+    return storage
+
+
+def _attach_indexer_prefetch(tutti_loader: Optional[Any] = None) -> None:
+    """Attach SSD-backed CSA indexer prefetch when enabled by environment.
+
+    Args:
+        tutti_loader: Optional active :class:`TuttiDirectLoader`.  When the
+            environment requests the Tutti backend (see
+            ``LMCACHE_INDEXER_TUTTI_BACKEND``), this loader is used to allocate
+            a shared :class:`TuttiIndexerStorage` and route CSA indexer I/O
+            through Tutti's GPU-direct NVMe path.  When ``None`` or the
+            environment requests the file backend, the legacy per-layer
+            ``.bin`` file backend is used.
+    """
     global _INDEXER_PREFETCH_MANAGER
 
     if not _indexer_prefetch_enabled():
@@ -1135,6 +1247,13 @@ def _attach_indexer_prefetch() -> None:
     io_workers = int(os.environ.get("LMCACHE_INDEXER_IO_WORKERS", "8"))
     max_seq_len = int(os.environ.get("LMCACHE_INDEXER_MAX_SEQ_LEN", "131072"))
 
+    tutti_storage = _maybe_build_indexer_tutti_storage(
+        tutti_loader=tutti_loader,
+        csa_layer_ids=csa_layer_ids,
+        token_bytes=token_bytes,
+        max_seq_len=max_seq_len,
+    )
+
     manager = IndexerSSDManager(
         csa_layer_ids=csa_layer_ids,
         store_dir=store_dir,
@@ -1143,6 +1262,7 @@ def _attach_indexer_prefetch() -> None:
         max_seq_len=max_seq_len,
         io_workers=io_workers,
         device=device,
+        tutti_storage=tutti_storage,
     )
 
     for layer_id, indexer_op in csa_info:
@@ -2072,7 +2192,12 @@ class LMCacheConnectorV1Impl:
         self._kv_cache_layer_names = tuple(kv_caches.keys())
         self._capture_vllm_hma_layout()
         self._manager.post_init()
-        _attach_indexer_prefetch()
+        engine_tutti_loader = (
+            getattr(self.lmcache_engine, "_tutti_loader", None)
+            if self.lmcache_engine is not None
+            else None
+        )
+        _attach_indexer_prefetch(tutti_loader=engine_tutti_loader)
         _attach_hca_prefetch()
 
     def _capture_vllm_hma_layout(self) -> None:

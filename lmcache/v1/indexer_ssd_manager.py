@@ -340,6 +340,134 @@ class IndexerBlockStore:
 # Per-layer HBM pool
 # ---------------------------------------------------------------------------
 
+class IndexerStorageProtocol:
+    """Per-CSA-layer indexer storage interface.
+
+    Two implementations live alongside :class:`IndexerSSDManager`:
+
+    * :class:`IndexerBlockStore` — legacy per-layer ``.bin`` file via
+      ``os.pread``/``os.pwrite``.  Used when ``LMCACHE_INDEXER_BACKEND``
+      is unset or ``file``.
+    * :class:`TuttiIndexerBlockStore` — GPU-direct NVMe path through
+      :class:`lmcache.v1.indexer_tutti_backend.TuttiIndexerStorage`.  Used when
+      ``LMCACHE_INDEXER_BACKEND=tutti`` and a Tutti loader is attached.
+
+    The protocol is informational only; both implementations are duck-typed.
+    Methods:
+
+    * ``read_token(token_id) -> bytes``
+    * ``write_token(token_id, data: bytes) -> None``
+    * ``write_tokens_contiguous(start_token_id, data: bytes) -> None``
+    * ``read_tokens_batch(token_ids: List[int]) -> List[bytes]``
+    * ``close() -> None``
+    """
+
+
+class TuttiIndexerBlockStore:
+    """Per-CSA-layer indexer block store backed by Tutti raw NVMe extents.
+
+    Thin adapter that satisfies the same interface as
+    :class:`IndexerBlockStore` but routes I/O through a shared
+    :class:`lmcache.v1.indexer_tutti_backend.TuttiIndexerStorage` instance.
+    The storage class owns the raw region and the Tutti loader reference;
+    one ``TuttiIndexerBlockStore`` exists per CSA layer and targets one
+    slot inside that region.
+
+    Read path (CSA spec prefetch and true-LI miss correction) is wired in a
+    follow-up commit; this scaffold raises :class:`NotImplementedError`
+    for reads so callers fail loudly instead of silently returning empty
+    bytes.  The write path (LMCache retrieve seed + prefill new-token
+    persistence) is fully wired through
+    :meth:`TuttiIndexerStorage.write_bytes`.
+    """
+
+    def __init__(
+        self,
+        tutti_storage: Any,
+        layer_id: int,
+    ) -> None:
+        """Bind this store to one CSA layer slot inside the Tutti region.
+
+        Args:
+            tutti_storage: Shared :class:`TuttiIndexerStorage` owning the raw
+                region and the Tutti loader.
+            layer_id: CSA layer id for this store; must be a key in
+                ``tutti_storage._slots``.
+
+        Raises:
+            KeyError: If ``layer_id`` was not registered with
+                ``tutti_storage`` at construction time.
+        """
+        self._storage = tutti_storage
+        self._slot = tutti_storage.slot_for_layer(int(layer_id))
+        self._token_bytes = self._slot.token_bytes
+        self._max_seq_len = self._slot.max_seq_len
+
+    def read_token(self, token_id: int) -> bytes:
+        """Synchronously read one token's K vector from the Tutti raw region.
+
+        Raises:
+            NotImplementedError: Reads are routed through Tutti GPU-direct
+                ``load_chunks_to_hbm`` rather than per-token CPU reads.
+                Higher-level callers should batch via :meth:`read_tokens_batch`
+                or use :meth:`TuttiIndexerStorage.build_read_request` directly.
+        """
+        raise NotImplementedError(
+            "TuttiIndexerBlockStore.read_token is not implemented; callers must "
+            "use batched read_tokens_batch or TuttiIndexerStorage.build_read_request "
+            "to take advantage of GPU-direct NVMe DMA."
+        )
+
+    def read_tokens_batch(self, token_ids: List[int]) -> List[bytes]:
+        """Read multiple token K vectors via Tutti GPU-direct DMA.
+
+        Raises:
+            NotImplementedError: Wired in a follow-up commit; callers should
+                go through :meth:`TuttiIndexerStorage.build_read_request` and
+                submit the request via the shared :class:`TuttiDirectLoader`.
+        """
+        raise NotImplementedError(
+            "TuttiIndexerBlockStore.read_tokens_batch is not yet wired; the "
+            "Tutti GPU-direct read path lands in a follow-up commit."
+        )
+
+    def write_token(self, token_id: int, data: bytes) -> None:
+        """Persist one token K vector to the Tutti raw region.
+
+        Args:
+            token_id: Global token position index.
+            data: Raw uint8 bytes of length ``token_bytes``.
+
+        Raises:
+            ValueError: If ``data`` size or ``token_id`` is invalid.
+        """
+        if len(data) != self._token_bytes:
+            raise ValueError(
+                f"Expected {self._token_bytes} bytes, got {len(data)}"
+            )
+        self._storage.write_bytes(self._slot, int(token_id), data)
+
+    def write_tokens_contiguous(self, start_token_id: int, data: bytes) -> None:
+        """Persist contiguous token K vectors starting at ``start_token_id``.
+
+        Args:
+            start_token_id: Global token position of the first token.
+            data: Raw uint8 bytes; length must be a multiple of ``token_bytes``.
+
+        Raises:
+            ValueError: If ``data`` size or ``start_token_id`` is invalid.
+        """
+        if len(data) % self._token_bytes != 0:
+            raise ValueError(
+                f"Expected byte length divisible by {self._token_bytes}, "
+                f"got {len(data)}"
+            )
+        self._storage.write_bytes(self._slot, int(start_token_id), data)
+
+    def close(self) -> None:
+        """No-op; the underlying Tutti loader is owned by the cache engine."""
+
+
 class IndexerHBMPool:
     """Fixed-size HBM tensor holding FP8-quantized K vectors for one CSA layer.
 
@@ -636,16 +764,24 @@ class IndexerSSDManager:
         max_seq_len: int,
         io_workers: int,
         device: torch.device,
+        tutti_storage: Optional[Any] = None,
     ) -> None:
         """
         Args:
             csa_layer_ids: Sorted list of CSA layer indices in the model.
-            store_dir: Directory for SSD backing files.
+            store_dir: Directory for SSD backing files (file backend) or for
+                the synthetic raw region path metadata (Tutti backend).
             pool_size: HBM pool capacity in tokens per CSA layer.
             token_bytes: Bytes per token (head_dim + scale overhead).
             max_seq_len: Maximum context length for SSD file sizing.
             io_workers: Number of async I/O threads.
             device: CUDA device for HBM pools.
+            tutti_storage: Optional shared
+                :class:`lmcache.v1.indexer_tutti_backend.TuttiIndexerStorage`
+                owning a pre-reserved Tutti raw region.  When provided, this
+                manager uses :class:`TuttiIndexerBlockStore` for every CSA
+                layer (GPU-direct NVMe path).  When ``None``, the legacy
+                per-layer ``.bin`` file backend is used.
         """
         self._csa_layer_ids = csa_layer_ids
         self._store_dir = store_dir
@@ -657,17 +793,39 @@ class IndexerSSDManager:
         self._prefill_ready_timeout_s = float(
             _env_int("LMCACHE_INDEXER_PREFILL_READY_TIMEOUT_SEC", 600)
         )
+        self._tutti_storage = tutti_storage
 
         # Per-layer HBM pool
         self._pools: Dict[int, IndexerHBMPool] = {
             lid: IndexerHBMPool(pool_size, token_bytes, device)
             for lid in csa_layer_ids
         }
-        # Per-layer SSD store
-        self._stores: Dict[int, IndexerBlockStore] = {
-            lid: IndexerBlockStore(store_dir, lid, token_bytes, max_seq_len)
-            for lid in csa_layer_ids
-        }
+        # Per-layer SSD store; backend depends on whether a Tutti storage is
+        # attached.  The legacy IndexerBlockStore writes per-layer .bin files
+        # via os.pread/pwrite; the Tutti backend routes I/O through Tutti's
+        # GPU-direct NVMe path against a shared pre-reserved raw region.
+        if tutti_storage is not None:
+            self._stores: Dict[int, Any] = {
+                lid: TuttiIndexerBlockStore(tutti_storage, lid)
+                for lid in csa_layer_ids
+            }
+            logger.info(
+                "IndexerSSDManager: using Tutti GPU-direct backend; layers=%d "
+                "raw_region_path=%s slot_bytes=%d",
+                len(csa_layer_ids),
+                tutti_storage.raw_region_path,
+                tutti_storage.slot_bytes,
+            )
+        else:
+            self._stores = {
+                lid: IndexerBlockStore(store_dir, lid, token_bytes, max_seq_len)
+                for lid in csa_layer_ids
+            }
+            logger.info(
+                "IndexerSSDManager: using file backend; layers=%d store_dir=%s",
+                len(csa_layer_ids),
+                store_dir,
+            )
 
         # Async I/O
         self._executor = ThreadPoolExecutor(max_workers=io_workers)
