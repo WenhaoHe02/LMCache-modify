@@ -1111,7 +1111,7 @@ def _indexer_tutti_backend_enabled() -> bool:
 
 def _maybe_build_indexer_tutti_storage(
     tutti_loader: Optional[Any],
-    csa_layer_ids: List[int],
+    csa_layer_ids: list[int],
     token_bytes: int,
     max_seq_len: int,
 ) -> Optional[Any]:
