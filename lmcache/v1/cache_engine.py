@@ -2544,6 +2544,7 @@ class LMCacheEngine:
                 size=int(record.aligned_length),
                 fmt=MemoryFormat.BINARY_BUFFER,
             )
+            record_end = int(record.offset) + int(record.aligned_length)
             for layer_slot_idx, transformer_layer_id in enumerate(
                 layer_ids_for_group
             ):
@@ -2553,6 +2554,28 @@ class LMCacheEngine:
                     pool_byte_offset
                     + layer_slot_idx * bytes_per_layer_in_chunk
                 )
+                layer_byte_end_in_pool = (
+                    layer_byte_offset_in_pool
+                    + blocks_per_layer_in_chunk * bytes_per_compressed_block
+                )
+                # Skip layers whose final byte falls past the chunk's
+                # registered aligned_length.  Tutti aborts the whole batch
+                # when ANY byte_range is not fully covered by the
+                # registered LBA extents, so admitting an out-of-range
+                # layer here would silently destroy the entire layer-60
+                # miss-correction batch.
+                if layer_byte_end_in_pool > record_end:
+                    logger.warning(
+                        "DSv4 CSA chunk %s layer slot %d byte range "
+                        "[%d, %d) past record aligned_length end %d; "
+                        "skipping",
+                        key.to_string() if hasattr(key, "to_string") else repr(key),
+                        layer_slot_idx,
+                        layer_byte_offset_in_pool,
+                        layer_byte_end_in_pool,
+                        record_end,
+                    )
+                    continue
                 chunks_by_layer[int(transformer_layer_id)].append(
                     CSAAttentionKVChunkLoc(
                         first_compressed_block=compressed_blocks_cursor,
