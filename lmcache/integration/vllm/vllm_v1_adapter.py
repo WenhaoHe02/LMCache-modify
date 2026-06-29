@@ -76,18 +76,11 @@ _OVERLAP_HOOK_ERROR_LOGGED: set[tuple[str, int, str]] = set()
 _SCHEDULER_HMA_INVALID_BLOCK_PATCH_INSTALLED: bool = False
 _TTFT_PROFILE_FORWARD_LOGGED: set[tuple[str, int]] = set()
 _TTFT_PROFILE_HC_PRE_LOGGED: set[tuple[str, int]] = set()
-_DSV4_TUTTI_LAYERWISE_ADAPTERS: Any = weakref.WeakSet()
 
 
 def _ttft_profile_enabled() -> bool:
     """Return whether request-level TTFT stage markers should be logged."""
     value = os.environ.get("LMCACHE_TTFT_STAGE_PROFILE", "")
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
-def _dsv4_tutti_layerwise_ttft_enabled() -> bool:
-    """Return whether DSv4 Tutti TTFT layerwise restore is enabled."""
-    value = os.environ.get("LMCACHE_DSV4_TUTTI_LAYERWISE_TTFT", "")
     return value.lower() in {"1", "true", "yes", "on"}
 
 
@@ -103,36 +96,6 @@ def _ttft_profile_request_id() -> str:
         if req_id:
             return str(req_id)
     return "unknown"
-
-
-def _advance_dsv4_tutti_layerwise(layer_id: int) -> None:
-    """Advance env-gated DSv4 Tutti layerwise restore at decoder layer entry."""
-    if not _dsv4_tutti_layerwise_ttft_enabled():
-        return
-    for adapter in list(_DSV4_TUTTI_LAYERWISE_ADAPTERS):
-        if not getattr(adapter, "_dsv4_tutti_layerwise_hook_active", False):
-            continue
-        if not getattr(adapter, "layerwise_retrievers", None):
-            continue
-        if int(getattr(adapter, "current_layer", -1)) != int(layer_id):
-            continue
-        try:
-            adapter.wait_for_layer_load(f"model.layers.{layer_id}")
-        except StopIteration:
-            logger.exception(
-                "DSv4 Tutti layerwise retriever ended early at layer %d",
-                layer_id,
-            )
-            adapter.layerwise_retrievers = []
-            adapter._dsv4_tutti_layerwise_hook_active = False
-        except Exception:
-            logger.exception(
-                "DSv4 Tutti layerwise restore failed at layer %d",
-                layer_id,
-            )
-            adapter.layerwise_retrievers = []
-            adapter._dsv4_tutti_layerwise_hook_active = False
-            raise
 
 
 def _block_ids_at_index(block_id_groups: tuple[list[int], ...], idx: int) -> set[int]:
@@ -864,9 +827,6 @@ def _install_decoder_forward_position_hook(decoder_layer: Any) -> bool:
                     layer_id,
                     time.perf_counter(),
                 )
-        layer_id = int(getattr(self, "layer_idx", -1))
-        if layer_id >= 0:
-            _advance_dsv4_tutti_layerwise(layer_id)
         try:
             return original_forward(*args, **kwargs)
         finally:
@@ -1928,7 +1888,6 @@ class LMCacheConnectorV1Impl:
             vllm_config.parallel_config
         )
         self.current_layer = 0
-        self._dsv4_tutti_layerwise_hook_active = False
 
         self.force_skip_save = bool(os.environ.get("LMCACHE_FORCE_SKIP_SAVE", False))
         self._requests_priority: dict[str, int] = {}
@@ -2252,44 +2211,7 @@ class LMCacheConnectorV1Impl:
 
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
             hma_kwargs = self._hma_transfer_kwargs(request)
-            use_dsv4_tutti_layerwise = (
-                _dsv4_tutti_layerwise_ttft_enabled()
-                and request.load_spec.vllm_cached_tokens == 0
-                and lmcache_cached_tokens > 0
-                and hasattr(self.lmcache_engine, "retrieve_dsv4_tutti_layers")
-            )
-            if use_dsv4_tutti_layerwise:
-                retrieve_t0 = time.perf_counter() if start_load_profile_enabled else 0.0
-                layerwise_retriever = self.lmcache_engine.retrieve_dsv4_tutti_layers(
-                    tokens[:lmcache_cached_tokens],
-                    token_mask[:lmcache_cached_tokens],
-                    kvcaches=kvcaches,
-                    slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                    vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
-                    request_configs=request.request_configs,
-                    req_id=request.req_id,
-                    **hma_kwargs,
-                )
-                next(layerwise_retriever)
-                next(layerwise_retriever)
-                self.layerwise_retrievers.append((layerwise_retriever, request))
-                self._dsv4_tutti_layerwise_hook_active = True
-                try:
-                    _DSV4_TUTTI_LAYERWISE_ADAPTERS.add(self)
-                except TypeError:
-                    pass
-                if start_load_profile_enabled:
-                    retrieve_ms = (time.perf_counter() - retrieve_t0) * 1000.0
-                    logger.info(
-                        "LMCACHE_TTFT_STAGE req_id=%s "
-                        "event=start_load_layerwise_prime total_ms=%.3f "
-                        "tokens=%d t=%.9f",
-                        request.req_id,
-                        retrieve_ms,
-                        len(tokens),
-                        time.perf_counter(),
-                    )
-            elif self.use_layerwise:
+            if self.use_layerwise:
                 if idx == last_idx:
                     sync = True
                 else:
@@ -2934,7 +2856,6 @@ class LMCacheConnectorV1Impl:
             if ret_token_mask is not None:
                 num_retrieved_tokens = ret_token_mask.sum().item()
                 logger.info(f"Retrieved {num_retrieved_tokens} tokens")
-                self._dsv4_tutti_layerwise_hook_active = False
 
         if self.layerwise_retrievers:
             self.current_layer += 1
