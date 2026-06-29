@@ -164,13 +164,17 @@ class CSAAttentionKVLayerState:
         k_cache_tensor: vLLM's MLA Attention K cache tensor for this layer,
             shape ``[num_blocks, compressed_block_size, token_bytes]``.
             Reads land directly into slices of this tensor.
-        compressed_block_ids_in_pool: Set of compressed block ids whose K
-            cache slot currently holds valid data.  Used to dedup predicted
-            and miss reads.
+        in_pool_bitmap: GPU bool tensor of length
+            ``ceil(max_seq_len / compress_ratio / compressed_block_size)``
+            where ``True`` at index ``b`` means the layer's K cache slot for
+            compressed block ``b`` is currently populated.  This replaces a
+            Python set so the miss-vs-pool check can run entirely on the GPU
+            and avoid a per-layer GPU→CPU sync of the full top-K.
         chunks: Ordered list of LMCache chunks covering the active request's
             prefix for this CSA layer.  Populated by
             :meth:`register_request_chunks`.
-        pending_reads_lock: Guards mutation of ``pending_reads``.
+        pending_reads_lock: Guards mutation of ``pending_reads`` /
+            ``last_drain_event``.
         pending_reads: Set of compressed block ids whose Tutti read is
             currently in-flight or queued.
         last_drain_event: Optional CUDA event recording the completion of
@@ -182,7 +186,7 @@ class CSAAttentionKVLayerState:
     compressed_block_size: int
     token_bytes: int
     k_cache_tensor: torch.Tensor
-    compressed_block_ids_in_pool: set[int]
+    in_pool_bitmap: torch.Tensor
     chunks: List[CSAAttentionKVChunkLoc]
     pending_reads_lock: threading.Lock
     pending_reads: set[int]
@@ -297,12 +301,23 @@ class CSAAttentionKVPrefetchManager:
                 f"k_cache_tensor token_bytes {int(k_cache_tensor.shape[2])} != "
                 f"manager token_bytes {self._token_bytes}"
             )
+        # vLLM's MLA K cache tensor has ``num_blocks`` slots; the same slot
+        # count is the upper bound on compressed block ids the indexer can
+        # ever emit for this layer.  Allocate a bool bitmap sized to match
+        # so ``_miss_ids_for_topk`` can answer "is this block already in
+        # pool" entirely on the GPU.
+        num_blocks = int(k_cache_tensor.shape[0])
+        in_pool_bitmap = torch.zeros(
+            num_blocks,
+            dtype=torch.bool,
+            device=k_cache_tensor.device,
+        )
         self._layers[int(layer_id)] = CSAAttentionKVLayerState(
             layer_id=int(layer_id),
             compressed_block_size=self._compressed_block_size,
             token_bytes=self._token_bytes,
             k_cache_tensor=k_cache_tensor,
-            compressed_block_ids_in_pool=set(),
+            in_pool_bitmap=in_pool_bitmap,
             chunks=[],
             pending_reads_lock=threading.Lock(),
             pending_reads=set(),
@@ -335,30 +350,45 @@ class CSAAttentionKVPrefetchManager:
         """
         self._active_request_id = str(req_id)
 
-        # Collect every (path, raw_extents) pair carried by the chunk map
-        # and push them into the Tutti loader's LBA cache.  Multiple chunks
-        # share the same pool path, so dedup before registering.
+        # Accumulate every (path, raw_extents) pair carried by the chunk
+        # map and push the union into the Tutti loader's LBA cache.  All
+        # chunks belonging to the same rank-local pool share one synthetic
+        # path (e.g. ``tutti://rank2-full``), but each chunk only carries
+        # the raw extents covering ITS slab of the pool.  Naively
+        # deduplicating by path would register one chunk's extents and drop
+        # every other chunk's coverage — exactly the
+        # ``Tutti extents ... cover 0/N bytes`` bug.  Dedup at the
+        # (path, file_offset, slba, n_sectors) tuple level instead.
         try:
             from lmcache.v1.gpu_connector.tutti_direct_loader import LbaRecord
         except ImportError:
             LbaRecord = None  # type: ignore[assignment]
         if LbaRecord is not None:
+            seen: set[tuple[str, int, int, int]] = set()
             raw_lba_cache: dict[str, list["LbaRecord"]] = {}
             for chunks in chunks_by_layer.values():
                 for chunk in chunks:
                     path = chunk.disk_meta.path if chunk.disk_meta else None
                     if not path or not chunk.raw_extents:
                         continue
-                    if path in raw_lba_cache:
-                        continue
-                    raw_lba_cache[path] = [
-                        LbaRecord(
-                            file_offset=int(file_offset),
-                            slba=int(slba),
-                            n_sectors=int(n_sectors),
+                    bucket = raw_lba_cache.setdefault(path, [])
+                    for file_offset, slba, n_sectors in chunk.raw_extents:
+                        key = (
+                            path,
+                            int(file_offset),
+                            int(slba),
+                            int(n_sectors),
                         )
-                        for file_offset, slba, n_sectors in chunk.raw_extents
-                    ]
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        bucket.append(
+                            LbaRecord(
+                                file_offset=int(file_offset),
+                                slba=int(slba),
+                                n_sectors=int(n_sectors),
+                            )
+                        )
             if raw_lba_cache:
                 try:
                     self._tutti_loader.register_lba_cache(raw_lba_cache)
@@ -391,7 +421,7 @@ class CSAAttentionKVPrefetchManager:
                     )
                 expected = chunk.end_compressed_block
             state.chunks = ordered
-            state.compressed_block_ids_in_pool.clear()
+            state.in_pool_bitmap.zero_()
             with state.pending_reads_lock:
                 state.pending_reads.clear()
                 state.last_drain_event = None
@@ -536,13 +566,29 @@ class CSAAttentionKVPrefetchManager:
             )
             return
 
+        # Decide which block ids are net-new (not already in pool, not
+        # already in flight).  ``in_pool_bitmap`` lives on the GPU so the
+        # cross-check stays a CPU-only set lookup against the small
+        # ``pending_reads`` set; the bitmap read happens after we've
+        # narrowed the candidate list.
+        candidate_ids = sorted(set(int(bid) for bid in compressed_block_ids))
         with state.pending_reads_lock:
-            new_ids = [
-                int(bid)
-                for bid in compressed_block_ids
-                if int(bid) not in state.compressed_block_ids_in_pool
-                and int(bid) not in state.pending_reads
-            ]
+            in_flight = state.pending_reads
+            ids_after_flight = [bid for bid in candidate_ids if bid not in in_flight]
+            if not ids_after_flight:
+                return
+        ids_tensor = torch.as_tensor(
+            ids_after_flight,
+            dtype=torch.int64,
+            device=state.in_pool_bitmap.device,
+        )
+        in_pool_mask = state.in_pool_bitmap[ids_tensor]
+        new_ids_tensor = ids_tensor[~in_pool_mask]
+        if new_ids_tensor.numel() == 0:
+            return
+        new_ids = new_ids_tensor.cpu().tolist()
+        with state.pending_reads_lock:
+            new_ids = [bid for bid in new_ids if bid not in state.pending_reads]
             if not new_ids:
                 return
             state.pending_reads.update(new_ids)
@@ -563,8 +609,16 @@ class CSAAttentionKVPrefetchManager:
 
         with state.pending_reads_lock:
             state.pending_reads.difference_update(new_ids)
-            state.compressed_block_ids_in_pool.update(new_ids)
             state.last_drain_event = event
+        if new_ids:
+            # Update GPU bitmap in bulk so subsequent miss filtering sees
+            # these block ids as already-resident.
+            ids_tensor = torch.as_tensor(
+                new_ids,
+                dtype=torch.int64,
+                device=state.in_pool_bitmap.device,
+            )
+            state.in_pool_bitmap.index_fill_(0, ids_tensor, True)
 
     def _issue_reads(
         self,
@@ -741,16 +795,40 @@ class CSAAttentionKVPrefetchManager:
 
         Returns:
             Sorted unique list of block ids not yet in the layer's pool.
+
+        Implementation note: the entire filter runs on the GPU so we do not
+        pay a per-layer ``true_topk.cpu()`` sync.  The Python sync at the
+        tail of the function only touches the (small) miss-set, which is
+        typically a single-digit number of block ids once the HC-proxy
+        prediction has primed the pool.  When the miss-set is empty the
+        function returns ``[]`` without ever materialising it on the host.
         """
         state = self._layers.get(int(layer_id))
         if state is None:
             return []
-        entries = true_topk.reshape(-1).cpu().tolist()
-        block_ids = sorted(
-            {
-                int(v) // state.compressed_block_size
-                for v in entries
-                if int(v) >= 0
-            }
-        )
-        return [bid for bid in block_ids if bid not in state.compressed_block_ids_in_pool]
+        entries = true_topk.reshape(-1)
+        if entries.numel() == 0:
+            return []
+        if entries.device != state.in_pool_bitmap.device:
+            entries = entries.to(state.in_pool_bitmap.device)
+        # Drop sentinel/negative entries before integer division.
+        valid = entries >= 0
+        if not bool(valid.any().item()):
+            return []
+        entries = entries[valid].to(torch.int64)
+        block_ids = entries // state.compressed_block_size
+        # Clip block_ids to the bitmap range so an out-of-range entry from
+        # the indexer cannot index past the bitmap.  Tutti reads will skip
+        # any clipped value anyway because the chunk map only covers the
+        # registered range.
+        bitmap_len = int(state.in_pool_bitmap.shape[0])
+        in_range = block_ids < bitmap_len
+        if not bool(in_range.any().item()):
+            return []
+        block_ids = block_ids[in_range]
+        in_pool_mask = state.in_pool_bitmap[block_ids]
+        miss = block_ids[~in_pool_mask]
+        if miss.numel() == 0:
+            return []
+        miss_unique = torch.unique(miss)
+        return miss_unique.cpu().tolist()
