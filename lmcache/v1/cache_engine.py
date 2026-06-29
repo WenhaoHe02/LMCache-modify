@@ -2585,6 +2585,8 @@ class LMCacheEngine:
                 path=synth_path,
                 size=int(record.aligned_length),
                 fmt=MemoryFormat.BINARY_BUFFER,
+                shape=torch.Size((int(record.aligned_length),)),
+                dtype=torch.uint8,
             )
             record_end = int(record.offset) + int(record.aligned_length)
             for layer_slot_idx, transformer_layer_id in enumerate(

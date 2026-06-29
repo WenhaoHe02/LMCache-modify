@@ -262,6 +262,13 @@ class CSAAttentionKVPrefetchManager:
         self._compressed_block_size = int(compressed_block_size)
         self._token_bytes = int(token_bytes)
         self._bytes_per_block = self._compressed_block_size * self._token_bytes
+        # Per-request LBA cache snapshot.  Other paths (e.g.,
+        # ``_tutti_batched_get``) overwrite ``self._tutti_loader._lba_cache``
+        # with the FILTERED ``read_ranges`` extents, which exclude
+        # csa_attention_kv.  We cache the union here and re-register before
+        # every ``_issue_reads`` to ensure the loader sees our full-record
+        # extents at the moment Tutti dispatches.
+        self._pending_raw_lba_cache: dict[str, list[Any]] = {}
         self._layers: Dict[int, CSAAttentionKVLayerState] = {}
         self._csa_layer_ids = tuple(sorted(int(lid) for lid in csa_layer_ids))
         self._patched_modules: List[Tuple[Any, str, Callable]] = []
@@ -404,6 +411,9 @@ class CSAAttentionKVPrefetchManager:
                             )
                         )
             if raw_lba_cache:
+                # Stash for re-registration on every read (see comment on
+                # ``_pending_raw_lba_cache``).
+                self._pending_raw_lba_cache = raw_lba_cache
                 try:
                     self._tutti_loader.register_lba_cache(raw_lba_cache)
                 except Exception:
@@ -733,6 +743,21 @@ class CSAAttentionKVPrefetchManager:
         if not keys:
             return None
 
+        # Re-register our full-record LBA extents.  ``_tutti_batched_get``
+        # in the retrieve path overwrites ``_lba_cache`` with extents that
+        # respect ``record.read_ranges``, which excludes csa_attention_kv
+        # when the filter is enabled.  Without this re-registration, Tutti
+        # reports "extents cover 0/N bytes" on every csa byte_range because
+        # the cache only covers the prior groups.
+        if self._pending_raw_lba_cache:
+            try:
+                self._tutti_loader.register_lba_cache(self._pending_raw_lba_cache)
+            except Exception:
+                logger.exception(
+                    "CSAAttentionKVPrefetchManager: re-register LBA cache "
+                    "failed in _issue_reads"
+                )
+
         memory_objs = self._tutti_loader.load_chunks_to_hbm(
             keys,
             disk_metas,
@@ -759,13 +784,6 @@ class CSAAttentionKVPrefetchManager:
                     )
                 flat = tensor.reshape(-1).contiguous().view(torch.uint8)
                 for compressed_block_id, byte_offset in target_offsets:
-                    # Translate sequence-position compressed_block_id to
-                    # the K-cache row that the sparse-attention kernel
-                    # will actually read.  vLLM's MLA K cache is a global
-                    # pool shared across requests; the block-table
-                    # indirection lives in slot_mapping which was captured
-                    # at register_request_chunks time as
-                    # ``chunk.physical_block_ids``.
                     chunk_idx = chunk_index_by_block.get(int(compressed_block_id))
                     chunk_for_block = (
                         state.chunks[chunk_idx]
@@ -789,9 +807,6 @@ class CSAAttentionKVPrefetchManager:
                         else:
                             dst_block_idx = int(compressed_block_id)
                     else:
-                        # Fallback only when caller did not provide
-                        # slot_mapping (logged as warning at register
-                        # time so the operator can spot this).
                         dst_block_idx = int(compressed_block_id)
                     if not (0 <= dst_block_idx < int(state.k_cache_tensor.shape[0])):
                         logger.warning(
