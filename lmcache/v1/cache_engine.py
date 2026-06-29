@@ -2266,11 +2266,15 @@ class LMCacheEngine:
         DSv4-optimized tail-only masking from
         :meth:`_dsv4_store_shapes_for_range` and the additional
         ``csa_attention_kv`` zero-shape when the CSA attention KV prefetcher
-        is attached.
+        is attached AND the operator has opted in to the filter via
+        ``LMCACHE_DSV4_CSA_ATTENTION_KV_FILTER=1``.
 
-        This is the retrieve-side variant; on-disk byte layouts continue to
-        use the unfiltered :meth:`_dsv4_store_shapes_for_range` because the
-        chunk was previously stored with full ``csa_attention_kv`` bytes.
+        The filter is a separate opt-in from the prefetcher's attach so the
+        prefetcher can be wired and observed in production without breaking
+        attention when its read path is still being validated.  Once the
+        prefetcher reliably populates the correct csa_attention_kv bytes in
+        vLLM's MLA K cache slots, the operator can flip the filter on to
+        save the ~100 MiB synchronous scatter at retrieve time.
 
         Args:
             shapes: Original per-group shapes from
@@ -2293,6 +2297,8 @@ class LMCacheEngine:
             total_tokens,
         )
         if not self._dsv4_csa_attention_kv_prefetch_active():
+            return base
+        if not _env_flag("LMCACHE_DSV4_CSA_ATTENTION_KV_FILTER"):
             return base
         klg_manager = self.metadata.kv_layer_groups_manager
         if klg_manager is None or not klg_manager.kv_layer_groups:

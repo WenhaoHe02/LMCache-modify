@@ -1509,16 +1509,28 @@ def _ensure_hca_prefetch_attached() -> Any:
 def _csa_attention_kv_prefetch_enabled() -> bool:
     """Return whether CSA attention KV prefetch should be attached.
 
-    Gated on ``LMCACHE_INDEXER_FULL_OVERLAP`` (master switch for the full
-    spec prefetch pipeline) plus the indexer prefetch master switch
-    (``LMCACHE_INDEXER_ENABLE_PREFETCH``).  Without an active
-    :class:`IndexerSSDManager` the attention KV prefetcher has no source of
-    predicted top-K, so the gate is intentionally conservative.
+    Gated on three flags:
+
+    * ``LMCACHE_INDEXER_ENABLE_PREFETCH`` — IndexerSSDManager must be active
+      because the attention KV prefetcher takes its predicted top-K from the
+      indexer's HC-proxy.
+    * ``LMCACHE_INDEXER_FULL_OVERLAP`` — high-level master switch for the
+      full spec prefetch pipeline; defaults to off.
+    * ``LMCACHE_DSV4_CSA_ATTENTION_KV_FILTER`` — explicit acknowledgement
+      that the operator wants the synchronous ``csa_attention_kv`` scatter
+      replaced by prefetcher writes.  Until this flag is set the prefetcher
+      stays detached because attaching it without the retrieve-side filter
+      would have prefetcher writes race the synchronous scatter and either
+      duplicate work or corrupt vLLM's K cache slots if the read path is
+      not yet fully validated.
     """
     if not _indexer_prefetch_enabled():
         return False
     value = os.environ.get("LMCACHE_INDEXER_FULL_OVERLAP", "")
-    return value.lower() in {"1", "true", "yes", "on"}
+    if value.lower() not in {"1", "true", "yes", "on"}:
+        return False
+    filter_value = os.environ.get("LMCACHE_DSV4_CSA_ATTENTION_KV_FILTER", "")
+    return filter_value.lower() in {"1", "true", "yes", "on"}
 
 
 def _attach_csa_attention_kv_prefetch(tutti_loader: Optional[Any] = None) -> None:
