@@ -749,19 +749,24 @@ class CSAAttentionKVPrefetchManager:
                     )
                 flat = tensor.reshape(-1).contiguous().view(torch.uint8)
                 for compressed_block_id, byte_offset in target_offsets:
-                    dst_block_idx = compressed_block_id // state.compressed_block_size
-                    entry_idx = compressed_block_id % state.compressed_block_size
-                    if entry_idx != 0:
-                        # The current implementation assumes block_size-aligned
-                        # reads (entries are batched per K cache block).  This
-                        # is true for the standard DSv4 layout where one
-                        # csa_block_id maps 1:1 to one entry inside the K cache
-                        # block.  Reaching this branch indicates a layout
-                        # mismatch.
-                        raise RuntimeError(
-                            f"Unexpected non-aligned compressed_block_id "
-                            f"{compressed_block_id} (entry_idx={entry_idx})"
+                    # ``compressed_block_id`` is already a K-cache block
+                    # index in ``[0, num_blocks)``; it indexes
+                    # ``k_cache_tensor`` directly.  An earlier draft of
+                    # this code divided by ``compressed_block_size`` again,
+                    # collapsing every read into K-cache block 0 and
+                    # silently writing 30 layers' worth of garbage into
+                    # the same slot.
+                    dst_block_idx = int(compressed_block_id)
+                    if not (0 <= dst_block_idx < int(state.k_cache_tensor.shape[0])):
+                        logger.warning(
+                            "CSAAttentionKVPrefetchManager: dropping write "
+                            "for layer %d compressed_block_id=%d outside "
+                            "k_cache_tensor[0:%d]",
+                            state.layer_id,
+                            dst_block_idx,
+                            int(state.k_cache_tensor.shape[0]),
                         )
+                        continue
                     dst_slot = state.k_cache_tensor[dst_block_idx]
                     src_slice = flat[
                         byte_offset : byte_offset
