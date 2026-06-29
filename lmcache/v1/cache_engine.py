@@ -49,6 +49,7 @@ from lmcache.usage_context import InitializeUsageContext
 from lmcache.utils import (
     CacheEngineKey,
     CacheStoreEvent,
+    DiskCacheMetadata,
     _lmcache_nvtx_annotate,
     compress_slot_mapping,
     convert_tokens_to_list,
