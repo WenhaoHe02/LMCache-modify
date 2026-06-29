@@ -4266,12 +4266,19 @@ class LMCacheEngine:
                     for _, start, end in blocks
                 ]
                 if self._dsv4_csa_attention_kv_prefetch_active():
-                    self._register_csa_attention_kv_chunks(
-                        blocks,
-                        [disk_backend.dict.get(key) for key, _, _ in blocks],
-                        total_tokens,
-                        kwargs.get("req_id", "unknown"),
+                    csa_disk_backend = self.storage_manager.storage_backends.get(
+                        "LocalDiskBackend"
                     )
+                    if csa_disk_backend is not None:
+                        self._register_csa_attention_kv_chunks(
+                            blocks,
+                            [
+                                csa_disk_backend.dict.get(key)
+                                for key, _, _ in blocks
+                            ],
+                            total_tokens,
+                            kwargs.get("req_id", "unknown"),
+                        )
             else:
                 store_shapes_per_key = None
 
