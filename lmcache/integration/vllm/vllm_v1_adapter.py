@@ -1678,6 +1678,28 @@ def _attach_csa_attention_kv_prefetch(tutti_loader: Optional[Any] = None) -> Non
     )
 
 
+def _ensure_csa_attention_kv_prefetch_attached(
+    tutti_loader: Optional[Any],
+) -> Any:
+    """Lazy-attach the CSA attention KV prefetcher when Tutti becomes ready.
+
+    ``_attach_csa_attention_kv_prefetch`` is initially called from
+    ``post_init`` but Tutti's loader is bootstrapped asynchronously and is
+    often still ``None`` at post_init time.  Retrieve paths call this helper
+    to retry the attach once the loader has finished warming up.
+
+    Returns the active :class:`CSAAttentionKVPrefetchManager` or ``None``.
+    """
+    global _CSA_ATTENTION_KV_PREFETCH_MANAGER
+
+    if _CSA_ATTENTION_KV_PREFETCH_MANAGER is not None:
+        return _CSA_ATTENTION_KV_PREFETCH_MANAGER
+    if tutti_loader is None:
+        return None
+    _attach_csa_attention_kv_prefetch(tutti_loader=tutti_loader)
+    return _CSA_ATTENTION_KV_PREFETCH_MANAGER
+
+
 @dataclass
 class LoadSpec:
     # Number of tokens cached in vLLM

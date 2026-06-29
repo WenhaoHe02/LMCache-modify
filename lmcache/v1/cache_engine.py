@@ -2321,7 +2321,20 @@ class LMCacheEngine:
             return
         manager = get_csa_attention_kv_prefetch_manager()
         if manager is None:
-            return
+            # Tutti loader may have been bootstrapped after post_init; retry
+            # the attach lazily now that we're inside a retrieve and the
+            # loader has had a chance to warm up.
+            try:
+                from lmcache.integration.vllm.vllm_v1_adapter import (
+                    _ensure_csa_attention_kv_prefetch_attached,
+                )
+            except ImportError:
+                return
+            manager = _ensure_csa_attention_kv_prefetch_attached(
+                getattr(self, "_tutti_loader", None)
+            )
+            if manager is None:
+                return
         chunks_by_layer = self._dsv4_build_csa_attention_kv_chunks(
             blocks,
             disk_metas,
