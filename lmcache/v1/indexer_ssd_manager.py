@@ -1485,6 +1485,60 @@ class IndexerSSDManager:
             mode="sync",
         )
 
+    def attach_csa_attention_kv_manager(self, manager: Optional[Any]) -> None:
+        """Attach (or detach) the CSA attention KV prefetcher.
+
+        When attached, every predicted top-K computed in
+        :meth:`fire_async_for_layer` is also forwarded to the attention KV
+        prefetcher so it can issue Tutti reads in parallel with the
+        indexer-cache reads.  Passing ``None`` detaches the prefetcher.
+
+        Args:
+            manager: A
+                :class:`lmcache.v1.csa_attention_kv_prefetch_manager.CSAAttentionKVPrefetchManager`
+                instance, or ``None``.
+        """
+        self._csa_attention_kv_manager = manager
+
+    def _dispatch_csa_attention_kv_predicted(
+        self,
+        layer_id: int,
+        predicted_token_ids: Sequence[int],
+    ) -> None:
+        """Forward a predicted top-K to the CSA attention KV prefetcher.
+
+        Predicted token ids (CSA-compressed positions) are converted to
+        block ids using the vLLM IndexerCache block size constant
+        :data:`DEEPGEMM_PAGED_BLOCK_SIZE` (64).  Errors are swallowed and
+        logged so a malformed prediction never breaks the indexer-cache
+        prefetch path that owns this method's call site.
+
+        Args:
+            layer_id: CSA layer id whose prediction this is.
+            predicted_token_ids: Compressed token ids forming the predicted
+                top-K.
+        """
+        manager = getattr(self, "_csa_attention_kv_manager", None)
+        if manager is None or not predicted_token_ids:
+            return
+        try:
+            block_ids = sorted(
+                {
+                    int(tid) // DEEPGEMM_PAGED_BLOCK_SIZE
+                    for tid in predicted_token_ids
+                    if int(tid) >= 0
+                }
+            )
+            if block_ids:
+                manager.fire_predicted_reads(layer_id, block_ids)
+        except Exception:
+            logger.exception(
+                "Failed to dispatch CSA attention KV predicted reads for "
+                "layer %d (%d ids)",
+                layer_id,
+                len(predicted_token_ids),
+            )
+
     def prepare_layer_async(self, layer_id: int) -> None:
         """Submit CSA ready/drain work before the target layer consumes it.
 
@@ -1708,6 +1762,12 @@ class IndexerSSDManager:
         with self._lock:
             self._pending[layer_id].extend(futures)
             self._inflight_tokens[layer_id].update(tid for tid, _ in futures)
+        # Mirror the prediction to the CSA attention KV prefetcher when it is
+        # attached.  Predicted token ids are converted to compressed-block
+        # ids via integer division by the vLLM IndexerCache block size (64,
+        # matches DEEPGEMM_PAGED_BLOCK_SIZE).  Reads land in vLLM's MLA K
+        # cache slots, not in this manager's pool.
+        self._dispatch_csa_attention_kv_predicted(layer_id, filtered)
         self.prepare_layer_async(layer_id)
         self._log_timing(
             "prefill_fire_async" if is_prefill_proxy else "fire_async",
