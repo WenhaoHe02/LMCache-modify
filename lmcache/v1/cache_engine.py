@@ -2323,6 +2323,7 @@ class LMCacheEngine:
         disk_metas: list[Optional[DiskCacheMetadata]],
         total_tokens: int,
         req_id: str,
+        slot_mapping: Optional[torch.Tensor] = None,
     ) -> None:
         """Build and register the CSA attention KV chunk map with the manager.
 
@@ -2363,6 +2364,7 @@ class LMCacheEngine:
             blocks,
             disk_metas,
             total_tokens,
+            slot_mapping=slot_mapping,
         )
         if not chunks_by_layer:
             return
@@ -2380,6 +2382,7 @@ class LMCacheEngine:
         blocks: list[tuple[CacheEngineKey, int, int]],
         disk_metas: list[Optional[DiskCacheMetadata]],
         total_tokens: int,
+        slot_mapping: Optional[torch.Tensor] = None,
     ) -> dict[int, list[Any]]:
         """Build the per-CSA-layer chunk map for the active request.
 
@@ -2455,6 +2458,22 @@ class LMCacheEngine:
         keys = [key for key, _, _ in blocks]
         object_records = disk_backend.get_kv_object_records(keys, roles=None)
 
+        # Pre-materialise slot_mapping CPU view; the per-chunk physical
+        # block id lookup needs Python ints, not GPU tensor elements.
+        slot_mapping_cpu: Optional[list[int]] = None
+        if slot_mapping is not None:
+            try:
+                if isinstance(slot_mapping, torch.Tensor):
+                    slot_mapping_cpu = slot_mapping.detach().to("cpu").tolist()
+                else:
+                    slot_mapping_cpu = [int(s) for s in slot_mapping]
+            except Exception:
+                logger.warning(
+                    "DSv4 CSA chunk builder: failed to materialise "
+                    "slot_mapping; physical_block_ids will be empty"
+                )
+                slot_mapping_cpu = None
+
         chunks_by_layer: dict[int, list[Any]] = {
             int(layer_id): [] for layer_id in layer_ids_for_group
         }
@@ -2519,6 +2538,29 @@ class LMCacheEngine:
                 continue
             blocks_per_layer_in_chunk = rows_per_layer // compressed_block_size
             bytes_per_compressed_block = compressed_block_size * bytes_per_token
+
+            # Compute the physical K-cache row(s) this chunk maps to.  Each
+            # row of the CSA K cache holds ``compress_ratio *
+            # compressed_block_size`` source tokens (= 256 for DSv4
+            # csa_attention_kv).  ``slot_mapping[t] // 256`` gives the
+            # physical block id assigned by vLLM's block allocator.  When
+            # ``slot_mapping`` is unavailable we fall back to the
+            # sequence-position index in the prefetcher's _issue_reads,
+            # which only happens to be correct for fresh per-request CSA
+            # caches without a block table.
+            tokens_per_compressed_block = compress_ratio * compressed_block_size
+            chunk_physical_block_ids: tuple[int, ...] = ()
+            if slot_mapping_cpu is not None:
+                ids: list[int] = []
+                base = int(start)
+                for block_local in range(blocks_per_layer_in_chunk):
+                    pos = base + block_local * tokens_per_compressed_block
+                    if 0 <= pos < len(slot_mapping_cpu):
+                        slot = int(slot_mapping_cpu[pos])
+                        if slot >= 0:
+                            ids.append(slot // tokens_per_compressed_block)
+                if len(ids) == blocks_per_layer_in_chunk:
+                    chunk_physical_block_ids = tuple(ids)
 
             # Locate the chunk's kv_object_store record so reads can resolve
             # post-snvme-bind via the synthetic ``tutti://...`` path that
@@ -2588,6 +2630,7 @@ class LMCacheEngine:
                             (int(fo), int(slba), int(n_sectors))
                             for fo, slba, n_sectors in record.raw_extents
                         ),
+                        physical_block_ids=chunk_physical_block_ids,
                     )
                 )
             compressed_blocks_cursor += blocks_per_layer_in_chunk
@@ -4360,6 +4403,7 @@ class LMCacheEngine:
                             ],
                             total_tokens,
                             kwargs.get("req_id", "unknown"),
+                            slot_mapping=kwargs.get("slot_mapping"),
                         )
             else:
                 store_shapes_per_key = None

@@ -118,6 +118,15 @@ class CSAAttentionKVChunkLoc:
             loader in ``register_request_chunks``; the union of every
             chunk's extents is what makes the synthetic path resolvable for
             every byte range the prefetcher asks for.
+        physical_block_ids: vLLM K-cache physical row indices that this
+            chunk's csa_attention_kv slab must be written into, one per
+            compressed block covered by the chunk.  Derived from the
+            retrieve's ``slot_mapping`` so the destination row matches what
+            the sparse-attention kernel will read.  An empty tuple means
+            the caller did not provide ``slot_mapping`` (legacy path); the
+            prefetcher then falls back to the sequence-position index,
+            which is correct ONLY for fresh per-request CSA caches without
+            a block table indirection.
     """
 
     first_compressed_block: int
@@ -127,6 +136,7 @@ class CSAAttentionKVChunkLoc:
     layer_byte_offset: int
     bytes_per_block: int
     raw_extents: tuple[tuple[int, int, int], ...] = ()
+    physical_block_ids: tuple[int, ...] = ()
 
     @property
     def end_compressed_block(self) -> int:
@@ -749,14 +759,40 @@ class CSAAttentionKVPrefetchManager:
                     )
                 flat = tensor.reshape(-1).contiguous().view(torch.uint8)
                 for compressed_block_id, byte_offset in target_offsets:
-                    # ``compressed_block_id`` is already a K-cache block
-                    # index in ``[0, num_blocks)``; it indexes
-                    # ``k_cache_tensor`` directly.  An earlier draft of
-                    # this code divided by ``compressed_block_size`` again,
-                    # collapsing every read into K-cache block 0 and
-                    # silently writing 30 layers' worth of garbage into
-                    # the same slot.
-                    dst_block_idx = int(compressed_block_id)
+                    # Translate sequence-position compressed_block_id to
+                    # the K-cache row that the sparse-attention kernel
+                    # will actually read.  vLLM's MLA K cache is a global
+                    # pool shared across requests; the block-table
+                    # indirection lives in slot_mapping which was captured
+                    # at register_request_chunks time as
+                    # ``chunk.physical_block_ids``.
+                    chunk_idx = chunk_index_by_block.get(int(compressed_block_id))
+                    chunk_for_block = (
+                        state.chunks[chunk_idx]
+                        if chunk_idx is not None
+                        else None
+                    )
+                    if (
+                        chunk_for_block is not None
+                        and chunk_for_block.physical_block_ids
+                    ):
+                        local_idx = (
+                            int(compressed_block_id)
+                            - chunk_for_block.first_compressed_block
+                        )
+                        if 0 <= local_idx < len(
+                            chunk_for_block.physical_block_ids
+                        ):
+                            dst_block_idx = int(
+                                chunk_for_block.physical_block_ids[local_idx]
+                            )
+                        else:
+                            dst_block_idx = int(compressed_block_id)
+                    else:
+                        # Fallback only when caller did not provide
+                        # slot_mapping (logged as warning at register
+                        # time so the operator can spot this).
+                        dst_block_idx = int(compressed_block_id)
                     if not (0 <= dst_block_idx < int(state.k_cache_tensor.shape[0])):
                         logger.warning(
                             "CSAAttentionKVPrefetchManager: dropping write "
