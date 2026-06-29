@@ -166,19 +166,57 @@ def _profile_accuracy_enabled() -> bool:
 # Environment flag: set LMCACHE_DISABLE_RESIDENT_INDEXER=1 to use flat LRU
 # ---------------------------------------------------------------------------
 _RESIDENT_ENABLED: bool = os.environ.get("LMCACHE_DISABLE_RESIDENT_INDEXER", "0") != "1"
-_RESIDUAL_PROXY_ENABLED: bool = _env_flag("LMCACHE_INDEXER_ENABLE_RESIDUAL_PROXY")
-_DECODE_PREFETCH_ENABLED: bool = _env_flag(
-    "LMCACHE_INDEXER_ENABLE_DECODE_PREFETCH"
+
+# When LMCACHE_INDEXER_FULL_OVERLAP=1 the CSA spec prefetch + miss-correction
+# pipeline runs end-to-end on a side stream so the proxy Lightning Indexer
+# and Tutti reads cannot block the forward stream.  Individual sub-flags
+# below still let operators turn pieces off, but their defaults flip to ON
+# when this master flag is set.  Keep this in lockstep with the doc string
+# of LMCACHE_INDEXER_ENABLE_PREFETCH.
+_FULL_OVERLAP_ENABLED: bool = _env_flag("LMCACHE_INDEXER_FULL_OVERLAP")
+
+
+def _env_flag_default_on(name: str) -> bool:
+    """Return env flag value, defaulting to ``True`` when the var is unset.
+
+    Args:
+        name: Environment variable name.
+
+    Returns:
+        ``True`` if the value is empty/unset OR a truthy literal; ``False``
+        only when explicitly set to a falsey literal (``0``/``false``/``no``/
+        ``off``).
+    """
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return True
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+_RESIDUAL_PROXY_ENABLED: bool = (
+    _env_flag_default_on("LMCACHE_INDEXER_ENABLE_RESIDUAL_PROXY")
+    if _FULL_OVERLAP_ENABLED
+    else _env_flag("LMCACHE_INDEXER_ENABLE_RESIDUAL_PROXY")
+)
+_DECODE_PREFETCH_ENABLED: bool = (
+    _env_flag_default_on("LMCACHE_INDEXER_ENABLE_DECODE_PREFETCH")
+    if _FULL_OVERLAP_ENABLED
+    else _env_flag("LMCACHE_INDEXER_ENABLE_DECODE_PREFETCH")
 )
 _PREFILL_RESIDUAL_PROXY_ENV = os.environ.get(
     "LMCACHE_INDEXER_ENABLE_PREFILL_RESIDUAL_PROXY"
+)
+_REUSE_PREFETCH_ENABLED: bool = (
+    _env_flag_default_on("LMCACHE_INDEXER_ENABLE_REUSE_PREFETCH")
+    if _FULL_OVERLAP_ENABLED
+    else _env_flag("LMCACHE_INDEXER_ENABLE_REUSE_PREFETCH")
 )
 _PREFILL_RESIDUAL_PROXY_ENABLED: bool = (
     _env_flag("LMCACHE_INDEXER_ENABLE_PREFILL_RESIDUAL_PROXY")
     if _PREFILL_RESIDUAL_PROXY_ENV is not None
     else (
         _RESIDUAL_PROXY_ENABLED
-        and _env_flag("LMCACHE_INDEXER_ENABLE_REUSE_PREFETCH")
+        and _REUSE_PREFETCH_ENABLED
     )
 )
 _PREFILL_PROXY_ROWS: int = max(
@@ -206,7 +244,11 @@ _PREFILL_OVERLAP_PROFILE_LIMIT: int = max(
 _PREFILL_OVERLAP_READ_LIMIT: int = max(
     1, _env_int("LMCACHE_INDEXER_PREFILL_OVERLAP_READ_LIMIT", 256)
 )
-_PROXY_ASYNC_ENABLED = _env_flag("LMCACHE_INDEXER_PROXY_ASYNC")
+_PROXY_ASYNC_ENABLED = (
+    _env_flag_default_on("LMCACHE_INDEXER_PROXY_ASYNC")
+    if _FULL_OVERLAP_ENABLED
+    else _env_flag("LMCACHE_INDEXER_PROXY_ASYNC")
+)
 _PROXY_ASYNC_WORKERS = max(
     1, _env_int("LMCACHE_INDEXER_PROXY_ASYNC_WORKERS", 2)
 )
@@ -1040,7 +1082,7 @@ class IndexerSSDManager:
 
     def reuse_prefetch_enabled(self) -> bool:
         """Return True when LMCache-hit prefill may seed CSA prefetch state."""
-        return _env_flag("LMCACHE_INDEXER_ENABLE_REUSE_PREFETCH")
+        return _REUSE_PREFETCH_ENABLED
 
     def decode_prefetch_enabled(self) -> bool:
         """Return True when per-token decode CSA prefetch/correction is enabled."""
