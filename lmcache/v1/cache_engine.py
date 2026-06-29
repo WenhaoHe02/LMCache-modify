@@ -2227,6 +2227,11 @@ class LMCacheEngine:
         path must NOT scatter those bytes to vLLM's KV cache, and must
         register the per-request chunk locations with the prefetcher so it
         can issue range reads when the Lightning Indexer outputs top-K.
+
+        Lazily attaches the manager when the Tutti loader has become
+        available since post_init.  ``_attach_csa_attention_kv_prefetch``
+        skips if its env gate is off, so this call is a no-op when the
+        operator has not opted into the full-overlap pipeline.
         """
         try:
             from lmcache.v1.csa_attention_kv_prefetch_manager import (
@@ -2234,7 +2239,20 @@ class LMCacheEngine:
             )
         except ImportError:
             return False
-        return get_csa_attention_kv_prefetch_manager() is not None
+        manager = get_csa_attention_kv_prefetch_manager()
+        if manager is not None:
+            return True
+        tutti_loader = getattr(self, "_tutti_loader", None)
+        if tutti_loader is None:
+            return False
+        try:
+            from lmcache.integration.vllm.vllm_v1_adapter import (
+                _ensure_csa_attention_kv_prefetch_attached,
+            )
+        except ImportError:
+            return False
+        manager = _ensure_csa_attention_kv_prefetch_attached(tutti_loader)
+        return manager is not None
 
     def _dsv4_retrieve_shapes_for_range(
         self,
