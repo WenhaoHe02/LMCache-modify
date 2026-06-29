@@ -103,11 +103,14 @@ class CSAAttentionKVChunkLoc:
             loader's ``_lba_cache``.  Reads against this path bypass the
             filesystem and read directly from the pre-FIEMAP'd raw NVMe
             extents (raw_extents).
-        layer_byte_offset: **Chunk-relative** byte offset where the chunk's
-            csa_attention_kv slab for this CSA layer begins (i.e. the offset
-            inside the chunk's serialised payload, NOT inside the pool).
-            ``chunk_file_offset`` is added at read time to land on the
-            pool-absolute byte that the registered raw extents cover.
+        layer_byte_offset: **Pool-absolute** byte offset where the chunk's
+            csa_attention_kv slab for this CSA layer begins.  Already
+            includes ``record.offset``; the prefetcher passes it straight
+            into :class:`KVObjectByteRange`.``offset`` because Tutti's
+            ``_logical_read_ranges`` ignores ``file_offsets`` when explicit
+            read_ranges are provided, so the byte addressing must already
+            be in the same coordinate system as the registered LBA extents'
+            ``file_offset`` fields.
         bytes_per_block: ``block_size * token_bytes`` for the csa_attention_kv
             group (block_size == 64 typically, token_bytes == 584).
         raw_extents: ``(file_offset, slba, n_sectors)`` extents covering the
@@ -115,12 +118,6 @@ class CSAAttentionKVChunkLoc:
             loader in ``register_request_chunks``; the union of every
             chunk's extents is what makes the synthetic path resolvable for
             every byte range the prefetcher asks for.
-        chunk_file_offset: Pool-absolute byte offset of this chunk's first
-            byte.  Passed through ``file_offsets`` to
-            :meth:`TuttiDirectLoader.load_chunks_to_hbm` so the inner read
-            paths add it back when matching ``read_ranges_per_key`` against
-            the registered LBA extents (whose ``file_offset`` fields are
-            also pool-absolute).
     """
 
     first_compressed_block: int
@@ -130,7 +127,6 @@ class CSAAttentionKVChunkLoc:
     layer_byte_offset: int
     bytes_per_block: int
     raw_extents: tuple[tuple[int, int, int], ...] = ()
-    chunk_file_offset: int = 0
 
     @property
     def end_compressed_block(self) -> int:
@@ -720,7 +716,7 @@ class CSAAttentionKVPrefetchManager:
                 run_length = 1
             keys.append(chunk.key)
             disk_metas.append(chunk.disk_meta)
-            file_offsets.append(int(chunk.chunk_file_offset))
+            file_offsets.append(0)
             read_ranges_per_key.append(tuple(ranges))
             target_offsets_per_chunk.append(target_offsets)
 
@@ -802,7 +798,11 @@ class CSAAttentionKVPrefetchManager:
                 ``[num_blocks, 64, token_bytes]`` layout).
 
         Returns:
-            Sorted unique list of block ids not yet in the layer's pool.
+            Sorted unique list of block ids not yet in the layer's pool and
+            within the chunk map's registered compressed-block range.  The
+            indexer often emits block ids past the current prefix
+            (sentinel padding); skipping them here avoids noisy
+            "block_id N not covered by any chunk" warnings downstream.
 
         Implementation note: the entire filter runs on the GPU so we do not
         pay a per-layer ``true_topk.cpu()`` sync.  The Python sync at the
@@ -812,7 +812,7 @@ class CSAAttentionKVPrefetchManager:
         function returns ``[]`` without ever materialising it on the host.
         """
         state = self._layers.get(int(layer_id))
-        if state is None:
+        if state is None or not state.chunks:
             return []
         entries = true_topk.reshape(-1)
         if entries.numel() == 0:
@@ -825,15 +825,21 @@ class CSAAttentionKVPrefetchManager:
             return []
         entries = entries[valid].to(torch.int64)
         block_ids = entries // state.compressed_block_size
-        # Clip block_ids to the bitmap range so an out-of-range entry from
-        # the indexer cannot index past the bitmap.  Tutti reads will skip
-        # any clipped value anyway because the chunk map only covers the
-        # registered range.
-        bitmap_len = int(state.in_pool_bitmap.shape[0])
-        in_range = block_ids < bitmap_len
+        # Clip to the chunk-map's registered range so out-of-prefix sentinel
+        # values (e.g. when the indexer pads its top-K with positions past
+        # the cached prefix) are dropped silently rather than triggering a
+        # "block_id N not covered by any chunk" warning per layer per call.
+        max_block_id = state.chunks[-1].end_compressed_block
+        in_range = block_ids < max_block_id
         if not bool(in_range.any().item()):
             return []
         block_ids = block_ids[in_range]
+        # Also drop blocks past the bitmap's capacity (which mirrors vLLM's
+        # K cache num_blocks) so an index_select never reads out of bounds.
+        bitmap_len = int(state.in_pool_bitmap.shape[0])
+        block_ids = block_ids[block_ids < bitmap_len]
+        if block_ids.numel() == 0:
+            return []
         in_pool_mask = state.in_pool_bitmap[block_ids]
         miss = block_ids[~in_pool_mask]
         if miss.numel() == 0:
