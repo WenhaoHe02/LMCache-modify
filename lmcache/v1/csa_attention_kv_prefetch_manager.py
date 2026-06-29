@@ -682,7 +682,11 @@ class CSAAttentionKVPrefetchManager:
         Args:
             layer_id: Transformer-side CSA layer id.
             true_topk: Output tensor of the true Lightning Indexer, shape
-                ``[num_queries, top_k]`` or ``[top_k]``.
+                ``[num_queries, top_k]`` or ``[top_k]``.  Values are
+                compressed *entry* ids in ``[0, S/compress_ratio)``; they are
+                converted to block ids by integer division with
+                ``compressed_block_size`` (matches vLLM IndexerCache's
+                ``[num_blocks, 64, token_bytes]`` layout).
 
         Returns:
             Sorted unique list of block ids not yet in the layer's pool.
@@ -690,5 +694,12 @@ class CSAAttentionKVPrefetchManager:
         state = self._layers.get(int(layer_id))
         if state is None:
             return []
-        block_ids = sorted(set(int(v) for v in true_topk.reshape(-1).cpu().tolist()))
+        entries = true_topk.reshape(-1).cpu().tolist()
+        block_ids = sorted(
+            {
+                int(v) // state.compressed_block_size
+                for v in entries
+                if int(v) >= 0
+            }
+        )
         return [bid for bid in block_ids if bid not in state.compressed_block_ids_in_pool]
