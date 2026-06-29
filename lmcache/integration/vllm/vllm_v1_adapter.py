@@ -68,6 +68,7 @@ logger = init_logger(__name__)
 
 _INDEXER_PREFETCH_MANAGER: Any = None
 _HCA_PREFETCH_MANAGER: Any = None
+_CSA_ATTENTION_KV_PREFETCH_MANAGER: Any = None
 _DEEPSEEK_DECODER_LAYER_CACHE: tuple[Any, ...] = ()
 _LMCACHE_DEEPSEEK_DECODER_LAYER_REGISTRY: Any = weakref.WeakSet()
 _DEEPSEEK_DECODER_REGISTRY_HOOK_INSTALLED: bool = False
@@ -586,6 +587,35 @@ def _decoder_hca_attention(decoder_layer: Any) -> Any:
         compress_ratio = int(getattr(candidate, "compress_ratio", 1))
         kv_cache = getattr(candidate, "kv_cache", None)
         if compress_ratio == 128 and isinstance(kv_cache, torch.Tensor):
+            return candidate
+    return None
+
+
+def _decoder_csa_attention(decoder_layer: Any) -> Any:
+    """Return the CSA MLA attention object owned by a DeepSeek decoder layer.
+
+    The returned object has a populated ``kv_cache`` tensor of shape
+    ``[num_blocks, compressed_block_size, token_bytes]`` and
+    ``compress_ratio == 4``.  Returns ``None`` when the layer is HCA or the
+    cache has not been materialised yet.
+    """
+    attn = getattr(decoder_layer, "self_attn", None)
+    if attn is None:
+        attn = getattr(decoder_layer, "attn", None)
+    if attn is None:
+        return None
+    wrapper = getattr(attn, "mla_attn", None)
+    candidates = [
+        getattr(wrapper, "mla_attn", None),
+        wrapper,
+        attn,
+    ]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        compress_ratio = int(getattr(candidate, "compress_ratio", 1))
+        kv_cache = getattr(candidate, "kv_cache", None)
+        if compress_ratio == 4 and isinstance(kv_cache, torch.Tensor) and kv_cache.numel() > 0:
             return candidate
     return None
 
@@ -1476,6 +1506,178 @@ def _ensure_hca_prefetch_attached() -> Any:
     return _HCA_PREFETCH_MANAGER
 
 
+def _csa_attention_kv_prefetch_enabled() -> bool:
+    """Return whether CSA attention KV prefetch should be attached.
+
+    Gated on ``LMCACHE_INDEXER_FULL_OVERLAP`` (master switch for the full
+    spec prefetch pipeline) plus the indexer prefetch master switch
+    (``LMCACHE_INDEXER_ENABLE_PREFETCH``).  Without an active
+    :class:`IndexerSSDManager` the attention KV prefetcher has no source of
+    predicted top-K, so the gate is intentionally conservative.
+    """
+    if not _indexer_prefetch_enabled():
+        return False
+    value = os.environ.get("LMCACHE_INDEXER_FULL_OVERLAP", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _attach_csa_attention_kv_prefetch(tutti_loader: Optional[Any] = None) -> None:
+    """Attach the CSA attention KV prefetcher when enabled by environment.
+
+    Wires up a :class:`CSAAttentionKVPrefetchManager` covering all DSv4 CSA
+    decoder layers, registers each layer's vLLM MLA K cache tensor, patches
+    each ``DeepseekV4Indexer.forward`` so the true_topk drives miss
+    correction + drain, and attaches the manager onto the active
+    :class:`IndexerSSDManager` so predicted top-K is mirrored across the
+    indexer-cache and attention-KV prefetchers.
+
+    Args:
+        tutti_loader: Active :class:`TuttiDirectLoader`.  Reads route through
+            Tutti GPU-direct DMA; when no loader is available the manager
+            is not attached and the legacy synchronous scatter remains in
+            effect.
+    """
+    global _CSA_ATTENTION_KV_PREFETCH_MANAGER
+
+    if not _csa_attention_kv_prefetch_enabled():
+        return
+    if tutti_loader is None:
+        logger.warning(
+            "LMCACHE_INDEXER_FULL_OVERLAP=1 but no Tutti loader is available; "
+            "skipping CSA attention KV prefetch attach"
+        )
+        return
+    if _CSA_ATTENTION_KV_PREFETCH_MANAGER is not None:
+        return
+
+    try:
+        from lmcache.v1.csa_attention_kv_prefetch_manager import (
+            CSAAttentionKVPrefetchManager,
+            set_csa_attention_kv_prefetch_manager,
+        )
+        from lmcache.v1.indexer_ssd_manager import get_indexer_ssd_manager
+    except ImportError as exc:
+        logger.warning(
+            "CSA attention KV prefetcher is unavailable: %s; skipping attach",
+            exc,
+        )
+        return
+
+    indexer_manager = get_indexer_ssd_manager()
+    if indexer_manager is None:
+        logger.warning(
+            "CSA attention KV prefetch requested but no IndexerSSDManager is "
+            "attached; skipping attach"
+        )
+        return
+
+    decoder_layers = _deepseek_decoder_layers()
+    if not decoder_layers:
+        logger.warning(
+            "CSA attention KV prefetch requested but no DeepSeek decoder "
+            "layers were found; skipping attach"
+        )
+        return
+
+    csa_layer_entries: list[tuple[int, Any, Any, Any]] = []
+    for decoder_layer in decoder_layers:
+        layer_id = getattr(decoder_layer, "layer_idx", -1)
+        if not isinstance(layer_id, int) or layer_id < 0:
+            continue
+        attention = _decoder_csa_attention(decoder_layer)
+        if attention is None:
+            continue
+        indexer_op = _decoder_csa_indexer(decoder_layer)
+        if indexer_op is None:
+            continue
+        csa_layer_entries.append((layer_id, attention, indexer_op, decoder_layer))
+
+    if not csa_layer_entries:
+        logger.warning(
+            "CSA attention KV prefetch requested but no CSA layers exposed "
+            "both attention.kv_cache and indexer modules; skipping attach"
+        )
+        return
+
+    csa_layer_entries.sort(key=lambda entry: entry[0])
+    csa_layer_ids = [layer_id for layer_id, _, _, _ in csa_layer_entries]
+
+    # Probe the first attention to derive token_bytes/compressed_block_size.
+    probe_kv_cache = getattr(csa_layer_entries[0][1], "kv_cache", None)
+    if not isinstance(probe_kv_cache, torch.Tensor) or probe_kv_cache.ndim != 3:
+        logger.warning(
+            "CSA attention KV prefetch: expected [num_blocks, block_size, "
+            "token_bytes] K cache tensor; got shape %s; skipping attach",
+            None if not isinstance(probe_kv_cache, torch.Tensor) else
+            tuple(probe_kv_cache.shape),
+        )
+        return
+    compressed_block_size = int(probe_kv_cache.shape[1])
+    token_bytes = int(probe_kv_cache.shape[2])
+
+    manager = CSAAttentionKVPrefetchManager(
+        tutti_loader=tutti_loader,
+        csa_layer_ids=csa_layer_ids,
+        compressed_block_size=compressed_block_size,
+        token_bytes=token_bytes,
+    )
+
+    patched_layers = 0
+    for layer_id, attention, indexer_op, decoder_layer in csa_layer_entries:
+        try:
+            kv_cache = getattr(attention, "kv_cache", None)
+            if not isinstance(kv_cache, torch.Tensor):
+                continue
+            manager.register_layer(int(layer_id), kv_cache)
+            # patch_indexer_forward wraps the SparseAttnIndexer op exposed
+            # via ``attn.indexer.indexer_op`` (the leaf module that runs the
+            # actual Lightning Indexer kernel and returns top-K indices).
+            # If a downstream model surfaces a different leaf, the
+            # ``LMCACHE_CSA_ATTENTION_KV_INDEXER_PATCH_TARGET`` env can
+            # request that we patch the parent ``indexer`` module instead.
+            target_module = indexer_op
+            override = os.environ.get(
+                "LMCACHE_CSA_ATTENTION_KV_INDEXER_PATCH_TARGET",
+                "indexer_op",
+            )
+            if override == "outer":
+                attn = (
+                    getattr(decoder_layer, "self_attn", None)
+                    or getattr(decoder_layer, "attn", None)
+                )
+                outer_indexer = getattr(attn, "indexer", None) if attn else None
+                if outer_indexer is not None:
+                    target_module = outer_indexer
+            manager.patch_indexer_forward(target_module, int(layer_id))
+            patched_layers += 1
+        except Exception:
+            logger.exception(
+                "Failed to register CSA attention KV prefetch for layer %d",
+                layer_id,
+            )
+
+    if patched_layers == 0:
+        logger.warning(
+            "CSA attention KV prefetch attach failed for all %d CSA layers; "
+            "rolling back",
+            len(csa_layer_entries),
+        )
+        manager.close()
+        return
+
+    indexer_manager.attach_csa_attention_kv_manager(manager)
+    set_csa_attention_kv_prefetch_manager(manager)
+    _CSA_ATTENTION_KV_PREFETCH_MANAGER = manager
+    logger.info(
+        "CSAAttentionKVPrefetchManager: attached with %d/%d CSA layers, "
+        "compressed_block_size=%d token_bytes=%d",
+        patched_layers,
+        len(csa_layer_entries),
+        compressed_block_size,
+        token_bytes,
+    )
+
+
 @dataclass
 class LoadSpec:
     # Number of tokens cached in vLLM
@@ -2199,6 +2401,7 @@ class LMCacheConnectorV1Impl:
         )
         _attach_indexer_prefetch(tutti_loader=engine_tutti_loader)
         _attach_hca_prefetch()
+        _attach_csa_attention_kv_prefetch(tutti_loader=engine_tutti_loader)
 
     def _capture_vllm_hma_layout(self) -> None:
         """Capture vLLM HMA group metadata for LMCache GPU transfers."""
