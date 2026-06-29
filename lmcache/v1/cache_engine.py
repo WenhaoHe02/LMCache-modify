@@ -2522,29 +2522,30 @@ class LMCacheEngine:
 
             # Locate the chunk's kv_object_store record so reads can resolve
             # post-snvme-bind via the synthetic ``tutti://...`` path that
-            # was registered in TuttiDirectLoader's _lba_cache.  The byte
-            # offset is expressed in pool-absolute units so the prefetcher
-            # passes it straight to load_chunks_to_hbm without further
-            # translation.
+            # was registered in TuttiDirectLoader's _lba_cache.  Byte
+            # offsets are expressed CHUNK-RELATIVE (group_offset + layer
+            # offset within the csa_attention_kv slab); the prefetcher
+            # passes ``record.offset`` as ``file_offsets`` so Tutti adds it
+            # back when looking up the LBA extent.
             try:
                 synth_path = disk_backend.kv_object_tutti_path(record.pool_id)
             except Exception:
                 continue
             if not synth_path or not record.raw_extents:
                 continue
-            pool_byte_offset = int(record.offset) + group_byte_offset
             synth_disk_meta = DiskCacheMetadata(
                 path=synth_path,
                 size=int(record.aligned_length),
                 fmt=MemoryFormat.BINARY_BUFFER,
             )
+            chunk_file_offset = int(record.offset)
             for layer_slot_idx, transformer_layer_id in enumerate(
                 layer_ids_for_group
             ):
                 if layer_slot_idx >= num_layers_in_group:
                     break
-                layer_byte_offset_in_pool = (
-                    pool_byte_offset
+                layer_byte_offset_in_chunk = (
+                    group_byte_offset
                     + layer_slot_idx * bytes_per_layer_in_chunk
                 )
                 chunks_by_layer[int(transformer_layer_id)].append(
@@ -2553,12 +2554,13 @@ class LMCacheEngine:
                         n_compressed_blocks=blocks_per_layer_in_chunk,
                         key=key,
                         disk_meta=synth_disk_meta,
-                        layer_byte_offset=layer_byte_offset_in_pool,
+                        layer_byte_offset=layer_byte_offset_in_chunk,
                         bytes_per_block=bytes_per_compressed_block,
                         raw_extents=tuple(
                             (int(fo), int(slba), int(n_sectors))
                             for fo, slba, n_sectors in record.raw_extents
                         ),
+                        chunk_file_offset=chunk_file_offset,
                     )
                 )
             compressed_blocks_cursor += blocks_per_layer_in_chunk

@@ -103,17 +103,24 @@ class CSAAttentionKVChunkLoc:
             loader's ``_lba_cache``.  Reads against this path bypass the
             filesystem and read directly from the pre-FIEMAP'd raw NVMe
             extents (raw_extents).
-        layer_byte_offset: **Pool-absolute** byte offset where the chunk's
-            csa_attention_kv slab for this CSA layer begins.  This already
-            includes ``record.offset`` plus the per-group/per-layer offset
-            inside the chunk's payload, so the prefetcher passes it through
-            ``read_ranges_per_key`` without translation.
+        layer_byte_offset: **Chunk-relative** byte offset where the chunk's
+            csa_attention_kv slab for this CSA layer begins (i.e. the offset
+            inside the chunk's serialised payload, NOT inside the pool).
+            ``chunk_file_offset`` is added at read time to land on the
+            pool-absolute byte that the registered raw extents cover.
         bytes_per_block: ``block_size * token_bytes`` for the csa_attention_kv
             group (block_size == 64 typically, token_bytes == 584).
         raw_extents: ``(file_offset, slba, n_sectors)`` extents covering the
-            entire pool ``disk_meta.path`` maps to.  Registered once with
-            the Tutti loader in ``register_request_chunks`` so the synthetic
-            path resolves at read time.
+            chunk's slot inside the pool.  Registered once with the Tutti
+            loader in ``register_request_chunks``; the union of every
+            chunk's extents is what makes the synthetic path resolvable for
+            every byte range the prefetcher asks for.
+        chunk_file_offset: Pool-absolute byte offset of this chunk's first
+            byte.  Passed through ``file_offsets`` to
+            :meth:`TuttiDirectLoader.load_chunks_to_hbm` so the inner read
+            paths add it back when matching ``read_ranges_per_key`` against
+            the registered LBA extents (whose ``file_offset`` fields are
+            also pool-absolute).
     """
 
     first_compressed_block: int
@@ -123,6 +130,7 @@ class CSAAttentionKVChunkLoc:
     layer_byte_offset: int
     bytes_per_block: int
     raw_extents: tuple[tuple[int, int, int], ...] = ()
+    chunk_file_offset: int = 0
 
     @property
     def end_compressed_block(self) -> int:
@@ -712,7 +720,7 @@ class CSAAttentionKVPrefetchManager:
                 run_length = 1
             keys.append(chunk.key)
             disk_metas.append(chunk.disk_meta)
-            file_offsets.append(0)
+            file_offsets.append(int(chunk.chunk_file_offset))
             read_ranges_per_key.append(tuple(ranges))
             target_offsets_per_chunk.append(target_offsets)
 
