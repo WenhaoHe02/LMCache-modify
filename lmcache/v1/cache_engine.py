@@ -2383,19 +2383,31 @@ class LMCacheEngine:
         compressed attention KV bytes, plus the byte offset within each
         chunk where that layer's slab begins.
 
+        Reads must work post-snvme-bind when filesystem paths are no longer
+        mountable, so the chunk map is built against the
+        :class:`KVObjectStore` raw NVMe path (synthetic ``tutti://...``
+        identifier + pre-FIEMAP'd raw LBA extents).  The per-chunk byte
+        offset is expressed in pool-absolute units so the prefetcher can
+        pass it through ``load_chunks_to_hbm``'s ``read_ranges_per_key``
+        unchanged.
+
         Args:
             blocks: Ordered ``(key, start_token, end_token)`` triples for the
                 chunks covering the request's prefix.
             disk_metas: ``DiskCacheMetadata`` entries aligned with
-                ``blocks``; entries may be ``None`` if a chunk is missing.
+                ``blocks``.  Currently unused (the kv_object_store records
+                are looked up directly) but kept in the signature for API
+                stability.
             total_tokens: Total logical tokens in the request.
 
         Returns:
             ``{transformer_layer_id: [CSAAttentionKVChunkLoc, ...]}``.
             Returns an empty dict when the layout is invalid, when no
-            ``csa_attention_kv`` group exists, or when the GPU connector is
-            unavailable.
+            ``csa_attention_kv`` group exists, when the GPU connector is
+            unavailable, or when the LocalDiskBackend is not using
+            kv_object_store raw mode.
         """
+        del disk_metas  # see docstring
         try:
             from lmcache.v1.csa_attention_kv_prefetch_manager import (
                 CSAAttentionKVChunkLoc,
@@ -2404,7 +2416,16 @@ class LMCacheEngine:
             return {}
         if not self.dsv4_optimized_kv:
             return {}
-        if self.gpu_connector is None:
+        if self.gpu_connector is None or self.storage_manager is None:
+            return {}
+        disk_backend = self.storage_manager.storage_backends.get("LocalDiskBackend")
+        if disk_backend is None or not getattr(
+            disk_backend, "kv_object_store_enabled", False
+        ):
+            # The CSA attention KV prefetcher requires the kv_object_store
+            # raw path because filesystem paths are unmounted after snvme
+            # bind; bail out cleanly so the retrieve falls back to the
+            # synchronous scatter.
             return {}
         klg_manager = self.metadata.kv_layer_groups_manager
         if klg_manager is None or not klg_manager.kv_layer_groups:
@@ -2425,12 +2446,15 @@ class LMCacheEngine:
         if not layer_ids_for_group:
             return {}
 
+        keys = [key for key, _, _ in blocks]
+        object_records = disk_backend.get_kv_object_records(keys, roles=None)
+
         chunks_by_layer: dict[int, list[Any]] = {
             int(layer_id): [] for layer_id in layer_ids_for_group
         }
         compressed_blocks_cursor = 0
-        for (key, start, end), disk_meta in zip(blocks, disk_metas, strict=True):
-            if disk_meta is None:
+        for (key, start, end), record in zip(blocks, object_records, strict=True):
+            if record is None:
                 continue
             chunk_tokens = end - start
             if chunk_tokens <= 0:
@@ -2489,13 +2513,32 @@ class LMCacheEngine:
                 continue
             blocks_per_layer_in_chunk = rows_per_layer // compressed_block_size
             bytes_per_compressed_block = compressed_block_size * bytes_per_token
+
+            # Locate the chunk's kv_object_store record so reads can resolve
+            # post-snvme-bind via the synthetic ``tutti://...`` path that
+            # was registered in TuttiDirectLoader's _lba_cache.  The byte
+            # offset is expressed in pool-absolute units so the prefetcher
+            # passes it straight to load_chunks_to_hbm without further
+            # translation.
+            try:
+                synth_path = disk_backend.kv_object_tutti_path(record.pool_id)
+            except Exception:
+                continue
+            if not synth_path or not record.raw_extents:
+                continue
+            pool_byte_offset = int(record.offset) + group_byte_offset
+            synth_disk_meta = DiskCacheMetadata(
+                path=synth_path,
+                size=int(record.aligned_length),
+                fmt=MemoryFormat.BINARY_BUFFER,
+            )
             for layer_slot_idx, transformer_layer_id in enumerate(
                 layer_ids_for_group
             ):
                 if layer_slot_idx >= num_layers_in_group:
                     break
-                layer_byte_offset = (
-                    group_byte_offset
+                layer_byte_offset_in_pool = (
+                    pool_byte_offset
                     + layer_slot_idx * bytes_per_layer_in_chunk
                 )
                 chunks_by_layer[int(transformer_layer_id)].append(
@@ -2503,9 +2546,13 @@ class LMCacheEngine:
                         first_compressed_block=compressed_blocks_cursor,
                         n_compressed_blocks=blocks_per_layer_in_chunk,
                         key=key,
-                        disk_meta=disk_meta,
-                        layer_byte_offset=layer_byte_offset,
+                        disk_meta=synth_disk_meta,
+                        layer_byte_offset=layer_byte_offset_in_pool,
                         bytes_per_block=bytes_per_compressed_block,
+                        raw_extents=tuple(
+                            (int(fo), int(slba), int(n_sectors))
+                            for fo, slba, n_sectors in record.raw_extents
+                        ),
                     )
                 )
             compressed_blocks_cursor += blocks_per_layer_in_chunk

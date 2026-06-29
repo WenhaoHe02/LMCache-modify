@@ -98,14 +98,22 @@ class CSAAttentionKVChunkLoc:
             ``[first_compressed_block, first_compressed_block +
             n_compressed_blocks)``.
         key: LMCache cache engine key identifying the chunk.
-        disk_meta: Cached :class:`DiskCacheMetadata` pointing at the chunk's
-            on-disk location.  Reused verbatim for Tutti reads.
-        layer_byte_offset: Byte offset inside the chunk's payload where the
-            csa_attention_kv slab for this CSA layer begins.  Tutti reads
-            stage a ``read_ranges_per_key`` entry at this offset plus the
-            block-relative offset.
+        disk_meta: Cached :class:`DiskCacheMetadata` pointing at a synthetic
+            ``tutti://<pool_id>`` path that resolves through the Tutti
+            loader's ``_lba_cache``.  Reads against this path bypass the
+            filesystem and read directly from the pre-FIEMAP'd raw NVMe
+            extents (raw_extents).
+        layer_byte_offset: **Pool-absolute** byte offset where the chunk's
+            csa_attention_kv slab for this CSA layer begins.  This already
+            includes ``record.offset`` plus the per-group/per-layer offset
+            inside the chunk's payload, so the prefetcher passes it through
+            ``read_ranges_per_key`` without translation.
         bytes_per_block: ``block_size * token_bytes`` for the csa_attention_kv
             group (block_size == 64 typically, token_bytes == 584).
+        raw_extents: ``(file_offset, slba, n_sectors)`` extents covering the
+            entire pool ``disk_meta.path`` maps to.  Registered once with
+            the Tutti loader in ``register_request_chunks`` so the synthetic
+            path resolves at read time.
     """
 
     first_compressed_block: int
@@ -114,6 +122,7 @@ class CSAAttentionKVChunkLoc:
     disk_meta: DiskCacheMetadata
     layer_byte_offset: int
     bytes_per_block: int
+    raw_extents: tuple[tuple[int, int, int], ...] = ()
 
     @property
     def end_compressed_block(self) -> int:
@@ -312,6 +321,12 @@ class CSAAttentionKVPrefetchManager:
         consecutive compressed block ranges starting at 0; gaps trigger a
         warning because they would surface as silent miss-on-fetch later.
 
+        For every distinct ``disk_meta.path`` referenced by the supplied
+        chunks, the chunk's ``raw_extents`` are pushed into the Tutti
+        loader's ``_lba_cache`` so subsequent ``load_chunks_to_hbm`` calls
+        can resolve the synthetic path without FIEMAP.  Re-registering the
+        same path is idempotent in Tutti.
+
         Args:
             req_id: Request identifier (advisory; the manager only keeps
                 one active request at a time in the initial implementation).
@@ -319,6 +334,42 @@ class CSAAttentionKVPrefetchManager:
                 descriptors.  Empty entries clear the layer's chunk list.
         """
         self._active_request_id = str(req_id)
+
+        # Collect every (path, raw_extents) pair carried by the chunk map
+        # and push them into the Tutti loader's LBA cache.  Multiple chunks
+        # share the same pool path, so dedup before registering.
+        try:
+            from lmcache.v1.gpu_connector.tutti_direct_loader import LbaRecord
+        except ImportError:
+            LbaRecord = None  # type: ignore[assignment]
+        if LbaRecord is not None:
+            raw_lba_cache: dict[str, list["LbaRecord"]] = {}
+            for chunks in chunks_by_layer.values():
+                for chunk in chunks:
+                    path = chunk.disk_meta.path if chunk.disk_meta else None
+                    if not path or not chunk.raw_extents:
+                        continue
+                    if path in raw_lba_cache:
+                        continue
+                    raw_lba_cache[path] = [
+                        LbaRecord(
+                            file_offset=int(file_offset),
+                            slba=int(slba),
+                            n_sectors=int(n_sectors),
+                        )
+                        for file_offset, slba, n_sectors in chunk.raw_extents
+                    ]
+            if raw_lba_cache:
+                try:
+                    self._tutti_loader.register_lba_cache(raw_lba_cache)
+                except Exception:
+                    logger.exception(
+                        "CSAAttentionKVPrefetchManager: failed to register %d "
+                        "LBA cache entries for request %s",
+                        len(raw_lba_cache),
+                        req_id,
+                    )
+
         for layer_id, state in self._layers.items():
             chunks = chunks_by_layer.get(int(layer_id), [])
             ordered = sorted(chunks, key=lambda chunk: chunk.first_compressed_block)
