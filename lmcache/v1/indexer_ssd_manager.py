@@ -406,30 +406,108 @@ class TuttiIndexerBlockStore:
     def read_token(self, token_id: int) -> bytes:
         """Synchronously read one token's K vector from the Tutti raw region.
 
+        Args:
+            token_id: Global token position index.
+
+        Returns:
+            Raw uint8 bytes of length ``token_bytes``.
+
         Raises:
-            NotImplementedError: Reads are routed through Tutti GPU-direct
-                ``load_chunks_to_hbm`` rather than per-token CPU reads.
-                Higher-level callers should batch via :meth:`read_tokens_batch`
-                or use :meth:`TuttiIndexerStorage.build_read_request` directly.
+            ValueError: If ``token_id`` is outside slot capacity.
         """
-        raise NotImplementedError(
-            "TuttiIndexerBlockStore.read_token is not implemented; callers must "
-            "use batched read_tokens_batch or TuttiIndexerStorage.build_read_request "
-            "to take advantage of GPU-direct NVMe DMA."
-        )
+        results = self.read_tokens_batch([int(token_id)])
+        if not results:
+            raise RuntimeError(
+                f"TuttiIndexerBlockStore.read_token returned no bytes for "
+                f"token_id={token_id}"
+            )
+        return results[0]
 
     def read_tokens_batch(self, token_ids: List[int]) -> List[bytes]:
         """Read multiple token K vectors via Tutti GPU-direct DMA.
 
+        Each batch issues a single ``load_chunks_to_hbm`` call against the
+        shared indexer raw region.  Adjacent ``token_ids`` are coalesced into
+        contiguous byte ranges so NVMe issues large sequential reads instead
+        of many sector-sized random reads.
+
+        Args:
+            token_ids: Token ids to read.  Returned bytes follow the input
+                order (not sorted).
+
+        Returns:
+            List of bytes, one entry per ``token_id`` with length
+            ``token_bytes`` each.  Returns an empty list if ``token_ids`` is
+            empty.
+
         Raises:
-            NotImplementedError: Wired in a follow-up commit; callers should
-                go through :meth:`TuttiIndexerStorage.build_read_request` and
-                submit the request via the shared :class:`TuttiDirectLoader`.
+            ValueError: If any ``token_id`` is outside slot capacity.
+            RuntimeError: If Tutti reports a read failure.
         """
-        raise NotImplementedError(
-            "TuttiIndexerBlockStore.read_tokens_batch is not yet wired; the "
-            "Tutti GPU-direct read path lands in a follow-up commit."
+        if not token_ids:
+            return []
+        request = self._storage.build_read_request(self._slot, token_ids)
+        if request.is_empty:
+            return [b""] * len(token_ids)
+
+        # Allocate ephemeral disk_metadata + key bundle for Tutti.  The
+        # synthetic CacheEngineKey carries the layer+token-range identity in
+        # its chunk_hash so logging is debuggable even if the request is
+        # batched with others later.
+        loader = self._storage._tutti_loader  # noqa: SLF001 — single owner
+        memory_objs = loader.load_chunks_to_hbm(
+            [request.key],
+            [request.disk_meta],
+            shapes_per_key=None,
+            file_offsets=[request.file_offset],
+            read_ranges_per_key=[request.read_ranges],
         )
+        if not memory_objs or memory_objs[0] is None:
+            raise RuntimeError(
+                f"Tutti load_chunks_to_hbm returned no payload for indexer "
+                f"layer {self._slot.layer_id} request "
+                f"({len(request.read_ranges)} ranges, "
+                f"{request.total_nbytes} bytes)"
+            )
+        memory_obj = memory_objs[0]
+        try:
+            tensor = memory_obj.raw_tensor
+            if tensor is None:
+                raise RuntimeError(
+                    "TuttiDirectLoader returned a MemoryObj without raw_tensor"
+                )
+            # Flatten to 1-D uint8 and copy to CPU bytes.  This intermediate
+            # CPU bounce exists only to satisfy the IndexerBlockStore bytes
+            # API; the higher-level IndexerSSDManager will be refactored to
+            # consume the GPU tensor directly in a later commit.
+            flat = tensor.reshape(-1).contiguous()
+            host = flat.cpu().numpy().tobytes()
+        finally:
+            ref_count_down = getattr(memory_obj, "ref_count_down", None)
+            if callable(ref_count_down):
+                ref_count_down()
+
+        if len(host) < request.total_nbytes:
+            raise RuntimeError(
+                f"Tutti read returned {len(host)} bytes, expected "
+                f"{request.total_nbytes} for layer {self._slot.layer_id}"
+            )
+
+        # Reconstruct per-token bytes from the read payload.  Token order in
+        # the request follows token_runs (sorted, deduplicated).  Map back to
+        # the caller's original token_ids order.
+        per_token: Dict[int, bytes] = {}
+        cursor = 0
+        for first_token, n_tokens in request.token_runs:
+            run_bytes = host[cursor : cursor + n_tokens * request.token_bytes]
+            cursor += n_tokens * request.token_bytes
+            for offset in range(n_tokens):
+                tid = first_token + offset
+                start = offset * request.token_bytes
+                end = start + request.token_bytes
+                per_token[tid] = run_bytes[start:end]
+
+        return [per_token[int(tid)] for tid in token_ids]
 
     def write_token(self, token_id: int, data: bytes) -> None:
         """Persist one token K vector to the Tutti raw region.
