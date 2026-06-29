@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 import asyncio
@@ -242,6 +242,13 @@ class LocalDiskBackend(StorageBackendInterface):
         self.kv_object_metadata_store: Optional[KVObjectMetadataStore] = None
         self.kv_object_pool_io: Optional[KVObjectPoolIO] = None
         self.kv_object_store_lock = threading.Lock()
+        # Separate 1-worker executor for fire-and-forget HCA NVMe writes.
+        # HCA slab/deferred writes are large and slow; submitting them here
+        # keeps them off the main disk_worker pool so they cannot saturate
+        # the 4-worker capacity that regular KV chunk writes need.
+        self._hca_write_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="lmcache-hca-disk-write"
+        )
         self._diagnose_contains_misses = _env_flag(
             "LMCACHE_DISK_CONTAINS_DIAGNOSTICS"
         )
@@ -1948,33 +1955,61 @@ class LocalDiskBackend(StorageBackendInterface):
                 )
                 return False
             try:
-                with self.kv_object_store_lock:
-                    compact_written = self._write_hca_deferred_retrieve_object(
-                        key,
-                        memory_obj,
-                        buffer,
-                        raw_writer,
-                    )
-                    slab_written = self._write_hca_slab_object(
-                        key,
-                        memory_obj,
-                        buffer,
-                        raw_writer,
-                    )
-                elapsed_ms = (time.perf_counter() - start) * 1000.0
-                logger.info(
-                    "KV_OBJECT_STORE_PROFILE op=write key=%s bytes=%d "
-                    "status=hca_deferred_only compact=%s slab=%s "
-                    "staging_bytes=%s total_ms=%.3f",
-                    key.to_string(),
-                    len(buffer),
-                    compact_written,
-                    slab_written,
-                    self.kv_object_tutti_raw_staging_bytes,
-                    elapsed_ms,
-                )
-                return compact_written and slab_written
+                # Submit HCA deferred writes to a dedicated background executor
+                # so the NVMe I/O (via raw_writer) does not hold kv_object_store_lock
+                # on the disk-worker thread and cannot saturate the 4-worker pool.
+                # Bump ref count to keep the memory alive until the task finishes.
+                memory_obj.ref_count_up()
+
+                def _do_hca_deferred_writes(
+                    _key=key,
+                    _memory_obj=memory_obj,
+                    _buffer=buffer,
+                    _raw_writer=raw_writer,
+                    _start=start,
+                ) -> None:
+                    try:
+                        with self.kv_object_store_lock:
+                            compact_written = (
+                                self._write_hca_deferred_retrieve_object(
+                                    _key,
+                                    _memory_obj,
+                                    _buffer,
+                                    _raw_writer,
+                                )
+                            )
+                            slab_written = self._write_hca_slab_object(
+                                _key,
+                                _memory_obj,
+                                _buffer,
+                                _raw_writer,
+                            )
+                        elapsed_ms = (time.perf_counter() - _start) * 1000.0
+                        logger.info(
+                            "KV_OBJECT_STORE_PROFILE op=write key=%s bytes=%d "
+                            "status=hca_deferred_only compact=%s slab=%s "
+                            "staging_bytes=%s total_ms=%.3f",
+                            _key.to_string(),
+                            len(_buffer),
+                            compact_written,
+                            slab_written,
+                            self.kv_object_tutti_raw_staging_bytes,
+                            elapsed_ms,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "KV_OBJECT_STORE_PROFILE op=write key=%s "
+                            "status=hca_deferred_failed error=%s",
+                            _key.to_string(),
+                            exc,
+                        )
+                    finally:
+                        _memory_obj.ref_count_down()
+
+                self._hca_write_executor.submit(_do_hca_deferred_writes)
+                return True
             except Exception as exc:
+                memory_obj.ref_count_down()
                 logger.warning(
                     "KV_OBJECT_STORE_PROFILE op=write key=%s "
                     "status=hca_deferred_failed error=%s",
@@ -2040,20 +2075,57 @@ class LocalDiskBackend(StorageBackendInterface):
                     ready_record,
                     memory_obj,
                 )
-                if self._write_hca_deferred_retrieve_object(
-                    key,
-                    memory_obj,
-                    buffer,
-                    raw_writer,
-                ):
-                    indexed_views += 1
-                if self._write_hca_slab_object(
-                    key,
-                    memory_obj,
-                    buffer,
-                    raw_writer,
-                ):
-                    indexed_views += 1
+            # Submit the supplementary HCA slab/deferred writes as a
+            # fire-and-forget background task so the NVMe I/O for these
+            # secondary objects does not extend the lock hold time and
+            # does not occupy the disk_worker pool capacity.
+            memory_obj.ref_count_up()
+
+            def _do_hca_supplementary_writes(
+                _key=key,
+                _memory_obj=memory_obj,
+                _buffer=buffer,
+                _raw_writer=raw_writer,
+            ) -> None:
+                try:
+                    with self.kv_object_store_lock:
+                        deferred = self._write_hca_deferred_retrieve_object(
+                            _key,
+                            _memory_obj,
+                            _buffer,
+                            _raw_writer,
+                        )
+                        slab = self._write_hca_slab_object(
+                            _key,
+                            _memory_obj,
+                            _buffer,
+                            _raw_writer,
+                        )
+                    if deferred or slab:
+                        logger.info(
+                            "KV_OBJECT_STORE_PROFILE op=write key=%s "
+                            "status=hca_supplementary deferred=%s slab=%s",
+                            _key.to_string(),
+                            deferred,
+                            slab,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "KV_OBJECT_STORE_PROFILE op=write key=%s "
+                        "status=hca_supplementary_failed error=%s",
+                        _key.to_string(),
+                        exc,
+                    )
+                finally:
+                    _memory_obj.ref_count_down()
+
+            try:
+                self._hca_write_executor.submit(_do_hca_supplementary_writes)
+            except Exception:
+                # submit() failed (e.g. executor shut down); balance the
+                # ref_count_up we did before defining the closure.
+                memory_obj.ref_count_down()
+                raise
             elapsed_ms = (time.perf_counter() - start) * 1000.0
             logger.info(
                 "KV_OBJECT_STORE_PROFILE op=write key=%s bytes=%d "
@@ -2329,4 +2401,5 @@ class LocalDiskBackend(StorageBackendInterface):
     def close(self) -> None:
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.close()
+        self._hca_write_executor.shutdown(wait=False)
         self.disk_worker.close()

@@ -542,7 +542,10 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                 "VLLMPagedMemGPUConnectorV3 found an empty KV layer-groups "
                 "manager; rebuilding from registered vLLM KV caches"
             )
-            self.metadata.kv_layer_groups_manager = None
+            # Do NOT set to None here: clearing to None before the rebuild
+            # check (below) would cause all TP workers to see None
+            # simultaneously and trigger redundant parallel rebuilds.  The
+            # rebuild check already handles both None and empty-groups cases.
 
         self.gpu_kv_format, self.kvcaches = normalize_kv_and_discover_format(
             self.kvcaches, EngineType.VLLM, layout_hints=self.layout_hints
