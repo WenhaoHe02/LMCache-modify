@@ -2217,6 +2217,268 @@ class LMCacheEngine:
         max_tokens = _env_int("LMCACHE_DSV4_DEFER_HCA_MAX_TOKENS", 0)
         return max_tokens <= 0 or total_tokens <= max_tokens
 
+    def _dsv4_csa_attention_kv_prefetch_active(self) -> bool:
+        """Return whether the CSA attention KV prefetch manager is attached.
+
+        When attached, the on-demand prefetcher owns the load lifecycle of
+        ``csa_attention_kv`` group bytes via Tutti GPU-direct reads timed to
+        the FFN/MoE overlap window.  In that case the synchronous retrieve
+        path must NOT scatter those bytes to vLLM's KV cache, and must
+        register the per-request chunk locations with the prefetcher so it
+        can issue range reads when the Lightning Indexer outputs top-K.
+        """
+        try:
+            from lmcache.v1.csa_attention_kv_prefetch_manager import (
+                get_csa_attention_kv_prefetch_manager,
+            )
+        except ImportError:
+            return False
+        return get_csa_attention_kv_prefetch_manager() is not None
+
+    def _dsv4_retrieve_shapes_for_range(
+        self,
+        shapes: list[torch.Size],
+        dtypes: list[torch.dtype],
+        start: int,
+        end: int,
+        total_tokens: int,
+    ) -> list[torch.Size]:
+        """Return per-group shapes for a retrieve chunk, applying both the
+        DSv4-optimized tail-only masking from
+        :meth:`_dsv4_store_shapes_for_range` and the additional
+        ``csa_attention_kv`` zero-shape when the CSA attention KV prefetcher
+        is attached.
+
+        This is the retrieve-side variant; on-disk byte layouts continue to
+        use the unfiltered :meth:`_dsv4_store_shapes_for_range` because the
+        chunk was previously stored with full ``csa_attention_kv`` bytes.
+
+        Args:
+            shapes: Original per-group shapes from
+                :meth:`KVCacheMetadata.get_shapes` for this chunk's token
+                count.
+            dtypes: Per-group dtypes from
+                :meth:`KVCacheMetadata.get_dtypes`.
+            start: Logical token start of this chunk inside the request.
+            end: Logical token end (exclusive).
+            total_tokens: Total logical tokens in the request.
+
+        Returns:
+            Per-group shapes with all relevant zero-shape masks applied.
+        """
+        base = self._dsv4_store_shapes_for_range(
+            shapes,
+            dtypes,
+            start,
+            end,
+            total_tokens,
+        )
+        if not self._dsv4_csa_attention_kv_prefetch_active():
+            return base
+        klg_manager = self.metadata.kv_layer_groups_manager
+        if klg_manager is None or not klg_manager.kv_layer_groups:
+            return base
+        filtered: list[torch.Size] = []
+        for shape, dtype, group in zip(
+            base,
+            dtypes,
+            klg_manager.kv_layer_groups,
+            strict=True,
+        ):
+            role = self._dsv4_group_role(group, dtype)
+            if role == "csa_attention_kv":
+                filtered.append(self._zero_token_shape(shape))
+            else:
+                filtered.append(shape)
+        return filtered
+
+    def _register_csa_attention_kv_chunks(
+        self,
+        blocks: list[tuple[CacheEngineKey, int, int]],
+        disk_metas: list[Optional[DiskCacheMetadata]],
+        total_tokens: int,
+        req_id: str,
+    ) -> None:
+        """Build and register the CSA attention KV chunk map with the manager.
+
+        Best-effort: any failure (missing manager, layout mismatch, FIEMAP
+        error) logs and silently falls back to leaving the manager
+        unregistered, which means the prefetcher will warn-and-skip when
+        later asked to read.
+
+        Args:
+            blocks: Ordered ``(key, start_token, end_token)`` triples.
+            disk_metas: Per-block ``DiskCacheMetadata``; ``None`` is allowed.
+            total_tokens: Total logical tokens in the request.
+            req_id: Request identifier for the prefetcher's internal logging.
+        """
+        try:
+            from lmcache.v1.csa_attention_kv_prefetch_manager import (
+                get_csa_attention_kv_prefetch_manager,
+            )
+        except ImportError:
+            return
+        manager = get_csa_attention_kv_prefetch_manager()
+        if manager is None:
+            return
+        chunks_by_layer = self._dsv4_build_csa_attention_kv_chunks(
+            blocks,
+            disk_metas,
+            total_tokens,
+        )
+        if not chunks_by_layer:
+            return
+        try:
+            manager.register_request_chunks(req_id, chunks_by_layer)
+        except Exception:
+            logger.exception(
+                "Failed to register CSA attention KV chunks for request %s; "
+                "the prefetcher will fall back to warn-and-skip on reads",
+                req_id,
+            )
+
+    def _dsv4_build_csa_attention_kv_chunks(
+        self,
+        blocks: list[tuple[CacheEngineKey, int, int]],
+        disk_metas: list[Optional[DiskCacheMetadata]],
+        total_tokens: int,
+    ) -> dict[int, list[Any]]:
+        """Build the per-CSA-layer chunk map for the active request.
+
+        The returned mapping is suitable for passing into
+        :meth:`CSAAttentionKVPrefetchManager.register_request_chunks`.  Each
+        entry locates the LMCache chunks that contain a given CSA layer's
+        compressed attention KV bytes, plus the byte offset within each
+        chunk where that layer's slab begins.
+
+        Args:
+            blocks: Ordered ``(key, start_token, end_token)`` triples for the
+                chunks covering the request's prefix.
+            disk_metas: ``DiskCacheMetadata`` entries aligned with
+                ``blocks``; entries may be ``None`` if a chunk is missing.
+            total_tokens: Total logical tokens in the request.
+
+        Returns:
+            ``{transformer_layer_id: [CSAAttentionKVChunkLoc, ...]}``.
+            Returns an empty dict when the layout is invalid, when no
+            ``csa_attention_kv`` group exists, or when the GPU connector is
+            unavailable.
+        """
+        try:
+            from lmcache.v1.csa_attention_kv_prefetch_manager import (
+                CSAAttentionKVChunkLoc,
+            )
+        except ImportError:
+            return {}
+        if not self.dsv4_optimized_kv:
+            return {}
+        if self.gpu_connector is None:
+            return {}
+        klg_manager = self.metadata.kv_layer_groups_manager
+        if klg_manager is None or not klg_manager.kv_layer_groups:
+            return {}
+        dtypes = self.metadata.get_dtypes()
+        csa_group_idx: Optional[int] = None
+        csa_group: Optional[Any] = None
+        for idx, group in enumerate(klg_manager.kv_layer_groups):
+            if self._dsv4_group_role(group, dtypes[idx]) == "csa_attention_kv":
+                csa_group_idx = idx
+                csa_group = group
+                break
+        if csa_group_idx is None or csa_group is None:
+            return {}
+        layer_ids_for_group = self.gpu_connector._dsv4_layer_ids_for_group(  # noqa: SLF001
+            csa_group
+        )
+        if not layer_ids_for_group:
+            return {}
+
+        chunks_by_layer: dict[int, list[Any]] = {
+            int(layer_id): [] for layer_id in layer_ids_for_group
+        }
+        compressed_blocks_cursor = 0
+        for (key, start, end), disk_meta in zip(blocks, disk_metas, strict=True):
+            if disk_meta is None:
+                continue
+            chunk_tokens = end - start
+            if chunk_tokens <= 0:
+                continue
+            store_shapes = self._dsv4_store_shapes_for_range(
+                self.metadata.get_shapes(chunk_tokens),
+                dtypes,
+                start,
+                end,
+                total_tokens,
+            )
+            # Byte offset of csa_attention_kv group inside the chunk's
+            # serialised payload: sum of prior groups' byte sizes using the
+            # store shapes (not the retrieve shapes, since the chunk was
+            # written with the store layout).
+            group_byte_offset = 0
+            for prior_idx in range(csa_group_idx):
+                prior_shape = store_shapes[prior_idx]
+                prior_dtype = dtypes[prior_idx]
+                group_byte_offset += int(prior_shape.numel()) * int(
+                    prior_dtype.itemsize
+                )
+            csa_shape = store_shapes[csa_group_idx]
+            if csa_shape.numel() <= 0:
+                # This chunk has zero-shape csa_attention_kv (e.g., a non-tail
+                # variant that the store path masked out).  Skip — there is
+                # no source data to prefetch.
+                continue
+            # csa_attention_kv shape is [kv_size, num_layers_in_group, rows,
+            # hidden_dim].  Compressed rows per chunk = chunk_tokens //
+            # compress_ratio.
+            compress_ratio = int(csa_group.compress_ratio)
+            if compress_ratio <= 0:
+                continue
+            rows_per_layer = chunk_tokens // compress_ratio
+            if rows_per_layer <= 0:
+                continue
+            csa_dtype = dtypes[csa_group_idx]
+            hidden_dim = int(csa_shape[-1])
+            bytes_per_token = hidden_dim * int(csa_dtype.itemsize)
+            bytes_per_layer_in_chunk = rows_per_layer * bytes_per_token
+            num_layers_in_group = int(csa_shape[1])
+            # vLLM packs the K cache as [num_blocks, compressed_block_size,
+            # token_bytes] with compressed_block_size == DEEPGEMM_PAGED_BLOCK_SIZE
+            # (64).  Mirror that constant here so the indexer's top-K block ids
+            # can index into our chunk locations.
+            compressed_block_size = 64
+            if rows_per_layer % compressed_block_size != 0:
+                logger.warning(
+                    "DSv4 CSA chunk %s has %d compressed rows per layer, not a "
+                    "multiple of compressed_block_size=%d; skipping",
+                    key.to_string() if hasattr(key, "to_string") else repr(key),
+                    rows_per_layer,
+                    compressed_block_size,
+                )
+                continue
+            blocks_per_layer_in_chunk = rows_per_layer // compressed_block_size
+            bytes_per_compressed_block = compressed_block_size * bytes_per_token
+            for layer_slot_idx, transformer_layer_id in enumerate(
+                layer_ids_for_group
+            ):
+                if layer_slot_idx >= num_layers_in_group:
+                    break
+                layer_byte_offset = (
+                    group_byte_offset
+                    + layer_slot_idx * bytes_per_layer_in_chunk
+                )
+                chunks_by_layer[int(transformer_layer_id)].append(
+                    CSAAttentionKVChunkLoc(
+                        first_compressed_block=compressed_blocks_cursor,
+                        n_compressed_blocks=blocks_per_layer_in_chunk,
+                        key=key,
+                        disk_meta=disk_meta,
+                        layer_byte_offset=layer_byte_offset,
+                        bytes_per_block=bytes_per_compressed_block,
+                    )
+                )
+            compressed_blocks_cursor += blocks_per_layer_in_chunk
+        return chunks_by_layer
+
     def _dsv4_store_shapes_for_range(
         self,
         shapes: list[torch.Size],
@@ -3955,10 +4217,14 @@ class LMCacheEngine:
             # ~1.4 MB) instead of all 8 groups (~116 MB).  This mirrors the
             # shape masking already applied in the store path and prevents
             # vLLM RPC timeouts caused by reading ~110 GB sequentially for
-            # large prompts.
+            # large prompts.  ``_dsv4_retrieve_shapes_for_range`` additionally
+            # zero-shapes ``csa_attention_kv`` when the CSA attention KV
+            # prefetcher is attached, leaving those ~100 MiB for the
+            # prefetcher to load lazily via Tutti during the FFN/MoE overlap
+            # window.
             if self.dsv4_optimized_kv:
                 store_shapes_per_key: Optional[List[Optional[List[torch.Size]]]] = [
-                    self._dsv4_store_shapes_for_range(
+                    self._dsv4_retrieve_shapes_for_range(
                         self.metadata.get_shapes(end - start),
                         self.metadata.get_dtypes(),
                         start,
@@ -3967,6 +4233,13 @@ class LMCacheEngine:
                     )
                     for _, start, end in blocks
                 ]
+                if self._dsv4_csa_attention_kv_prefetch_active():
+                    self._register_csa_attention_kv_chunks(
+                        blocks,
+                        [disk_backend.dict.get(key) for key, _, _ in blocks],
+                        total_tokens,
+                        kwargs.get("req_id", "unknown"),
+                    )
             else:
                 store_shapes_per_key = None
 
