@@ -912,6 +912,16 @@ def _fire_decoder_ffn_overlap(
                 residual_f=residual_after_attention,
                 positions=positions,
             )
+            # Also dispatch CSA-attention-KV prefetch unconditionally so the
+            # K cache reads overlap with this layer's FFN window even when
+            # the indexer's residual-proxy path is disabled for prefill.
+            dispatch_csa_kv = getattr(
+                indexer_manager,
+                "dispatch_csa_kv_overlap_unconditional",
+                None,
+            )
+            if callable(dispatch_csa_kv):
+                dispatch_csa_kv(next_csa)
         except Exception as exc:
             _log_overlap_hook_error_once("CSA", int(layer_id), exc)
 

@@ -1485,6 +1485,38 @@ class IndexerSSDManager:
             mode="sync",
         )
 
+    def dispatch_csa_kv_overlap_unconditional(self, next_csa_layer_id: int) -> None:
+        """Fire CSA-attention-KV reads for ``next_csa_layer_id`` in the overlap window.
+
+        Independent of the indexer-cache fire_async path so the CSA attention
+        KV prefetch can run during the previous layer's FFN window even when
+        the indexer-side residual proxy is disabled (e.g. the prefill residual
+        proxy is off in the cache-hit retrieve scenario).  Uses the previous
+        CSA layer's last true top-K as the prediction.
+
+        Args:
+            next_csa_layer_id: The CSA layer whose K cache we want pre-loaded
+                before its sparse attention kernel runs.
+        """
+        manager = getattr(self, "_csa_attention_kv_manager", None)
+        if manager is None:
+            return
+        csa_ids = sorted(self._last_attention_true_ids.keys())
+        try:
+            idx = csa_ids.index(int(next_csa_layer_id))
+        except ValueError:
+            return
+        if idx == 0:
+            return
+        prev_csa = csa_ids[idx - 1]
+        prev_topk = self._last_attention_true_ids.get(prev_csa)
+        if not prev_topk:
+            return
+        self._dispatch_csa_attention_kv_predicted(
+            int(next_csa_layer_id),
+            list(prev_topk),
+        )
+
     def attach_csa_attention_kv_manager(self, manager: Optional[Any]) -> None:
         """Attach (or detach) the CSA attention KV prefetcher.
 
