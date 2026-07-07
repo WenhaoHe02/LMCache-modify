@@ -1,5 +1,29 @@
 # V24/V25 关键数据(2026-07-08 追加)
 
+## V27 正确性疑点(已结案:V27 无罪)
+
+V27-32K r1 的 hit-1..5 首 token 不同曾引发搬迁损坏怀疑。两点排除:
+
+1. **基准的 hit-1..5 prompt 本就各不相同**(run_incremental_v2.py 给每
+   个 hit 加 `Variant {i} nonce` 头)——跨 hit 输出不同是合法的,当初
+   的"翻转"是误读。r2 全 '178' 反而是填充文本主导输出的巧合。
+2. **同 boot A/B(abtext.sh,env 透传修复后干净跑)**:
+   - cycle-A(RESIDENT_SKIP=0,V25 每 hit 全量 walker):
+     hits 6.94/7.08/7.32/7.37,texts ' Now'/'314'/'314'/'314'/' Now',
+     repeat '5'/'5'
+   - cycle-B(=1,V27 搬迁):hits 6.40/6.00/6.00/6.61,
+     texts '202'/'2'/'583'/' Now'/'202',repeat '5'/'5'
+   - **两臂行为模式一致**:hit-5 与 repeat(同 prompt)都不同色、
+     repeat 两次都稳定 '5'。搬迁开或关没有引入任何新的输出变化模式。
+     (注:两 cycle nonce 不同,绝对文本跨 cycle 不可比。)
+
+**A/B 附带产出——同 boot 最干净的性能对照**:唯一变量是搬迁开关,
+skip0 稳态 6.94-7.37(V25 水平)vs skip1 稳态 6.00-6.61(OFF 线),
+**V27 净赚 ~0.9s/hit,与历史跨 boot 数据完全吻合**。
+
+遗留:严格的 vs-OFF 输出对照做不了(OFF 容器不回传 text);要做需给
+OFF 环境加 text 回传或用 logprobs 比对,列为后续项。
+
 ## V27:HBM 行搬迁 —— 稳态追平 OFF(突破!)
 
 V26 诊断日志给出精确根因:**chunk key 命中 100%(41979/41979),但
@@ -49,6 +73,16 @@ cold_store 433s 分歧超时)。重启容器后同脚本正常。这与 CSA 代�
 
 剩余差距:hit-1(首次命中,签名尚未建立)仍付全额 walker 税;真正
 反超 OFF 还需 csrc zero-copy(读路径首跑就免 scatter)。
+
+**hit-1 解剖(V27-32K r1 hit-1=19.3s 的去向)**:retrieve 2.6s 正常;
+layer-2 gate correction 在 7/8 rank 上 total=10.76s,但所有被测组件
+(wait 0.006ms / drain 0.017ms / miss_filter 32ms / 二次 drain 0.007ms)
+都可忽略——**10.6s 在 orig_forward(真 Lightning Indexer op)内部**,
+仅每次 boot 后第一个 hit 出现(r2 hit-1 = 7.9s 无此税;TP0 rank 无此税
+119ms)。walker 同窗口的 Tutti 读实际只 70ms(group_ms=10754 里 99% 是
+等这个 orig_forward 完成后 io_lock 才轮到它)。结论:**每 boot 一次性
+的 kernel warmup/JIT 税,与 CSA 读路径无关**,不值得修;基准协议应
+丢弃每 boot 的第一个 hit(既有协议已经这么做——r1 hit-1 从不计入稳态)。
 
 ## V26(已证伪,诊断价值):resident-chunk 同行跳过
 
