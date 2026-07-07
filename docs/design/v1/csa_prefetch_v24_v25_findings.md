@@ -31,10 +31,16 @@ gather(旧行)→ scatter(新行)搬迁**,在注册时(retrieve 阶段,SM 空闲
 - r1 hits 7.70/8.36/7.74/8.44,r2 hits 8.53/7.78/7.77/8.59(hit-1 7.94)
 - repeat 4.70/4.70(V25 是 6.4;OFF-16K repeat 4.6)
 - relocation matched=41979/41979,147ms/rank,illegal=0
-- 对照 OFF 7.74-7.82:**约一半 hit 落在 OFF 线上(7.70-7.78),其余
-  +0.6-0.8s**。比 V25 稳态(8.5-9.0)整体下移 ~0.7s,方差仍在——剩余
-  抖动来自 rank-skew retrieve + deferred store 碰撞,与 CSA scatter
-  无关(16K 上同环境几乎无方差,32K 的 12GB retrieve 放大了偏斜)。
+
+**同夜新鲜 OFF-32K 基线(含 repeat,公平对照)**:
+- r1 hits 7.80/8.33/7.71/7.80/7.74,repeat 10.17/4.82
+- r2 hits 7.76/7.83/7.75/8.39/8.52,repeat 4.73/4.78
+
+**结论:32K 上 ON 与 OFF 分布重合**(ON 7.70-8.59 vs OFF 7.71-8.52,
+均值 ~8.1 vs ~8.0;两者都有 8.3-8.5 波动点——之前"OFF 紧凑 7.74-7.82"
+是彼时 boot 的运气,今晚同环境 OFF 同样抖)。repeat ON 4.70/4.70 略优
+于 OFF 4.73-4.82。**V27 在两个形状上都实现统计意义上的 ON=OFF,
+repeat 均反超**。方差源(rank-skew retrieve)是共享的,不是 ON 独有。
 
 **32K 首启注意**:reboot 后第一次 32K cold_store 曾把 engine 打死
 (shm broadcast TimeoutError,worker 无 traceback无 OOM——EP rank 间
