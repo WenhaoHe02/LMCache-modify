@@ -45,6 +45,18 @@ import lmcache.c_ops as lmc_ops
 logger = init_logger(__name__)
 
 
+def _dsv4_vectorized_consume_enabled() -> bool:
+    """Return True when batched H2D scatter batches kernels per group.
+
+    V29: the per-chunk ``to_gpu`` loop costs ~1 ms host work per chunk
+    (measured 1.3-1.9 s per steady 480K retrieve against 146 ms of NVMe
+    time).  Default off — the flag flips retrieve scatter to one kernel
+    per group per Tutti staging batch.
+    """
+    value = os.environ.get("LMCACHE_DSV4_VECTORIZED_CONSUME", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
 class GPUConnectorInterface(metaclass=abc.ABCMeta):
     @abc.abstractmethod
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
@@ -1634,9 +1646,139 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
+        if _dsv4_vectorized_consume_enabled():
+            self._batched_to_gpu_vectorized(memory_objs, starts, ends, **kwargs)
+            return
         with torch.cuda.stream(self.load_stream):
             for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
                 self.to_gpu(memory_obj, start, end, **kwargs)
+        self.load_stream.synchronize()
+
+    def _batched_to_gpu_vectorized(
+        self,
+        memory_objs: List[MemoryObj],
+        starts: List[int],
+        ends: List[int],
+        **kwargs: object,
+    ) -> None:
+        """Vectorized H2D scatter: one kernel launch per group per batch.
+
+        The per-chunk ``to_gpu`` costs ~1 ms of host work per chunk (eight
+        group-policy branches + one small kernel each), which at 1874
+        chunks dominates the steady-state retrieve (measured 1.3-1.9 s
+        against 146 ms of actual NVMe time).  This path collects every
+        chunk's tensor pointer and block ids per group and issues ONE
+        ``multi_layer_block_kv_transfer`` per group, mirroring the
+        precedent in ``_batched_transfer``.
+
+        CPU-side per-chunk hooks (CSA indexer seeding, HCA-defer
+        bookkeeping) still run per chunk — they are cheap and their
+        semantics are per-chunk.  Chunks that hit a policy branch that
+        suppresses or redirects the plain group transfer (tail-only
+        masking active for the chunk, HCA defer, zero-shape group) simply
+        contribute no pointer for that group, which is exactly what the
+        per-chunk path does.
+
+        Args:
+            memory_objs: Staging-view memory objects for this Tutti batch.
+            starts: Logical token starts aligned with ``memory_objs``.
+            ends: Logical token ends aligned with ``memory_objs``.
+        """
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs.")
+        slot_mapping = kwargs["slot_mapping"]
+        if not isinstance(slot_mapping, torch.Tensor):
+            raise ValueError("slot_mapping must be a torch.Tensor")
+        self.initialize_kvcaches_ptr(**kwargs)
+        self._initialize_kv_cache_pointers()
+        if (
+            self.group_kv_cache_pointers_on_gpu is None
+            or self.metadata.kv_layer_groups_manager is None
+        ):
+            raise RuntimeError(
+                "KV cache pointers unavailable in vectorized batched_to_gpu"
+            )
+        klg_manager = self.metadata.kv_layer_groups_manager
+        num_groups = klg_manager.num_groups
+
+        vllm_cached = kwargs.get("vllm_cached_tokens", 0)
+
+        # Per group: parallel pointer and block-id accumulators.
+        group_ptrs: list[list[int]] = [[] for _ in range(num_groups)]
+        group_block_ids: list[list[torch.Tensor]] = [
+            [] for _ in range(num_groups)
+        ]
+
+        with torch.cuda.stream(self.load_stream):
+            self._update_hma_metadata(**kwargs)
+            self._log_dsv4_optimized_policy_once()
+            for memory_obj, start, end in zip(
+                memory_objs, starts, ends, strict=False
+            ):
+                if memory_obj is None or memory_obj.raw_tensor is None:
+                    continue
+                skip_prefix_n_tokens = min(
+                    end - start, max(0, int(vllm_cached) - start)
+                )
+                if (
+                    skip_prefix_n_tokens != 0
+                    or (end - start) != self.chunk_size
+                    or not memory_obj.raw_tensor.is_cuda
+                ):
+                    # Keep the well-tested per-chunk path for the cases the
+                    # batched kernel cannot fold: prefix-skip (first chunk
+                    # of a fresh request), tail chunks (different per-group
+                    # shapes, so per-pointer block counts would diverge),
+                    # and CPU-backed objects (need the tmp-buffer H2D copy).
+                    self.to_gpu(memory_obj, start, end, **kwargs)
+                    continue
+                for i in range(num_groups):
+                    group = klg_manager.kv_layer_groups[i]
+                    role = self._dsv4_group_role(group)
+                    memory_obj_tensor = memory_obj.get_tensor(i)
+                    if memory_obj_tensor is None:
+                        continue
+                    if memory_obj_tensor.numel() == 0:
+                        continue
+                    if self._prepare_hca_defer_for_group(
+                        i, group, memory_obj_tensor, start, end, role, **kwargs
+                    ):
+                        continue
+                    self._prepare_csa_direct_seed_for_group(
+                        i, group, memory_obj_tensor, start, end, role, **kwargs
+                    )
+                    if not self._should_transfer_group_to_gpu(
+                        i, start, end, **kwargs
+                    ):
+                        continue
+                    hma_block_ids = self._hma_block_ids_for_group(
+                        i, start, end, **kwargs
+                    )
+                    if hma_block_ids is None:
+                        block_ids = self._slot_mapping_to_block_ids(
+                            slot_mapping, start, end
+                        )
+                    else:
+                        block_ids, _ = hma_block_ids
+                    group_ptrs[i].append(memory_obj_tensor.data_ptr())
+                    group_block_ids[i].append(block_ids)
+
+            for i in range(num_groups):
+                if not group_ptrs[i]:
+                    continue
+                group = klg_manager.kv_layer_groups[i]
+                all_block_ids = torch.cat(group_block_ids[i])
+                lmc_ops.multi_layer_block_kv_transfer(
+                    self.group_kv_cache_pointers_on_gpu[i],
+                    group_ptrs[i],
+                    all_block_ids,
+                    self.device,
+                    lmc_ops.TransferDirection.H2D,
+                    group.shape_desc,
+                    group.physical_chunk_size,
+                    self.gpu_kv_format,
+                    0,
+                )
         self.load_stream.synchronize()
 
     def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
