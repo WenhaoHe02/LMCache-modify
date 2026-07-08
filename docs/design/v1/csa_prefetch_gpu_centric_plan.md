@@ -166,6 +166,24 @@ V29 修法(二选一,收益都是 ~1.5-2s → 稳态 ~3.6-4s):
    读它的 slab(与 CSA 同层同调用),gate 复用现有机制——但 indexer
    cache 在 gate 之前就被 Lightning Indexer 消费,需要确认消费点
    在 patched forward 之内(它在,indexer_op 就是消费者)。
+
+**V29 实施核查(2026-07-08,动手前的两个发现)**:
+- **方案 2 有架构阻碍**:manager 的 `_layers: Dict[int, state]` 按
+  transformer 层号做键,而 indexer cache 与 CSA attention KV 是
+  **同一层的两个不同张量**(132 宽 vs 584 宽)——加 indexer 组需要
+  把整个 walker/gate/搬迁的状态键改成 (group, layer) 二维,牵动全部
+  已验证代码。工作量大,不是"同款套路第三次复用"。
+- **方案 1 有现成先例**:`gpu_connectors.py` 中另一个 connector 的
+  `_batched_transfer`(~3144 行)已经演示了把多个 chunk 的 tensor
+  指针 + 拼接的 block_ids 交给**一次** `multi_layer_block_kv_transfer`
+  调用(kernel 天然接受指针列表)。V3 connector 的 `batched_to_gpu`
+  目前是逐 chunk 循环 `to_gpu`(每 chunk 过 8 组判断+发小 kernel,
+  这就是 1.3-1.9s 的来源);向量化 = 按组收集 ptrs + block_ids,
+  一组一次 kernel。注意 V3 的 to_gpu 里有 per-chunk 的 hma/tail/
+  hca-defer/csa-seed 分支,批处理需保持这些语义(可先只对
+  "全组直通"的 chunk 走快路径,特殊 chunk 回退逐个)。
+- **结论:V29 走方案 1**(向量化 consume),indexer-into-walker
+  留作 V30+(需要 (group,layer) 键重构)。
    方案 2 更优:同时消灭读和 scatter 的关键路径占用。
 
 ### 阶段 3:对齐论文 IOCB(改 csrc,长期)
