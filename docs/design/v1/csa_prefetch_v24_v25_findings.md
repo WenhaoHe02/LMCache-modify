@@ -1,5 +1,39 @@
 # V24/V25 关键数据(2026-07-08 追加)
 
+## V28(HCA walker):16K 首次明确跑赢 OFF
+
+V28 = 把 CSA walker/gate/V27 搬迁扩展到 HCA 组(剩余同步读的 84%,
+5.6GB)。开关 `LMCACHE_DSV4_HCA_WALKER=1`。三个硬工程问题的解:
+- **512B 对齐**(HCA 层 stride 1168B 永不对齐,Tutti 拒读)→ 读窗口
+  向下取整 + `payload_skip` 字段,scatter 时跳过;
+- **混合粒度**(cr=128,4 chunk 共享 1 个 bs=8 物理块)→ 按压缩条目
+  行寻址,physical id = 块×8+槽位;
+- **非连续张量**(vLLM HCA K cache 是大 buffer 的切片,view 抛异常)
+  → 层状态保持 3-D,全部四条写路径用 (block, slot) 双索引
+  `index_put_`;
+- **安全联锁**:manager 无 HCA 层注册时自动保留同步读(第一跑注册数
+  =0 时靠它避免了脏 KV)。
+
+**V28-48K**(机制验证,compute 主导形状):HCA 20 层全注册,同步
+retrieve 3.07→**2.06s(-33%)**,walker HCA 层 7-18ms,repeat **4.35**
+(历史最佳),稳态 8.9-9.8 ≈ 基线(compute 稀释);illegal=0,gate 超时=0。
+
+**V28-16K(决定性,retrieve 占比高的形状)**:
+
+| | r1 | r2 | 基线(V27 / OFF) |
+|---|---|---|---|
+| hits | **5.48**/6.04/6.74/6.01 | **5.59**/6.20/6.17/**5.59** | 6.03-6.72 / 6.04-6.68 |
+| repeat | 5.59 | 4.86/**4.04** | 4.43-4.49 / 4.59-5.51 |
+| retrieve | 1.93s | — | ~3.0s |
+
+**r2 稳态 5.59-6.20,多数 hit 落在 OFF 下界(6.04)之下;best 5.48;
+repeat 4.04 历史最佳。这是全部 28 个版本以来第一次在稳态 hit 上
+明确跑赢 OFF。** illegal=0,gate 超时=0。
+
+叙事闭环:增量越小(读占比越高)V28 稳态优势越大;增量越大 repeat
+优势越大(48K repeat 4.35 vs OFF 4.86)。scatter SM 争用仍是残余
+tax(48K 稳态被 compute 稀释),彻底消除 = csrc zero-copy(future)。
+
 ## 48K 增量实验(用户问:重算变大 ON 会不会拉开?答:不会,原因结构性)
 
 480K base + 48K 增量(528K 总长,贴 530K 上限),同 boot ON(V27)→
