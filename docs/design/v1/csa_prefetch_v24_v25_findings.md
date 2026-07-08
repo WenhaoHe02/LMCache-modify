@@ -1,5 +1,32 @@
 # V24/V25 关键数据(2026-07-08 追加)
 
+## 48K 增量实验(用户问:重算变大 ON 会不会拉开?答:不会,原因结构性)
+
+480K base + 48K 增量(528K 总长,贴 530K 上限),同 boot ON(V27)→
+新鲜 OFF 链式:
+
+| | hits(r1) | hits(r2) | repeat |
+|---|---|---|---|
+| ON V27 | 9.49/9.54/9.54/10.05 | 9.48/9.46/10.66/9.52 | 4.90/4.78 |
+| OFF | 9.49/10.12/9.55/9.50/9.53 | 9.54/9.48/10.29/9.58/9.46 | 4.86/4.89 |
+
+**仍是 parity(均值 ~9.6 vs ~9.6),没有随重算变大而拉开。** 搬迁
+scaling 正常(43302 chunks,稳态 ~115ms,首个 hit 875ms),illegal=0。
+
+**为什么重算变大不帮 ON**:两臂的执行都是 [同步 retrieve 全部] →
+[compute 增量] 串行。CSA filter 只把 csa_attention_kv(1.5GB / 12.2GB
+≈ 12%)挪出同步 retrieve(实测 retrieve ON 2.83s vs OFF 3.07s,差
+0.24s);剩余 10.7GB 主 KV 在两臂都同步读完才开始 compute。重算加大
+只是给两臂同加一个常数。**ON 的理论优势 = 被挪出的字节数,与 compute
+大小无关**——想利用大 compute,必须把主 KV retrieve 也藏进 compute
+(layerwise/流水 retrieve),那是另一个数量级的改造。
+
+推论(论文角度):当前架构下 CSA 路径的可赢空间被 filter 覆盖率
+(12%)封顶为 ~0.3-0.4s/hit;V27 已把这部分从"倒亏 0.9s"做到"打平
++repeat 反超"。下一个杠杆按收益排序:(1) 主 KV retrieve 与 compute
+重叠(结构大改,收益 ~3s);(2) csrc zero-copy 免首跑 scatter
+(~0.1-0.2s);(3) HCA 组同样 filter+prefetch(~0.2s)。
+
 ## V27 正确性疑点(已结案:V27 无罪)
 
 V27-32K r1 的 hit-1..5 首 token 不同曾引发搬迁损坏怀疑。两点排除:
