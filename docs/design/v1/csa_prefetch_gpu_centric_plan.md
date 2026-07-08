@@ -100,6 +100,30 @@ host gap,总 ~1s,藏进计算。ON hit 目标 < OFF。
    与 CSA walker 完全同构;失败路径 = wait_for_layer_load 里同步
    自读该层(miss 语义)。
 
+**V28 实现地图**(下一 session 直接照此动工):
+- [cache_engine.py](../../../lmcache/v1/cache_engine.py):
+  `_dsv4_retrieve_shapes_for_range` 在 V28 env 下对**所有** uint8 组
+  zero-shape(不只 csa_attention_kv);`_register_csa_attention_kv_chunks`
+  推广为按 (group, layer) 建 chunk 映射——每组的
+  `layer_byte_offset` 计算与 CSA 版同源(store_shapes 前缀求和)。
+- [csa_attention_kv_prefetch_manager.py](../../../lmcache/v1/csa_attention_kv_prefetch_manager.py):
+  walker 的 layer_groups 循环天然支持异构组;每层一个 Tutti 调用读
+  该层全部组的 slab(同层不同组可合并进同一 read_ranges 列表,
+  仍是"单层单调用",不违反 V10/V22 不变量)。V27 搬迁签名对主 KV
+  组同样适用(retrieve 不再写它们)。
+- [vllm_v1_adapter.py](../../../lmcache/integration/vllm/vllm_v1_adapter.py):
+  `wait_for_layer_load(layer_name)`(当前 layerwise_retrievers 为空时
+  直通)接 walker 的 per-layer notify;layer_name → layer_id 映射用
+  connector 已有的 `_layer_name_to_vllm_group`/`_kv_cache_layer_names`。
+- [gpu_connectors.py](../../../lmcache/v1/gpu_connector/gpu_connectors.py):
+  非 CSA 组的 scatter 用现成 `lmc_ops.single_layer_kv_transfer`
+  (1865/2275 行已有 H2D 单层路径)——staging→K cache 不需要新 kernel。
+- 环境开关:`LMCACHE_DSV4_ALL_GROUP_PREFETCH=1`(默认 0,V27 行为)。
+- 已知未决:HCA 组已有独立 deferred slab(write_hca_deferred,
+  3.85MB/chunk vs 主写 6.84MB)与 `LMCACHE_DSV4_DEFER_HCA_TO_MOE`
+  机制(当前 =0 关闭,原因未记录——启用需 HCAPrefetchManager
+  attach,子系统未验证,别与 V28 混做)。
+
 ### 阶段 3:对齐论文 IOCB(改 csrc,长期)
 
 6. **IOCB 批量化**:csrc 的 `k_submit_batch_sgl_read` 改成每个 SQE 打包
