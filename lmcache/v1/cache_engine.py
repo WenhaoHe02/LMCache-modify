@@ -2378,6 +2378,11 @@ class LMCacheEngine:
         klg_manager = self.metadata.kv_layer_groups_manager
         if klg_manager is None or not klg_manager.kv_layer_groups:
             return base
+        # V28: with the HCA walker enabled the hca_attention_kv group is
+        # ALSO left on NVMe for the layer-major walker (it accounts for 84%
+        # of the post-CSA-filter sync retrieve bytes).  Gated separately so
+        # the proven CSA-only behavior (V27) stays the default.
+        hca_walker = _env_flag("LMCACHE_DSV4_HCA_WALKER")
         filtered: list[torch.Size] = []
         for shape, dtype, group in zip(
             base,
@@ -2386,7 +2391,9 @@ class LMCacheEngine:
             strict=True,
         ):
             role = self._dsv4_group_role(group, dtype)
-            if role == "csa_attention_kv":
+            if role == "csa_attention_kv" or (
+                hca_walker and role == "hca_attention_kv"
+            ):
                 filtered.append(self._zero_token_shape(shape))
             else:
                 filtered.append(shape)

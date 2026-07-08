@@ -181,6 +181,14 @@ class CSAAttentionKVChunkLoc:
     bytes_per_block: int
     raw_extents: tuple[tuple[int, int, int], ...] = ()
     physical_block_ids: tuple[int, ...] = ()
+    # V28 (HCA rows): the Tutti loader rejects non-512B-aligned reads, and
+    # HCA's per-layer stride (2*584 bytes) never aligns.  When set,
+    # ``layer_byte_offset`` is already rounded DOWN to a 512B boundary,
+    # ``read_length`` is the rounded-UP read size, and the real payload
+    # starts ``payload_skip`` bytes into the returned buffer.  Zero values
+    # (CSA chunks) mean "payload starts at 0, read n_blocks*bytes_per_block".
+    payload_skip: int = 0
+    read_length: int = 0
 
     @property
     def end_compressed_block(self) -> int:
@@ -198,6 +206,11 @@ class CSAAttentionKVChunkLoc:
     def chunk_byte_offset_for(self, compressed_block_id: int) -> int:
         """Return absolute byte offset inside the chunk for one block id.
 
+        For 512B-rounded chunks (``payload_skip > 0``) the returned offset
+        addresses the TRUE payload byte (rounded base + skip + local
+        stride), so per-block miss reads still start at the real data; the
+        caller must round again for the Tutti alignment requirement.
+
         Raises:
             ValueError: If ``compressed_block_id`` is outside this chunk.
         """
@@ -207,7 +220,11 @@ class CSAAttentionKVChunkLoc:
                 f"[{self.first_compressed_block}, {self.end_compressed_block})"
             )
         local = compressed_block_id - self.first_compressed_block
-        return self.layer_byte_offset + local * self.bytes_per_block
+        return (
+            self.layer_byte_offset
+            + self.payload_skip
+            + local * self.bytes_per_block
+        )
 
 
 @dataclass(slots=True)
@@ -1109,12 +1126,14 @@ class CSAAttentionKVPrefetchManager:
                         keys.append(chunk.key)
                         disk_metas.append(chunk.disk_meta)
                         file_offsets.append(0)
+                        read_length = chunk.read_length or (
+                            chunk.n_compressed_blocks * chunk.bytes_per_block
+                        )
                         read_ranges_per_key.append(
                             (
                                 KVObjectByteRange(
                                     offset=chunk.layer_byte_offset,
-                                    length=chunk.n_compressed_blocks
-                                    * chunk.bytes_per_block,
+                                    length=read_length,
                                     target_offset=0,
                                 ),
                             )
@@ -1175,6 +1194,13 @@ class CSAAttentionKVPrefetchManager:
                             flat = memory_obj.raw_tensor.view(
                                 torch.uint8
                             ).reshape(-1)
+                            # HCA chunks read from a 512B-rounded window;
+                            # the real payload starts payload_skip bytes in.
+                            skip = int(
+                                chunk_refs[chunk_idx].payload_skip
+                            )
+                            if skip > 0:
+                                flat = flat[skip:]
                             have = int(flat.numel())
                             if n_blocks <= 0:
                                 continue
