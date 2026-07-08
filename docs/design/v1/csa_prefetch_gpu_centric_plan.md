@@ -67,6 +67,33 @@ host gap,总 ~1s,藏进计算。ON hit 目标 < OFF。
 
 预期:retrieve 2.0s → ~1.2s(带宽 ~10 GB/s,逼近单盘×8 上限)。
 
+### 阶段 2.5(V28 候选):主 KV retrieve 与 compute 流水(最大杠杆)
+
+48K 实验证明:CSA filter 只覆盖 12% retrieve 字节,ON 的可赢空间被
+封顶在 ~0.3s。**剩余 ~2.8s 的同步 retrieve(10.7GB 主 KV)在两臂都
+挡在 compute 前面**。48K 实测预算:
+- NVMe 真实读:3.5GB mega-batch poll_sync=300ms → 10.7GB ≈ **0.9s**
+- 其余 ~1.9s = host 构建 + scatter(batched_to_gpu)+ 批间空转
+- compute ≈ 6.5s(48K 增量)≫ NVMe 0.9s → 完全可藏
+
+做法(= 把 CSA walker 架构推广到全部 KV 组):
+1. retrieve 对所有组 zero-shape(不只 csa_attention_kv),同步路径只
+   做 lookup/pin/注册,秒回;
+2. 全组 walker:layer-major,每层读该层所有组的 slab(mla/nsa 主 KV
+   也有 per-layer 子槽,layer_byte_offset 同源),scatter 到
+   slot_mapping 行;
+3. gate:主 attention 的每层用 vLLM connector 既有的
+   `wait_for_layer_load(layer_name)` 挡(vLLM 每层调它,当前实现为
+   no-op passthrough);CSA 层继续用 indexer forward patch。
+4. V25 教训应用:scatter 在 compute 期抢 SM(~0.8-1s),所以净赢
+   ≈ 2.8 − 1 ≈ **1.5-2s/hit(48K 形状,~20%)**;increment 越大,
+   compute 越长,scatter 抢占比例越小,净赢越大——这才是"重算越大
+   越有利"的正确机制。
+5. 风险:61 层 × 每层一次 Tutti 调用(walker 实测 45-115ms/层,总
+   ~2-2.5s 墙钟,首层 ~150ms 内落地);层序落地顺序 = 消费顺序,
+   与 CSA walker 完全同构;失败路径 = wait_for_layer_load 里同步
+   自读该层(miss 语义)。
+
 ### 阶段 3:对齐论文 IOCB(改 csrc,长期)
 
 6. **IOCB 批量化**:csrc 的 `k_submit_batch_sgl_read` 改成每个 SQE 打包
