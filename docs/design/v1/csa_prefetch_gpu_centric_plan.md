@@ -67,75 +67,62 @@ host gap,总 ~1s,藏进计算。ON hit 目标 < OFF。
 
 预期:retrieve 2.0s → ~1.2s(带宽 ~10 GB/s,逼近单盘×8 上限)。
 
-### 阶段 2.5(V28 候选):主 KV retrieve 与 compute 流水(最大杠杆)
+### 阶段 2.5(V28,修订版):HCA 组 walker 化(真实最大杠杆)
 
-48K 实验证明:CSA filter 只覆盖 12% retrieve 字节,ON 的可赢空间被
-封顶在 ~0.3s。**剩余 ~2.8s 的同步 retrieve(10.7GB 主 KV)在两臂都
-挡在 compute 前面**。48K 实测预算:
-- NVMe 真实读:3.5GB mega-batch poll_sync=300ms → 10.7GB ≈ **0.9s**
-- 其余 ~1.9s = host 构建 + scatter(batched_to_gpu)+ 批间空转
-- compute ≈ 6.5s(48K 增量)≫ NVMe 0.9s → 完全可藏
+> **2026-07-08 修订**:早先版本此节写"10.7GB 主 KV"——**错误**。
+> DSV4_GROUP_TABLE 实测(每 256-token chunk 的 8 个组):
 
-做法(= 把 CSA walker 架构推广到全部 KV 组):
-1. retrieve 对所有组 zero-shape(不只 csa_attention_kv),同步路径只
-   做 lookup/pin/注册,秒回;
-2. 全组 walker:layer-major,每层读该层所有组的 slab(mla/nsa 主 KV
-   也有 per-layer 子槽,layer_byte_offset 同源),scatter 到
-   slot_mapping 行;
-3. gate:主 attention 的每层用 vLLM connector 既有的
-   `wait_for_layer_load(layer_name)` 挡(vLLM 每层调它,当前实现为
-   no-op passthrough);CSA 层继续用 indexer forward patch。
-   **可行性已验证(部署镜像 20260528_0630)**:`attention.py:753` 与
-   `mla_attention.py:1046` 均被 `@maybe_transfer_kv_layer` 包裹,每层
-   入口调 `connector.wait_for_layer_load`、出口调 `save_kv_layer`
-   (kv_transfer_utils.py)——gate 不需要改 vLLM,只需在 LMCache
-   connector 的 `wait_for_layer_load` 里接 walker 的 per-layer 完成
-   通知(与 CSA gate 的 pending_reads/notify 同构)。
-4. V25 教训应用:scatter 在 compute 期抢 SM(~0.8-1s),所以净赢
-   ≈ 2.8 − 1 ≈ **1.5-2s/hit(48K 形状,~20%)**;increment 越大,
-   compute 越长,scatter 抢占比例越小,净赢越大——这才是"重算越大
-   越有利"的正确机制。
-5. 风险:61 层 × 每层一次 Tutti 调用(walker 实测 45-115ms/层,总
-   ~2-2.5s 墙钟,首层 ~150ms 内落地);层序落地顺序 = 消费顺序,
-   与 CSA walker 完全同构;失败路径 = wait_for_layer_load 里同步
-   自读该层(miss 语义)。
+| 组 | role | 层数 | hidden | bytes/chunk | 存储 |
+|---|---|---|---|---|---|
+| 0 | csa_indexer_cache | 21 | 132 | 0.71MB | 每 chunk |
+| 1 | csa_attention_kv | 21 | 584 | 3.14MB | 每 chunk(walker 已接管) |
+| 2 | hca_attention_kv | 20 | 584 | 2.99MB | 每 chunk |
+| 3+4 | swa_cache | 43 | 584 | 6.4MB | 仅尾 chunk |
+| 5-7 | compressor_state(fp32) | 62 | — | 76MB | 仅尾 chunk |
 
-**V28 实现地图**(下一 session 直接照此动工):
-- **布局 ground truth(2026-07-08 groupprobe 实测)**:vLLM HMA 分组
-  `kv_cache_layers=167`:g0=62层/block_size=256(MLA 主 latent KV,
-  即 V28 目标),g1=22层/bs=64,g2=21层/bs=64(CSA K cache),
-  g3=42层/bs=4,g4=20层/bs=8。LMCache metadata
-  `kv_shape=(43,1,256,1,512)`,hidden=512 → 主 latent 组在
-  `_dsv4_group_role` 里返回 **"unknown"**(该函数只认 hidden 584/132
-  和 fp32)——V28 第一步必须先给主 KV 组补 role(如 "mla_latent_kv":
-  dtype uint8 + hidden_dim==512),否则 zero-shape 无法按 role 选组。
-  注意 store 侧 `swa_cache`/`compressor_state` 是 tail-only(非尾 chunk
-  本来就不存),非尾 chunk 的存储载荷 = 前缀组(主 latent + indexer +
-  csa),6.84MB/chunk;retrieve 6.69GB/rank@480K 与此吻合。
-  `_log_dsv4_optimized_policy_once` 只在 legacy to_gpu 触发,streaming
-  路径不打——V28 需在首次 retrieve 打一行全组 role/shape/bytes 诊断。
+> DSv4-Flash 62 层 = SWA 43 + CSA 21 + HCA 20 混合注意力,**没有
+> "MLA 主 latent KV"组**。非尾 chunk 存储载荷 = 0.71+3.14+2.99 =
+> 6.84MB(与 store 日志逐字节吻合);ON 的剩余同步 retrieve 6.9GB =
+> **HCA 5.6GB(84%)+ indexer 1.3GB(16%)**。
+
+**V28 真实做法 = 把已收敛的 CSA walker/gate/搬迁架构扩展到 HCA 组**:
+1. `_dsv4_retrieve_shapes_for_range` 在 flag 下对 hca_attention_kv
+   也 zero-shape(indexer cache 1.3GB 暂留同步——它是 gate 之前就要
+   的元数据,处理顺序敏感,第二阶段再动);
+2. `_dsv4_build_csa_attention_kv_chunks` 参数化 role:同一记录里 HCA
+   组的 layer_byte_offset = 前缀组字节和(indexer+csa)+ 层内 stride,
+   结构与 CSA 完全同源;HCA 20 层加入 walker 的层序循环(按 transformer
+   层号与 CSA 层交错排序,单层单调用不变);
+3. HCA 层的 gate:HCA attention 的 kv_cache 张量(compress 128:1)
+   注册进 manager,层入口用与 CSA 相同的 pending/notify;HCA 层没有
+   indexer forward 可 patch → 用 vLLM 每层 `wait_for_layer_load`
+    钩子(可行性已验证,见下);
+4. V27 搬迁签名自然覆盖 HCA chunk(同一签名机制,零新代码);
+5. 预期:ON 同步 retrieve 6.9→1.3GB(-80%),读时间 ~1.7s→~0.4s;
+   扣 walker scatter SM 税,48K 形状净赢 **~1.0-1.3s/hit**;fp32
+   compressor(尾 chunk 76MB)与 swa 不动。
+6. 注意与既有 `LMCACHE_DSV4_DEFER_HCA_TO_MOE`/HCAPrefetchManager
+   (独立未验证子系统,配置全关)划清边界:V28 不启用它,走 CSA
+   walker 的同一条代码路径。
+
+环境开关:`LMCACHE_DSV4_HCA_WALKER=1`(默认 0 = V27 行为)。
+
+**V28 实现地图**(修订):
 - [cache_engine.py](../../../lmcache/v1/cache_engine.py):
-  `_dsv4_retrieve_shapes_for_range` 在 V28 env 下对**所有** uint8 组
-  zero-shape(不只 csa_attention_kv);`_register_csa_attention_kv_chunks`
-  推广为按 (group, layer) 建 chunk 映射——每组的
-  `layer_byte_offset` 计算与 CSA 版同源(store_shapes 前缀求和)。
+  `_dsv4_retrieve_shapes_for_range` 加 HCA zero-shape 分支;
+  `_dsv4_build_csa_attention_kv_chunks` 抽出按 role 的通用版本,
+  给 HCA 组产 chunks_by_layer(注意 HCA cr=128 → tokens_per_block
+  = 128*64,physical row 换算随 cr 变);
 - [csa_attention_kv_prefetch_manager.py](../../../lmcache/v1/csa_attention_kv_prefetch_manager.py):
-  walker 的 layer_groups 循环天然支持异构组;每层一个 Tutti 调用读
-  该层全部组的 slab(同层不同组可合并进同一 read_ranges 列表,
-  仍是"单层单调用",不违反 V10/V22 不变量)。V27 搬迁签名对主 KV
-  组同样适用(retrieve 不再写它们)。
+  `register_layer` 已按 layer_id 泛化,HCA 层直接注册(token_bytes
+  同 584);walker 层序循环把 HCA 层并入;gate 对无 indexer 的 HCA
+  层暴露 `wait_for_layer(layer_id)` 公开方法;
 - [vllm_v1_adapter.py](../../../lmcache/integration/vllm/vllm_v1_adapter.py):
-  `wait_for_layer_load(layer_name)`(当前 layerwise_retrievers 为空时
-  直通)接 walker 的 per-layer notify;layer_name → layer_id 映射用
-  connector 已有的 `_layer_name_to_vllm_group`/`_kv_cache_layer_names`。
-- [gpu_connectors.py](../../../lmcache/v1/gpu_connector/gpu_connectors.py):
-  非 CSA 组的 scatter 用现成 `lmc_ops.single_layer_kv_transfer`
-  (1865/2275 行已有 H2D 单层路径)——staging→K cache 不需要新 kernel。
-- 环境开关:`LMCACHE_DSV4_ALL_GROUP_PREFETCH=1`(默认 0,V27 行为)。
-- 已知未决:HCA 组已有独立 deferred slab(write_hca_deferred,
-  3.85MB/chunk vs 主写 6.84MB)与 `LMCACHE_DSV4_DEFER_HCA_TO_MOE`
-  机制(当前 =0 关闭,原因未记录——启用需 HCAPrefetchManager
-  attach,子系统未验证,别与 V28 混做)。
+  attach 时收集 HCA 层的 attention.kv_cache;`wait_for_layer_load`
+  (layerwise_retrievers 为空时直通)接 manager.wait_for_layer;
+  **可行性已验证(部署镜像 20260528_0630)**:`attention.py:753` 与
+  `mla_attention.py:1046` 均被 `@maybe_transfer_kv_layer` 包裹,每层
+  入口调 `connector.wait_for_layer_load`——gate 不需要改 vLLM。
 
 ### 阶段 3:对齐论文 IOCB(改 csrc,长期)
 

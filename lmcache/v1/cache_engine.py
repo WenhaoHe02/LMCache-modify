@@ -3328,11 +3328,6 @@ class LMCacheEngine:
             return "unknown"
         if hidden_dim == 132:
             return "csa_indexer_cache"
-        if hidden_dim == 512:
-            # MLA latent KV (nh=1, hs=512): the main paged KV cache and the
-            # bulk of retrieve bytes.  V28 pipelined prefetch targets this
-            # role; everything else keys off the 584-wide groups below.
-            return "mla_latent_kv"
         if hidden_dim != 584:
             return "unknown"
         if compress_ratio == 1:

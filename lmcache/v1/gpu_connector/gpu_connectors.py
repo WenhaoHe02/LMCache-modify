@@ -752,11 +752,6 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         if hidden_dim == 132:
             return "csa_indexer_cache"
 
-        if hidden_dim == 512:
-            # MLA latent KV (nh=1, hs=512): the main paged KV cache.
-            # Kept in sync with LMCacheEngine._dsv4_group_role.
-            return "mla_latent_kv"
-
         if hidden_dim != 584:
             return "unknown"
 
