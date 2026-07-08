@@ -752,6 +752,11 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         if hidden_dim == 132:
             return "csa_indexer_cache"
 
+        if hidden_dim == 512:
+            # MLA latent KV (nh=1, hs=512): the main paged KV cache.
+            # Kept in sync with LMCacheEngine._dsv4_group_role.
+            return "mla_latent_kv"
+
         if hidden_dim != 584:
             return "unknown"
 
@@ -1000,13 +1005,28 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                 else end
             )
         total_logical_tokens = int(total_logical_tokens)
-        seeded = seed(
-            layer_ids,
-            memory_tensor,
-            start,
-            end,
-            total_logical_tokens=total_logical_tokens,
-        )
+        try:
+            seeded = seed(
+                layer_ids,
+                memory_tensor,
+                start,
+                end,
+                total_logical_tokens=total_logical_tokens,
+            )
+        except OSError as exc:
+            # The indexer store lives on a drive that Tutti unmounts for
+            # GPU-direct bind; a lazy file open after the unmount raises
+            # FileNotFoundError/EIO.  Seeding is an optimisation (the pool
+            # can be filled by the proxy path later) -- never let it abort
+            # the whole retrieve batch.
+            if not self._dsv4_csa_seed_fallback_logged:
+                logger.warning(
+                    "CSA direct LMCache seed skipped: indexer store "
+                    "unavailable (%s); retrieve continues without seeding",
+                    exc,
+                )
+                self._dsv4_csa_seed_fallback_logged = True
+            return
         if seeded <= 0:
             return
         if not self._dsv4_csa_seed_logged:

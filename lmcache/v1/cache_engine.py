@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 # Standard
 import asyncio
 import gc
+import inspect
 import multiprocessing
 import os
 import subprocess
@@ -408,6 +409,15 @@ class LMCacheEngine:
         self._tutti_store_warmup_keys: dict[str, set[CacheEngineKey]] = {}
         self._tutti_store_warmup_pending: dict[str, set[CacheEngineKey]] = {}
         self._tutti_store_warmup_last_seen: set[str] = set()
+        # Callbacks invoked once the Tutti loader is first created (from the
+        # warmup daemon or the first retrieve/store path that succeeds). Used by
+        # the vLLM adapter to re-attach the CSA attention-KV prefetch manager,
+        # which cannot attach at worker startup because the loader is created
+        # lazily. Callbacks MUST NOT touch CUDA -- they may run on a daemon
+        # thread; defer any CUDA work to a main-thread callsite.
+        self._tutti_loader_ready_callbacks: List[
+            Callable[["TuttiDirectLoader"], None]
+        ] = []
 
     def set_health_monitor(self, health_monitor: "HealthMonitor") -> None:
         """
@@ -747,6 +757,40 @@ class LMCacheEngine:
         warmup_done.wait()
         return self._tutti_loader is not None
 
+    def register_tutti_loader_ready_callback(
+        self,
+        callback: "Callable[[TuttiDirectLoader], None]",
+    ) -> None:
+        """Register a callback fired once the Tutti loader becomes available.
+
+        If the loader already exists, the callback fires immediately on the
+        caller's thread. Otherwise it is stored and invoked from
+        :meth:`_ensure_tutti_loader_locked` on whichever thread first succeeds
+        at creating the loader (the startup warmup daemon or the first
+        retrieve/store path that hits ``LocalDiskBackend``).
+
+        The callback MUST NOT allocate CUDA tensors or launch CUDA kernels: it
+        may run on a background daemon thread while the main thread is mid
+        forward. Use it only to record a reference or set a flag, and defer any
+        CUDA work to a main-thread callsite.
+
+        Args:
+            callback: Callable receiving the ready ``TuttiDirectLoader``.
+        """
+        with self._tutti_warmup_lock:
+            if self._tutti_loader is not None:
+                loader = self._tutti_loader
+            else:
+                self._tutti_loader_ready_callbacks.append(callback)
+                return
+        try:
+            callback(loader)
+        except Exception:
+            logger.exception(
+                "Tutti loader ready callback (immediate) failed (worker=%d)",
+                self.metadata.local_worker_id,
+            )
+
     def _ensure_tutti_loader_locked(
         self,
         keys: Optional[List[CacheEngineKey]] = None,
@@ -1025,6 +1069,18 @@ class LMCacheEngine:
             )
             if mount_info is not None:
                 self._tutti_can_cpu_fallback = False
+            # Notify registered callbacks that the loader is now available.
+            # The caller holds _tutti_warmup_lock; callbacks must not touch CUDA
+            # (they may run on the warmup daemon thread) and must not re-enter
+            # loader init. See register_tutti_loader_ready_callback.
+            for _cb in list(self._tutti_loader_ready_callbacks):
+                try:
+                    _cb(self._tutti_loader)
+                except Exception:
+                    logger.exception(
+                        "Tutti loader ready callback failed (worker=%d)",
+                        self.metadata.local_worker_id,
+                    )
             return True
         except Exception as exc:
             logger.warning(
@@ -1442,6 +1498,11 @@ class LMCacheEngine:
                 file_offsets=tutti_file_offsets,
                 read_ranges_per_key=tutti_read_ranges,
                 on_batch_loaded=on_batch_loaded,
+                # Whole-call lock: the CSA bulk walker lazy-starts at the
+                # first CSA gate (compute phase, queue idle) since V24, so
+                # nothing waits behind this retrieve anymore.  Per-batch
+                # locking here (V21-V23) fragmented the retrieve to
+                # ~2 GB/s without helping anyone.
             )
         except Exception:
             logger.exception(
@@ -1870,28 +1931,30 @@ class LMCacheEngine:
             )
             # TODO: we implicitly rely on batched_put to call ref_count_down
             # this management should be done in a cleaner way
-            try:
-                self.storage_manager.batched_put(
-                    keys,
-                    memory_objs,
-                    transfer_spec=transfer_spec,
-                    location=self.store_location,
-                    on_complete_callback=tutti_warmup_callback,
+            put_kwargs: dict[str, Any] = {
+                "transfer_spec": transfer_spec,
+                "location": self.store_location,
+            }
+            if tutti_warmup_callback is not None:
+                try:
+                    put_signature = inspect.signature(
+                        self.storage_manager.batched_put
+                    )
+                except (TypeError, ValueError):
+                    put_signature = None
+                supports_store_callback = (
+                    put_signature is not None
+                    and "on_complete_callback" in put_signature.parameters
                 )
-            except TypeError as exc:
-                if "on_complete_callback" not in str(exc):
-                    raise
-                logger.warning(
-                    "StorageManager.batched_put does not support "
-                    "on_complete_callback; continuing without Tutti store "
-                    "completion callback"
-                )
-                self.storage_manager.batched_put(
-                    keys,
-                    memory_objs,
-                    transfer_spec=transfer_spec,
-                    location=self.store_location,
-                )
+                if not supports_store_callback:
+                    raise RuntimeError(
+                        "StorageManager.batched_put must support "
+                        "on_complete_callback for Tutti store warmup. "
+                        "Sync lmcache/v1/storage_backend/storage_manager.py "
+                        "into the runtime patch bundle."
+                    )
+                put_kwargs["on_complete_callback"] = tutti_warmup_callback
+            self.storage_manager.batched_put(keys, memory_objs, **put_kwargs)
 
         self.stats_monitor.on_store_finished(
             store_stats,
@@ -2244,6 +2307,17 @@ class LMCacheEngine:
             return True
         tutti_loader = getattr(self, "_tutti_loader", None)
         if tutti_loader is None:
+            ensure_tutti_loader = getattr(self, "_ensure_tutti_loader", None)
+            if callable(ensure_tutti_loader):
+                try:
+                    ensure_tutti_loader(wait_for_warmup=False)
+                except Exception:
+                    logger.exception(
+                        "Failed to initialize Tutti loader for CSA attention "
+                        "KV prefetch attach"
+                    )
+            tutti_loader = getattr(self, "_tutti_loader", None)
+        if tutti_loader is None:
             return False
         try:
             from lmcache.integration.vllm.vllm_v1_adapter import (
@@ -2289,6 +2363,7 @@ class LMCacheEngine:
         Returns:
             Per-group shapes with all relevant zero-shape masks applied.
         """
+        self._dsv4_log_retrieve_group_table_once(shapes, dtypes)
         base = self._dsv4_store_shapes_for_range(
             shapes,
             dtypes,
@@ -2316,6 +2391,48 @@ class LMCacheEngine:
             else:
                 filtered.append(shape)
         return filtered
+
+    def _dsv4_log_retrieve_group_table_once(
+        self,
+        shapes: list[torch.Size],
+        dtypes: list[torch.dtype],
+    ) -> None:
+        """Log every KV group's role/shape/bytes on the first retrieve.
+
+        The connector's ``_log_dsv4_optimized_policy_once`` only fires on
+        the legacy ``to_gpu`` path; the Tutti streaming retrieve never
+        reaches it, leaving the group->role mapping invisible in production
+        logs.  This one-time table is the ground truth for choosing V28
+        zero-shape targets (per-chunk byte sizes at full chunk_size).
+
+        Args:
+            shapes: Per-group shapes for one full retrieve chunk.
+            dtypes: Per-group dtypes aligned with ``shapes``.
+        """
+        if getattr(self, "_dsv4_group_table_logged", False):
+            return
+        self._dsv4_group_table_logged = True
+        klg_manager = self.metadata.kv_layer_groups_manager
+        if klg_manager is None or not klg_manager.kv_layer_groups:
+            return
+        try:
+            rows = []
+            for idx, (shape, dtype, group) in enumerate(
+                zip(shapes, dtypes, klg_manager.kv_layer_groups, strict=True)
+            ):
+                role = self._dsv4_group_role(group, dtype)
+                nbytes = int(shape.numel()) * int(dtype.itemsize)
+                rows.append(
+                    f"{idx}:{role}:layers={group.num_layers}:"
+                    f"hidden={group.hidden_dim_size}:cr={group.compress_ratio}:"
+                    f"shape={tuple(shape)}:bytes={nbytes}"
+                )
+            logger.info(
+                "DSV4_GROUP_TABLE (first retrieve chunk): [%s]",
+                ", ".join(rows),
+            )
+        except Exception:
+            logger.exception("DSV4_GROUP_TABLE logging failed")
 
     def _register_csa_attention_kv_chunks(
         self,
@@ -3211,6 +3328,11 @@ class LMCacheEngine:
             return "unknown"
         if hidden_dim == 132:
             return "csa_indexer_cache"
+        if hidden_dim == 512:
+            # MLA latent KV (nh=1, hs=512): the main paged KV cache and the
+            # bulk of retrieve bytes.  V28 pipelined prefetch targets this
+            # role; everything else keys off the 584-wide groups below.
+            return "mla_latent_kv"
         if hidden_dim != 584:
             return "unknown"
         if compress_ratio == 1:
