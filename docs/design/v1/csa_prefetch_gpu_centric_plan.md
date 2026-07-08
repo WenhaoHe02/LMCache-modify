@@ -147,6 +147,27 @@ host gap,总 ~1s,藏进计算。ON hit 目标 < OFF。
   `mla_attention.py:1046` 均被 `@maybe_transfer_kv_layer` 包裹,每层
   入口调 `connector.wait_for_layer_load`——gate 不需要改 vLLM。
 
+### 阶段 2.6(V29 候选):稳态 retrieve 的 scatter 瓶颈(数据已定位)
+
+V28 收官 profile 的关键矛盾:稳态 retrieve 只剩 indexer 组 1.35GB,
+`load_total total_ms=1491-2115`,但其中 NVMe mega-batch 读
+(`batch_detail` 709MB×2)只要 **73ms×2=146ms**——**~1.3-1.9s 花在
+`_consume_tutti_batch` 回调里**:streaming retrieve 对 1874 个 chunk
+逐个调 `gpu_connector.to_gpu`(Python 循环,每 chunk 过 8 个组的
+zero-shape 判断 + 1 次 `multi_layer_block_kv_transfer` 小 kernel),
+~1ms/chunk 纯 host+launch 开销。
+
+V29 修法(二选一,收益都是 ~1.5-2s → 稳态 ~3.6-4s):
+1. **向量化 consume**:把整批 staging 里的 indexer 载荷合并成一次
+   大 scatter(与 walker 的 per-chunk index_copy_ 同构,indexer 组
+   bs=64、cr=4,与 CSA K cache 布局同源,physical rows 从
+   slot_mapping 推导);
+2. **indexer 组进 walker**:zero-shape indexer 组,walker 每层顺带
+   读它的 slab(与 CSA 同层同调用),gate 复用现有机制——但 indexer
+   cache 在 gate 之前就被 Lightning Indexer 消费,需要确认消费点
+   在 patched forward 之内(它在,indexer_op 就是消费者)。
+   方案 2 更优:同时消灭读和 scatter 的关键路径占用。
+
 ### 阶段 3:对齐论文 IOCB(改 csrc,长期)
 
 6. **IOCB 批量化**:csrc 的 `k_submit_batch_sgl_read` 改成每个 SQE 打包
