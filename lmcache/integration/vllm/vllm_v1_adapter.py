@@ -2045,62 +2045,38 @@ def _attach_csa_attention_kv_prefetch(tutti_loader: Optional[Any] = None) -> Non
     # wait_for_layer_load hook (HCA has no indexer forward to patch).
     hca_registered = 0
     if _env_flag("LMCACHE_DSV4_HCA_WALKER"):
-        hca_probe_logged = 0
+        # One-shot layer map: for every decoder layer log the best
+        # candidate's compress_ratio and kv_cache population so a finder
+        # mismatch (wrong cr constant, unmaterialised cache, different
+        # attribute path) is diagnosable from a single line.
+        layer_map: list[str] = []
+        for decoder_layer in decoder_layers:
+            lid = getattr(decoder_layer, "layer_idx", -1)
+            attn = getattr(decoder_layer, "self_attn", None) or getattr(
+                decoder_layer, "attn", None
+            )
+            wrapper = getattr(attn, "mla_attn", None)
+            best = ""
+            for cand in (getattr(wrapper, "mla_attn", None), wrapper, attn):
+                if cand is None:
+                    continue
+                cr = getattr(cand, "compress_ratio", None)
+                kv = getattr(cand, "kv_cache", None)
+                numel = kv.numel() if isinstance(kv, torch.Tensor) else -1
+                best = f"{lid}:cr{cr}:kv{numel}"
+                if isinstance(cr, int) and cr > 1:
+                    break
+            layer_map.append(best)
+        logger.info("HCA_WALKER_LAYER_MAP %s", " ".join(layer_map))
         for decoder_layer in decoder_layers:
             layer_id = getattr(decoder_layer, "layer_idx", -1)
             if not isinstance(layer_id, int) or layer_id < 0:
                 continue
             hca_attention = _decoder_hca_attention(decoder_layer)
             if hca_attention is None:
-                # Diagnostic (first 3 non-CSA layers): why did the finder
-                # miss?  Log candidate compress_ratios and kv_cache states.
-                if (
-                    hca_probe_logged < 3
-                    and _decoder_csa_attention(decoder_layer) is None
-                ):
-                    attn = getattr(decoder_layer, "self_attn", None) or getattr(
-                        decoder_layer, "attn", None
-                    )
-                    wrapper = getattr(attn, "mla_attn", None)
-                    probe = []
-                    for cand_name, cand in (
-                        ("inner", getattr(wrapper, "mla_attn", None)),
-                        ("wrapper", wrapper),
-                        ("attn", attn),
-                    ):
-                        if cand is None:
-                            probe.append(f"{cand_name}=None")
-                            continue
-                        kv = getattr(cand, "kv_cache", None)
-                        probe.append(
-                            f"{cand_name}(cr={getattr(cand, 'compress_ratio', '?')},"
-                            f"kv={type(kv).__name__}"
-                            + (
-                                f",shape={tuple(kv.shape)},numel={kv.numel()}"
-                                if isinstance(kv, torch.Tensor)
-                                else ""
-                            )
-                            + ")"
-                        )
-                    logger.info(
-                        "HCA_WALKER_PROBE layer=%d %s",
-                        layer_id,
-                        " ".join(probe),
-                    )
-                    hca_probe_logged += 1
                 continue
             kv_cache = getattr(hca_attention, "kv_cache", None)
             if not isinstance(kv_cache, torch.Tensor) or kv_cache.numel() == 0:
-                if hca_probe_logged < 3:
-                    logger.info(
-                        "HCA_WALKER_PROBE layer=%d finder hit but kv_cache "
-                        "empty: %s",
-                        layer_id,
-                        None
-                        if not isinstance(kv_cache, torch.Tensor)
-                        else tuple(kv_cache.shape),
-                    )
-                    hca_probe_logged += 1
                 continue
             try:
                 manager.register_hca_layer(int(layer_id), kv_cache)
