@@ -120,6 +120,17 @@ host gap,总 ~1s,藏进计算。ON hit 目标 < OFF。
   - manager 的 `register_layer` 校验 shape[1]==64 需放宽为 per-layer
     `compressed_block_size`(state 字段已存在,只是构造校验写死);
   - 读侧不变:HCA slab 在记录内同样是 per-layer 连续(前缀和寻址)。
+- **512B 对齐约束(第二个硬坑,loader 强制)**:`_load_batch` 拒绝
+  offset/length 非 512B 对齐的非尾 range(tutti_direct_loader.py
+  ~2360)。CSA 无此问题:per-layer stride = 64×584 = 37376 = 73×512。
+  **HCA per-layer stride = 2×584 = 1168 ≠ n×512**——奇数层槽位的
+  pool 偏移必然不对齐,整层 slab(20×1168=23360)也不对齐。做法:
+  读 range 向下取整到 512 边界 + 长度向上取整
+  (`aligned_off = off & ~511; skip = off - aligned_off;
+  aligned_len = ceil((skip+len)/512)*512`),scatter 时从
+  `flat[skip : skip+len]` 切真实载荷。skip 信息进 chunk 描述符
+  (新字段 `payload_skip`)。每层每 chunk 多读 ≤1KB,20 层 ×1874
+  chunk 额外 ~37MB(0.7%),可忽略。
 - [cache_engine.py](../../../lmcache/v1/cache_engine.py):
   `_dsv4_retrieve_shapes_for_range` 加 HCA zero-shape 分支;
   `_dsv4_build_csa_attention_kv_chunks` 抽出按 role 的通用版本,
