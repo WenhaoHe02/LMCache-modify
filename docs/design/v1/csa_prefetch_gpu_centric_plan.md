@@ -85,6 +85,12 @@ host gap,总 ~1s,藏进计算。ON hit 目标 < OFF。
 3. gate:主 attention 的每层用 vLLM connector 既有的
    `wait_for_layer_load(layer_name)` 挡(vLLM 每层调它,当前实现为
    no-op passthrough);CSA 层继续用 indexer forward patch。
+   **可行性已验证(部署镜像 20260528_0630)**:`attention.py:753` 与
+   `mla_attention.py:1046` 均被 `@maybe_transfer_kv_layer` 包裹,每层
+   入口调 `connector.wait_for_layer_load`、出口调 `save_kv_layer`
+   (kv_transfer_utils.py)——gate 不需要改 vLLM,只需在 LMCache
+   connector 的 `wait_for_layer_load` 里接 walker 的 per-layer 完成
+   通知(与 CSA gate 的 pending_reads/notify 同构)。
 4. V25 教训应用:scatter 在 compute 期抢 SM(~0.8-1s),所以净赢
    ≈ 2.8 − 1 ≈ **1.5-2s/hit(48K 形状,~20%)**;increment 越大,
    compute 越长,scatter 抢占比例越小,净赢越大——这才是"重算越大
