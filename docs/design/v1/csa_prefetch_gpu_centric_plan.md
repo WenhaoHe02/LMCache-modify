@@ -108,6 +108,18 @@ host gap,总 ~1s,藏进计算。ON hit 目标 < OFF。
 环境开关:`LMCACHE_DSV4_HCA_WALKER=1`(默认 0 = V27 行为)。
 
 **V28 实现地图**(修订):
+- **HCA 粒度差异(实现前必读)**:CSA cr=4 → 256-token chunk = 64 压缩
+  行 = 恰好 1 个 vLLM 块(bs=64),chunk↔块 1:1,scatter 可整块
+  `index_copy_`。**HCA cr=128 → 256-token chunk 只有 2 压缩行**,而
+  vLLM HCA 组 bs=8(HMA g4=20L/bs=8),即 **4 个 chunk 共享 1 个物理
+  块**。因此:
+  - scatter 必须按"压缩行"粒度:`kv_cache.view(num_blocks*8, 584)`,
+    行 id = 物理块 id×8 + 块内槽位(槽位 = 压缩条目序号 % 8);
+  - `physical_block_ids` 语义换成 per-compressed-entry 的行 id
+    (slot_mapping[pos]//(128*8) 给物理块,pos 按 128-token 步进);
+  - manager 的 `register_layer` 校验 shape[1]==64 需放宽为 per-layer
+    `compressed_block_size`(state 字段已存在,只是构造校验写死);
+  - 读侧不变:HCA slab 在记录内同样是 per-layer 连续(前缀和寻址)。
 - [cache_engine.py](../../../lmcache/v1/cache_engine.py):
   `_dsv4_retrieve_shapes_for_range` 加 HCA zero-shape 分支;
   `_dsv4_build_csa_attention_kv_chunks` 抽出按 role 的通用版本,
