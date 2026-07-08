@@ -1647,8 +1647,22 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
 
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
         if _dsv4_vectorized_consume_enabled():
-            self._batched_to_gpu_vectorized(memory_objs, starts, ends, **kwargs)
-            return
+            try:
+                self._batched_to_gpu_vectorized(
+                    memory_objs, starts, ends, **kwargs
+                )
+                return
+            except Exception:
+                # A vectorized-path failure must NEVER fail the retrieve:
+                # an exception here propagates into the Tutti streaming
+                # callback, marks the whole retrieve failed, and vLLM
+                # recomputes 480K tokens from scratch (measured 40-53 s
+                # hits on the first V29 run).  Log loudly and redo this
+                # batch on the proven per-chunk path.
+                logger.exception(
+                    "Vectorized batched_to_gpu failed; falling back to "
+                    "per-chunk transfers for this batch"
+                )
         with torch.cuda.stream(self.load_stream):
             for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
                 self.to_gpu(memory_obj, start, end, **kwargs)
