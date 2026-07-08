@@ -2381,8 +2381,32 @@ class LMCacheEngine:
         # V28: with the HCA walker enabled the hca_attention_kv group is
         # ALSO left on NVMe for the layer-major walker (it accounts for 84%
         # of the post-CSA-filter sync retrieve bytes).  Gated separately so
-        # the proven CSA-only behavior (V27) stays the default.
+        # the proven CSA-only behavior (V27) stays the default.  SAFETY
+        # INTERLOCK: only skip the sync read when the manager actually has
+        # HCA layers registered — otherwise nobody would load those bytes
+        # and attention would consume stale K rows.
         hca_walker = _env_flag("LMCACHE_DSV4_HCA_WALKER")
+        if hca_walker:
+            try:
+                from lmcache.v1.csa_attention_kv_prefetch_manager import (
+                    get_csa_attention_kv_prefetch_manager,
+                )
+
+                manager = get_csa_attention_kv_prefetch_manager()
+                hca_walker = bool(
+                    manager is not None and getattr(manager, "hca_layer_ids", ())
+                )
+            except ImportError:
+                hca_walker = False
+            if not hca_walker and not getattr(
+                self, "_hca_walker_interlock_logged", False
+            ):
+                self._hca_walker_interlock_logged = True
+                logger.warning(
+                    "LMCACHE_DSV4_HCA_WALKER=1 but no HCA layers are "
+                    "registered with the prefetch manager; keeping the "
+                    "synchronous HCA retrieve (no zero-shape)"
+                )
         filtered: list[torch.Size] = []
         for shape, dtype, group in zip(
             base,
