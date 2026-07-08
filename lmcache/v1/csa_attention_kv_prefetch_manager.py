@@ -273,6 +273,14 @@ class CSAAttentionKVLayerState:
     pending_reads: set[int]
     last_drain_event: Optional[torch.cuda.Event]
     pending_drains: List[Tuple[Optional[torch.cuda.Event], List[Any]]]
+    # V28 (HCA): vLLM's HCA K cache tensor is a NON-CONTIGUOUS slice of a
+    # larger buffer, so a flat [rows, bytes] view is not materialisable
+    # in-place (view raises; reshape would silently scatter into a COPY).
+    # When True the tensor stays 3-D [num_blocks, block_slot_size,
+    # token_bytes] and scatters use two-index ``index_put_`` with
+    # ``(row // block_slot_size, row % block_slot_size)``.
+    block_slot_scatter: bool = False
+    block_slot_size: int = 0
 
 
 class CSAAttentionKVPrefetchManager:
@@ -496,13 +504,13 @@ class CSAAttentionKVPrefetchManager:
 
         HCA compresses 128:1 and vLLM packs its K cache as
         ``[num_blocks, hca_block_size, token_bytes]`` with a small block
-        size (8 entries).  The walker addresses COMPRESSED-ENTRY rows, so
-        the layer state stores ``compressed_block_size=1`` semantics: chunk
-        descriptors count entries and carry flattened row ids
-        ``block_id * hca_block_size + slot`` matching a
-        ``view(num_blocks * hca_block_size, token_bytes)`` scatter target,
-        which is exactly the ``reshape(n_rows, -1)`` the walker already
-        performs.
+        size (8 entries).  The walker addresses COMPRESSED-ENTRY rows:
+        chunk descriptors count entries and carry flattened row ids
+        ``block_id * hca_block_size + slot``.  The vLLM tensor is a
+        non-contiguous slice of a larger paged buffer, so it CANNOT be
+        flattened with ``view``; the layer state keeps the 3-D tensor and
+        sets ``block_slot_scatter`` so scatters decompose each flat row id
+        into ``(row // hca_block_size, row % hca_block_size)``.
 
         Args:
             layer_id: Transformer-side HCA layer id.
@@ -523,16 +531,15 @@ class CSAAttentionKVPrefetchManager:
                 f"!= manager token_bytes {self._token_bytes}"
             )
         hca_block_size = int(k_cache_tensor.shape[1])
-        num_rows = int(k_cache_tensor.shape[0]) * hca_block_size
-        flat = k_cache_tensor.view(num_rows, 1, int(k_cache_tensor.shape[2]))
         self._hca_layer_ids = tuple(
             sorted(set(self._hca_layer_ids) | {int(layer_id)})
         )
         self._register_layer_state(
             int(layer_id),
-            flat,
+            k_cache_tensor,
             compressed_block_size=1,
             token_bytes=self._token_bytes,
+            block_slot_size=hca_block_size,
         )
 
     def _register_layer_state(
@@ -541,21 +548,27 @@ class CSAAttentionKVPrefetchManager:
         k_cache_tensor: torch.Tensor,
         compressed_block_size: int,
         token_bytes: int,
+        block_slot_size: int = 0,
     ) -> None:
         """Create the per-layer runtime state shared by CSA and HCA layers.
 
         Args:
             layer_id: Transformer-side layer id.
-            k_cache_tensor: Scatter target, 3-D; the walker flattens it to
-                ``[shape[0], -1]`` rows.
+            k_cache_tensor: Scatter target.  CSA layers flatten it to
+                ``[shape[0], -1]`` rows; HCA layers keep it 3-D and use
+                block/slot decomposition (``block_slot_size > 0``).
             compressed_block_size: Entries per addressable row (64 for CSA
                 blocks, 1 for HCA flattened entries).
             token_bytes: Bytes per compressed entry.
+            block_slot_size: Entries per physical block when the tensor is
+                non-contiguous (HCA); 0 selects the flat CSA addressing.
         """
-        # vLLM's K cache tensor has ``shape[0]`` addressable rows; the same
-        # count bounds the ids chunk descriptors may carry.  The bool bitmap
-        # answers "is this id already in pool" entirely on the GPU.
-        num_rows = int(k_cache_tensor.shape[0])
+        # Addressable-row count bounds the ids chunk descriptors may carry;
+        # for block/slot layers that is blocks * slots.
+        if block_slot_size > 0:
+            num_rows = int(k_cache_tensor.shape[0]) * block_slot_size
+        else:
+            num_rows = int(k_cache_tensor.shape[0])
         in_pool_bitmap = torch.zeros(
             num_rows,
             dtype=torch.bool,
@@ -572,6 +585,8 @@ class CSAAttentionKVPrefetchManager:
             pending_reads=set(),
             last_drain_event=None,
             pending_drains=[],
+            block_slot_scatter=block_slot_size > 0,
+            block_slot_size=block_slot_size,
         )
 
     def register_request_chunks(
@@ -834,7 +849,12 @@ class CSAAttentionKVPrefetchManager:
             relocate_chunks: List[
                 Tuple[str, CSAAttentionKVChunkLoc]
             ] = []
-            n_rows_cache = int(state.k_cache_tensor.shape[0])
+            if state.block_slot_scatter:
+                n_rows_cache = (
+                    int(state.k_cache_tensor.shape[0]) * state.block_slot_size
+                )
+            else:
+                n_rows_cache = int(state.k_cache_tensor.shape[0])
             for chunk in state.chunks:
                 total_chunks += 1
                 # Row-fallback chunks (no slot_mapping) use sequence-position
@@ -877,9 +897,6 @@ class CSAAttentionKVPrefetchManager:
             if relocate_chunks:
                 device = state.k_cache_tensor.device
                 scatter_stream = self._scatter_stream_for(device)
-                k_flat = state.k_cache_tensor.view(torch.uint8).reshape(
-                    n_rows_cache, -1
-                )
                 with torch.inference_mode(), torch.cuda.stream(
                     scatter_stream
                 ):
@@ -891,10 +908,29 @@ class CSAAttentionKVPrefetchManager:
                     new_t = torch.as_tensor(new_rows, dtype=torch.int64).to(
                         device, non_blocking=True
                     )
-                    # Gather fully before scatter: temp copy makes any
-                    # old/new aliasing (allocator reshuffle) safe.
-                    temp = k_flat.index_select(0, old_t)
-                    k_flat.index_copy_(0, new_t, temp)
+                    if state.block_slot_scatter:
+                        # Non-contiguous HCA tensor: gather/scatter via
+                        # (block, slot) decomposition of the flat row ids.
+                        kv3 = state.k_cache_tensor.view(torch.uint8)
+                        slot_size = state.block_slot_size
+                        old_b = torch.div(
+                            old_t, slot_size, rounding_mode="floor"
+                        )
+                        old_s = old_t - old_b * slot_size
+                        new_b = torch.div(
+                            new_t, slot_size, rounding_mode="floor"
+                        )
+                        new_s = new_t - new_b * slot_size
+                        temp = kv3[old_b, old_s]
+                        kv3.index_put_((new_b, new_s), temp)
+                    else:
+                        k_flat = state.k_cache_tensor.view(
+                            torch.uint8
+                        ).reshape(n_rows_cache, -1)
+                        # Gather fully before scatter: temp copy makes any
+                        # old/new aliasing (allocator reshuffle) safe.
+                        temp = k_flat.index_select(0, old_t)
+                        k_flat.index_copy_(0, new_t, temp)
                 scatter_stream.synchronize()
                 relocated_rows += len(old_rows)
                 for key_str, chunk in relocate_chunks:
@@ -1184,11 +1220,25 @@ class CSAAttentionKVPrefetchManager:
                 dst_rows_all: List[int] = []
                 row_spans: List[Tuple[int, int]] = []
                 k_flat_by_layer: Dict[int, torch.Tensor] = {}
+                # HCA layers scatter via (block, slot) indices into the 3-D
+                # non-contiguous tensor; CSA layers use the flat row view.
+                slot_size_by_layer: Dict[int, int] = {}
                 for lid, state in group:
-                    n_rows_cache = int(state.k_cache_tensor.shape[0])
-                    k_flat_by_layer[lid] = state.k_cache_tensor.view(
-                        torch.uint8
-                    ).reshape(n_rows_cache, -1)
+                    if state.block_slot_scatter:
+                        n_rows_cache = (
+                            int(state.k_cache_tensor.shape[0])
+                            * state.block_slot_size
+                        )
+                        k_flat_by_layer[lid] = state.k_cache_tensor.view(
+                            torch.uint8
+                        )
+                        slot_size_by_layer[lid] = state.block_slot_size
+                    else:
+                        n_rows_cache = int(state.k_cache_tensor.shape[0])
+                        k_flat_by_layer[lid] = state.k_cache_tensor.view(
+                            torch.uint8
+                        ).reshape(n_rows_cache, -1)
+                        slot_size_by_layer[lid] = 0
                     for chunk in state.chunks:
                         if self._chunk_is_resident(int(lid), chunk):
                             continue
@@ -1301,9 +1351,22 @@ class CSAAttentionKVPrefetchManager:
                             )
                             span_s, _span_e = row_spans[chunk_idx]
                             rows = rows_gpu[span_s : span_s + usable]
-                            k_flat_by_layer[plan_lid].index_copy_(
-                                0, rows, src
-                            )
+                            slot_size = slot_size_by_layer[plan_lid]
+                            if slot_size > 0:
+                                # Non-contiguous HCA tensor: decompose flat
+                                # row ids into (block, slot) and index_put_.
+                                blocks_idx = torch.div(
+                                    rows, slot_size, rounding_mode="floor"
+                                )
+                                slots_idx = rows - blocks_idx * slot_size
+                                k_flat_by_layer[plan_lid].index_put_(
+                                    (blocks_idx, slots_idx),
+                                    src,
+                                )
+                            else:
+                                k_flat_by_layer[plan_lid].index_copy_(
+                                    0, rows, src
+                                )
                             batch_landed.setdefault(plan_lid, []).extend(
                                 comp_ids[:usable]
                             )
@@ -1912,7 +1975,12 @@ class CSAAttentionKVPrefetchManager:
             cursor = 0
             sorted_ids_in_chunk = sorted(ids_in_chunk)
             span_start = len(dst_rows_all)
-            n_rows = int(state.k_cache_tensor.shape[0])
+            if state.block_slot_scatter:
+                n_rows = (
+                    int(state.k_cache_tensor.shape[0]) * state.block_slot_size
+                )
+            else:
+                n_rows = int(state.k_cache_tensor.shape[0])
             for block_id in sorted_ids_in_chunk:
                 if chunk.physical_block_ids:
                     local_idx = int(block_id) - chunk.first_compressed_block
@@ -2000,10 +2068,16 @@ class CSAAttentionKVPrefetchManager:
         # thread waiting on forward collectives while holding _io_lock is
         # the cross-rank deadlock we already debugged once.
         blk_bytes = state.compressed_block_size * state.token_bytes
-        n_rows = int(state.k_cache_tensor.shape[0])
-        # Byte view so index_copy_ sees identical dtype/shape on both sides
-        # regardless of the K cache's declared element type.
-        k_cache_flat = state.k_cache_tensor.view(torch.uint8).reshape(n_rows, -1)
+        if state.block_slot_scatter:
+            n_rows = int(state.k_cache_tensor.shape[0]) * state.block_slot_size
+            k_cache_flat = state.k_cache_tensor.view(torch.uint8)
+        else:
+            n_rows = int(state.k_cache_tensor.shape[0])
+            # Byte view so index_copy_ sees identical dtype/shape on both
+            # sides regardless of the K cache's declared element type.
+            k_cache_flat = state.k_cache_tensor.view(torch.uint8).reshape(
+                n_rows, -1
+            )
         scatter_stream = self._scatter_stream_for(state.k_cache_tensor.device)
         with torch.inference_mode():
             # Upload on the SAME stream that consumes it (see bulk walker:
@@ -2054,7 +2128,15 @@ class CSAAttentionKVPrefetchManager:
                         continue
                     src = flat[: usable * blk_bytes].view(usable, blk_bytes)
                     rows = dst_rows_gpu[span_start : span_start + usable]
-                    k_cache_flat.index_copy_(0, rows, src)
+                    if state.block_slot_scatter:
+                        slot_size = state.block_slot_size
+                        blocks_idx = torch.div(
+                            rows, slot_size, rounding_mode="floor"
+                        )
+                        slots_idx = rows - blocks_idx * slot_size
+                        k_cache_flat.index_put_((blocks_idx, slots_idx), src)
+                    else:
+                        k_cache_flat.index_copy_(0, rows, src)
                 # Staging slots are recycled as soon as this callback returns;
                 # retire the scatter kernels first (private stream only).
             scatter_stream.synchronize()
