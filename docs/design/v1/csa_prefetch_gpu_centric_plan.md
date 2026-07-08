@@ -101,6 +101,19 @@ host gap,总 ~1s,藏进计算。ON hit 目标 < OFF。
    自读该层(miss 语义)。
 
 **V28 实现地图**(下一 session 直接照此动工):
+- **布局 ground truth(2026-07-08 groupprobe 实测)**:vLLM HMA 分组
+  `kv_cache_layers=167`:g0=62层/block_size=256(MLA 主 latent KV,
+  即 V28 目标),g1=22层/bs=64,g2=21层/bs=64(CSA K cache),
+  g3=42层/bs=4,g4=20层/bs=8。LMCache metadata
+  `kv_shape=(43,1,256,1,512)`,hidden=512 → 主 latent 组在
+  `_dsv4_group_role` 里返回 **"unknown"**(该函数只认 hidden 584/132
+  和 fp32)——V28 第一步必须先给主 KV 组补 role(如 "mla_latent_kv":
+  dtype uint8 + hidden_dim==512),否则 zero-shape 无法按 role 选组。
+  注意 store 侧 `swa_cache`/`compressor_state` 是 tail-only(非尾 chunk
+  本来就不存),非尾 chunk 的存储载荷 = 前缀组(主 latent + indexer +
+  csa),6.84MB/chunk;retrieve 6.69GB/rank@480K 与此吻合。
+  `_log_dsv4_optimized_policy_once` 只在 legacy to_gpu 触发,streaming
+  路径不打——V28 需在首次 retrieve 打一行全组 role/shape/bytes 诊断。
 - [cache_engine.py](../../../lmcache/v1/cache_engine.py):
   `_dsv4_retrieve_shapes_for_range` 在 V28 env 下对**所有** uint8 组
   zero-shape(不只 csa_attention_kv);`_register_csa_attention_kv_chunks`
