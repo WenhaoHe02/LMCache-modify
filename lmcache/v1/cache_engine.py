@@ -2490,6 +2490,21 @@ class LMCacheEngine:
             total_tokens,
             slot_mapping=slot_mapping,
         )
+        if _env_flag("LMCACHE_DSV4_HCA_WALKER"):
+            hca_chunks = self._dsv4_build_hca_attention_kv_chunks(
+                blocks,
+                total_tokens,
+                slot_mapping=slot_mapping,
+            )
+            for layer_id, chunk_list in hca_chunks.items():
+                if layer_id in chunks_by_layer:
+                    logger.warning(
+                        "DSv4 HCA walker: layer %d already carries CSA "
+                        "chunks; HCA registration for it skipped",
+                        layer_id,
+                    )
+                    continue
+                chunks_by_layer[layer_id] = chunk_list
         if not chunks_by_layer:
             return
         try:
@@ -2760,6 +2775,224 @@ class LMCacheEngine:
                     )
                 )
             compressed_blocks_cursor += blocks_per_layer_in_chunk
+        return chunks_by_layer
+
+    def _dsv4_build_hca_attention_kv_chunks(
+        self,
+        blocks: list[tuple[CacheEngineKey, int, int]],
+        total_tokens: int,
+        slot_mapping: Optional[torch.Tensor] = None,
+    ) -> dict[int, list[Any]]:
+        """Build per-HCA-layer chunk locations for the V28 walker.
+
+        Mirrors :meth:`_dsv4_build_csa_attention_kv_chunks` for the
+        ``hca_attention_kv`` group with two structural differences:
+
+        * **Granularity**: HCA compresses 128:1, so a 256-token chunk holds
+          only 2 compressed entries and vLLM packs the HCA K cache as
+          ``[num_blocks, 8, token_bytes]`` — four chunks share one physical
+          block.  The prefetcher therefore addresses COMPRESSED-ENTRY rows:
+          ``n_compressed_blocks`` counts entries, ``bytes_per_block`` is one
+          entry (584 bytes), and ``physical_block_ids`` carries flattened
+          row ids ``slot_block_id * 8 + entry_slot`` for a
+          ``k_cache.view(num_blocks * 8, token_bytes)`` scatter target.
+        * **Alignment**: the per-layer slab stride (2 * 584 = 1168 bytes)
+          is never 512B-aligned and Tutti rejects unaligned reads, so each
+          chunk's read window is rounded down to a 512B boundary with the
+          true payload offset carried in ``payload_skip`` and the rounded
+          length in ``read_length``.
+
+        Args:
+            blocks: Ordered ``(key, start_token, end_token)`` triples for
+                the chunks covering the request's prefix.
+            total_tokens: Total logical tokens in the request.
+            slot_mapping: vLLM slot mapping for the request; required for
+                physical row resolution (entries without it are skipped
+                because HCA has no safe sequence-position fallback).
+
+        Returns:
+            ``{transformer_layer_id: [CSAAttentionKVChunkLoc, ...]}`` for
+            the HCA layers, or an empty dict when the layout, backend, or
+            slot mapping is unavailable.
+        """
+        try:
+            from lmcache.v1.csa_attention_kv_prefetch_manager import (
+                CSAAttentionKVChunkLoc,
+            )
+        except ImportError:
+            return {}
+        if not self.dsv4_optimized_kv:
+            return {}
+        if self.gpu_connector is None or self.storage_manager is None:
+            return {}
+        disk_backend = self.storage_manager.storage_backends.get("LocalDiskBackend")
+        if disk_backend is None or not getattr(
+            disk_backend, "kv_object_store_enabled", False
+        ):
+            return {}
+        klg_manager = self.metadata.kv_layer_groups_manager
+        if klg_manager is None or not klg_manager.kv_layer_groups:
+            return {}
+        dtypes = self.metadata.get_dtypes()
+        hca_group_idx: Optional[int] = None
+        hca_group: Optional[Any] = None
+        for idx, group in enumerate(klg_manager.kv_layer_groups):
+            if self._dsv4_group_role(group, dtypes[idx]) == "hca_attention_kv":
+                hca_group_idx = idx
+                hca_group = group
+                break
+        if hca_group_idx is None or hca_group is None:
+            return {}
+        layer_ids_for_group = self.gpu_connector._dsv4_layer_ids_for_group(  # noqa: SLF001
+            hca_group
+        )
+        if not layer_ids_for_group:
+            return {}
+        if slot_mapping is None:
+            logger.warning(
+                "DSv4 HCA chunk builder: slot_mapping unavailable; HCA "
+                "walker registration skipped (no positional fallback)"
+            )
+            return {}
+        try:
+            if isinstance(slot_mapping, torch.Tensor):
+                slot_mapping_cpu = slot_mapping.detach().to("cpu").tolist()
+            else:
+                slot_mapping_cpu = [int(s) for s in slot_mapping]
+        except Exception:
+            logger.warning(
+                "DSv4 HCA chunk builder: failed to materialise slot_mapping"
+            )
+            return {}
+
+        keys = [key for key, _, _ in blocks]
+        object_records = disk_backend.get_kv_object_records(keys, roles=None)
+
+        compress_ratio = int(hca_group.compress_ratio)
+        if compress_ratio <= 0:
+            return {}
+        # vLLM packs the HCA K cache as [num_blocks, hca_block_size,
+        # token_bytes]; HMA layout probing measured hca_block_size == 8
+        # entries (1024 tokens per physical block at cr=128).
+        hca_block_size = int(hca_group.shape_desc.bs)
+        if hca_block_size <= 0:
+            return {}
+        tokens_per_entry = compress_ratio
+        tokens_per_physical_block = compress_ratio * hca_block_size
+
+        chunks_by_layer: dict[int, list[Any]] = {
+            int(layer_id): [] for layer_id in layer_ids_for_group
+        }
+        entries_cursor = 0
+        for (key, start, end), record in zip(blocks, object_records, strict=True):
+            if record is None:
+                continue
+            chunk_tokens = end - start
+            if chunk_tokens <= 0:
+                continue
+            store_shapes = self._dsv4_store_shapes_for_range(
+                self.metadata.get_shapes(chunk_tokens),
+                dtypes,
+                start,
+                end,
+                total_tokens,
+            )
+            group_byte_offset = 0
+            for prior_idx in range(hca_group_idx):
+                prior_shape = store_shapes[prior_idx]
+                prior_dtype = dtypes[prior_idx]
+                group_byte_offset += int(prior_shape.numel()) * int(
+                    prior_dtype.itemsize
+                )
+            hca_shape = store_shapes[hca_group_idx]
+            if hca_shape.numel() <= 0:
+                continue
+            entries_per_layer = chunk_tokens // compress_ratio
+            if entries_per_layer <= 0:
+                continue
+            hca_dtype = dtypes[hca_group_idx]
+            token_bytes = int(hca_shape[-1]) * int(hca_dtype.itemsize)
+            bytes_per_layer_in_chunk = entries_per_layer * token_bytes
+            num_layers_in_group = int(hca_shape[1])
+
+            # Physical flattened row ids: one per compressed entry.  Entry
+            # slot within its physical block is the GLOBAL entry index
+            # modulo the block size (allocation order), and the block id
+            # comes from slot_mapping at the entry's first source token.
+            entry_row_ids: list[int] = []
+            base = int(start)
+            for entry_local in range(entries_per_layer):
+                global_entry = entries_cursor + entry_local
+                pos = base + entry_local * tokens_per_entry
+                if not 0 <= pos < len(slot_mapping_cpu):
+                    break
+                slot = int(slot_mapping_cpu[pos])
+                if slot < 0:
+                    break
+                block_id = slot // tokens_per_physical_block
+                entry_slot = global_entry % hca_block_size
+                entry_row_ids.append(block_id * hca_block_size + entry_slot)
+            if len(entry_row_ids) != entries_per_layer:
+                entries_cursor += entries_per_layer
+                continue
+
+            try:
+                synth_path = disk_backend.kv_object_tutti_path(record.pool_id)
+            except Exception:
+                entries_cursor += entries_per_layer
+                continue
+            if not synth_path or not record.raw_extents:
+                entries_cursor += entries_per_layer
+                continue
+            pool_byte_offset = int(record.offset) + group_byte_offset
+            synth_disk_meta = DiskCacheMetadata(
+                path=synth_path,
+                size=int(record.aligned_length),
+                fmt=MemoryFormat.BINARY_BUFFER,
+                shape=torch.Size((int(record.aligned_length),)),
+                dtype=torch.uint8,
+            )
+            record_end = int(record.offset) + int(record.aligned_length)
+            raw_extents = tuple(
+                (int(fo), int(slba), int(n_sectors))
+                for fo, slba, n_sectors in record.raw_extents
+            )
+            for layer_slot_idx, transformer_layer_id in enumerate(
+                layer_ids_for_group
+            ):
+                if layer_slot_idx >= num_layers_in_group:
+                    break
+                true_offset = (
+                    pool_byte_offset + layer_slot_idx * bytes_per_layer_in_chunk
+                )
+                aligned_offset = true_offset & ~511
+                payload_skip = true_offset - aligned_offset
+                payload_len = entries_per_layer * token_bytes
+                read_length = (
+                    (payload_skip + payload_len + 511) // 512
+                ) * 512
+                if aligned_offset + read_length > record_end:
+                    # Clamp the rounded-up window to the record end; the
+                    # loader treats tail ranges leniently but overrunning
+                    # the registered extents aborts the whole batch.
+                    read_length = record_end - aligned_offset
+                    if read_length < payload_skip + payload_len:
+                        continue
+                chunks_by_layer[int(transformer_layer_id)].append(
+                    CSAAttentionKVChunkLoc(
+                        first_compressed_block=entries_cursor,
+                        n_compressed_blocks=entries_per_layer,
+                        key=key,
+                        disk_meta=synth_disk_meta,
+                        layer_byte_offset=aligned_offset,
+                        bytes_per_block=token_bytes,
+                        raw_extents=raw_extents,
+                        physical_block_ids=tuple(entry_row_ids),
+                        payload_skip=payload_skip,
+                        read_length=read_length,
+                    )
+                )
+            entries_cursor += entries_per_layer
         return chunks_by_layer
 
     def _dsv4_store_shapes_for_range(
