@@ -10,6 +10,7 @@ import inspect
 import math
 import os
 import re
+import threading
 import time
 import weakref
 
@@ -69,6 +70,11 @@ logger = init_logger(__name__)
 _INDEXER_PREFETCH_MANAGER: Any = None
 _HCA_PREFETCH_MANAGER: Any = None
 _CSA_ATTENTION_KV_PREFETCH_MANAGER: Any = None
+# Tutti loader recorded by the loader-ready callback (may run on a background
+# daemon thread). Consumed on the main thread by _maybe_lazy_attach_csa_prefetch
+# so the CSA attention-KV manager attaches once the lazily-created loader exists.
+_CSA_PREFETCH_PENDING_LOADER: Any = None
+_CSA_PREFETCH_PENDING_LOCK = threading.Lock()
 _DEEPSEEK_DECODER_LAYER_CACHE: tuple[Any, ...] = ()
 _LMCACHE_DEEPSEEK_DECODER_LAYER_REGISTRY: Any = weakref.WeakSet()
 _DEEPSEEK_DECODER_REGISTRY_HOOK_INSTALLED: bool = False
@@ -77,6 +83,8 @@ _OVERLAP_HOOK_ERROR_LOGGED: set[tuple[str, int, str]] = set()
 _SCHEDULER_HMA_INVALID_BLOCK_PATCH_INSTALLED: bool = False
 _TTFT_PROFILE_FORWARD_LOGGED: set[tuple[str, int]] = set()
 _TTFT_PROFILE_HC_PRE_LOGGED: set[tuple[str, int]] = set()
+_TTFT_PROFILE_HC_POST_LOGGED: set[tuple[str, int]] = set()
+_TTFT_PROFILE_MHC_FUSED_LOGGED: set[tuple[str, int]] = set()
 
 
 def _ttft_profile_enabled() -> bool:
@@ -739,12 +747,62 @@ def _is_ffn_hc_pre_call(
     )
 
 
+def _mhc_fused_post_pre_fn_arg(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+    """Return the HC function argument from a fused post/pre call."""
+    if len(args) >= 5:
+        return args[4]
+    for name in ("fn", "hc_fn", "kernel", "op"):
+        if name in kwargs:
+            return kwargs[name]
+    return None
+
+
+def _is_ffn_mhc_fused_post_pre_call(
+    decoder_layer: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> bool:
+    """Return whether a fused MHC post/pre call is entering the FFN block."""
+    return _same_callable(
+        _mhc_fused_post_pre_fn_arg(args, kwargs),
+        getattr(decoder_layer, "hc_ffn_fn", None),
+    )
+
+
+def _overlap_token_rows(hidden_states: torch.Tensor) -> int:
+    """Return the token-row count represented by a decoder hidden tensor."""
+    if hidden_states.ndim == 0:
+        return 1
+    if hidden_states.ndim >= 3 and int(hidden_states.shape[0]) == 1:
+        return int(hidden_states.shape[1])
+    return int(hidden_states.shape[0])
+
+
+def _flatten_overlap_hidden_for_positions(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Align a decoder hidden tensor with flattened position rows."""
+    flat_positions = positions.reshape(-1)
+    if hidden_states.ndim >= 2:
+        if int(hidden_states.shape[0]) == int(flat_positions.shape[0]):
+            return hidden_states, flat_positions, int(flat_positions.shape[0])
+        flat_hidden = hidden_states.reshape(-1, int(hidden_states.shape[-1]))
+        max_rows = min(int(flat_hidden.shape[0]), int(flat_positions.shape[0]))
+        return (
+            flat_hidden[:max_rows].contiguous(),
+            flat_positions[:max_rows].contiguous(),
+            max_rows,
+        )
+    return hidden_states, flat_positions[:1].contiguous(), 1
+
+
 def _positions_from_forward_frame(
     frame: Any,
     hidden_states: torch.Tensor,
 ) -> torch.Tensor | None:
     device = hidden_states.device
-    rows = int(hidden_states.shape[0]) if hidden_states.ndim > 0 else 1
+    rows = _overlap_token_rows(hidden_states)
     current = frame
     for _ in range(6):
         if current is None:
@@ -809,7 +867,7 @@ def _positions_from_source(
     hidden_states: torch.Tensor,
 ) -> torch.Tensor | None:
     device = hidden_states.device
-    rows = int(hidden_states.shape[0]) if hidden_states.ndim > 0 else 1
+    rows = _overlap_token_rows(hidden_states)
     if isinstance(source, torch.Tensor) and source.numel() > 0:
         return source.reshape(-1).to(
             device=device,
@@ -826,6 +884,25 @@ def _positions_from_source(
     return None
 
 
+def _positions_for_overlap(
+    decoder_layer: Any,
+    hidden_states: torch.Tensor,
+) -> torch.Tensor | None:
+    """Return current forward positions for a decoder-layer overlap hook."""
+    positions = _positions_from_source(
+        getattr(decoder_layer, "_lmcache_forward_position_source", None),
+        hidden_states,
+    )
+    if positions is None:
+        frame = inspect.currentframe()
+        try:
+            caller = frame.f_back if frame is not None else None
+            positions = _positions_from_forward_frame(caller, hidden_states)
+        finally:
+            del frame
+    return positions
+
+
 def _install_decoder_forward_position_hook(decoder_layer: Any) -> bool:
     if getattr(decoder_layer, "_lmcache_forward_position_installed", False):
         return True
@@ -839,11 +916,29 @@ def _install_decoder_forward_position_hook(decoder_layer: Any) -> bool:
 
     def _lmcache_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
         previous_source = getattr(self, "_lmcache_forward_position_source", None)
+        previous_overlap_fired = getattr(
+            self,
+            "_lmcache_pre_ffn_overlap_fired",
+            None,
+        )
+        previous_python_overlap_fired = getattr(
+            self,
+            "_lmcache_python_pre_ffn_overlap_fired",
+            None,
+        )
+        previous_hc_post_index = getattr(
+            self,
+            "_lmcache_hc_post_call_index",
+            None,
+        )
         self._lmcache_forward_position_source = _forward_position_source(
             signature,
             args,
             kwargs,
         )
+        self._lmcache_pre_ffn_overlap_fired = False
+        self._lmcache_python_pre_ffn_overlap_fired = False
+        self._lmcache_hc_post_call_index = 0
         if _ttft_profile_enabled():
             req_id = _ttft_profile_request_id()
             layer_id = int(getattr(self, "layer_idx", -1))
@@ -867,6 +962,29 @@ def _install_decoder_forward_position_hook(decoder_layer: Any) -> bool:
                     pass
             else:
                 self._lmcache_forward_position_source = previous_source
+            if previous_overlap_fired is None:
+                try:
+                    delattr(self, "_lmcache_pre_ffn_overlap_fired")
+                except AttributeError:
+                    pass
+            else:
+                self._lmcache_pre_ffn_overlap_fired = previous_overlap_fired
+            if previous_python_overlap_fired is None:
+                try:
+                    delattr(self, "_lmcache_python_pre_ffn_overlap_fired")
+                except AttributeError:
+                    pass
+            else:
+                self._lmcache_python_pre_ffn_overlap_fired = (
+                    previous_python_overlap_fired
+                )
+            if previous_hc_post_index is None:
+                try:
+                    delattr(self, "_lmcache_hc_post_call_index")
+                except AttributeError:
+                    pass
+            else:
+                self._lmcache_hc_post_call_index = previous_hc_post_index
 
     decoder_layer._lmcache_original_forward = original_forward
     decoder_layer.forward = MethodType(_lmcache_forward, decoder_layer)
@@ -896,8 +1014,10 @@ def _fire_decoder_ffn_overlap(
     decoder_layer: Any,
     residual_after_attention: torch.Tensor,
     positions: torch.Tensor | None,
-) -> None:
+    source: str,
+) -> bool:
     layer_id = getattr(decoder_layer, "layer_idx", -1)
+    fired = False
 
     indexer_manager = getattr(
         decoder_layer,
@@ -907,21 +1027,56 @@ def _fire_decoder_ffn_overlap(
     next_csa = getattr(decoder_layer, "_lmcache_next_csa_layer_id", -1)
     if indexer_manager is not None and isinstance(next_csa, int) and next_csa >= 0:
         try:
-            indexer_manager.fire_async_for_layer(
-                next_csa,
-                residual_f=residual_after_attention,
-                positions=positions,
-            )
-            # Also dispatch CSA-attention-KV prefetch unconditionally so the
-            # K cache reads overlap with this layer's FFN window even when
-            # the indexer's residual-proxy path is disabled for prefill.
-            dispatch_csa_kv = getattr(
-                indexer_manager,
-                "dispatch_csa_kv_overlap_unconditional",
-                None,
-            )
-            if callable(dispatch_csa_kv):
-                dispatch_csa_kv(next_csa)
+            if positions is not None:
+                residual_after_attention, positions, rows = (
+                    _flatten_overlap_hidden_for_positions(
+                        residual_after_attention,
+                        positions,
+                    )
+                )
+            else:
+                rows = _overlap_token_rows(residual_after_attention)
+            if rows > 1:
+                csa_kv_attached_fn = getattr(
+                    indexer_manager,
+                    "csa_attention_kv_prefetch_attached",
+                    None,
+                )
+                csa_kv_attached = (
+                    bool(csa_kv_attached_fn())
+                    if callable(csa_kv_attached_fn)
+                    else False
+                )
+                prefill_proxy_enabled = getattr(
+                    indexer_manager,
+                    "prefill_proxy_enabled",
+                    None,
+                )
+                prefill_proxy_allowed = (
+                    bool(prefill_proxy_enabled())
+                    if callable(prefill_proxy_enabled)
+                    else False
+                )
+                if not (csa_kv_attached or prefill_proxy_allowed):
+                    indexer_manager = None
+            if indexer_manager is not None:
+                if _ttft_profile_enabled():
+                    logger.info(
+                        "LMCACHE_TTFT_STAGE event=csa_overlap_hook_fire "
+                        "source=%s source_layer=%d target_layer=%d "
+                        "rows=%d t=%.9f",
+                        source,
+                        int(layer_id),
+                        int(next_csa),
+                        rows,
+                        time.perf_counter(),
+                    )
+                indexer_manager.fire_async_for_layer(
+                    next_csa,
+                    residual_f=residual_after_attention,
+                    positions=positions,
+                )
+                fired = True
         except Exception as exc:
             _log_overlap_hook_error_once("CSA", int(layer_id), exc)
 
@@ -957,8 +1112,32 @@ def _fire_decoder_ffn_overlap(
                 if callable(prepare_hca):
                     for next_hca in prepare_targets:
                         prepare_hca(next_hca)
+            fired = True
         except Exception as exc:
             _log_overlap_hook_error_once("HCA", int(layer_id), exc)
+    return fired
+
+
+def _maybe_fire_decoder_ffn_overlap(
+    decoder_layer: Any,
+    residual_after_attention: torch.Tensor,
+    positions: torch.Tensor | None,
+    source: str,
+) -> None:
+    if positions is None:
+        return
+    if getattr(decoder_layer, "_lmcache_pre_ffn_overlap_fired", False):
+        return
+    if getattr(decoder_layer, "_lmcache_python_pre_ffn_overlap_fired", False):
+        return
+    if _fire_decoder_ffn_overlap(
+        decoder_layer,
+        residual_after_attention,
+        positions,
+        source,
+    ):
+        decoder_layer._lmcache_python_pre_ffn_overlap_fired = True
+        decoder_layer._lmcache_pre_ffn_overlap_fired = True
 
 
 def _install_decoder_hc_pre_overlap_hook(decoder_layer: Any) -> bool:
@@ -995,18 +1174,8 @@ def _install_decoder_hc_pre_overlap_hook(decoder_layer: Any) -> bool:
                         layer_id,
                         time.perf_counter(),
                     )
-            positions = _positions_from_source(
-                getattr(self, "_lmcache_forward_position_source", None),
-                hidden_states,
-            )
-            if positions is None:
-                frame = inspect.currentframe()
-                try:
-                    caller = frame.f_back if frame is not None else None
-                    positions = _positions_from_forward_frame(caller, hidden_states)
-                finally:
-                    del frame
-            _fire_decoder_ffn_overlap(self, hidden_states, positions)
+            positions = _positions_for_overlap(self, hidden_states)
+            _maybe_fire_decoder_ffn_overlap(self, hidden_states, positions, "hc_pre")
         return original_hc_pre(hidden_states, *args, **kwargs)
 
     _install_decoder_forward_position_hook(decoder_layer)
@@ -1016,6 +1185,143 @@ def _install_decoder_hc_pre_overlap_hook(decoder_layer: Any) -> bool:
     return True
 
 
+def _install_decoder_hc_post_overlap_hook(decoder_layer: Any) -> bool:
+    """Install an attention-post hook that fires before the FFN HC step."""
+    hc_post = getattr(decoder_layer, "hc_post", None)
+    if not callable(hc_post):
+        return False
+    if getattr(decoder_layer, "_lmcache_hc_post_overlap_installed", False):
+        return True
+
+    original_hc_post = hc_post
+
+    def _lmcache_hc_post(
+        self: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        result = original_hc_post(*args, **kwargs)
+        call_index = int(getattr(self, "_lmcache_hc_post_call_index", 0))
+        self._lmcache_hc_post_call_index = call_index + 1
+        if call_index == 0 and isinstance(result, torch.Tensor):
+            if _ttft_profile_enabled():
+                req_id = _ttft_profile_request_id()
+                layer_id = int(getattr(self, "layer_idx", -1))
+                key = (req_id, layer_id)
+                if key not in _TTFT_PROFILE_HC_POST_LOGGED:
+                    _TTFT_PROFILE_HC_POST_LOGGED.add(key)
+                    logger.info(
+                        "LMCACHE_TTFT_STAGE req_id=%s event=hc_post_attention "
+                        "layer=%d t=%.9f",
+                        req_id,
+                        layer_id,
+                        time.perf_counter(),
+                    )
+            positions = _positions_for_overlap(self, result)
+            _maybe_fire_decoder_ffn_overlap(self, result, positions, "hc_post")
+        return result
+
+    _install_decoder_forward_position_hook(decoder_layer)
+    decoder_layer._lmcache_original_hc_post = original_hc_post
+    decoder_layer.hc_post = MethodType(_lmcache_hc_post, decoder_layer)
+    decoder_layer._lmcache_hc_post_overlap_installed = True
+    return True
+
+
+def _install_decoder_mhc_fused_post_pre_overlap_hook(decoder_layer: Any) -> bool:
+    """Install a CUDA fused attention-post/FFN-pre overlap hook."""
+    fused_op = getattr(decoder_layer, "mhc_fused_post_pre", None)
+    original_forward = getattr(fused_op, "forward", None)
+    if not callable(original_forward):
+        return False
+    if getattr(fused_op, "_lmcache_mhc_fused_overlap_installed", False):
+        return True
+
+    def _lmcache_mhc_fused_post_pre(
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        result = original_forward(*args, **kwargs)
+        if not _is_ffn_mhc_fused_post_pre_call(decoder_layer, args, kwargs):
+            return result
+        residual_after_attention = None
+        if isinstance(result, tuple) and result:
+            candidate = result[0]
+            if isinstance(candidate, torch.Tensor):
+                residual_after_attention = candidate
+        if residual_after_attention is None:
+            return result
+        if _ttft_profile_enabled():
+            req_id = _ttft_profile_request_id()
+            layer_id = int(getattr(decoder_layer, "layer_idx", -1))
+            key = (req_id, layer_id)
+            if key not in _TTFT_PROFILE_MHC_FUSED_LOGGED:
+                _TTFT_PROFILE_MHC_FUSED_LOGGED.add(key)
+                logger.info(
+                    "LMCACHE_TTFT_STAGE req_id=%s event=mhc_fused_ffn_pre "
+                    "layer=%d t=%.9f",
+                    req_id,
+                    layer_id,
+                    time.perf_counter(),
+                )
+        positions = _positions_for_overlap(decoder_layer, residual_after_attention)
+        _maybe_fire_decoder_ffn_overlap(
+            decoder_layer,
+            residual_after_attention,
+            positions,
+            "mhc_fused",
+        )
+        return result
+
+    _install_decoder_forward_position_hook(decoder_layer)
+    fused_op._lmcache_original_forward = original_forward
+    fused_op.forward = _lmcache_mhc_fused_post_pre
+    fused_op._lmcache_mhc_fused_overlap_installed = True
+    return True
+
+
+def _install_decoder_native_indexer_prefetch_guard(decoder_layer: Any) -> None:
+    """Guard native vLLM indexer prefetch against Python fallback double-fire."""
+    native_fire = getattr(decoder_layer, "_fire_indexer_prefetch", None)
+    if not callable(native_fire):
+        return
+    if getattr(decoder_layer, "_lmcache_native_indexer_guard_installed", False):
+        return
+
+    original_native_fire = native_fire
+
+    def _lmcache_fire_indexer_prefetch(
+        self: Any,
+        residual_f: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+    ) -> Any:
+        if getattr(self, "_lmcache_pre_ffn_overlap_fired", False):
+            return None
+        self._lmcache_pre_ffn_overlap_fired = True
+        return original_native_fire(residual_f, positions)
+
+    _install_decoder_forward_position_hook(decoder_layer)
+    decoder_layer._lmcache_original_fire_indexer_prefetch = original_native_fire
+    decoder_layer._fire_indexer_prefetch = MethodType(
+        _lmcache_fire_indexer_prefetch,
+        decoder_layer,
+    )
+    decoder_layer._lmcache_native_indexer_guard_installed = True
+
+
+def _install_decoder_pre_ffn_overlap_hooks(decoder_layer: Any) -> bool:
+    """Install best-effort Python hooks for the pre-FFN overlap window."""
+    _install_decoder_native_indexer_prefetch_guard(decoder_layer)
+    installed = False
+    if _install_decoder_hc_post_overlap_hook(decoder_layer):
+        installed = True
+    if _install_decoder_mhc_fused_post_pre_overlap_hook(decoder_layer):
+        installed = True
+    if _install_decoder_hc_pre_overlap_hook(decoder_layer):
+        installed = True
+    return installed
+
+
 def _configure_decoder_csa_overlap(
     decoder_layer: Any,
     manager: Any,
@@ -1023,9 +1329,12 @@ def _configure_decoder_csa_overlap(
 ) -> bool:
     decoder_layer._lmcache_indexer_prefetch_manager = manager
     decoder_layer._lmcache_next_csa_layer_id = next_csa_layer_id
-    if callable(getattr(decoder_layer, "_lmcache_fire_pre_ffn_overlap", None)):
-        return True
-    return _install_decoder_hc_pre_overlap_hook(decoder_layer)
+    native_hook = callable(
+        getattr(decoder_layer, "_lmcache_fire_pre_ffn_overlap", None)
+    )
+    if not isinstance(next_csa_layer_id, int) or next_csa_layer_id < 0:
+        return native_hook
+    return _install_decoder_pre_ffn_overlap_hooks(decoder_layer) or native_hook
 
 
 def _configure_decoder_hca_overlap(
@@ -1037,9 +1346,15 @@ def _configure_decoder_hca_overlap(
     decoder_layer._lmcache_hca_prefetch_manager = manager
     decoder_layer._lmcache_next_hca_layer_id = next_hca_layer_id
     decoder_layer._lmcache_next_hca_layer_ids = next_hca_layer_ids
-    if callable(getattr(decoder_layer, "_lmcache_fire_pre_ffn_overlap", None)):
-        return True
-    return _install_decoder_hc_pre_overlap_hook(decoder_layer)
+    native_hook = callable(
+        getattr(decoder_layer, "_lmcache_fire_pre_ffn_overlap", None)
+    )
+    if (
+        (not isinstance(next_hca_layer_id, int) or next_hca_layer_id < 0)
+        and not next_hca_layer_ids
+    ):
+        return native_hook
+    return _install_decoder_pre_ffn_overlap_hooks(decoder_layer) or native_hook
 
 
 def _install_hca_attention_drain_hook(
@@ -1211,6 +1526,41 @@ def _maybe_build_indexer_tutti_storage(
     return storage
 
 
+def _shard_indexer_ssd_dir(base_csv: str, rank_suffix: str) -> str:
+    """Select this worker's indexer SSD base directory from a CSV of paths.
+
+    ``LMCACHE_INDEXER_SSD_DIR`` (and ``LMCACHE_HCA_SSD_DIR``) may be a single
+    path or a comma-separated list of one path per drive. This shards the list
+    across GPUs with the same ``by_gpu`` policy the KV cache ``local_disk``
+    backend uses, so each rank's indexer lands on its own drive rather than all
+    ranks sharing one -- which would be a single point of failure and an I/O
+    bottleneck. A single-path value is returned unchanged.
+
+    Args:
+        base_csv: One path, or a comma-separated list of per-drive paths.
+        rank_suffix: This worker's local rank as a string, used to derive the
+            GPU device index for ``by_gpu`` sharding.
+
+    Returns:
+        The single base directory selected for this worker (no ``rank_N``
+        suffix appended).
+
+    Raises:
+        ValueError: If ``base_csv`` contains no non-empty paths.
+    """
+    # Local import: keep the storage backend optional for callers that never
+    # reach the prefetch attach paths.
+    from lmcache.v1.storage_backend.path_sharder import PathSharder
+
+    sharder = PathSharder(
+        base_csv,
+        strategy="by_gpu",
+        dst_device=f"cuda:{rank_suffix}",
+        create_dirs=True,
+    )
+    return sharder.selected
+
+
 def _attach_indexer_prefetch(tutti_loader: Optional[Any] = None) -> None:
     """Attach SSD-backed CSA indexer prefetch when enabled by environment.
 
@@ -1237,7 +1587,8 @@ def _attach_indexer_prefetch(tutti_loader: Optional[Any] = None) -> None:
         return
 
     rank_suffix = os.environ.get("LOCAL_RANK") or os.environ.get("RANK") or "0"
-    store_dir = os.path.join(base_store_dir, f"rank_{rank_suffix}")
+    selected_base = _shard_indexer_ssd_dir(base_store_dir, rank_suffix)
+    store_dir = os.path.join(selected_base, f"rank_{rank_suffix}")
 
     try:
         from lmcache.v1.indexer_ssd_manager import (
@@ -1321,16 +1672,11 @@ def _attach_indexer_prefetch(tutti_loader: Optional[Any] = None) -> None:
 
     attached_decoders = 0
     early_overlap_hooks = 0
+    csa_layer_id_set = set(csa_layer_ids)
     for decoder_layer in decoder_layers:
         decoder_layer_id = getattr(decoder_layer, "layer_idx", -1)
-        next_csa = next(
-            (
-                csa_layer_id
-                for csa_layer_id in csa_layer_ids
-                if csa_layer_id > decoder_layer_id
-            ),
-            -1,
-        )
+        next_layer_id = decoder_layer_id + 1
+        next_csa = next_layer_id if next_layer_id in csa_layer_id_set else -1
         attach = getattr(decoder_layer, "attach_indexer_prefetch", None)
         if callable(attach):
             attach(manager, next_csa)
@@ -1382,12 +1728,17 @@ def _attach_hca_prefetch() -> None:
         )
         return
 
-    base_store_dir = os.environ.get("LMCACHE_HCA_SSD_DIR", "")
-    if not base_store_dir:
-        indexer_dir = os.environ.get("LMCACHE_INDEXER_SSD_DIR", "")
-        if indexer_dir:
-            base_store_dir = os.path.join(indexer_dir, "hca")
-    if not base_store_dir:
+    hca_ssd_csv = os.environ.get("LMCACHE_HCA_SSD_DIR", "")
+    hca_nested_suffix = ""
+    if not hca_ssd_csv:
+        hca_ssd_csv = os.environ.get("LMCACHE_INDEXER_SSD_DIR", "")
+        if hca_ssd_csv:
+            # Fall back to a subdir under the (possibly sharded) indexer dir.
+            # The "hca" suffix is applied per-shard after selection so a
+            # comma-separated indexer CSV shards correctly instead of being
+            # treated as one path.
+            hca_nested_suffix = "hca"
+    if not hca_ssd_csv:
         logger.warning(
             "LMCACHE_HCA_ENABLE_PREFETCH is set, but neither "
             "LMCACHE_HCA_SSD_DIR nor LMCACHE_INDEXER_SSD_DIR is set; "
@@ -1431,7 +1782,10 @@ def _attach_hca_prefetch() -> None:
     hca_info.sort(key=lambda item: item[0])
     hca_layer_ids = [layer_id for layer_id, _ in hca_info]
     rank_suffix = os.environ.get("LOCAL_RANK") or os.environ.get("RANK") or "0"
-    store_dir = os.path.join(base_store_dir, f"rank_{rank_suffix}")
+    selected_base = _shard_indexer_ssd_dir(hca_ssd_csv, rank_suffix)
+    if hca_nested_suffix:
+        selected_base = os.path.join(selected_base, hca_nested_suffix)
+    store_dir = os.path.join(selected_base, f"rank_{rank_suffix}")
 
     manager = HCAPrefetchManager(
         store_dir=store_dir,
@@ -1564,9 +1918,8 @@ def _attach_csa_attention_kv_prefetch(tutti_loader: Optional[Any] = None) -> Non
     if not _csa_attention_kv_prefetch_enabled():
         return
     if tutti_loader is None:
-        logger.warning(
-            "LMCACHE_INDEXER_FULL_OVERLAP=1 but no Tutti loader is available; "
-            "skipping CSA attention KV prefetch attach"
+        logger.debug(
+            "CSA attention KV prefetch waiting for Tutti loader before attach"
         )
         return
     if _CSA_ATTENTION_KV_PREFETCH_MANAGER is not None:
@@ -1687,6 +2040,36 @@ def _attach_csa_attention_kv_prefetch(tutti_loader: Optional[Any] = None) -> Non
         manager.close()
         return
 
+    # V28: register HCA layers so the layer-major walker also owns their
+    # attention-KV bytes.  Gate is the connector's per-layer
+    # wait_for_layer_load hook (HCA has no indexer forward to patch).
+    hca_registered = 0
+    if _env_flag("LMCACHE_DSV4_HCA_WALKER"):
+        for decoder_layer in decoder_layers:
+            layer_id = getattr(decoder_layer, "layer_idx", -1)
+            if not isinstance(layer_id, int) or layer_id < 0:
+                continue
+            hca_attention = _decoder_hca_attention(decoder_layer)
+            if hca_attention is None:
+                continue
+            kv_cache = getattr(hca_attention, "kv_cache", None)
+            if not isinstance(kv_cache, torch.Tensor) or kv_cache.numel() == 0:
+                continue
+            try:
+                manager.register_hca_layer(int(layer_id), kv_cache)
+                hca_registered += 1
+            except Exception:
+                logger.exception(
+                    "Failed to register HCA layer %d with the CSA/HCA "
+                    "prefetch walker",
+                    layer_id,
+                )
+        logger.info(
+            "CSAAttentionKVPrefetchManager: HCA walker registered %d HCA "
+            "layers",
+            hca_registered,
+        )
+
     indexer_manager.attach_csa_attention_kv_manager(manager)
     set_csa_attention_kv_prefetch_manager(manager)
     _CSA_ATTENTION_KV_PREFETCH_MANAGER = manager
@@ -1720,6 +2103,47 @@ def _ensure_csa_attention_kv_prefetch_attached(
         return None
     _attach_csa_attention_kv_prefetch(tutti_loader=tutti_loader)
     return _CSA_ATTENTION_KV_PREFETCH_MANAGER
+
+
+def _csa_prefetch_set_pending_loader(tutti_loader: Any) -> None:
+    """Loader-ready callback: record the Tutti loader for a later main-thread attach.
+
+    Registered with the cache engine via ``register_tutti_loader_ready_callback``
+    and may be invoked from the Tutti warmup daemon thread. It therefore only
+    stores the loader reference under a lock and performs no CUDA work; the
+    actual attach (which allocates CUDA bitmaps and patches indexer forwards)
+    runs on the main thread in :func:`_maybe_lazy_attach_csa_prefetch`.
+
+    Args:
+        tutti_loader: The freshly created :class:`TuttiDirectLoader`.
+    """
+    global _CSA_PREFETCH_PENDING_LOADER
+    with _CSA_PREFETCH_PENDING_LOCK:
+        _CSA_PREFETCH_PENDING_LOADER = tutti_loader
+
+
+def _maybe_lazy_attach_csa_prefetch(engine: Any) -> None:
+    """Attach the CSA attention-KV prefetch manager on the main thread.
+
+    Called per request from ``start_load_kv`` before the model forward. When the
+    Tutti loader was created after ``register_kv_caches`` (the common case, due
+    to the warmup delay), this performs the deferred attach exactly once. It is
+    a fast no-op after the manager is attached.
+
+    Args:
+        engine: The active LMCache engine, or ``None``.
+    """
+    if _CSA_ATTENTION_KV_PREFETCH_MANAGER is not None:
+        return
+    with _CSA_PREFETCH_PENDING_LOCK:
+        loader = _CSA_PREFETCH_PENDING_LOADER
+    if loader is None:
+        # The callback may not have fired yet (or was never registered); fall
+        # back to reading the loader directly off the engine.
+        loader = getattr(engine, "_tutti_loader", None) if engine is not None else None
+    if loader is None:
+        return
+    _ensure_csa_attention_kv_prefetch_attached(loader)
 
 
 @dataclass
@@ -2446,6 +2870,22 @@ class LMCacheConnectorV1Impl:
         _attach_indexer_prefetch(tutti_loader=engine_tutti_loader)
         _attach_hca_prefetch()
         _attach_csa_attention_kv_prefetch(tutti_loader=engine_tutti_loader)
+        # The Tutti loader is usually still None here (created lazily after the
+        # warmup delay), so the attach above no-ops. Register a callback so the
+        # CSA attention-KV manager attaches on the main thread once the loader
+        # is created. See _maybe_lazy_attach_csa_prefetch / start_load_kv.
+        if (
+            _CSA_ATTENTION_KV_PREFETCH_MANAGER is None
+            and self.lmcache_engine is not None
+            and _csa_attention_kv_prefetch_enabled()
+        ):
+            register_cb = getattr(
+                self.lmcache_engine,
+                "register_tutti_loader_ready_callback",
+                None,
+            )
+            if callable(register_cb):
+                register_cb(_csa_prefetch_set_pending_loader)
 
     def _capture_vllm_hma_layout(self) -> None:
         """Capture vLLM HMA group metadata for LMCache GPU transfers."""
@@ -2519,6 +2959,19 @@ class LMCacheConnectorV1Impl:
             forward_context (ForwardContext): the forward context.
             **kwargs: additional arguments for the load operation
         """
+        try:
+            self._start_load_kv_impl(forward_context, **kwargs)
+        except Exception:
+            import traceback as _tb
+            logger.error(
+                "start_load_kv unhandled exception (worker traceback):\n%s",
+                _tb.format_exc(),
+            )
+            raise
+
+    def _start_load_kv_impl(
+        self, forward_context: "ForwardContext", **kwargs
+    ) -> None:
         start_load_profile_enabled = _ttft_profile_enabled()
         start_load_t0 = time.perf_counter() if start_load_profile_enabled else 0.0
         self.current_layer = 0
@@ -2531,9 +2984,15 @@ class LMCacheConnectorV1Impl:
             self._init_kv_caches_from_forward_context(forward_context)
 
         metadata = self._parent._get_connector_metadata()
-        assert isinstance(metadata, LMCacheConnectorMetadata)
+        if not isinstance(metadata, LMCacheConnectorMetadata):
+            raise ValueError(
+                f"Expected LMCacheConnectorMetadata, got {type(metadata)}"
+            )
 
-        assert len(self.kv_caches) > 0
+        if len(self.kv_caches) == 0:
+            raise ValueError(
+                "start_load_kv: kv_caches still empty after init attempt"
+            )
         kvcaches = list(self.kv_caches.values())
 
         attn_metadata = forward_context.attn_metadata
@@ -2541,7 +3000,17 @@ class LMCacheConnectorV1Impl:
             logger.debug("In connector.start_load_kv, but the attn_metadata is None")
             return
 
-        assert self.lmcache_engine is not None
+        if self.lmcache_engine is None:
+            logger.warning(
+                "start_load_kv: lmcache_engine is None (degraded mode), skipping KV load"
+            )
+            return
+
+        # Attach the CSA attention-KV prefetch manager if the Tutti loader
+        # became ready after register_kv_caches. Runs on the main thread before
+        # the model forward; idempotent no-op once attached.
+        if _CSA_ATTENTION_KV_PREFETCH_MANAGER is None:
+            _maybe_lazy_attach_csa_prefetch(self.lmcache_engine)
 
         self.layerwise_retrievers = []
 
@@ -2635,6 +3104,10 @@ class LMCacheConnectorV1Impl:
                 num_expected_tokens = (
                     lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
                 )
+                retrieved_lmcache_cached_tokens = (
+                    request.load_spec.vllm_cached_tokens
+                    + int(num_retrieved_tokens)
+                )
                 if num_retrieved_tokens < num_expected_tokens:
                     logger.error(
                         "Request %s"
@@ -2657,6 +3130,12 @@ class LMCacheConnectorV1Impl:
                         slot_mapping[:lmcache_cached_tokens],
                     )
                     self._invalid_block_ids.update(missing_blocks)
+                    if num_retrieved_tokens > 0:
+                        self._maybe_seed_indexer_reuse_prefetch(
+                            request,
+                            retrieved_lmcache_cached_tokens,
+                            request.slot_mapping,
+                        )
                 else:
                     skip_hca_retrieve_drain = (
                         _hca_skip_retrieve_ttft_drain_enabled()
@@ -3207,6 +3686,26 @@ class LMCacheConnectorV1Impl:
         Args:
             layer_name: the name of that layer
         """
+        # V28 HCA walker gate: HCA layers have no indexer forward to patch,
+        # so this per-layer connector hook blocks until the layer-major
+        # walker has landed the layer's attention-KV bytes.  No-op for CSA
+        # layers (their gate is the patched indexer forward) and for layers
+        # the walker does not own.
+        manager = _CSA_ATTENTION_KV_PREFETCH_MANAGER
+        if manager is not None and _env_flag("LMCACHE_DSV4_HCA_WALKER"):
+            layer_id = _layer_idx_from_prefix(layer_name)
+            if layer_id >= 0 and layer_id in getattr(
+                manager, "hca_layer_ids", ()
+            ):
+                try:
+                    manager.wait_for_layer(layer_id)
+                except Exception:
+                    logger.exception(
+                        "HCA walker gate failed for layer %s; attention may "
+                        "read stale HCA KV",
+                        layer_name,
+                    )
+
         if self.layerwise_retrievers:
             logger.debug(f"Waiting for layer {self.current_layer} to be loaded")
 
@@ -3252,7 +3751,9 @@ class LMCacheConnectorV1Impl:
             attn_metadata (AttentionMetadata): the attention metadata.
             **kwargs: additional arguments for the save operation.
         """
-        assert self.lmcache_engine is not None
+        if self.lmcache_engine is None:
+            logger.warning("save_kv_layer: lmcache_engine is None, skipping save")
+            return
 
         if not self.use_layerwise and not self.layerwise_retrievers:
             return
@@ -3266,9 +3767,16 @@ class LMCacheConnectorV1Impl:
             )
             return
         connector_metadata = self._parent._get_connector_metadata()
-        assert isinstance(connector_metadata, LMCacheConnectorMetadata)
+        if not isinstance(connector_metadata, LMCacheConnectorMetadata):
+            logger.warning(
+                "save_kv_layer: expected LMCacheConnectorMetadata, got %s",
+                type(connector_metadata),
+            )
+            return
 
-        assert len(self.kv_caches) > 0
+        if len(self.kv_caches) == 0:
+            logger.warning("save_kv_layer: kv_caches is empty, skipping")
+            return
 
         kvcaches = list(self.kv_caches.values())
         is_first = True
@@ -3367,10 +3875,14 @@ class LMCacheConnectorV1Impl:
                 self.lmcache_engine.lookup_unpin(request.req_id)
             return
 
-        assert len(self.kv_caches) > 0
+        if len(self.kv_caches) == 0:
+            logger.warning("wait_for_save: kv_caches is empty, skipping")
+            return
         kvcaches = list(self.kv_caches.values())
 
-        assert self.lmcache_engine is not None
+        if self.lmcache_engine is None:
+            logger.warning("wait_for_save: lmcache_engine is None, skipping save")
+            return
 
         # Probe decoder cache before store if bidirectional mode is enabled
         bidir_enabled = getattr(self.config, "pd_bidirectional", False)
@@ -3622,8 +4134,16 @@ class LMCacheConnectorV1Impl:
 
         req_id = request.request_id
 
-        # lookup_client is always initialized for scheduler role
-        assert self.lookup_client is not None
+        if self.lookup_client is None:
+            logger.error(
+                "get_num_new_matched_tokens: lookup_client is None (scheduler "
+                "init failed?); returning 0 for request %s. "
+                "init_failed=%s init_failed_reason=%s",
+                req_id,
+                getattr(self._manager, "_init_failed", "?"),
+                getattr(self._manager, "_init_failed_reason", "?"),
+            )
+            return 0
 
         if (
             num_external_hit_tokens := self.lookup_client.lookup_cache(lookup_id=req_id)
@@ -3663,12 +4183,12 @@ class LMCacheConnectorV1Impl:
         if num_external_hit_tokens is None:
             logger.debug(
                 "Reqid: %s, Total tokens %d, Inference Engine computed tokens: %d, "
-                "LMCache hit tokens: None.",
+                "LMCache hit tokens: None (async lookup pending, treating as miss).",
                 req_id,
                 request.num_tokens,
                 num_computed_tokens,
             )
-            return None
+            return 0
 
         # When prompt length is divisible by the block size and all
         # blocks are cached, we need to recompute the last token.
@@ -3735,7 +4255,13 @@ class LMCacheConnectorV1Impl:
 
         # Clear local status in lookup client when a new request is
         # successfully scheduled.
-        assert self.lookup_client is not None
+        if self.lookup_client is None:
+            logger.warning(
+                "update_state_after_alloc: lookup_client is None, skipping "
+                "clear_lookup_status for request %s",
+                request.request_id,
+            )
+            return
         self.lookup_client.clear_lookup_status(request.request_id)
 
         kv_transfer_params = (

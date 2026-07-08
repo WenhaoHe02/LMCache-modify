@@ -881,6 +881,15 @@ class LocalDiskBackend(StorageBackendInterface):
         )
         start = time.perf_counter()
         existing = self.kv_object_metadata_store.get(object_id)
+        if (
+            existing is not None
+            and existing.state == KVObjectState.READY
+            and existing.length == compact_nbytes
+        ):
+            # Content-addressed key already persisted with identical length:
+            # skip the redundant NVMe rewrite (fires on every hit otherwise;
+            # see the matching guard in the primary object write path).
+            return True
         if existing is None:
             if raw_writer is not None:
                 offset, end_offset, aligned_length = (
@@ -998,6 +1007,17 @@ class LocalDiskBackend(StorageBackendInterface):
 
         slab_range = slab_ranges[0]
         slab_nbytes = slab_range.length
+        object_id = self._key_to_object_id(key, role=_DSV4_HCA_SLAB_ROLE)
+        existing = self.kv_object_metadata_store.get(object_id)
+        if (
+            existing is not None
+            and existing.state == KVObjectState.READY
+            and existing.length == slab_nbytes
+        ):
+            # Content-addressed key already persisted with identical length:
+            # skip the redundant NVMe rewrite AND the slab payload copy
+            # (fires on every hit otherwise; see the primary-path guard).
+            return True
         if raw_writer is not None and not self.kv_object_payload_fits_tutti_staging(
             slab_nbytes
         ):
@@ -1015,9 +1035,7 @@ class LocalDiskBackend(StorageBackendInterface):
         slab_payload = bytearray(slab_nbytes)
         slab_payload[:] = buffer[source_start:source_end].tobytes()
 
-        object_id = self._key_to_object_id(key, role=_DSV4_HCA_SLAB_ROLE)
         start = time.perf_counter()
-        existing = self.kv_object_metadata_store.get(object_id)
         if existing is None:
             if raw_writer is not None:
                 offset, end_offset, aligned_length = (
@@ -2020,6 +2038,26 @@ class LocalDiskBackend(StorageBackendInterface):
         try:
             with self.kv_object_store_lock:
                 existing = self.kv_object_metadata_store.get(object_id)
+                if (
+                    existing is not None
+                    and existing.state == KVObjectState.READY
+                    and existing.length == len(buffer)
+                ):
+                    # Idempotent re-store: keys are content-addressed (chunk
+                    # hash), so a ready record of identical length means the
+                    # same bytes are already on NVMe.  vLLM re-saves the whole
+                    # prefix on every hit request; without this check each hit
+                    # rewrote every chunk (measured 16k+ redundant NVMe writes
+                    # in 3 minutes at 26K context), and with the loader's
+                    # io_lock those writes queued ahead of retrieve reads --
+                    # the direct cause of repeat-hit latency inflating from
+                    # ~0.6 s to 2-6 s.
+                    self._log_kv_object_write_skip(
+                        key,
+                        reason="already_stored",
+                        bytes_len=len(buffer),
+                    )
+                    return True
                 if existing is None:
                     if raw_writer is not None:
                         offset, end_offset, aligned_length = (

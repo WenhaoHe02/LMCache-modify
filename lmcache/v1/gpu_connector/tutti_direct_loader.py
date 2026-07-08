@@ -41,12 +41,14 @@ Usage
     loader.close()
 """
 
+import bisect
 import ctypes
 import hashlib
 import mmap
 import os
 import struct as _struct
 import sys
+import threading
 import time
 import types
 from collections.abc import Callable, Sequence
@@ -92,8 +94,11 @@ _GPU_PAGE_SIZE: int = 1 << 16  # 64 KiB
 # NVMe logical block size (512-byte sectors).
 _NVME_LBS: int = 512
 
-# Default per-CQE spin budget (~5 s at ~10 ns/iter on a GPU).
-_DEFAULT_MAX_ITERS: int = 500_000_000
+# Default per-CQE spin budget (~100 ms at ~10 ns/iter on a GPU).
+# Reduced from 500_000_000 (5s) so NVMe read failures time out quickly instead
+# of stalling the entire forward pass.  _submit_reads catches the resulting
+# RuntimeError and skips the prefetch gracefully.
+_DEFAULT_MAX_ITERS: int = 10_000_000
 
 # cudaHostRegisterIoMemory flag (CUDA runtime header).
 _CUDA_HOST_REGISTER_IO_MEMORY: int = 0x04
@@ -1142,6 +1147,56 @@ class TuttiDirectLoader:
         self._slot_gpu_pages = slot_gpu_pages
         self._slot_bytes = slot_gpu_pages * _GPU_PAGE_SIZE
         self._cuda_device = cuda_device
+        # Serialises every NVMe submit/poll cycle (loads AND raw stores).
+        # The SQ/CQ ring, doorbells, staging pool, and status buffer are all
+        # single-instance per loader; the CSA prefetch path calls
+        # load_chunks_to_hbm from proxy executor threads while the main
+        # thread may be inside another load or a raw store.  Unsynchronised
+        # concurrent submit/poll interleaves ring updates and staging reuse,
+        # which manifests as NVMe poll timeouts, kernel-side
+        # cuda-EvtHandlr/cache_mgr_main blocking, and CUDA illegal memory
+        # access (see docs/design/v1/csa_prefetch_illegal_access_bug.md).
+        self._io_lock = threading.Lock()
+        # High-priority (synchronous retrieve) readers currently inside
+        # load_chunks_to_hbm.  Bulk prefetch batches wait until this drops
+        # to zero before grabbing _io_lock for their next batch.
+        self._hp_readers = 0
+        # Read-priority gate over _io_lock.  Deferred HCA store writes
+        # (background, latency-insensitive, ~27 ms p90 each and thousands
+        # per request) share the single NVMe queue with prefetch/retrieve
+        # reads (critical path, ~3 ms each).  With a bare lock, a read
+        # arriving while a write burst holds the lock queues behind the
+        # WHOLE burst -- measured as multi-second correction-wait tails
+        # (p99 spikes up to 13 s) even though median reads are fully
+        # overlapped.  Readers announce on a SEPARATE mutex (so the
+        # announcement is never blocked by an in-flight write) and writers
+        # re-check between stores, yielding until no reader is waiting.
+        self._readers_waiting = 0
+        self._reader_gate = threading.Condition(threading.Lock())
+        # Slack-only write scheduling (Tutti design: reads own the queue
+        # while a request is active; writes go into idle windows).  A write
+        # may proceed only when no read has touched the queue for
+        # ``_write_slack_s`` seconds -- during prefill, prefetch reads
+        # arrive every few ms, so writers stay parked until the
+        # inter-request gap and then drain at full speed.
+        # ``_write_max_delay_s`` bounds the park time so a continuous read
+        # stream cannot starve writers forever (deferred-write buffers pin
+        # retrieve memory objects while queued).
+        self._last_read_end = 0.0
+        self._write_slack_s = float(
+            os.environ.get("LMCACHE_TUTTI_WRITE_SLACK_SEC", "0.05")
+        )
+        self._write_max_delay_s = float(
+            os.environ.get("LMCACHE_TUTTI_WRITE_MAX_DELAY_SEC", "2.0")
+        )
+        # Dedicated stream for the submit/poll spin kernels.  On the default
+        # stream a polling kernel hard-serialises with model forward kernels
+        # (prefetch reads stop overlapping compute entirely) and a slow NVMe
+        # completion turns the spin into a global freeze: forward and NCCL
+        # kernels queue behind it on every rank that fired a read.
+        self._io_stream: Optional[torch.cuda.Stream] = None
+        if torch.cuda.is_available():
+            self._io_stream = torch.cuda.Stream(device=cuda_device)
 
         # Managed-memory control scalars (writable from both CPU and GPU).
         self._sq_tail_ptr = sq_tail_ptr
@@ -1157,6 +1212,12 @@ class TuttiDirectLoader:
         # accessible); additional entries are added lazily via FIEMAP if the
         # filesystem remains accessible (i.e. drive not yet bound).
         self._lba_cache: dict[str, list[LbaRecord]] = dict(initial_lba_cache or {})
+        # Sorted-extent index per path for range queries; invalidated by
+        # identity check against the _lba_cache entry (register_lba_cache
+        # replaces the list object).
+        self._extent_index: dict[
+            str, tuple[list[LbaRecord], list[LbaRecord], list[int]]
+        ] = {}
         self._debug_expected_checksums = debug_expected_checksums or {}
 
     @staticmethod
@@ -1337,6 +1398,44 @@ class TuttiDirectLoader:
             self._lba_cache[file_path] = FiemapHelper.query_extents(file_path)
         return self._lba_cache[file_path]
 
+    def _extents_overlapping(
+        self,
+        file_path: str,
+        start: int,
+        end: int,
+    ) -> list[LbaRecord]:
+        """Return only the extents intersecting ``[start, end)``.
+
+        KV object pools register ONE synthetic path (e.g.
+        ``tutti://rank0-full``) whose extent list holds every object's
+        extents — tens of thousands of records.  The read loops used to scan
+        that whole list per byte-range per key (O(keys x extents) Python
+        iterations ~= 13M per batch, measured 1.3 s/batch of pure CPU on the
+        ON retrieve path).  A bisect over the sorted extent starts reduces
+        each lookup to O(log n + hits).
+        """
+        extents = self._get_extents(file_path)
+        index = self._extent_index.get(file_path)
+        if index is None or index[0] is not extents:
+            self._build_extent_index(file_path)
+            index = self._extent_index.get(file_path)
+            if index is None:
+                return []
+        _, ordered, starts = index
+        # First extent whose END could exceed `start`: extents are
+        # non-overlapping, but the one preceding the insertion point may
+        # span past `start`, so step back one.
+        lo = bisect.bisect_right(starts, start) - 1
+        if lo < 0:
+            lo = 0
+        hits: list[LbaRecord] = []
+        for record in ordered[lo:]:
+            if record.file_offset >= end:
+                break
+            if record.file_offset + record.n_sectors * _NVME_LBS > start:
+                hits.append(record)
+        return hits
+
     def register_lba_cache(self, records_by_path: dict[str, list[LbaRecord]]) -> None:
         """Register known LBA extents that do not require FIEMAP.
 
@@ -1349,6 +1448,42 @@ class TuttiDirectLoader:
         for path, records in records_by_path.items():
             if records:
                 self._lba_cache[path] = list(records)
+                # Build the sorted range-query index NOW, outside any read
+                # path: pool paths carry tens of thousands of extents and
+                # sorting them inside the first _load_batch (under _io_lock)
+                # stalls the whole loader.
+                self._build_extent_index(path)
+
+    def ensure_lba_cache(
+        self, records_by_path: dict[str, list[LbaRecord]]
+    ) -> None:
+        """Idempotently ensure ``records_by_path`` is the active extent table.
+
+        Stores the caller's list objects by reference so a later call can
+        detect "still ours" via identity and skip the O(n log n) index
+        rebuild entirely.  Only when another path (e.g. a retrieve that
+        registered CSA-filtered extents) has overwritten an entry do we
+        restore it and re-sort.  The bulk walker calls this before every
+        staging batch — with identity short-circuit it costs nanoseconds
+        instead of re-sorting ~30k pool extents per batch.
+        """
+        for path, records in records_by_path.items():
+            if not records:
+                continue
+            if self._lba_cache.get(path) is records:
+                continue
+            self._lba_cache[path] = records
+            self._build_extent_index(path)
+
+    def _build_extent_index(self, file_path: str) -> None:
+        """(Re)build the sorted extent index for one path."""
+        extents = self._lba_cache.get(file_path)
+        if not extents:
+            self._extent_index.pop(file_path, None)
+            return
+        ordered = sorted(extents, key=lambda record: record.file_offset)
+        starts = [record.file_offset for record in ordered]
+        self._extent_index[file_path] = (extents, ordered, starts)
 
     def _staging_slice(self, slot_idx: int, nbytes: int) -> torch.Tensor:
         """Return the uint8 view into staging slot slot_idx, trimmed to nbytes."""
@@ -1418,7 +1553,9 @@ class TuttiDirectLoader:
         max_io = self._session.info.max_data_size
         n_ios = 0
         covered = 0
-        for extent in self._get_extents(meta.path):
+        for extent in self._extents_overlapping(
+            meta.path, file_offset, file_offset + nbytes
+        ):
             extent_start = extent.file_offset
             extent_end = extent_start + extent.n_sectors * _NVME_LBS
             read_start = max(file_offset, extent_start)
@@ -1486,6 +1623,89 @@ class TuttiDirectLoader:
         on_batch_loaded: Optional[
             Callable[[int, list[Optional[MemoryObj]]], None]
         ] = None,
+        lock_per_batch: bool = False,
+        before_batch: Optional[Callable[[], None]] = None,
+    ) -> list[Optional[MemoryObj]]:
+        """Thread-safe wrapper around the GPU-direct NVMe read path.
+
+        Serialises the submit/poll/consume cycle on ``_io_lock``: the
+        CSA prefetch path issues reads from proxy executor threads while the
+        retrieve path may be mid-load on the main thread, and the loader has
+        a single SQ/CQ ring and staging pool.  The lock also protects
+        ``on_batch_loaded`` consumers, whose staging views become invalid the
+        moment another batch overwrites the pool.  Reads announce themselves
+        via ``_readers_waiting`` so raw stores (background writes) yield the
+        queue; see ``_reader_gate``.  See ``_load_chunks_to_hbm_locked`` for
+        the full contract.
+
+        Args:
+            lock_per_batch: When True, ``_io_lock`` is acquired around each
+                internal staging batch instead of the whole call, letting a
+                concurrent load (e.g. the synchronous retrieve path) interleave
+                its batches with this one.  Requires ``on_batch_loaded``:
+                each batch's staging views are fully consumed inside the
+                lock, so releasing it between batches is safe.  Long bulk
+                prefetch walks use this so they never stall the retrieve
+                path for more than one batch.
+            before_batch: Optional callback invoked under the batch lock just
+                before each batch's extents are resolved.  Bulk prefetch uses
+                it to re-register its full-record LBA cache: an interleaved
+                retrieve overwrites the loader's extent table with
+                CSA-filtered ranges between batches, which the walker's byte
+                ranges cannot resolve against.
+        """
+        with self._reader_gate:
+            self._readers_waiting += 1
+            if not lock_per_batch:
+                # Synchronous retrieve = high-priority reader.  Bulk prefetch
+                # batches yield to it (see the per-batch wait below) so the
+                # foreground TTFT path always owns the NVMe queue; the bulk
+                # walker then runs alone during the compute phase, which is
+                # exactly the window it is meant to hide in.
+                self._hp_readers += 1
+        try:
+            if lock_per_batch:
+                return self._load_chunks_to_hbm_locked(
+                    keys,
+                    disk_metadatas,
+                    shapes_per_key=shapes_per_key,
+                    file_offsets=file_offsets,
+                    read_ranges_per_key=read_ranges_per_key,
+                    on_batch_loaded=on_batch_loaded,
+                    batch_lock=self._io_lock,
+                    before_batch=before_batch,
+                )
+            with self._io_lock:
+                return self._load_chunks_to_hbm_locked(
+                    keys,
+                    disk_metadatas,
+                    shapes_per_key=shapes_per_key,
+                    file_offsets=file_offsets,
+                    read_ranges_per_key=read_ranges_per_key,
+                    on_batch_loaded=on_batch_loaded,
+                )
+        finally:
+            with self._reader_gate:
+                self._readers_waiting -= 1
+                if not lock_per_batch:
+                    self._hp_readers -= 1
+                self._last_read_end = time.perf_counter()
+                self._reader_gate.notify_all()
+
+    def _load_chunks_to_hbm_locked(
+        self,
+        keys: list[CacheEngineKey],
+        disk_metadatas: list[Optional[DiskCacheMetadata]],
+        shapes_per_key: Optional[list[Optional[list[torch.Size]]]] = None,
+        file_offsets: Optional[list[int]] = None,
+        read_ranges_per_key: Optional[
+            list[Optional[Sequence[KVObjectByteRange]]]
+        ] = None,
+        on_batch_loaded: Optional[
+            Callable[[int, list[Optional[MemoryObj]]], None]
+        ] = None,
+        batch_lock: Optional[threading.Lock] = None,
+        before_batch: Optional[Callable[[], None]] = None,
     ) -> list[Optional[MemoryObj]]:
         """Load KV chunks directly from NVMe into HBM staging.
 
@@ -1623,6 +1843,64 @@ class TuttiDirectLoader:
 
             pack_ms = _elapsed_ms(pack_start)
             batch_profile_start = time.perf_counter()
+            if batch_lock is not None:
+                # Per-batch locking (bulk prefetch): submit/poll/consume of
+                # THIS batch happens under the lock, then it is released so
+                # a concurrent retrieve can interleave its own batches.
+                # NOTE: no priority yield here.  An earlier version waited
+                # for _hp_readers == 0 before each batch; with multiple
+                # back-to-back requests (each triggering a fresh walk and a
+                # fresh retrieve) the walker starved for 10s+ while the
+                # forward's miss path waited on the walker's pending marks —
+                # a livelock that tripped vLLM's RPC watchdog.  Plain
+                # per-batch interleave bounds retrieve delay to one batch
+                # (~150 ms) and keeps the walker finishing fast.
+                with batch_lock:
+                    if before_batch is not None:
+                        try:
+                            before_batch()
+                        except Exception:
+                            logger.exception(
+                                "Tutti before_batch callback failed; "
+                                "continuing with current LBA cache"
+                            )
+                    batch_results = self._load_batch(
+                        batch_keys,
+                        batch_metas,
+                        shapes_per_key=batch_shapes,
+                        file_offsets=(
+                            file_offsets[batch_start:batch_end]
+                            if file_offsets is not None
+                            else None
+                        ),
+                        read_ranges_per_key=(
+                            read_ranges_per_key[batch_start:batch_end]
+                            if read_ranges_per_key is not None
+                            else None
+                        ),
+                        clone_results=on_batch_loaded is None,
+                    )
+                    n_batches += 1
+                    batch_loaded = sum(
+                        1 for res in batch_results if res is not None
+                    )
+                    n_loaded += batch_loaded
+                    if on_batch_loaded is not None:
+                        on_batch_loaded(batch_start, batch_results)
+                    else:
+                        # clone_results=True: the results are owned copies,
+                        # safe to hand out after the lock is released.
+                        for i, res in enumerate(batch_results):
+                            results[batch_start + i] = res
+                batch_start = batch_end
+                # Fair handoff: a bare threading.Lock has no FIFO ordering
+                # and this loop re-acquires immediately (barging), so a
+                # waiter (the CSA walker's 40 ms layer read) can starve
+                # behind several consecutive mega-batches (measured 1.3-3.5 s
+                # first-gate stalls).  A 1 ms sleep after release lets any
+                # waiter win the lock; costs ~4 ms per multi-batch retrieve.
+                time.sleep(0.001)
+                continue
             batch_results = self._load_batch(
                 batch_keys,
                 batch_metas,
@@ -1785,6 +2063,51 @@ class TuttiDirectLoader:
 
         profile_start = time.perf_counter()
         _dev = f"cuda:{self._cuda_device}"
+        # Same single SQ/CQ ring and staging pool as the read path: a raw
+        # store racing a concurrent load corrupts both. Serialise on _io_lock
+        # from the staging copy through the last poll/status batch.
+        # Slack-only scheduling (Tutti design): writes wait for an idle
+        # window -- no reader waiting AND no read finished within
+        # _write_slack_s.  During an active request, prefetch reads arrive
+        # every few ms, so the queue never looks idle and writes park until
+        # the inter-request gap, where they drain at full bandwidth.
+        # _write_max_delay_s bounds the park so a saturating read stream
+        # cannot pin deferred-write buffers indefinitely.
+        park_start = time.perf_counter()
+        while True:
+            with self._reader_gate:
+                idle_for = time.perf_counter() - self._last_read_end
+                if self._readers_waiting == 0 and idle_for >= self._write_slack_s:
+                    break
+                if time.perf_counter() - park_start >= self._write_max_delay_s:
+                    break
+                self._reader_gate.wait(timeout=self._write_slack_s)
+        with self._io_lock:
+            return self._store_bytes_to_raw_extents_locked(
+                payload_view=payload_view,
+                payload_nbytes=payload_nbytes,
+                dma_nbytes=dma_nbytes,
+                aligned_nbytes=aligned_nbytes,
+                raw_extents=raw_extents,
+                base_file_offset=base_file_offset,
+                profile_start=profile_start,
+                dev=_dev,
+            )
+
+    def _store_bytes_to_raw_extents_locked(
+        self,
+        *,
+        payload_view: memoryview,
+        payload_nbytes: int,
+        dma_nbytes: int,
+        aligned_nbytes: int,
+        raw_extents: list[LbaRecord],
+        base_file_offset: int,
+        profile_start: float,
+        dev: str,
+    ) -> list[LbaRecord]:
+        """Body of :meth:`store_bytes_to_raw_extents`; caller holds _io_lock."""
+        _dev = dev
         with torch.cuda.device(self._cuda_device):
             copy_start = time.perf_counter()
             staging = self._staging_slice_at(0, aligned_nbytes)
@@ -1875,7 +2198,16 @@ class TuttiDirectLoader:
             sq_db_ptr = self._session.db_gpu_ptr(q.sq_db_offset)
             cq_db_ptr = self._session.db_gpu_ptr(q.cq_db_offset)
 
+            # Same dedicated-stream rationale as the read path: keep the
+            # spinning poll kernel off the shared default stream so raw
+            # stores cannot serialise against forward/NCCL kernels.
+            io_stream = self._io_stream
+            io_stream_ptr = io_stream.cuda_stream if io_stream is not None else 0
             with torch.cuda.device(self._cuda_device):
+                # Order the io_stream after the argument-tensor H2D copies
+                # issued on the current stream (same race as the read path).
+                if io_stream is not None:
+                    io_stream.wait_stream(torch.cuda.current_stream())
                 submit_start = time.perf_counter()
                 _c_ops.tutti_submit_batch_sgl_write(
                     sq_dev_ptr=sq_dev_ptr,
@@ -1889,7 +2221,7 @@ class TuttiDirectLoader:
                     staging_iovas=staging_iovas_t,
                     slbas=slbas_t,
                     byte_lens=byte_lens_t,
-                    stream_ptr=0,
+                    stream_ptr=io_stream_ptr,
                 )
                 submit_ms += _elapsed_ms(submit_start)
 
@@ -1906,9 +2238,12 @@ class TuttiDirectLoader:
                     status_out=self._status_buf,
                     timed_out_ptr=self._timed_out_ptr,
                     max_iters=self.POLL_MAX_ITERS,
-                    stream_ptr=0,
+                    stream_ptr=io_stream_ptr,
                 )
-                torch.cuda.synchronize(device=self._cuda_device)
+                if io_stream is not None:
+                    io_stream.synchronize()
+                else:
+                    torch.cuda.synchronize(device=self._cuda_device)
                 poll_sync_ms += _elapsed_ms(poll_start)
 
             status_start = time.perf_counter()
@@ -1975,7 +2310,9 @@ class TuttiDirectLoader:
                 continue
             try:
                 extents_start = time.perf_counter()
-                extents = self._get_extents(meta.path)
+                # Populate the extent cache (FIEMAP on first touch); range
+                # queries below use the sorted index, not this list.
+                self._get_extents(meta.path)
                 extents_ms += _elapsed_ms(extents_start)
             except (FileNotFoundError, ValueError, OSError) as exc:
                 logger.warning("Tutti FIEMAP failed for %s: %s", meta.path, exc)
@@ -2038,7 +2375,9 @@ class TuttiDirectLoader:
                 range_ios_start = len(io_to_key_index)
                 range_file_bytes = 0
                 range_end_offset = byte_range.offset + range_dma_nbytes
-                for extent in extents:
+                for extent in self._extents_overlapping(
+                    meta.path, byte_range.offset, range_end_offset
+                ):
                     extent_start = extent.file_offset
                     extent_end = extent_start + extent.n_sectors * _NVME_LBS
                     read_start = max(byte_range.offset, extent_start)
@@ -2167,15 +2506,41 @@ class TuttiDirectLoader:
             return [None] * len(keys)
 
         # Build GPU tensors for kernel arguments (same device as staging).
+        # Upload ON the io_stream itself: these pointers are dereferenced by
+        # the submit kernel on io_stream, and uploading on the calling
+        # thread's current stream + wait_stream() only builds the dependency
+        # for THAT thread's stream.  With two loader threads (retrieve +
+        # bulk walker) the H2D copies and the consuming kernel ended up on
+        # unrelated streams -> submit kernel read half-written argument
+        # tensors -> DMA to garbage IOVAs -> illegal memory access family.
         arg_start = time.perf_counter()
         _dev = f"cuda:{self._cuda_device}"
-        staging_iovas_t = torch.tensor(
-            staging_iovas_list,
-            dtype=torch.int64,
-            device=_dev,
-        )
-        slbas_t = torch.tensor(slbas_list, dtype=torch.int64, device=_dev)
-        byte_lens_t = torch.tensor(byte_lens_list, dtype=torch.int32, device=_dev)
+        _arg_stream = self._io_stream
+        with torch.cuda.device(self._cuda_device):
+            if _arg_stream is not None:
+                with torch.cuda.stream(_arg_stream):
+                    staging_iovas_t = torch.tensor(
+                        staging_iovas_list,
+                        dtype=torch.int64,
+                    ).to(_dev, non_blocking=True)
+                    slbas_t = torch.tensor(
+                        slbas_list, dtype=torch.int64
+                    ).to(_dev, non_blocking=True)
+                    byte_lens_t = torch.tensor(
+                        byte_lens_list, dtype=torch.int32
+                    ).to(_dev, non_blocking=True)
+            else:
+                staging_iovas_t = torch.tensor(
+                    staging_iovas_list,
+                    dtype=torch.int64,
+                    device=_dev,
+                )
+                slbas_t = torch.tensor(
+                    slbas_list, dtype=torch.int64, device=_dev
+                )
+                byte_lens_t = torch.tensor(
+                    byte_lens_list, dtype=torch.int32, device=_dev
+                )
         arg_ms = _elapsed_ms(arg_start)
 
         q = self._session.queue
@@ -2189,7 +2554,27 @@ class TuttiDirectLoader:
         # multi-GPU callers would launch on whatever device happens to be active,
         # causing cudaErrorIllegalAddress when the kernel dereferences pointers
         # that live on a different GPU.
+        #
+        # The submit/poll pair runs on the loader's dedicated stream, NOT the
+        # shared default stream: tutti_poll_batch is a spinning kernel, and on
+        # the legacy default stream it interleaves with model-forward and NCCL
+        # kernels enqueued concurrently by the main thread.  Ranks enqueue the
+        # spin and their collectives in different orders, which produces a
+        # cross-rank circular wait (all-rank freeze, sample_tokens RPC
+        # timeout).  On a private stream the spin coexists with compute and
+        # only this host thread blocks on it.
+        io_stream = self._io_stream
+        io_stream_ptr = io_stream.cuda_stream if io_stream is not None else 0
         with torch.cuda.device(self._cuda_device):
+            # The argument tensors above (staging_iovas_t/slbas_t/byte_lens_t)
+            # were H2D-copied on the CURRENT stream; the submit/poll kernels
+            # below run on the private io_stream and dereference those device
+            # pointers.  Without an explicit dependency the io_stream kernel
+            # can race ahead of the copies -> CUDA illegal memory access
+            # (observed at io_stream.synchronize() on warm repeats, where the
+            # launch path is fast enough to expose the window).
+            if io_stream is not None:
+                io_stream.wait_stream(torch.cuda.current_stream())
             # Submit all reads in one kernel launch.
             submit_start = time.perf_counter()
             _c_ops.tutti_submit_batch_sgl_read(
@@ -2204,12 +2589,12 @@ class TuttiDirectLoader:
                 staging_iovas=staging_iovas_t,
                 slbas=slbas_t,
                 byte_lens=byte_lens_t,
-                stream_ptr=0,
+                stream_ptr=io_stream_ptr,
             )
             submit_launch_ms = _elapsed_ms(submit_start)
 
-            # Poll completions synchronously (default CUDA stream, so submit
-            # happens-before poll without an explicit sync).
+            # Poll completions on the same dedicated stream (submit
+            # happens-before poll within the stream without an explicit sync).
             poll_start = time.perf_counter()
             _c_ops.tutti_poll_batch(
                 sq_dev_ptr=sq_dev_ptr,
@@ -2223,11 +2608,17 @@ class TuttiDirectLoader:
                 status_out=self._status_buf,
                 timed_out_ptr=self._timed_out_ptr,
                 max_iters=self.POLL_MAX_ITERS,
-                stream_ptr=0,
+                stream_ptr=io_stream_ptr,
             )
 
-            # Sync before reading back status / building MemoryObjs.
-            torch.cuda.synchronize(device=self._cuda_device)
+            # Sync the I/O stream before reading back status / building
+            # MemoryObjs.  NVMe DMA writes are visible to all streams once the
+            # poll kernel has confirmed the CQEs, so a host-side sync of just
+            # this stream orders the staging reads that follow.
+            if io_stream is not None:
+                io_stream.synchronize()
+            else:
+                torch.cuda.synchronize(device=self._cuda_device)
             poll_sync_ms = _elapsed_ms(poll_start)
 
         if ctypes.c_int32.from_address(self._timed_out_ptr).value != 0:
@@ -2281,7 +2672,23 @@ class TuttiDirectLoader:
             gpu_raw = self._staging_slice_at(chunk_offset, nbytes)
             self._debug_verify_direct_read(meta, gpu_raw)
             persist_start = time.perf_counter()
-            owned_raw = gpu_raw.clone() if clone_results else gpu_raw
+            if clone_results:
+                # Clone on the private io_stream, NOT the caller's current
+                # (default) stream: prefetch fires run on background threads,
+                # and a default-stream clone there deadlocks against the main
+                # forward's collectives (fire waits for default stream ->
+                # default stream runs all_reduce waiting for other ranks ->
+                # other ranks' forwards wait for their own fires).  Captured
+                # by py-spy under CUDA_LAUNCH_BLOCKING=1: fire thread in
+                # clone(), main thread in symm_mem all_reduce, all ranks.
+                if io_stream is not None:
+                    with torch.cuda.stream(io_stream):
+                        owned_raw = gpu_raw.clone()
+                    owned_raw.record_stream(io_stream)
+                else:
+                    owned_raw = gpu_raw.clone()
+            else:
+                owned_raw = gpu_raw
             persist_ms += _elapsed_ms(persist_start)
 
             # Wrap the staging slice as a TensorMemoryObj with GPU raw_data.

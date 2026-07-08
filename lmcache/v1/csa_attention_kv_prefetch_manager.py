@@ -339,6 +339,10 @@ class CSAAttentionKVPrefetchManager:
         self._pending_raw_lba_cache: dict[str, list[Any]] = {}
         self._layers: Dict[int, CSAAttentionKVLayerState] = {}
         self._csa_layer_ids = tuple(sorted(int(lid) for lid in csa_layer_ids))
+        # HCA layers registered via register_hca_layer (V28 walker); walked
+        # in the same layer-major pass, gated via wait_for_layer instead of
+        # a patched indexer forward.
+        self._hca_layer_ids: Tuple[int, ...] = ()
         self._patched_modules: List[Tuple[Any, str, Callable]] = []
         self._patch_lock = threading.Lock()
         self._active_request_id: Optional[str] = None
@@ -434,6 +438,11 @@ class CSAAttentionKVPrefetchManager:
         """Bytes per compressed K cache block (block_size × token_bytes)."""
         return self._bytes_per_block
 
+    @property
+    def hca_layer_ids(self) -> Tuple[int, ...]:
+        """Transformer layer ids registered via :meth:`register_hca_layer`."""
+        return self._hca_layer_ids
+
     def register_layer(
         self,
         layer_id: int,
@@ -471,21 +480,91 @@ class CSAAttentionKVPrefetchManager:
                 f"k_cache_tensor token_bytes {int(k_cache_tensor.shape[2])} != "
                 f"manager token_bytes {self._token_bytes}"
             )
-        # vLLM's MLA K cache tensor has ``num_blocks`` slots; the same slot
-        # count is the upper bound on compressed block ids the indexer can
-        # ever emit for this layer.  Allocate a bool bitmap sized to match
-        # so ``_miss_ids_for_topk`` can answer "is this block already in
-        # pool" entirely on the GPU.
-        num_blocks = int(k_cache_tensor.shape[0])
+        self._register_layer_state(
+            int(layer_id),
+            k_cache_tensor,
+            compressed_block_size=self._compressed_block_size,
+            token_bytes=self._token_bytes,
+        )
+
+    def register_hca_layer(
+        self,
+        layer_id: int,
+        k_cache_tensor: torch.Tensor,
+    ) -> None:
+        """Register one HCA layer's vLLM K cache tensor (V28 walker).
+
+        HCA compresses 128:1 and vLLM packs its K cache as
+        ``[num_blocks, hca_block_size, token_bytes]`` with a small block
+        size (8 entries).  The walker addresses COMPRESSED-ENTRY rows, so
+        the layer state stores ``compressed_block_size=1`` semantics: chunk
+        descriptors count entries and carry flattened row ids
+        ``block_id * hca_block_size + slot`` matching a
+        ``view(num_blocks * hca_block_size, token_bytes)`` scatter target,
+        which is exactly the ``reshape(n_rows, -1)`` the walker already
+        performs.
+
+        Args:
+            layer_id: Transformer-side HCA layer id.
+            k_cache_tensor: vLLM's HCA K cache tensor, 3-D as above.
+
+        Raises:
+            ValueError: If the tensor is not 3-D or its token_bytes differ
+                from the manager's.
+        """
+        if k_cache_tensor.ndim != 3:
+            raise ValueError(
+                "HCA k_cache_tensor must be 3-D [num_blocks, block_size, "
+                f"token_bytes]; got shape {tuple(k_cache_tensor.shape)}"
+            )
+        if int(k_cache_tensor.shape[2]) != self._token_bytes:
+            raise ValueError(
+                f"HCA k_cache_tensor token_bytes {int(k_cache_tensor.shape[2])} "
+                f"!= manager token_bytes {self._token_bytes}"
+            )
+        hca_block_size = int(k_cache_tensor.shape[1])
+        num_rows = int(k_cache_tensor.shape[0]) * hca_block_size
+        flat = k_cache_tensor.view(num_rows, 1, int(k_cache_tensor.shape[2]))
+        self._hca_layer_ids = tuple(
+            sorted(set(self._hca_layer_ids) | {int(layer_id)})
+        )
+        self._register_layer_state(
+            int(layer_id),
+            flat,
+            compressed_block_size=1,
+            token_bytes=self._token_bytes,
+        )
+
+    def _register_layer_state(
+        self,
+        layer_id: int,
+        k_cache_tensor: torch.Tensor,
+        compressed_block_size: int,
+        token_bytes: int,
+    ) -> None:
+        """Create the per-layer runtime state shared by CSA and HCA layers.
+
+        Args:
+            layer_id: Transformer-side layer id.
+            k_cache_tensor: Scatter target, 3-D; the walker flattens it to
+                ``[shape[0], -1]`` rows.
+            compressed_block_size: Entries per addressable row (64 for CSA
+                blocks, 1 for HCA flattened entries).
+            token_bytes: Bytes per compressed entry.
+        """
+        # vLLM's K cache tensor has ``shape[0]`` addressable rows; the same
+        # count bounds the ids chunk descriptors may carry.  The bool bitmap
+        # answers "is this id already in pool" entirely on the GPU.
+        num_rows = int(k_cache_tensor.shape[0])
         in_pool_bitmap = torch.zeros(
-            num_blocks,
+            num_rows,
             dtype=torch.bool,
             device=k_cache_tensor.device,
         )
         self._layers[int(layer_id)] = CSAAttentionKVLayerState(
             layer_id=int(layer_id),
-            compressed_block_size=self._compressed_block_size,
-            token_bytes=self._token_bytes,
+            compressed_block_size=compressed_block_size,
+            token_bytes=token_bytes,
             k_cache_tensor=k_cache_tensor,
             in_pool_bitmap=in_pool_bitmap,
             chunks=[],
@@ -908,7 +987,7 @@ class CSAAttentionKVPrefetchManager:
         # them — marking them pending would stall gates for the full miss
         # grace.  A layer whose EVERY chunk is resident is fully resident
         # before the walk even starts.
-        for lid in self._csa_layer_ids:
+        for lid in self._walk_layer_ids():
             state = self._layers.get(int(lid))
             if state is None or not state.chunks:
                 continue
@@ -929,6 +1008,16 @@ class CSAAttentionKVPrefetchManager:
                 continue
             with state.pending_reads_lock:
                 state.pending_reads.update(covered)
+
+    def _walk_layer_ids(self) -> Tuple[int, ...]:
+        """Return all walkable layer ids in forward-consumption order.
+
+        CSA and HCA layers interleave by transformer layer id, which is
+        exactly the order the forward pass consumes them — the walker must
+        land layer L's bytes before layer L's gate regardless of the
+        attention flavor.
+        """
+        return tuple(sorted(set(self._csa_layer_ids) | set(self._hca_layer_ids)))
 
     def ensure_bulk_started(self) -> None:
         """Start the armed bulk walk if it has not started yet.
@@ -976,7 +1065,7 @@ class CSAAttentionKVPrefetchManager:
         t0 = time.perf_counter()
         layer_states = [
             (lid, self._layers[lid])
-            for lid in self._csa_layer_ids
+            for lid in self._walk_layer_ids()
             if lid in self._layers and self._layers[lid].chunks
         ]
         if not layer_states:
@@ -1357,6 +1446,45 @@ class CSAAttentionKVPrefetchManager:
                 slots are not yet populated.
         """
         self._submit_reads(layer_id, compressed_block_ids, label="miss")
+
+    def wait_for_layer(self, layer_id: int, timeout_s: float = 2.0) -> bool:
+        """Block until the walker has landed every pending byte of a layer.
+
+        The HCA gate primitive (V28): HCA layers have no indexer forward to
+        patch, so the vLLM connector's per-layer ``wait_for_layer_load``
+        hook calls this before the layer's attention runs.  Starts the
+        armed walk if the caller is the first gate to arrive.
+
+        Args:
+            layer_id: Transformer-side layer id.
+            timeout_s: Upper bound on the wait.  On expiry the method
+                returns ``False`` and the caller must treat the layer as
+                potentially stale (log and proceed; the walker keeps
+                landing bytes in the background).
+
+        Returns:
+            ``True`` when the layer has no pending reads (fully landed or
+            never registered), ``False`` on timeout.
+        """
+        self.ensure_bulk_started()
+        state = self._layers.get(int(layer_id))
+        if state is None:
+            return True
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        with state.pending_reads_lock:
+            while state.pending_reads:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.warning(
+                        "CSAAttentionKVPrefetchManager: wait_for_layer %d "
+                        "timed out with %d reads still pending",
+                        layer_id,
+                        len(state.pending_reads),
+                    )
+                    return False
+                state.pending_reads_lock.wait(remaining)
+        self.drain_for_layer(int(layer_id))
+        return True
 
     def drain_for_layer(self, layer_id: int) -> None:
         """Block until all pending reads for ``layer_id`` have completed.
