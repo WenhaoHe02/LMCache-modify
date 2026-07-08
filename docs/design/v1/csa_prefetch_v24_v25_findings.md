@@ -30,6 +30,30 @@ retrieve 3.07→**2.06s(-33%)**,walker HCA 层 7-18ms,repeat **4.35**
 repeat 4.04 历史最佳。这是全部 28 个版本以来第一次在稳态 hit 上
 明确跑赢 OFF。** illegal=0,gate 超时=0。
 
+**同 boot 新鲜 OFF-16K 确认(winchain,无 boot 运气)**:
+- OFF r1 hits 6.13/6.08/6.76/6.22/6.10,r2 6.14/6.19/6.07/6.20/6.14
+  (repeat 4.53-5.41)
+- **V28 十个 hit 中位 ~5.9 vs OFF 二十个 hit 中位 ~6.14;V28 best 5.48
+  vs OFF floor 6.07;repeat 4.04 vs 4.53** —— 同机同 boot 同协议,
+  胜利成立。
+
+**稳态 hit-5 的逐时间戳 profile(r2, 5.586s,全部测量值)**:
+- pre-retrieve(HTTP+tokenize 496K+调度+lookup):**2.84s(51%)**
+- retrieve(只剩 indexer 组 1.35GB):**2.52s(45%)**——0.6GB/s,
+  1874 个 0.71MB 碎读,比 walker mega-batch 的 11GB/s 慢 18 倍
+- 搬迁 262-275ms(retrieve 窗口内,免费);compute+21 gate:0.23s
+  (每 gate <0.1ms)
+- **下一个最大杠杆:indexer 组合并大读或进 walker,可再省 ~2s,
+  稳态可望 ~3.5-4s**。pre-retrieve 的 2.84s 属 API/tokenize 层,
+  与 KV 系统无关。
+
+**为什么 ON 能赢(机制)**:OFF 每个 hit 无条件重读 12.8GB;V28 稳态
+hit 利用跨请求 HBM 残留(内容没变,只是 vLLM 换了行)——250ms GPU 内
+搬迁替代 11.5GB 读,同步路径只剩 1.35GB。前 27 个版本只做到"少读",
+但被挪走的字节回来的方式都收税(gate 阻塞/SM 争用);V27/V28 让字节
+根本不用回来。边界:依赖前缀复用;冷 miss 退化为 walker 藏读(=OFF
+打平);赢的绝对值与 compute 无关(48K 被稀释成 parity 的原因)。
+
 叙事闭环:增量越小(读占比越高)V28 稳态优势越大;增量越大 repeat
 优势越大(48K repeat 4.35 vs OFF 4.86)。scatter SM 争用仍是残余
 tax(48K 稳态被 compute 稀释),彻底消除 = csrc zero-copy(future)。
