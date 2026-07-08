@@ -1781,18 +1781,22 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                 if not group_ptrs[i]:
                     continue
                 group = klg_manager.kv_layer_groups[i]
-                all_block_ids = torch.cat(group_block_ids[i])
-                lmc_ops.multi_layer_block_kv_transfer(
-                    self.group_kv_cache_pointers_on_gpu[i],
-                    group_ptrs[i],
-                    all_block_ids,
-                    self.device,
-                    lmc_ops.TransferDirection.H2D,
-                    group.shape_desc,
-                    group.physical_chunk_size,
-                    self.gpu_kv_format,
-                    0,
-                )
+                # The transfer kernel accepts at most 4 source pointers per
+                # call ("Expected 1-4 LMCache objects"); feed it in slices.
+                ptrs = group_ptrs[i]
+                ids = group_block_ids[i]
+                for s in range(0, len(ptrs), 4):
+                    lmc_ops.multi_layer_block_kv_transfer(
+                        self.group_kv_cache_pointers_on_gpu[i],
+                        ptrs[s : s + 4],
+                        torch.cat(ids[s : s + 4]),
+                        self.device,
+                        lmc_ops.TransferDirection.H2D,
+                        group.shape_desc,
+                        group.physical_chunk_size,
+                        self.gpu_kv_format,
+                        0,
+                    )
         self.load_stream.synchronize()
 
     def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
