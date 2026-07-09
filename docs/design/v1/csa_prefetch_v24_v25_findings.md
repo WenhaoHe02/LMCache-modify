@@ -2,12 +2,24 @@
 
 ## 会议任务 2 最终结论(2026-07-10,生产栈 torch.profiler trace)
 
-**对象**:vLLM+LMCache 完整服务栈,预测臂,稳态 hit 的**一个完整
-forward**(62 层,fused kernel)。钩子:CSA gate 内 torch.profiler
-一次性捕获(LMCACHE_TORCH_PROFILE,跳过 3 个 warmup gate)。两个
-形状各一份 chrome trace(rank0),已下载到本地
-`Desktop\vllm_traces\`。注意:8 个 worker 的 RANK 均为 0,trace
-文件名需 pid 后缀否则互相覆盖(已修)。
+**对象**:vLLM+LMCache 完整服务栈,预测臂,fused kernel,62 层。
+钩子:CSA gate 内 torch.profiler 一次性捕获一个 chunked-prefill
+microbatch 的完整 forward(LMCACHE_TORCH_PROFILE,SKIP=3)。两个形状
+各一份 chrome trace(rank0),已下载到本地 `Desktop\vllm_traces\`。
+注意:8 个 worker 的 RANK 均为 0,trace 文件名需 pid 后缀否则互相覆盖
+(已修)。
+
+**采集窗口口径(重要,勿混淆)**:
+- **64K trace = 真稳态 hit**:SKIP=3 落在 hit-2 的第一个 chunk
+  (65536 token 全量,hit-2 墙钟 1.32s,run 全绿:cold 8.9s/hit-1
+  21.9s/hit-2..5 1.3-3.3s)。
+- **480K trace = cold_store 预填充的第 4 个 chunk**(65536 token,
+  KV 深度 ~197K→262K),**不是 hit**:480K cold_store 有 8 个 chunk,
+  SKIP=3 时捕获窗口尚在 seeding。该 run 在 trace 导出后 ~1 分钟死于
+  illegal access(store 写路径,BULK=0 + profiler 导出后首见),
+  cold_store 返回 500,hits 全 exception。因此 480K 表中的 k_poll
+  自旋属于 store 写路径,不是 hit 读路径;indexer 打分占比在真
+  480K hit(深度 48 万)只会**更高**——21.9% 是深度 ~26 万时的值。
 
 **64K+2K forward(GPU kernel 总时间 810ms,10255 kernels)**:
 | kernel | ms | 占比 |
@@ -38,9 +50,10 @@ forward**(62 层,fused kernel)。钩子:CSA gate 内 torch.profiler
    (跨层共享直接砍打分次数,一石二鸟)。
 2. **all_reduce 双形状都是第一**(53.7%/24.5%)——TP=8 的通信税;
    indexer 的 index_score all_reduce 是其中一部分。
-3. **Tutti poll 自旋占 GPU 6-18%**——预测读的 NVMe 等待烧在 GPU
-   kernel 上;此前的 host 口径没看到这块。GPU-driven poll(csrc
-   计划阶段 3)或减少读次数都能砍它。
+3. **Tutti poll 自旋占 GPU 6-18%**——NVMe 等待烧在 GPU kernel 上
+   (64K hit 里是读路径的等待,480K cold_store 里是写路径的等待);
+   此前的 host 口径没看到这块。GPU-driven poll(csrc 计划阶段 3)
+   或减少 IO 次数都能砍它。
 4. 参考实现(官方 model.py)的 profile 因无 fused kernel/无 LMCache
    被判定不可用于生产结论(用户指出),仅保留 indexer 算子链结构
    参考(~161 launches/call)。
