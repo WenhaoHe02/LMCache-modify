@@ -144,3 +144,142 @@ repeat 3.05s 历史最低。**但注意:稳态赢依赖上一请求的 HBM 残�
 3. 跨层预测离线验证(会议任务 3,delta-select 脚本改比较层 L vs L+2/3/4)。
 4. nsys 拉一次 timeline(会议任务 2),定量 indexer 算子链和 launch 气泡,
    决定 graph 化收益。
+
+---
+
+## 6. 接手后补充(2026-07-08)
+
+### 6.1 MOE_TIMING 污染修复已完成
+
+gpu002 持久补丁文件:
+`/home/zbuser02/codex_sync_overlap_fix/patches/deepseek_v4.py`。
+
+- 旧文件备份:
+  `/home/zbuser02/codex_sync_overlap_fix/patches/deepseek_v4.py.bak_moe_timing_sync_20260708`
+  (`sha256=01276659dcbdf32ec4bf0626a3a9dd7ba58a80c25acd27fbf18ffb351858766b`)。
+- 新补丁:
+  `sha256=3b2446c20eceb90827bbad80ff5a3c3683b1b5a2031cbea520542a346f246c31`。
+- 修法:新增 `_sync_current_cuda_stream()`，用
+  `torch.cuda.current_stream().synchronize()` 替换 `LMCACHE_MOE_TIMING`
+  计时段附近所有 `torch.cuda.synchronize()`。目的不是改变 MoE 语义,
+  而是避免 device-wide sync 把独立 predicted-read stream 的等待计入
+  MoE 窗口。
+- 已通过 `python3 -m py_compile`。容器启动后确认三处 vLLM 路径 hash
+  都是新 hash:
+  `/usr/local/lib/python3.12/site-packages/vllm/model_executor/models/deepseek_v4.py`,
+  `/usr/local/lib/python3.12/site-packages/vllm/models/deepseek_v4/nvidia/model.py`,
+  `/usr/local/lib/python3.12/site-packages/vllm/models/deepseek_v4/amd/model.py`。
+
+### 6.2 重启前的异常与归档
+
+重启前环境已经不可信:
+
+- `th_a0_b64k` 在新 timing 补丁下跑过 `extra=500`,但预测读在 layer 2
+  报 `failed to issue predicted reads`，trace 落在
+  `torch.cuda.stream(scatter_stream)` 的 CUDA OOM。当时 GPU 1-7 仅剩约
+  605 MB free。
+- 同一格进入 `extra=1000` 后 `cold_store` 300s HTTP 500,随后
+  `ENGINE_DEAD`。
+- 降到 `LMCACHE_ABLATION_GPU_UTIL=0.70` 后仍在 `cold_store` 崩溃,但根因
+  是 `deepseek_compressor.py` 的 Triton attention/compressor OOM,不是预测读。
+
+已在重启前归档 `/tmp` 到:
+`/home/zbuser02/codex_sync_overlap_fix/reboot_archive_20260708_1535`
+(约 399 MB)。其中 `th_a1_b480k` 是 timing 修复前完成的数据,可用于
+load/Tutti 侧参考,不可用于干净 `T_MoE` 结论。
+
+### 6.3 重启后状态
+
+按用户指示已重启 gpu002。重启后确认:
+
+- `uptime` 约 2 分钟,8 张 GPU 初始 `memory.used=0`。
+- 从 `master:/tmp/recover_gpu002.sh` 复制恢复脚本到 gpu002,执行后
+  `snvme` 模块和 8 个 `/mnt/nvme*` mount 全部恢复。
+- 从归档恢复 `/tmp/thsweep.sh`, `/tmp/thchain.sh`, `/tmp/thsum.sh` 等脚本。
+- 启动 `bash /tmp/thsweep.sh 0 64000`。容器 ready 后确认三处
+  `deepseek_v4.py` 都是新 hash `3b2446...`。
+
+干净烟测结果:
+
+- `a0/b64k/e500` 全部请求 HTTP 200:
+  `cold_store=8.741867s`, `hit-1=17.795282s`,
+  `hit-2=1.106813s`, `hit-3=1.062072s`, `hit-4=1.048769s`,
+  `hit-5=1.047786s`, `repeat-5a=7.327753s`,
+  `repeat-5b=1.019523s`。
+- `seg_e500.log`: `illegal: 0`,未发现
+  `failed to issue predicted reads`、CUDA OOM、`ENGINE_DEAD`。
+- `a0/b64k/e1000` 也已完整通过:
+  `cold_store=2.784405s`, `hit-1=6.736567s`,
+  `hit-2=1.086095s`, `hit-3=1.065047s`, `hit-4=1.064560s`,
+  `hit-5=1.077189s`, `repeat-5a=5.610580s`,
+  `repeat-5b=1.039928s`, `illegal: 0`。
+
+### 6.4 重启后阈值矩阵已完整跑完
+
+完整结果已归档到 gpu002:
+`/home/zbuser02/codex_sync_overlap_fix/postreboot_threshold_20260708`。
+
+四格都已完成并归档:
+
+- `th_a0_b64k`: predicted arm, base 64K, extras 500/1000/2000/4000/8000。
+- `th_a1_b64k`: bulk arm, base 64K, extras 500/1000/2000/4000/8000。
+- `th_a0_b480k`: predicted arm, base 480K, extras 500/1000/2000/4000/8000。
+- `th_a1_b480k`: bulk arm, base 480K, extras 500/1000/2000/4000/8000。
+
+清洁性检查:
+
+- 每格每个 extra 的 `e*.jsonl` 都有 8 条 HTTP 200 记录。
+- 每个 segment log 都报告 `illegal: 0`。
+- 每格归档前 fatal grep 都为空:
+  `failed to issue predicted reads|CUDA error|out of memory|ENGINE_DEAD|illegal memory access|Traceback|ERROR`。
+- `README.txt` 已写入同一归档目录,记录补丁 hash、四格完成状态和清洁性规则。
+- 另有探索性汇总 `threshold_summary.md` 和 `threshold_summary.csv`。其中
+  steady hit 暂定为 `hit-2..hit-5 + repeat-5b`。MoE delta bucket 只是
+  compute-window 参考尺子,不是 LMCache 侧待办;不接 LMCache 也能单独跑。
+  这个汇总只作后续阈值拟合入口,最终公式应优先围绕 LMCache 的
+  predicted read/selectivity/wait 行为重算。
+
+分析建议:
+
+- `T_load` 继续用已验证的 `3.85 + MB/10.97` 和 scatter 0.02ms/IO 口径。
+- `T_MoE` 是外部 compute window 参考,不要把它写成 LMCache 侧未完成任务。
+  如果要用它做阈值公式,只需给出稳定口径和 `n/std/p50/p90`。
+- 预测臂只用于选择性、miss 分布、端到端 hit 行为;不要再拿污染过的
+  旧预测臂 `MOE_TIMING` 拟合窗口。
+
+---
+
+## 7. 会议任务终局(2026-07-09/10 补充)
+
+三个任务全部完成,最终结论集中归档在
+[csa_prefetch_v24_v25_findings.md](csa_prefetch_v24_v25_findings.md)
+顶部三节("会议任务 1/2/3 最终结论")。此处只留索引和物料位置:
+
+- **任务 1(阈值)**:`可藏 ⟺ N ≤ 66 + 10.4·Q_k(块/层)`,两边全实测
+  (碎读 21µs/块 = 1.7GB/s,**不是** 11GB/s;T_MoE_p50=1.80+0.219·Q_k,
+  n=1720/桶)。当前实现下预测方案有效阈值不存在;量化出三条活路:
+  graph 化固定开销、跨层扩窗、碎读连续化(6.5×)。
+  数据:gpu002 `postreboot_threshold_20260708/`、`/tmp/moemeas`、
+  `/tmp/load_pairs.txt`(已镜像到 `vprof_archive_20260710/`)。
+- **任务 3(跨层)**:官方推理代码逐行 recall。age1=92.7%(锚点吻合
+  生产 93%);深层(L26-42)隔 2-4 层共享可行(86-95%),浅层不可行
+  (57-81%)→ 深度分段共享。脚本 `offline_xlayer.py`(gpu002
+  `codex_sync_overlap_fix/` + `offxl_20260709/`)。
+- **任务 2(profiling)**:生产栈(vLLM+LMCache)torch.profiler trace
+  两份:64K+2K 真稳态 hit、480K+2K cold_store 第 4 chunk(深度~23 万,
+  见 findings 里的口径警告)。**480K 下 indexer 打分 mqa_logits 占
+  21.9% GPU,是第二大消耗** → 跨层共享(砍打分次数)收益远大于
+  graph 化(launch 项合计 ~250ms)。trace 本地
+  `Desktop\vllm_traces\vllm_trace_{64k2k,480k2k}.rank0.json`,gpu002
+  镜像 `vprof_archive_20260710/`。nsys 口径(cudaProfilerApi
+  capture-range,同一 gate 状态机)已部署:manager 的
+  `_torch_profile_hook` 加了 `LMCACHE_NSYS_CAPTURE=1` 分支
+  (备份 .bak_pre_nsys),run_container.sh 挂载宿主机
+  `/opt/nvidia/nsight-systems` 并透传 `LMCACHE_EXEC_PREFIX`
+  (startup 脚本 exec 前缀)。采集脚本 `/tmp/vnsys.sh`。
+
+已知开放 bug(不阻塞会议结论):BULK=0 预测臂在 480K cold_store
+偶发 illegal access(写路径,`KV_OBJECT_STORE_PROFILE op=write
+status=failed error=illegal memory access` → shm_broadcast cancelled
+→ 引擎死)。20260709 的 480K profiling run 死于此;64K 同配置全绿。
+与 bulk 臂的 illegal-access 家族(V29/batched=4096)可能同源。
