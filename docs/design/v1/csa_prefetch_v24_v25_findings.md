@@ -105,6 +105,31 @@ nsys 用 `-s none` + 全局一份 session,开销极小,54ms(82 次,
 sparse_attn 15ms、dequant_gather 14ms。占用率仅 53%——forward 期
 仍有近半 SM 空闲,散块预测读的时延(不是带宽)是瓶颈的另一证据。
 
+**480K nsys(同窗口:cold_store 第 4 chunk,深度 ~23 万)**:干净
+reboot 后全绿 run(cold 54s,hit-2..5 = 9.5-10.4s,repeat 8.5s,
+**illegal=0**——此前 480K 预测臂的 illegal access 在干净环境未复现,
+非确定性,疑与脏环境/torch profiler 导出相关)。dev0 单簇
+span 5616ms,busy 4595ms,**占用率 81.8%**(64K 稳态 hit 只有 53%)。
+报告:`Desktop\vllm_traces\prod480k.nsys-rep`。
+
+| kernel(dev0) | torch | nsys | 判定 |
+|---|---|---|---|
+| **mqa_logits(indexer 打分,672 次)** | 1136ms | **1195ms** | ✓ 吻合 |
+| sparse_attn | 764ms | 802ms | ✓ 吻合 |
+| nccl all_reduce | 1270ms | **617ms** | ✗ torch 虚高 2× |
+| Marlin MoE | 385ms | 429ms | ✓ 吻合 |
+| k_poll_batch | 330ms | 238ms | ≈(自旋时长本身随 IO 时序波动) |
+| topKPerRowPrefill | 186ms | 185ms | ✓ 吻合 |
+| dequantize_gather_k | 129ms | 132ms | ✓ 吻合 |
+
+**nsys 双口径下的最终排名(480K,深度 ~23 万,单 forward,dev0)**:
+**indexer 打分 mqa_logits 1195ms 是第一大 GPU kernel 消耗**(超过
+nccl 617ms、sparse_attn 802ms、Marlin 429ms)。torch 表里 nccl 排第一
+是 8 进程 profiler 互拖的假象。**会议结论强化:indexer 打分本身就是
+长上下文下最大的单项 GPU 负载,跨层共享(直接砍打分次数 ×1/2-1/4)
+是收益最大的一刀;graph 化只动 launch 项(topk/rope/quant ~500ms
+合计),排第二。**
+
 ## 会议任务 3 最终结论(2026-07-09,官方推理代码离线验证)
 
 **方法**:官方 `inference/model.py`(43 层,topk=512)一次 7K prefill,
