@@ -1,5 +1,50 @@
 # V24/V25 关键数据(2026-07-08 追加)
 
+## 会议任务 2 最终结论(2026-07-10,生产栈 torch.profiler trace)
+
+**对象**:vLLM+LMCache 完整服务栈,预测臂,稳态 hit 的**一个完整
+forward**(62 层,fused kernel)。钩子:CSA gate 内 torch.profiler
+一次性捕获(LMCACHE_TORCH_PROFILE,跳过 3 个 warmup gate)。两个
+形状各一份 chrome trace(rank0),已下载到本地
+`Desktop\vllm_traces\`。注意:8 个 worker 的 RANK 均为 0,trace
+文件名需 pid 后缀否则互相覆盖(已修)。
+
+**64K+2K forward(GPU kernel 总时间 810ms,10255 kernels)**:
+| kernel | ms | 占比 |
+|---|---|---|
+| multimem_all_reduce | 435 | **53.7%** |
+| k_poll_batch(Tutti NVMe 轮询自旋) | 148 | **18.3%** |
+| index_elementwise(KV scatter 类) | 55 | 6.8% |
+| Marlin MoE(fused experts) | 27 | 3.4% |
+| deep_gemm mqa_logits(indexer 打分) | 23 | 2.8% |
+| sparse_attn | 15 | 1.9% |
+
+**480K+2K forward(GPU kernel 总时间 5193ms,6129 kernels)**:
+| kernel | ms | 占比 |
+|---|---|---|
+| nccl all_reduce | 1270 | **24.5%** |
+| **deep_gemm mqa_logits(indexer 打分,672 次)** | **1136** | **21.9%** |
+| sparse_attn | 764 | 14.7% |
+| Marlin MoE | 385 | 7.4% |
+| k_poll_batch(Tutti 轮询) | 330 | 6.4% |
+| topKPerRowPrefill(672 次) | 186 | 3.6% |
+| dequantize_gather_k | 129 | 2.5% |
+
+**生产结论**:
+1. **indexer 打分(mqa_logits)在 480K 是第二大 GPU 消耗**(1136ms
+   =21.9%,672 次调用 = 21 层×32 microbatch)——**indexer 成本随上下文
+   线性增长,长上下文下它本身就是重负载**,"launch 开销"是次要项
+   (topk+rope+quant 合计 ~250ms);graph 化收益远小于减少打分量
+   (跨层共享直接砍打分次数,一石二鸟)。
+2. **all_reduce 双形状都是第一**(53.7%/24.5%)——TP=8 的通信税;
+   indexer 的 index_score all_reduce 是其中一部分。
+3. **Tutti poll 自旋占 GPU 6-18%**——预测读的 NVMe 等待烧在 GPU
+   kernel 上;此前的 host 口径没看到这块。GPU-driven poll(csrc
+   计划阶段 3)或减少读次数都能砍它。
+4. 参考实现(官方 model.py)的 profile 因无 fused kernel/无 LMCache
+   被判定不可用于生产结论(用户指出),仅保留 indexer 算子链结构
+   参考(~161 launches/call)。
+
 ## 会议任务 3 最终结论(2026-07-09,官方推理代码离线验证)
 
 **方法**:官方 `inference/model.py`(43 层,topk=512)一次 7K prefill,
