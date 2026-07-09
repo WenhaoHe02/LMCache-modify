@@ -50,6 +50,9 @@ microbatch 的完整 forward(LMCACHE_TORCH_PROFILE,SKIP=3)。两个形状
    (跨层共享直接砍打分次数,一石二鸟)。
 2. **all_reduce 双形状都是第一**(53.7%/24.5%)——TP=8 的通信税;
    indexer 的 index_score all_reduce 是其中一部分。
+   **⚠ 此条被 nsys 交叉验证推翻,见下节:53.7% 是 torch.profiler
+   八进程互相拖慢造成的假象,真实 all_reduce 在 64K 稳态只占 ~15%
+   busy。**
 3. **Tutti poll 自旋占 GPU 6-18%**——NVMe 等待烧在 GPU kernel 上
    (64K hit 里是读路径的等待,480K cold_store 里是写路径的等待);
    此前的 host 口径没看到这块。GPU-driven poll(csrc 计划阶段 3)
@@ -57,6 +60,50 @@ microbatch 的完整 forward(LMCACHE_TORCH_PROFILE,SKIP=3)。两个形状
 4. 参考实现(官方 model.py)的 profile 因无 fused kernel/无 LMCache
    被判定不可用于生产结论(用户指出),仅保留 indexer 算子链结构
    参考(~161 launches/call)。
+
+## 会议任务 2 补充:nsys 交叉验证(2026-07-10,同一 gate 状态机)
+
+**方法**:manager 的 profile 钩子加 `LMCACHE_NSYS_CAPTURE=1` 分支
+(cudaProfilerStart/Stop,与 torch 口径完全相同的 skip/gate 状态机),
+宿主机 nsight-systems 2025.3.2 挂载进容器,`nsys profile
+--capture-range=cudaProfilerApi -s none` 包 api_server。**一份 capture
+同时覆盖全部 8 张 GPU**(torch trace 只能看单进程)。64K+2K,干净
+reboot 后全绿 run(cold 10.5s/hit-2 1.25s/hit-5 1.15s,全部 200)。
+报告:`Desktop\vllm_traces\prod64k.nsys-rep`(gpu002 镜像
+`vprof_archive_20260710/`)。
+
+**capture 窗口结构**(dev0,gate→gate 语义):cluster0 = hit-2 的
+完整 forward(span 614ms,busy 326ms,占用率 53%);中间 14.9s 空闲
+= 请求间 sleep;cluster1 = hit-3 的 retrieve 段+前两层(span 615ms,
+busy 108ms:k_poll 2 次 85ms 大读 + multi_layer_block_transfer 500 次
+scatter 10ms)。
+
+**逐 kernel 对照(dev0,一个 forward)**:
+
+| kernel | torch trace | nsys | 判定 |
+|---|---|---|---|
+| k_poll_batch | 148ms | 150.3ms | ✓ 吻合 |
+| index_elementwise(scatter 家族) | 55ms | 55.1ms | ✓ 吻合 |
+| Marlin MoE | 27ms | 28.1ms | ✓ 吻合 |
+| mqa_logits(indexer 打分) | 23ms | 23.1ms | ✓ 吻合 |
+| sparse_attn | 15ms | 15.5ms | ✓ 吻合 |
+| **multimem_all_reduce** | **435ms** | **53.9ms** | **✗ torch 虚高 8×** |
+| GPU busy 合计 | 810ms | 433.5ms | 差额≈all_reduce 虚增部分 |
+
+**解读**:multimem all_reduce kernel 是自旋等 peer 的——8 个 worker
+同时开 torch.profiler,CUPTI 开销让各 rank 步调错开,rank0 的
+all_reduce kernel 把等待时间全记在自己头上(0.6ms/次 → 5ms/次)。
+nsys 用 `-s none` + 全局一份 session,开销极小,54ms(82 次,
+0.6ms/次)才是真值。**结论修正:64K 稳态 all_reduce 只占 busy 的
+~15%(不是 53.7%),第一大 GPU 消耗实为 Tutti k_poll 自旋;其余
+所有 torch 数字(indexer/MoE/attention/scatter/poll)被 nsys 双口径
+确认可信。** 480K torch 表的 nccl 1270ms 同理存疑偏高,mqa_logits
+的真实占比只会比 21.9% 更高。
+
+**dev0 forward 内部构成(nsys,busy 326ms)**:k_poll 65ms(预测读
+等待)、all_reduce 49ms、scatter 家族 ~49ms、Marlin 27ms、mqa 22.5ms、
+sparse_attn 15ms、dequant_gather 14ms。占用率仅 53%——forward 期
+仍有近半 SM 空闲,散块预测读的时延(不是带宽)是瓶颈的另一证据。
 
 ## 会议任务 3 最终结论(2026-07-09,官方推理代码离线验证)
 
