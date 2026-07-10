@@ -1,5 +1,12 @@
 # 交接说明:V28 profiling 重测(2026-07-10)
 
+> 2026-07-10 追加:本交接中的 V28 nsys 臂已补跑完成。结果已写入
+> [csa_prefetch_v24_v25_findings.md](csa_prefetch_v24_v25_findings.md)
+> 顶部 "V28 profiling 补充结论" 小节。远端归档:
+> `~/vprof_archive_20260710/v28_480k16k.nsys-rep`;本地已有
+> `Desktop\vllm_traces\v28_480k16k.nsys-rep` 和 CSV 汇总。torch trace
+> 远端归档完整,本地大文件拉取曾因跳板机 SSH 超时中断,需要时可重拉。
+
 > 写给接手的人(GPT/Codex/下一个 session)。当前工作做到一半,
 > gpu002 正在第二次 reboot。本文档自包含:任务、进度、脚本位置、
 > 环境铁律、参考文档全在这里。

@@ -1,5 +1,63 @@
 # V24/V25 关键数据(2026-07-08 追加)
 
+## V28 profiling 补充结论(2026-07-10,480K+16K,生产栈 V28)
+
+**对象**:vLLM+LMCache 完整服务栈,形状 480K base + 16K 增量,V28 决胜配置:
+`LMCACHE_CSA_BULK_PREDICTED=1`,
+`LMCACHE_CSA_WALKER_RESIDENT_SKIP=1`,
+`LMCACHE_DSV4_HCA_WALKER=1`,
+`LMCACHE_DSV4_VECTORIZED_CONSUME=0`。torch.profiler 与 nsys 均使用
+同一 gate 状态机,`SKIP=9`,捕获 hit-2 稳态 forward。昨晚 BULK=0
+预测臂 profiling 只保留方法论结论,不再作为 V28 kernel 排名依据。
+
+**run 结果**:
+- torch 臂: cold 49.24s,hit-1 18.39s,hit-2 5.77s,hit-3 8.85s,
+  hit-4 6.42s,hit-5 6.51s,repeat-5a 6.15s,repeat-5b 4.45s,
+  illegal=0。
+- nsys 臂: cold 51.42s,hit-1 18.64s,hit-2 7.11s,hit-3 10.17s,
+  hit-4 5.61s,hit-5 6.27s,repeat-5a 5.22s,repeat-5b 4.72s,
+  illegal=0。
+
+**归档**:
+- gpu002: `~/vprof_archive_20260710/trace_v28_480k16k.rank0.json`,
+  `~/vprof_archive_20260710/v28_480k16k.nsys-rep`。
+- 本地: `Desktop\vllm_traces\v28_480k16k.nsys-rep`,
+  `Desktop\vllm_traces\v28_kern_sum.csv`,
+  `Desktop\vllm_traces\v28_gpu_sum.csv`,
+  `Desktop\vllm_traces\v28_per_device_summary.csv`。
+  torch trace 本地拉取曾被跳板机 SSH 超时打断,远端归档仍完整。
+
+**torch rank0 vs nsys dev0 对照(hit-2 forward)**:
+
+| kernel(dev0/rank0) | torch | nsys | n / median / std | 判定 |
+|---|---:|---:|---|---|
+| nccl all_reduce | 865ms | **157.6ms** | n=87,med=1.283ms,std=4.414ms | torch 虚高 5.5x |
+| **mqa_logits(indexer 打分)** | **721ms** | **725.7ms** | n=336,med=2.257ms,std=0.443ms | 吻合 |
+| sparse_attn | 330ms | 332.3ms | n=43,med=2.758ms,std=5.572ms | 吻合 |
+| k_poll_batch | 254ms | 265.9ms | n=128,med=1.104ms,std=8.098ms | 基本吻合,受 IO 时序波动 |
+| Marlin MoE | 114.5ms | 113.7ms | n=86,med=1.209ms,std=0.516ms | 吻合 |
+| dequantize_gather_k | 104ms | 104.9ms | n=84,med=0.508ms,std=1.500ms | 吻合 |
+| topKPerRowPrefill | 94ms | 94.4ms | n=336,med=0.295ms,std=0.061ms | 吻合 |
+| multi_layer_block_transfer | 77ms | 77.4ms | n=2073,med=0.035ms/0.039ms | 吻合 |
+
+**结论修正**:V28 上 torch.profiler 的通信 kernel 依然不可信。nsys 显示
+rank0/dev0 真实 all_reduce 约 158ms,不是 torch 表里的 865ms;8 GPU 合计
+all_reduce 为 1451ms(696 次)。除通信外,mqa/attention/MoE/poll/topk/dequant/
+block_transfer 全部与 torch rank0 对齐。
+
+**V28 的真实 GPU 排名(dev0,busy 2138ms,span 21.24s)**:
+1. **mqa_logits(indexer 打分) 725.7ms**,n=336,p50=2.257ms/call。
+2. sparse_attn 332.3ms,n=43,p50=2.758ms,长尾到 14.18ms。
+3. k_poll_batch 265.9ms,n=128,p50=1.104ms,长尾到 70.81ms。
+4. all_reduce 157.6ms,n=87,p50=1.283ms。
+5. Marlin MoE 113.7ms,n=86,p50=1.209ms。
+
+**会议任务 2 的 V28 口径答案**:在真正 V28 生产栈、480K+16K
+稳态 forward 中,indexer 打分(mqa_logits)是最大的单项 GPU kernel 负载,
+约 726ms/rank,336 次调用,而不是通信。all_reduce 的 torch 865ms 是
+8 进程 in-process profiler 互拖造成的虚高;最终通信数字以 nsys 的
+~158ms/rank 为准。
+
 ## 会议任务 2 最终结论(2026-07-10,生产栈 torch.profiler trace)
 
 **对象**:vLLM+LMCache 完整服务栈,预测臂,fused kernel,62 层。
