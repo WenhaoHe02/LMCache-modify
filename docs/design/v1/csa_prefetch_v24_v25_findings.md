@@ -58,6 +58,45 @@ block_transfer 全部与 torch rank0 对齐。
 8 进程 in-process profiler 互拖造成的虚高;最终通信数字以 nsys 的
 ~158ms/rank 为准。
 
+## V28 profiling 补充:ncu 单 kernel 解剖 mqa_logits(2026-07-13)
+
+**方法**:宿主机 Nsight Compute 2025.3.1 挂进容器,对
+`sm90_fp8_mqa_logits` 在**生产锚定形状**下抓 3 个 launch
+(`--set basic` + MemoryWorkloadAnalysis + Roofline,12 passes/launch)。
+形状:M=1024(微批 query 行)、H=64、D=128、N=124160(496K/cr4 压缩
+条目)——H 由两处确认:官方 config `index_n_heads=64`,且 deep_gemm
+kernel 断言只接受 H=32/64(indexer 头不做 TP 切分);裸跑 H=64 为
+1.81ms/call,与生产 nsys 中位 2.257ms 同量级(生产行有变长因果窗口
++并发流干扰,略高正常)。报告:`Desktop\vllm_traces\mqa_prod.ncu-rep`
+(gpu002 镜像 `vprof_archive_20260710/`)。
+
+**关键指标(两 launch 一致,取第一个)**:
+
+| 指标 | 值 | 解读 |
+|---|---|---|
+| Duration(ncu 回放口径) | 2.56ms | 含 profiling 干扰,略高于裸跑 1.81ms |
+| Compute (SM) Throughput | **56.8%** | 未打满算力 |
+| Memory Throughput(总) | 56.5% | 未打满存储管线 |
+| **DRAM Throughput** | **4.5%**(218GB/s) | 几乎不碰 HBM:KV 15.9MB 驻 L2,DRAM 流量≈508MB logits 写出 |
+| L1/TEX 命中率 | 65.7% | — |
+| Grid / Block / Waves | 132 blocks / 640 threads / **1 wave** | persistent-grid,正好铺满 132 个 SM |
+| Registers/Thread | 96 | 占用率被寄存器压住 |
+| 理论/实测 Occupancy | 31.25% / 26.55% | WGMMA 流水线设计使然 |
+
+**算力核算**:2·M·H·D·N ≈ 2.08 TFLOP/call ÷ 1.81ms ≈ **1150 TFLOPS
+fp8 ≈ H200 峰值的 ~58%**,与 SM Throughput 吻合。
+
+**结论**:该 kernel **既不是带宽瓶颈(DRAM 4.5%)也没打满算力
+(SM 57%)**,卡在低占用率(1 wave、寄存器重)的流水线时延上——这是
+DeepGEMM WGMMA 设计的固有形态,kernel 级调优的天花板 ≤1.7×。
+**与"减少打分量"(跨层共享 ×2-4,线性收益)相比,调 kernel 不值得
+投入**——ncu 口径最终封死了"kernel 还能抠"的方向,会议结论
+(跨层共享 > graph 化 > kernel 调优)三层全部定量闭环。
+
+附:H=32 同形状 1.02ms(近似线性于 H)——若跨层共享后打分头数可减半,
+还有第二重乘法收益。ncu 采集时顺带发现并停掉了一个 7-12 遗留的
+32K idle 容器(占满 8 卡 131GB/卡,BULK=1+SKIP=1 环境,空转 21 小时)。
+
 ## 会议任务 2 最终结论(2026-07-10,生产栈 torch.profiler trace)
 
 **对象**:vLLM+LMCache 完整服务栈,预测臂,fused kernel,62 层。
@@ -302,8 +341,10 @@ repeat 4.04 历史最佳。这是全部 28 个版本以来第一次在稳态 hit
 
 **稳态 hit-5 的逐时间戳 profile(r2, 5.586s,全部测量值)**:
 - pre-retrieve(HTTP+tokenize 496K+调度+lookup):**2.84s(51%)**
-- retrieve(只剩 indexer 组 1.35GB):**2.52s(45%)**——0.6GB/s,
-  1874 个 0.71MB 碎读,比 walker mega-batch 的 11GB/s 慢 18 倍
+- retrieve(只剩 indexer 组 1.35GB):**2.52s(45%)**。这里
+  `1.35GB/2.52s=0.6GB/s` 是**端到端有效吞吐,不是 SSD 带宽**;NVMe
+  mega-batch 两批合计约 146ms(数据面约 9-11GB/s),剩余主要耗在 1874 个
+  对象的 Python callback/descriptor 构造和 scatter
 - 搬迁 262-275ms(retrieve 窗口内,免费);compute+21 gate:0.23s
   (每 gate <0.1ms)
 - **下一个最大杠杆:indexer 组合并大读或进 walker,可再省 ~2s,
