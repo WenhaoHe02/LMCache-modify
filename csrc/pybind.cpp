@@ -81,6 +81,20 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("shape_desc"), py::arg("lmcache_chunk_size"),
         py::arg("gpu_kv_format"), py::arg("skip_prefix_n_blocks"),
         py::call_guard<py::gil_scoped_release>());
+  m.def("multi_layer_block_kv_transfer_batched",
+        &multi_layer_block_kv_transfer_batched,
+        py::arg("paged_buffer_ptrs_tensor"),
+        py::arg("lmcache_objects_ptrs_tensor"), py::arg("block_ids"),
+        py::arg("device"), py::arg("direction"), py::arg("shape_desc"),
+        py::arg("lmcache_chunk_size"), py::arg("gpu_kv_format"),
+        py::arg("skip_prefix_n_blocks"),
+        py::call_guard<py::gil_scoped_release>());
+  m.def("scatter_rows_from_object_ptrs", &scatter_rows_from_object_ptrs,
+        py::arg("source_ptrs"), py::arg("destination"),
+        py::arg("destination_rows"), py::arg("rows_per_object"),
+        py::arg("row_bytes"), py::arg("logical_slots_per_block") = 0,
+        py::arg("source_ptrs_aligned") = true,
+        py::call_guard<py::gil_scoped_release>());
   py::class_<PageBufferShapeDesc>(m, "PageBufferShapeDesc")
       .def(py::init<>())
       .def_readwrite("kv_size", &PageBufferShapeDesc::kv_size)
@@ -105,6 +119,15 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("q_depth"), py::arg("qid"), py::arg("nsid"),
         py::arg("staging_iovas"), py::arg("slbas"), py::arg("byte_lens"),
         py::arg("stream_ptr") = int64_t(0),
+        py::call_guard<py::gil_scoped_release>());
+  m.def("tutti_submit_indexed_sgl_read", &tutti_submit_indexed_sgl_read,
+        py::arg("sq_dev_ptr"), py::arg("cq_dev_ptr"),
+        py::arg("sq_db_ptr"), py::arg("cq_db_ptr"),
+        py::arg("sq_tail_ptr"),
+        py::arg("q_depth"), py::arg("qid"), py::arg("nsid"),
+        py::arg("staging_page_iovas"), py::arg("staging_stride"),
+        py::arg("slba_table"), py::arg("selected_ids"),
+        py::arg("byte_len"), py::arg("stream_ptr") = int64_t(0),
         py::call_guard<py::gil_scoped_release>());
   m.def("tutti_submit_batch_sgl_write", &tutti_submit_batch_sgl_write,
         py::arg("sq_dev_ptr"), py::arg("cq_dev_ptr"),

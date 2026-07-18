@@ -2,10 +2,10 @@
 //
 // GPU-direct NVMe batch I/O kernels for the Tutti/snvme integration.
 //
-// These kernels are batch versions of the single-I/O k_submit_rw /
-// k_poll_one kernels in snvme_smoke_gpu.cu.  Both kernels run
-// single-threaded (<<<1,1>>>) so the SQ/CQ ring state needs no
-// synchronisation primitives.
+// Most kernels are batch versions of the single-I/O k_submit_rw /
+// k_poll_one kernels in snvme_smoke_gpu.cu. The fixed-size indexed CSA
+// submit and the CQ poll paths run cooperatively; each publishes one queue
+// doorbell per batch.
 //
 // SGL encoding (NVMe Base Spec 1.4 §4.4.1, SGL Data Block Descriptor):
 //   prp1 = dptr0 = IOVA of the HBM staging buffer
@@ -74,6 +74,18 @@ struct nvme_cqe {
 } __attribute__((packed));
 
 static_assert(sizeof(nvme_cqe) == NVME_CQE_SIZE, "nvme_cqe must be 16 bytes");
+
+// NVMe completions arrive through PCIe DMA, outside the GPU's normal store
+// path. Plain C++ volatile prevents compiler hoisting but can keep an old CQ
+// cache line in L2 when many future slots are polled before the controller
+// writes them. PTX cache-volatile loads invalidate a matching L2 line before
+// refetching it, which is required for forward progress of parallel polling.
+__device__ __forceinline__ uint16_t load_cq_status_cv(const nvme_cqe* slot) {
+  uint16_t status;
+  const void* address = reinterpret_cast<const char*>(slot) + 14;
+  asm volatile("ld.global.cv.u16 %0, [%1];" : "=h"(status) : "l"(address));
+  return status;
+}
 
 // Per-queue device-side state passed by value into kernels.
 struct tutti_queue_dev {
@@ -146,71 +158,155 @@ __global__ void k_submit_batch_sgl_rw(
     *sq_tail_io = tail;
 }
 
-// Poll for n_ios NVMe CQE completions in submission order.
-// On per-CQE timeout, sets *timed_out = 1 and returns immediately,
-// leaving head/phase at the last successfully consumed CQE position.
-__global__ void k_poll_batch(
+// Submit fixed-size reads selected through a GPU-resident LBA lookup table.
+// This is the CSA fast path: Python no longer builds staging_iovas/slbas/
+// byte_lens lists for every layer. Each object occupies one 64-KiB-aligned
+// staging row, so its IOVA can be resolved through the registered GPU-page
+// IOVA table without assuming that adjacent pages have contiguous IOVAs.
+__global__ void k_submit_indexed_sgl_read(
     tutti_queue_dev qd,
-    uint16_t*       cq_head_io,
-    uint8_t*        cq_phase_io,
-    int             n_ios,
-    uint32_t*       status_out,
-    int*            timed_out,
-    uint64_t        max_iters)
+    uint16_t* sq_tail_io,
+    uint32_t nsid,
+    const uint64_t* staging_page_iovas,
+    uint64_t staging_stride,
+    const uint64_t* slba_table,
+    const int64_t* selected_ids,
+    uint32_t byte_len,
+    int n_ios)
 {
-    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    __shared__ uint16_t base_tail;
+    if (threadIdx.x == 0) base_tail = *sq_tail_io;
+    __syncthreads();
 
-    uint16_t head  = *cq_head_io;
-    uint8_t  phase = *cq_phase_io;
-    *timed_out = 0;
+    for (int i = threadIdx.x; i < n_ios; i += blockDim.x) {
+        const uint16_t slot_index = static_cast<uint16_t>(
+            (static_cast<uint32_t>(base_tail) + static_cast<uint32_t>(i)) %
+            qd.q_depth);
+        nvme_sqe* slot = &qd.sq[slot_index];
+        // Unlike the legacy path, the controller sees no doorbell until the
+        // whole batch is ready. Each thread exclusively owns its 64-byte,
+        // naturally aligned slot, so four vector stores safely replace the
+        // old 64 byte stores.
+        uint4* words = reinterpret_cast<uint4*>(slot);
+        #pragma unroll
+        for (int j = 0; j < 4; j++) words[j] = make_uint4(0, 0, 0, 0);
 
-    for (int i = 0; i < n_ios; i++) {
-        volatile nvme_cqe* slot = &qd.cq[head];
+        const uint64_t staging_offset =
+            static_cast<uint64_t>(i) * staging_stride;
+        const uint64_t page_index = staging_offset / 65536u;
+        const uint64_t page_offset = staging_offset % 65536u;
+        const int64_t selected_id = selected_ids[i];
+        const uint64_t sgl_dptr1 =
+            static_cast<uint64_t>(byte_len) |
+            (static_cast<uint64_t>(NVME_SGL_BYTE15) << 56);
+        const uint64_t slba = slba_table[selected_id];
 
-        uint64_t iter = 0;
-        uint16_t status;
-        for (;;) {
-            status = slot->status;
-            if (static_cast<uint8_t>(status & 0x1u) == phase) break;
-            if (++iter >= max_iters) {
-                *timed_out = 1;
-                return;
-            }
-        }
-
-        status_out[i] = static_cast<uint32_t>(status);
-
-        const uint16_t new_head = static_cast<uint16_t>((head + 1) % qd.q_depth);
-        // Phase bit toggles each time the head pointer wraps around.
-        if (new_head == 0) phase ^= 1u;
-
-        // Ensure the CQE read completes before writing the head doorbell.
-        __threadfence_system();
-        *qd.cq_db = new_head;
-        head = new_head;
+        slot->opcode = NVME_OPC_READ;
+        slot->flags = NVME_FLAG_PSDT_SGL;
+        slot->cid = static_cast<uint16_t>(i);
+        slot->nsid = nsid;
+        slot->prp1 = staging_page_iovas[page_index] + page_offset;
+        slot->prp2 = sgl_dptr1;
+        slot->cdw10 = static_cast<uint32_t>(slba & 0xffffffffu);
+        slot->cdw11 = static_cast<uint32_t>(slba >> 32);
+        slot->cdw12 = byte_len / NVME_LBS - 1u;
     }
 
-    *cq_head_io  = head;
-    *cq_phase_io = phase;
+    // Every producer makes its SQE stores visible to the PCIe device before
+    // thread 0 advances the hardware tail. One doorbell per batch avoids the
+    // previous O(n_ios) MMIO writes while preserving NVMe queue semantics.
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      const uint16_t new_tail = static_cast<uint16_t>(
+          (static_cast<uint32_t>(base_tail) + static_cast<uint32_t>(n_ios)) %
+          qd.q_depth);
+      *sq_tail_io = new_tail;
+      *qd.sq_db = new_tail;
+    }
+}
+
+// Poll one queue-depth-bounded CQ batch in parallel. Each CUDA thread owns a
+// strided subset of CQ slots; after every expected phase bit is visible,
+// thread 0 advances the CQ head and rings the doorbell once for the batch.
+//
+// The legacy max_iters value was calibrated for one serial polling thread.
+// Starting that raw iteration budget independently for every CQ slot makes
+// later completions time out almost immediately when all slots are polled in
+// parallel. Use it as a coarse wall-clock budget instead, and back off between
+// MMIO reads to avoid flooding the PCIe BAR while the device is working.
+__global__ void k_poll_batch(tutti_queue_dev qd, uint16_t* cq_head_io,
+                             uint8_t* cq_phase_io, int n_ios,
+                             uint32_t* status_out, int* timed_out,
+                             uint64_t max_iters) {
+  if (blockIdx.x != 0) return;
+
+  const uint16_t head = *cq_head_io;
+  const uint8_t phase = *cq_phase_io;
+  if (threadIdx.x == 0) *timed_out = 0;
+  __syncthreads();
+
+  constexpr uint64_t kTimeoutCyclesPerLegacyIter = 512;
+  constexpr unsigned int kPollBackoffNs = 256;
+  const uint64_t start_clock = clock64();
+  const uint64_t timeout_cycles =
+      max_iters > UINT64_MAX / kTimeoutCyclesPerLegacyIter
+          ? UINT64_MAX
+          : max_iters * kTimeoutCyclesPerLegacyIter;
+
+  for (int i = threadIdx.x; i < n_ios; i += blockDim.x) {
+    const uint32_t absolute_slot =
+        static_cast<uint32_t>(head) + static_cast<uint32_t>(i);
+    const uint16_t slot_index = static_cast<uint16_t>(
+        absolute_slot % static_cast<uint32_t>(qd.q_depth));
+    const uint8_t expected_phase = static_cast<uint8_t>(
+        phase ^ (absolute_slot >= static_cast<uint32_t>(qd.q_depth)));
+    const nvme_cqe* slot = &qd.cq[slot_index];
+
+    uint16_t status = 0;
+    for (;;) {
+      status = load_cq_status_cv(slot);
+      if (static_cast<uint8_t>(status & 0x1u) == expected_phase) break;
+      if (clock64() - start_clock >= timeout_cycles) {
+        atomicExch(timed_out, 1);
+        break;
+      }
+      __nanosleep(kPollBackoffNs);
+    }
+    status_out[i] = static_cast<uint32_t>(status);
+    // Order this thread's CQE read before the batched head doorbell.
+    __threadfence_system();
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0 && *timed_out == 0) {
+    const uint32_t absolute_head =
+        static_cast<uint32_t>(head) + static_cast<uint32_t>(n_ios);
+    const uint16_t new_head = static_cast<uint16_t>(
+        absolute_head % static_cast<uint32_t>(qd.q_depth));
+    const uint8_t new_phase = static_cast<uint8_t>(
+        phase ^ (absolute_head >= static_cast<uint32_t>(qd.q_depth)));
+    *cq_head_io = new_head;
+    *cq_phase_io = new_phase;
+    *qd.cq_db = new_head;
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Host-side helpers
 // ---------------------------------------------------------------------------
 
-static tutti_queue_dev make_qd(
-    int64_t sq_dev_ptr, int64_t cq_dev_ptr,
-    int64_t sq_db_ptr,  int64_t cq_db_ptr,
-    int     q_depth,    int qid)
-{
-    tutti_queue_dev qd;
-    qd.sq      = reinterpret_cast<nvme_sqe*>(sq_dev_ptr);
-    qd.cq      = reinterpret_cast<nvme_cqe*>(cq_dev_ptr);
-    qd.sq_db   = reinterpret_cast<volatile uint32_t*>(sq_db_ptr);
-    qd.cq_db   = reinterpret_cast<volatile uint32_t*>(cq_db_ptr);
-    qd.q_depth = static_cast<uint16_t>(q_depth);
-    qd.qid     = static_cast<uint16_t>(qid);
-    return qd;
+static tutti_queue_dev make_qd(int64_t sq_dev_ptr, int64_t cq_dev_ptr,
+                               int64_t sq_db_ptr, int64_t cq_db_ptr,
+                               int q_depth, int qid) {
+  tutti_queue_dev qd;
+  qd.sq = reinterpret_cast<nvme_sqe*>(sq_dev_ptr);
+  qd.cq = reinterpret_cast<nvme_cqe*>(cq_dev_ptr);
+  qd.sq_db = reinterpret_cast<volatile uint32_t*>(sq_db_ptr);
+  qd.cq_db = reinterpret_cast<volatile uint32_t*>(cq_db_ptr);
+  qd.q_depth = static_cast<uint16_t>(q_depth);
+  qd.qid = static_cast<uint16_t>(qid);
+  return qd;
 }
 
 // ---------------------------------------------------------------------------
@@ -244,9 +340,9 @@ static void tutti_submit_batch_sgl_rw(
 
     const int n_ios = static_cast<int>(staging_iovas.numel());
     TORCH_CHECK(n_ios > 0, "n_ios must be positive");
-    TORCH_CHECK(n_ios <= q_depth,
-                "n_ios (", n_ios, ") exceeds q_depth (", q_depth, "); "
-                "split into smaller batches");
+    TORCH_CHECK(n_ios < q_depth,
+                "n_ios (", n_ios, ") must be smaller than q_depth (",
+                q_depth, ") so the NVMe queue retains one empty slot");
 
     tutti_queue_dev qd = make_qd(
         sq_dev_ptr, cq_dev_ptr, sq_db_ptr, cq_db_ptr, q_depth, qid);
@@ -283,6 +379,71 @@ void tutti_submit_batch_sgl_read(
         NVME_OPC_READ, stream_ptr);
 }
 
+void tutti_submit_indexed_sgl_read(
+    int64_t sq_dev_ptr,
+    int64_t cq_dev_ptr,
+    int64_t sq_db_ptr,
+    int64_t cq_db_ptr,
+    int64_t sq_tail_ptr,
+    int q_depth,
+    int qid,
+    int64_t nsid,
+    at::Tensor staging_page_iovas,
+    int64_t staging_stride,
+    at::Tensor slba_table,
+    at::Tensor selected_ids,
+    int byte_len,
+    int64_t stream_ptr)
+{
+    TORCH_CHECK(staging_page_iovas.dtype() == at::kLong,
+                "staging_page_iovas must be int64");
+    TORCH_CHECK(slba_table.dtype() == at::kLong,
+                "slba_table must be int64");
+    TORCH_CHECK(selected_ids.dtype() == at::kLong,
+                "selected_ids must be int64");
+    TORCH_CHECK(staging_page_iovas.is_cuda(),
+                "staging_page_iovas must be a CUDA tensor");
+    TORCH_CHECK(slba_table.is_cuda(), "slba_table must be a CUDA tensor");
+    TORCH_CHECK(selected_ids.is_cuda(), "selected_ids must be a CUDA tensor");
+    TORCH_CHECK(staging_page_iovas.is_contiguous(),
+                "staging_page_iovas must be contiguous");
+    TORCH_CHECK(slba_table.is_contiguous(), "slba_table must be contiguous");
+    TORCH_CHECK(selected_ids.is_contiguous(),
+                "selected_ids must be contiguous");
+    TORCH_CHECK(staging_stride > 0 && staging_stride % 65536 == 0,
+                "staging_stride must be a positive multiple of 65536");
+    TORCH_CHECK(byte_len > 0 && byte_len % NVME_LBS == 0,
+                "byte_len must be a positive multiple of 512");
+    TORCH_CHECK(byte_len <= staging_stride,
+                "byte_len must not exceed staging_stride");
+
+    const int n_ios = static_cast<int>(selected_ids.numel());
+    TORCH_CHECK(n_ios > 0, "n_ios must be positive");
+    TORCH_CHECK(n_ios < q_depth,
+                "n_ios (", n_ios, ") must be smaller than q_depth (",
+                q_depth, ") for one batched doorbell");
+    TORCH_CHECK(
+        static_cast<int64_t>(n_ios) * staging_stride <=
+            staging_page_iovas.numel() * 65536,
+        "indexed staging plan exceeds registered staging pages");
+
+    tutti_queue_dev qd = make_qd(
+        sq_dev_ptr, cq_dev_ptr, sq_db_ptr, cq_db_ptr, q_depth, qid);
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    constexpr int kSubmitThreads = 256;
+    k_submit_indexed_sgl_read<<<1, kSubmitThreads, 0, stream>>>(
+        qd,
+        reinterpret_cast<uint16_t*>(sq_tail_ptr),
+        static_cast<uint32_t>(nsid),
+        reinterpret_cast<const uint64_t*>(
+            staging_page_iovas.data_ptr<int64_t>()),
+        static_cast<uint64_t>(staging_stride),
+        reinterpret_cast<const uint64_t*>(slba_table.data_ptr<int64_t>()),
+        selected_ids.data_ptr<int64_t>(),
+        static_cast<uint32_t>(byte_len),
+        n_ios);
+}
+
 void tutti_submit_batch_sgl_write(
     int64_t   sq_dev_ptr,
     int64_t   cq_dev_ptr,
@@ -297,43 +458,30 @@ void tutti_submit_batch_sgl_write(
     at::Tensor byte_lens,
     int64_t   stream_ptr)
 {
-    tutti_submit_batch_sgl_rw(
-        sq_dev_ptr, cq_dev_ptr, sq_db_ptr, cq_db_ptr, sq_tail_ptr,
-        q_depth, qid, nsid, staging_iovas, slbas, byte_lens,
-        NVME_OPC_WRITE, stream_ptr);
+  tutti_submit_batch_sgl_rw(sq_dev_ptr, cq_dev_ptr, sq_db_ptr, cq_db_ptr,
+                            sq_tail_ptr, q_depth, qid, nsid, staging_iovas,
+                            slbas, byte_lens, NVME_OPC_WRITE, stream_ptr);
 }
 
-void tutti_poll_batch(
-    int64_t   sq_dev_ptr,
-    int64_t   cq_dev_ptr,
-    int64_t   sq_db_ptr,
-    int64_t   cq_db_ptr,
-    int64_t   cq_head_ptr,
-    int64_t   cq_phase_ptr,
-    int       q_depth,
-    int       n_ios,
-    at::Tensor status_out,
-    int64_t   timed_out_ptr,
-    int64_t   max_iters,
-    int64_t   stream_ptr)
-{
-    TORCH_CHECK(status_out.dtype() == at::kInt,
-                "status_out must be int32");
-    TORCH_CHECK(status_out.is_contiguous(), "status_out must be contiguous");
-    TORCH_CHECK(static_cast<int>(status_out.numel()) >= n_ios,
-                "status_out too small (", status_out.numel(), " < ", n_ios, ")");
-    TORCH_CHECK(max_iters > 0, "max_iters must be positive");
+void tutti_poll_batch(int64_t sq_dev_ptr, int64_t cq_dev_ptr, int64_t sq_db_ptr,
+                      int64_t cq_db_ptr, int64_t cq_head_ptr,
+                      int64_t cq_phase_ptr, int q_depth, int n_ios,
+                      at::Tensor status_out, int64_t timed_out_ptr,
+                      int64_t max_iters, int64_t stream_ptr) {
+  TORCH_CHECK(status_out.dtype() == at::kInt, "status_out must be int32");
+  TORCH_CHECK(status_out.is_contiguous(), "status_out must be contiguous");
+  TORCH_CHECK(static_cast<int>(status_out.numel()) >= n_ios,
+              "status_out too small (", status_out.numel(), " < ", n_ios, ")");
+  TORCH_CHECK(max_iters > 0, "max_iters must be positive");
 
-    tutti_queue_dev qd = make_qd(
-        sq_dev_ptr, cq_dev_ptr, sq_db_ptr, cq_db_ptr, q_depth, 0);
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+  tutti_queue_dev qd =
+      make_qd(sq_dev_ptr, cq_dev_ptr, sq_db_ptr, cq_db_ptr, q_depth, 0);
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
-    k_poll_batch<<<1, 1, 0, stream>>>(
-        qd,
-        reinterpret_cast<uint16_t*>(cq_head_ptr),
-        reinterpret_cast<uint8_t*>(cq_phase_ptr),
-        n_ios,
-        reinterpret_cast<uint32_t*>(status_out.data_ptr<int32_t>()),
-        reinterpret_cast<int*>(timed_out_ptr),
-        static_cast<uint64_t>(max_iters));
+  constexpr int kPollThreads = 256;
+  k_poll_batch<<<1, kPollThreads, 0, stream>>>(
+      qd, reinterpret_cast<uint16_t*>(cq_head_ptr),
+      reinterpret_cast<uint8_t*>(cq_phase_ptr), n_ios,
+      reinterpret_cast<uint32_t*>(status_out.data_ptr<int32_t>()),
+      reinterpret_cast<int*>(timed_out_ptr), static_cast<uint64_t>(max_iters));
 }

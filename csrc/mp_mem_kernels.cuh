@@ -88,3 +88,22 @@ void multi_layer_block_kv_transfer(
     const torch::Device& device, TransferDirection direction,
     PageBufferShapeDesc shape_desc, int lmcache_chunk_size,
     GPUKVFormat gpu_kv_format, int skip_prefix_n_blocks);
+
+// Batched transfer from any number of LMCache objects. Source pointers come
+// from a CUDA int64 tensor, avoiding the four-object launch limit.
+void multi_layer_block_kv_transfer_batched(
+    const torch::Tensor& paged_buffer_ptrs_tensor,
+    const torch::Tensor& lmcache_objects_ptrs_tensor,
+    const torch::Tensor& block_ids, const torch::Device& device,
+    TransferDirection direction, PageBufferShapeDesc shape_desc,
+    int lmcache_chunk_size, GPUKVFormat gpu_kv_format,
+    int skip_prefix_n_blocks);
+
+// Scatter fixed-width rows from GPU object pointers. destination_rows maps
+// source rows to flat rows or to (block, slot) locations.
+void scatter_rows_from_object_ptrs(const torch::Tensor& source_ptrs,
+                                   const torch::Tensor& destination,
+                                   const torch::Tensor& destination_rows,
+                                   int rows_per_object, int row_bytes,
+                                   int logical_slots_per_block,
+                                   bool source_ptrs_aligned);

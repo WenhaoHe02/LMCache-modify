@@ -333,6 +333,56 @@ class TestKVObjectStoreLocalDiskBackend:
             full_record.offset + 3 * 512 * 584,
         ]
 
+    def test_attention_layer_major_snapshot_gathers_chunks_in_token_order(
+        self,
+        temp_disk_path: str,
+        async_loop: asyncio.AbstractEventLoop,
+        local_cpu_backend: LocalCPUBackend,
+    ) -> None:
+        """Layer-major sidecars concatenate each layer across input chunks."""
+        with patch(
+            "os.statvfs",
+            return_value=SimpleNamespace(f_bsize=4096),
+            create=True,
+        ):
+            backend = self._create_object_store_backend(
+                temp_disk_path,
+                async_loop,
+                local_cpu_backend,
+            )
+        allocator = AdHocMemoryAllocator(device="cpu")
+        memory_objs: list[MemoryObj] = []
+        for chunk_id in range(2):
+            memory_obj = allocator.allocate(
+                [torch.Size([2, 2, 2, 4])],
+                [torch.uint8],
+                fmt=MemoryFormat.KV_2LTD,
+            )
+            assert memory_obj is not None
+            tensor = memory_obj.get_tensor(0)
+            assert tensor is not None
+            for kv_id in range(2):
+                for layer_id in range(2):
+                    tensor[kv_id, layer_id].fill_(
+                        chunk_id * 40 + kv_id * 10 + layer_id
+                    )
+            memory_objs.append(memory_obj)
+
+        prefix_key = create_test_key(299)
+        assert backend.store_attention_layer_major_snapshot(
+            prefix_key,
+            memory_objs,
+        ) == 2
+        records = backend.get_csa_layer_major_records(prefix_key, [0, 1])
+        record0, record1 = records
+        assert record0 is not None
+        assert record1 is not None
+        assert backend.kv_object_pool_io is not None
+        payload0 = backend.kv_object_pool_io.read_object(record0)
+        payload1 = backend.kv_object_pool_io.read_object(record1)
+        assert payload0 == bytes([0] * 8 + [10] * 8 + [40] * 8 + [50] * 8)
+        assert payload1 == bytes([1] * 8 + [11] * 8 + [41] * 8 + [51] * 8)
+
         backend.local_cpu_backend.memory_allocator.close()
 
     def test_raw_lba_cache_is_sliced_to_view_ranges(

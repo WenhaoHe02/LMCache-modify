@@ -21,7 +21,7 @@ The current work targets prefill cache-hit reuse for DSv4-Pro with CSA
 attention-KV filtering:
 
 ```text
-LMCACHE_DSV4_CSA_ATTENTION_KV_FILTER=1
+LMCACHE_INDEXER_ENABLE_PREFETCH=1
 ```
 
 Normal KV retrieve skips `csa_attention_kv`; predicted CSA attention-KV blocks
@@ -173,17 +173,13 @@ Tutti direct load found no readable KV extents
 Recommended CSA-only prefill overlap path:
 
 ```text
-LMCACHE_DSV4_CSA_ATTENTION_KV_FILTER=1
-LMCACHE_INDEXER_ENABLE_DECODE_PREFETCH=0
-LMCACHE_INDEXER_ENABLE_PREFILL_EVICTION=0
-LMCACHE_INDEXER_ENABLE_PREFILL_RESIDUAL_PROXY=0
-LMCACHE_CSA_ATTENTION_KV_PROXY_MICROBATCH_ROWS=64
+LMCACHE_INDEXER_ENABLE_PREFETCH=1
+LMCACHE_CSA_PREFETCH_LOOKAHEAD_BY_LAYER=profile80
 ```
 
-`LMCACHE_INDEXER_ENABLE_PREFILL_RESIDUAL_PROXY=0` disables the old
-indexer-cache prefill correction path. It must not prevent the CSA
-attention-KV prefill hook from computing native target-layer proxy topK and
-submitting Tutti reads.
+The single feature gate attaches retrieve filtering, native target-layer proxy
+scoring, Tutti reads, and true-indexer miss correction atomically. The policy
+keeps shallow layers demand-only and enables one L2 prediction for deep layers.
 
 ## Log Invariants
 

@@ -39,6 +39,7 @@ in vLLM with LMCACHE_INDEXER_ENABLE_POOL_SCORING=1.
 Only single-sequence decode is supported in this version (batch_size = 1).
 Multi-sequence support can be added by keying pool state per seq_id.
 """
+
 from __future__ import annotations
 
 import os
@@ -48,11 +49,12 @@ import time
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import torch
 
 from lmcache.logging import init_logger
+from lmcache.v1.csa_pipeline_nvtx import CsaNvtxEvent, csa_pipeline_nvtx
 
 logger = init_logger(__name__)
 DEEPGEMM_PAGED_BLOCK_SIZE = 64
@@ -68,6 +70,15 @@ def set_indexer_ssd_manager(manager: Optional["IndexerSSDManager"]) -> None:
     """Set the process-local CSA indexer SSD manager used by GPU connectors."""
     global _INDEXER_SSD_MANAGER
     _INDEXER_SSD_MANAGER = manager
+
+
+class _SpeculativeReadCancelled(RuntimeError):
+    """Raised when Tutti declines an unsubmitted speculative batch."""
+
+
+def _future_list_item(future: "Future[List[bytes]]", index: int) -> bytes:
+    """Return one item from a shared batch-read future."""
+    return future.result()[index]
 
 
 def _proxy_num_rows(proxy_state: Optional[torch.Tensor]) -> int:
@@ -176,79 +187,8 @@ def _profile_accuracy_enabled() -> bool:
 # ---------------------------------------------------------------------------
 _RESIDENT_ENABLED: bool = os.environ.get("LMCACHE_DISABLE_RESIDENT_INDEXER", "0") != "1"
 
-# When LMCACHE_INDEXER_FULL_OVERLAP=1 the CSA spec prefetch + miss-correction
-# pipeline runs end-to-end on a side stream so the proxy Lightning Indexer
-# and Tutti reads cannot block the forward stream.  Individual sub-flags
-# below still let operators turn pieces off, but their defaults flip to ON
-# when this master flag is set.  Keep this in lockstep with the doc string
-# of LMCACHE_INDEXER_ENABLE_PREFETCH.
-_FULL_OVERLAP_ENABLED: bool = _env_flag("LMCACHE_INDEXER_FULL_OVERLAP")
-
-
-def _env_flag_default_on(name: str) -> bool:
-    """Return env flag value, defaulting to ``True`` when the var is unset.
-
-    Args:
-        name: Environment variable name.
-
-    Returns:
-        ``True`` if the value is empty/unset OR a truthy literal; ``False``
-        only when explicitly set to a falsey literal (``0``/``false``/``no``/
-        ``off``).
-    """
-    value = os.environ.get(name)
-    if value is None or value == "":
-        return True
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
-_RESIDUAL_PROXY_ENABLED: bool = (
-    _env_flag_default_on("LMCACHE_INDEXER_ENABLE_RESIDUAL_PROXY")
-    if _FULL_OVERLAP_ENABLED
-    else _env_flag("LMCACHE_INDEXER_ENABLE_RESIDUAL_PROXY")
-)
-_DECODE_PREFETCH_ENABLED: bool = (
-    _env_flag_default_on("LMCACHE_INDEXER_ENABLE_DECODE_PREFETCH")
-    if _FULL_OVERLAP_ENABLED
-    else _env_flag("LMCACHE_INDEXER_ENABLE_DECODE_PREFETCH")
-)
-_PREFILL_RESIDUAL_PROXY_ENV = os.environ.get(
-    "LMCACHE_INDEXER_ENABLE_PREFILL_RESIDUAL_PROXY"
-)
-_REUSE_PREFETCH_ENABLED: bool = (
-    _env_flag_default_on("LMCACHE_INDEXER_ENABLE_REUSE_PREFETCH")
-    if _FULL_OVERLAP_ENABLED
-    else _env_flag("LMCACHE_INDEXER_ENABLE_REUSE_PREFETCH")
-)
-_PREFILL_RESIDUAL_PROXY_ENABLED: bool = (
-    _env_flag("LMCACHE_INDEXER_ENABLE_PREFILL_RESIDUAL_PROXY")
-    if _PREFILL_RESIDUAL_PROXY_ENV is not None
-    else (
-        _RESIDUAL_PROXY_ENABLED
-        and _REUSE_PREFETCH_ENABLED
-    )
-)
-_PREFILL_EVICTION_ENABLED: bool = _env_flag(
-    "LMCACHE_INDEXER_ENABLE_PREFILL_EVICTION"
-)
-_PREFILL_EVICTION_FLAG_FILE = "/tmp/lmcache_indexer_enable_prefill_eviction"
 _TIMING_LIMIT: int = max(0, _env_int("LMCACHE_INDEXER_TIMING_LIMIT", 512))
 _TIMING_SEED_VERBOSE = _env_flag("LMCACHE_INDEXER_TIMING_SEED_VERBOSE")
-_PREFILL_NATIVE_PROXY_TOPK_ENABLED = _env_flag(
-    "LMCACHE_INDEXER_ENABLE_PREFILL_NATIVE_PROXY_TOPK"
-)
-_CSA_ATTENTION_KV_PROXY_MICROBATCH_ROWS: int = max(
-    1,
-    _env_int("LMCACHE_CSA_ATTENTION_KV_PROXY_MICROBATCH_ROWS", 64),
-)
-_PROXY_ASYNC_ENABLED = (
-    _env_flag_default_on("LMCACHE_INDEXER_PROXY_ASYNC")
-    if _FULL_OVERLAP_ENABLED
-    else _env_flag("LMCACHE_INDEXER_PROXY_ASYNC")
-)
-_PROXY_ASYNC_WORKERS = max(
-    1, _env_int("LMCACHE_INDEXER_PROXY_ASYNC_WORKERS", 2)
-)
 
 
 def _timing_enabled() -> bool:
@@ -258,9 +198,58 @@ def _timing_enabled() -> bool:
     )
 
 
+def _select_rank_local_proxy_blocks(
+    token_ids: torch.Tensor,
+    cursor: int,
+    num_blocks: int,
+    block_budget: int,
+) -> torch.Tensor:
+    """Select a fixed-budget rank-local block list from proxy token IDs.
+
+    The per-query proxy output is reduced to block occurrence counts locally.
+    Only the most frequent blocks survive; no rank collective or persistent
+    score vector is required. Empty slots are represented by ``-1`` so the
+    result always has a host-known size and can be copied asynchronously.
+
+    Args:
+        token_ids: Proxy-selected logical token IDs on CPU or CUDA.
+        cursor: Exclusive upper bound of initialized logical token IDs.
+        num_blocks: Number of initialized compressed blocks.
+        block_budget: Maximum number of blocks to return.
+
+    Returns:
+        One-dimensional int64 tensor of length
+        ``min(num_blocks, block_budget)``. Valid block IDs precede optional
+        ``-1`` padding in unspecified order.
+
+    Raises:
+        ValueError: If ``num_blocks`` or ``block_budget`` is not positive.
+    """
+    if num_blocks <= 0:
+        raise ValueError("num_blocks must be positive")
+    if block_budget <= 0:
+        raise ValueError("block_budget must be positive")
+    flat = token_ids.reshape(-1).to(dtype=torch.int64)
+    valid = flat[(flat >= 0) & (flat < int(cursor))]
+    block_ids = torch.div(
+        valid,
+        DEEPGEMM_PAGED_BLOCK_SIZE,
+        rounding_mode="floor",
+    )
+    counts = torch.bincount(block_ids, minlength=int(num_blocks))
+    budget = min(int(num_blocks), int(block_budget))
+    top_counts, top_blocks = torch.topk(counts, k=budget, sorted=False)
+    return torch.where(
+        top_counts > 0,
+        top_blocks,
+        torch.full_like(top_blocks, -1),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Low-level pread helper (Linux/macOS)
 # ---------------------------------------------------------------------------
+
 
 def _pread(fd: int, size: int, offset: int) -> bytes:
     """Read *size* bytes from *fd* at *offset* without moving the file cursor."""
@@ -290,6 +279,7 @@ def _pwrite(fd: int, data: bytes, offset: int) -> None:
 # SSD block store — flat file, one entry per token
 # ---------------------------------------------------------------------------
 
+
 class IndexerBlockStore:
     """Per-CSA-layer flat SSD file storing FP8-quantized K vectors.
 
@@ -311,8 +301,14 @@ class IndexerBlockStore:
             token_bytes: Bytes per token (head_dim_with_scale).
             max_seq_len: Maximum context length (determines file capacity).
         """
-        Path(store_dir).mkdir(parents=True, exist_ok=True)
-        self._path = Path(store_dir) / f"indexer_layer_{layer_id:03d}.bin"
+        store_path = Path(store_dir)
+        # The per-rank directories are normally created before snvme binds
+        # and unmounts the filesystem.  Avoid a redundant mkdir syscall here:
+        # during the lazy first-request attach it can race that unmount and
+        # surface as EPERM even though the directory already exists.
+        if not store_path.is_dir():
+            store_path.mkdir(parents=True, exist_ok=True)
+        self._path = store_path / f"indexer_layer_{layer_id:03d}.bin"
         self._token_bytes = token_bytes
         self._max_seq_len = max_seq_len
         self._fd: Optional[int] = None
@@ -348,9 +344,7 @@ class IndexerBlockStore:
     def write_token(self, token_id: int, data: bytes) -> None:
         """Write one token's K vector to SSD."""
         if len(data) != self._token_bytes:
-            raise ValueError(
-                f"Expected {self._token_bytes} bytes, got {len(data)}"
-            )
+            raise ValueError(f"Expected {self._token_bytes} bytes, got {len(data)}")
         fd = self._open()
         _pwrite(fd, data, token_id * self._token_bytes)
 
@@ -377,6 +371,7 @@ class IndexerBlockStore:
 # ---------------------------------------------------------------------------
 # Per-layer HBM pool
 # ---------------------------------------------------------------------------
+
 
 class IndexerStorageProtocol:
     """Per-CSA-layer indexer storage interface.
@@ -411,11 +406,10 @@ class TuttiIndexerBlockStore:
     one ``TuttiIndexerBlockStore`` exists per CSA layer and targets one
     slot inside that region.
 
-    Read path (CSA spec prefetch and true-LI miss correction) is wired in a
-    follow-up commit; this scaffold raises :class:`NotImplementedError`
-    for reads so callers fail loudly instead of silently returning empty
-    bytes.  The write path (LMCache retrieve seed + prefill new-token
-    persistence) is fully wired through
+    Demand reads support true-topK correction. Predicted reads use bounded
+    speculative batches so foreground retrieve and store announcements
+    can cancel unsubmitted indexer work. The write path (LMCache retrieve seed
+    + prefill new-token persistence) is wired through
     :meth:`TuttiIndexerStorage.write_bytes`.
     """
 
@@ -461,7 +455,14 @@ class TuttiIndexerBlockStore:
             )
         return results[0]
 
-    def read_tokens_batch(self, token_ids: List[int]) -> List[bytes]:
+    def read_tokens_batch(
+        self,
+        token_ids: List[int],
+        *,
+        io_priority: str = "demand",
+        should_continue: Optional[Callable[[], bool]] = None,
+        deadline_monotonic: Optional[float] = None,
+    ) -> List[bytes]:
         """Read multiple token K vectors via Tutti GPU-direct DMA.
 
         Each batch issues a single ``load_chunks_to_hbm`` call against the
@@ -472,6 +473,9 @@ class TuttiIndexerBlockStore:
         Args:
             token_ids: Token ids to read.  Returned bytes follow the input
                 order (not sorted).
+            io_priority: Tutti admission class for this read.
+            should_continue: Optional speculative cancellation predicate.
+            deadline_monotonic: Optional absolute speculative deadline.
 
         Returns:
             List of bytes, one entry per ``token_id`` with length
@@ -492,15 +496,17 @@ class TuttiIndexerBlockStore:
         # synthetic CacheEngineKey carries the layer+token-range identity in
         # its chunk_hash so logging is debuggable even if the request is
         # batched with others later.
-        loader = self._storage._tutti_loader  # noqa: SLF001 — single owner
-        memory_objs = loader.load_chunks_to_hbm(
-            [request.key],
-            [request.disk_meta],
-            shapes_per_key=None,
-            file_offsets=[request.file_offset],
-            read_ranges_per_key=[request.read_ranges],
+        memory_objs = self._storage.load_read_request(
+            request,
+            io_priority=io_priority,
+            should_continue=should_continue,
+            deadline_monotonic=deadline_monotonic,
         )
         if not memory_objs or memory_objs[0] is None:
+            if io_priority == "speculative":
+                raise _SpeculativeReadCancelled(
+                    "Tutti declined an unsubmitted speculative indexer read"
+                )
             raise RuntimeError(
                 f"Tutti load_chunks_to_hbm returned no payload for indexer "
                 f"layer {self._slot.layer_id} request "
@@ -558,9 +564,7 @@ class TuttiIndexerBlockStore:
             ValueError: If ``data`` size or ``token_id`` is invalid.
         """
         if len(data) != self._token_bytes:
-            raise ValueError(
-                f"Expected {self._token_bytes} bytes, got {len(data)}"
-            )
+            raise ValueError(f"Expected {self._token_bytes} bytes, got {len(data)}")
         self._storage.write_bytes(self._slot, int(token_id), data)
 
     def write_tokens_contiguous(self, start_token_id: int, data: bytes) -> None:
@@ -628,11 +632,16 @@ class IndexerHBMPool:
         )
         # pool slot → global token ID (-1 = empty)
         self.pool_ids: torch.Tensor = torch.full(
-            (self._pool_size,), -1, dtype=torch.int64, device=device,
+            (self._pool_size,),
+            -1,
+            dtype=torch.int64,
+            device=device,
         )
         # block_table for fp8_fp4_paged_mqa_logits: [1, pool_size] int32
         self.block_table: torch.Tensor = torch.arange(
-            num_blocks, dtype=torch.int32, device=device,
+            num_blocks,
+            dtype=torch.int32,
+            device=device,
         ).unsqueeze(0)
 
         # CPU-side index structures
@@ -669,8 +678,9 @@ class IndexerHBMPool:
             return slot
 
         slot = self._free.pop() if self._free else self._evict_one()
-        self._write_slot(slot, data)
-        self.pool_ids[slot] = token_id
+        with torch.inference_mode():
+            self._write_slot(slot, data)
+            self.pool_ids[slot] = token_id
         self._id_to_slot[token_id] = slot
         self._lru_ordinary[slot] = None
         return slot
@@ -700,30 +710,38 @@ class IndexerHBMPool:
         if not token_ids:
             return
 
-        rows = token_bytes.to(device=self.pool_tensor.device, dtype=torch.uint8)
-        n = len(token_ids)
-        slots = torch.arange(n, dtype=torch.long, device=self.pool_tensor.device)
-        block_idx = slots // self.block_size
-        block_offset = slots % self.block_size
-        value_offsets = (
-            block_offset.unsqueeze(1) * self._head_dim
-            + torch.arange(self._head_dim, dtype=torch.long, device=self.pool_tensor.device)
-        )
-        scale_offsets = (
-            self.block_size * self._head_dim
-            + block_offset.unsqueeze(1) * self._scale_bytes
-            + torch.arange(
-                self._scale_bytes, dtype=torch.long, device=self.pool_tensor.device
+        with torch.inference_mode():
+            rows = token_bytes.to(device=self.pool_tensor.device, dtype=torch.uint8)
+            n = len(token_ids)
+            slots = torch.arange(n, dtype=torch.long, device=self.pool_tensor.device)
+            block_idx = slots // self.block_size
+            block_offset = slots % self.block_size
+            value_offsets = block_offset.unsqueeze(1) * self._head_dim + torch.arange(
+                self._head_dim, dtype=torch.long, device=self.pool_tensor.device
             )
-        )
-        flat_blocks = self.pool_tensor.view(self.pool_tensor.shape[0], -1)
-        flat_blocks[block_idx.unsqueeze(1), value_offsets] = rows[:, : self._head_dim]
-        flat_blocks[block_idx.unsqueeze(1), scale_offsets] = rows[:, self._head_dim :]
+            scale_offsets = (
+                self.block_size * self._head_dim
+                + block_offset.unsqueeze(1) * self._scale_bytes
+                + torch.arange(
+                    self._scale_bytes,
+                    dtype=torch.long,
+                    device=self.pool_tensor.device,
+                )
+            )
+            flat_blocks = self.pool_tensor.view(self.pool_tensor.shape[0], -1)
+            flat_blocks[block_idx.unsqueeze(1), value_offsets] = rows[
+                :, : self._head_dim
+            ]
+            flat_blocks[block_idx.unsqueeze(1), scale_offsets] = rows[
+                :, self._head_dim :
+            ]
 
-        self.pool_ids[:n] = torch.tensor(
-            token_ids, dtype=self.pool_ids.dtype, device=self.pool_ids.device
-        )
-        self.pool_ids[n:] = -1
+            self.pool_ids[:n] = torch.tensor(
+                token_ids,
+                dtype=self.pool_ids.dtype,
+                device=self.pool_ids.device,
+            )
+            self.pool_ids[n:] = -1
         self._id_to_slot = {int(tid): idx for idx, tid in enumerate(token_ids)}
         self._free = list(range(n, self._pool_size))
         self._lru_ordinary = OrderedDict((idx, None) for idx in range(n))
@@ -775,7 +793,12 @@ class IndexerHBMPool:
 
     def reset(self) -> None:
         """Clear all pool metadata before loading a new sequence."""
-        self.pool_ids.fill_(-1)
+        # ``pool_ids`` is created while the model executes under
+        # ``torch.inference_mode``. Reset can run later on the asynchronous
+        # prefill-eviction worker, where inference mode is thread-local and
+        # therefore no longer inherited.
+        with torch.inference_mode():
+            self.pool_ids.fill_(-1)
         self._id_to_slot.clear()
         self._free = list(range(self._pool_size))
         self._lru_ordinary.clear()
@@ -818,9 +841,7 @@ class IndexerHBMPool:
     def _write_slot(self, slot: int, data: bytes) -> None:
         """Write interleaved token bytes into the packed block layout."""
         if len(data) != self._token_bytes:
-            raise ValueError(
-                f"Expected {self._token_bytes} bytes, got {len(data)}"
-            )
+            raise ValueError(f"Expected {self._token_bytes} bytes, got {len(data)}")
         raw = torch.frombuffer(bytearray(data), dtype=torch.uint8)
         block_idx = slot // self.block_size
         block_offset = slot % self.block_size
@@ -852,6 +873,7 @@ class IndexerHBMPool:
 # ---------------------------------------------------------------------------
 # Top-level manager
 # ---------------------------------------------------------------------------
+
 
 class IndexerSSDManager:
     """Manages SSD-backed HBM pools for all CSA Indexer layers in DeepSeek V4.
@@ -913,8 +935,7 @@ class IndexerSSDManager:
 
         # Per-layer HBM pool
         self._pools: Dict[int, IndexerHBMPool] = {
-            lid: IndexerHBMPool(pool_size, token_bytes, device)
-            for lid in csa_layer_ids
+            lid: IndexerHBMPool(pool_size, token_bytes, device) for lid in csa_layer_ids
         }
         # Per-layer SSD store; backend depends on whether a Tutti storage is
         # attached.  The legacy IndexerBlockStore writes per-layer .bin files
@@ -922,8 +943,7 @@ class IndexerSSDManager:
         # GPU-direct NVMe path against a shared pre-reserved raw region.
         if tutti_storage is not None:
             self._stores: Dict[int, Any] = {
-                lid: TuttiIndexerBlockStore(tutti_storage, lid)
-                for lid in csa_layer_ids
+                lid: TuttiIndexerBlockStore(tutti_storage, lid) for lid in csa_layer_ids
             }
             logger.info(
                 "IndexerSSDManager: using Tutti GPU-direct backend; layers=%d "
@@ -945,9 +965,17 @@ class IndexerSSDManager:
 
         # Async I/O
         self._executor = ThreadPoolExecutor(max_workers=io_workers)
-        self._proxy_executor: Optional[ThreadPoolExecutor] = None
-        if _PROXY_ASYNC_ENABLED:
-            self._proxy_executor = ThreadPoolExecutor(max_workers=_PROXY_ASYNC_WORKERS)
+        # A single worker preserves per-layer CPU collective ordering across
+        # ranks while keeping proxy completion off the model-forward thread.
+        self._proxy_executor = ThreadPoolExecutor(max_workers=1)
+        # Do not run Tutti I/O on the ordered collective worker.  A speculative
+        # read synchronizes its private CUDA I/O stream batch by batch; keeping
+        # that work on _proxy_executor serializes later layers behind the full
+        # NVMe walk even after their proxy kernels have completed.
+        self._proxy_io_executor = ThreadPoolExecutor(
+            max_workers=max(2, min(int(io_workers), 4))
+        )
+        self._closed = False
         self._lock = threading.Lock()
         # pending async read results: layer_id → list of (token_id, Future[bytes])
         self._pending: Dict[int, List[Tuple[int, "Future[bytes]"]]] = {
@@ -963,6 +991,9 @@ class IndexerSSDManager:
         self._last_proxy_topk: Dict[int, Optional[List[int]]] = {
             lid: None for lid in csa_layer_ids
         }
+        self._last_proxy_blocks: Dict[int, Optional[List[int]]] = {
+            lid: None for lid in csa_layer_ids
+        }
         self._decoder_layers: Dict[int, Any] = {}
 
         # Future tracking for post-prefill async SSD eviction.
@@ -976,6 +1007,22 @@ class IndexerSSDManager:
         self._proxy_futures: Dict[int, List[Future[None]]] = {
             lid: [] for lid in csa_layer_ids
         }
+        self._expired_proxy_layers: Set[int] = set()
+        self._proxy_block_budget = max(
+            1,
+            _env_int("LMCACHE_CSA_PREFETCH_BLOCK_BUDGET", 256),
+        )
+        # One reusable proxy stream per target layer. Different target layers
+        # still overlap, while repeated requests avoid creating a fresh CUDA
+        # stream for every fire. A single per-device stream is intentionally
+        # not used: it serializes independent lookahead levels and previously
+        # caused a large steady-state TTFT regression.
+        self._proxy_streams: Dict[int, torch.cuda.Stream] = {}
+        self._proxy_streams_lock = threading.Lock()
+        self._proxy_cpu_selection_pool: Dict[int, List[torch.Tensor]] = {
+            lid: [] for lid in csa_layer_ids
+        }
+        self._proxy_buffers_lock = threading.Lock()
         self._direct_seed_tail_buffers: Dict[int, List[Tuple[int, torch.Tensor]]] = {
             lid: [] for lid in csa_layer_ids
         }
@@ -994,7 +1041,11 @@ class IndexerSSDManager:
         # memory on the second request).  True-topK miss correction remains
         # the correctness net for any blocks the single fire missed.
         self._csa_fired_request_id: str = ""
-        self._csa_fired_layers: Set[int] = set()
+        self._csa_fired_levels: Set[Tuple[int, int]] = set()
+        self._prefetch_lookahead: Dict[int, int] = {lid: 0 for lid in csa_layer_ids}
+        self._cp_proxy_fallback_logged: Set[Tuple[int, str]] = set()
+        self._hca_fired_request_id: str = ""
+        self._hca_fired_layers: Set[int] = set()
 
         # CSA layer index → position in csa_layer_ids list (for "next CSA layer" lookup)
         self._csa_pos: Dict[int, int] = {lid: i for i, lid in enumerate(csa_layer_ids)}
@@ -1019,19 +1070,11 @@ class IndexerSSDManager:
         self._attention_profile_hits = 0
         self._attention_profile_total = 0
         self._timing_seen = 0
-        logger.info(
-            "IndexerSSDManager: config residual_proxy=%s reuse_prefetch=%s "
-            "decode_prefetch=%s prefill_proxy=%s "
-            "proxy_async=%s proxy_async_workers=%d "
-            "csa_attention_kv_microbatch_rows=%d",
-            _RESIDUAL_PROXY_ENABLED,
-            self.reuse_prefetch_enabled(),
-            _DECODE_PREFETCH_ENABLED,
-            _PREFILL_RESIDUAL_PROXY_ENABLED,
-            _PROXY_ASYNC_ENABLED,
-            _PROXY_ASYNC_WORKERS,
-            _CSA_ATTENTION_KV_PROXY_MICROBATCH_ROWS,
-        )
+        self._nsys_seen_request_id = ""
+        self._nsys_seen_requests = 0
+        self._nsys_capture_active = False
+        self._nsys_capture_complete = False
+        logger.info("IndexerSSDManager: canonical L2 pipeline enabled")
 
     def _log_timing(self, event: str, layer_id: int, **fields: Any) -> None:
         """Emit one lightweight timing line when timing diagnostics are enabled."""
@@ -1060,27 +1103,99 @@ class IndexerSSDManager:
         """Register a decoder layer for optional residual proxy prefetch."""
         self._decoder_layers[layer_id] = decoder_layer
 
-    def prefill_eviction_enabled(self) -> bool:
-        """Return True when post-prefill SSD/pool initialization is enabled."""
-        return _PREFILL_EVICTION_ENABLED or os.path.exists(
-            _PREFILL_EVICTION_FLAG_FILE
-        )
+    def configure_prefetch_lookahead(self, by_target_layer: Dict[int, int]) -> None:
+        """Configure demand-only or two-layer prefetch per target CSA.
 
-    def reuse_prefetch_enabled(self) -> bool:
-        """Return True when LMCache-hit prefill may seed CSA prefetch state."""
-        return _REUSE_PREFETCH_ENABLED
+        Args:
+            by_target_layer: Mapping from target transformer layer id to a
+                lookahead of zero or two layers. Zero disables proxy
+                prediction while preserving true-indexer miss correction.
 
-    def decode_prefetch_enabled(self) -> bool:
-        """Return True when per-token decode CSA prefetch/correction is enabled."""
-        return _DECODE_PREFETCH_ENABLED
-
-    def prefill_proxy_enabled(self) -> bool:
-        """Return True when prefill-stage CSA residual proxy is enabled."""
-        return _PREFILL_RESIDUAL_PROXY_ENABLED
+        Raises:
+            ValueError: If a target is unknown or lookahead is not zero or two.
+        """
+        configured = dict(self._prefetch_lookahead)
+        for layer_id, lookahead in by_target_layer.items():
+            target = int(layer_id)
+            level = int(lookahead)
+            if target not in self._csa_pos:
+                raise ValueError(f"unknown CSA target layer {target}")
+            if level not in (0, 2):
+                raise ValueError("CSA prefetch lookahead must be 0 or 2")
+            configured[target] = level
+        self._prefetch_lookahead = configured
 
     def csa_attention_kv_prefetch_attached(self) -> bool:
         """Return True when CSA attention-KV prefetch is attached."""
         return getattr(self, "_csa_attention_kv_manager", None) is not None
+
+    def start_nsys_capture_for_layer(self, layer_id: int, request_id: str) -> None:
+        """Start one profiler-gated capture at the first configured L2 target.
+
+        Args:
+            layer_id: CSA target whose proxy prediction is being submitted.
+            request_id: Active request identifier used to skip warmup requests.
+        """
+        if not _env_flag("LMCACHE_NSYS_CAPTURE"):
+            return
+        if self._nsys_capture_active or self._nsys_capture_complete:
+            return
+        enabled_targets = sorted(
+            target
+            for target, lookahead in self._prefetch_lookahead.items()
+            if lookahead == 2
+        )
+        if not enabled_targets or int(layer_id) != enabled_targets[0]:
+            return
+        if request_id != self._nsys_seen_request_id:
+            self._nsys_seen_request_id = request_id
+            self._nsys_seen_requests += 1
+        skip = max(0, _env_int("LMCACHE_NSYS_CAPTURE_SKIP_REQUESTS", 0))
+        if self._nsys_seen_requests <= skip:
+            return
+        try:
+            torch.cuda.profiler.start()
+            self._nsys_capture_active = True
+            logger.info(
+                "IndexerSSDManager: NSYS_CAPTURE start target_layer=%d "
+                "request_index=%d",
+                layer_id,
+                self._nsys_seen_requests,
+            )
+        except Exception:
+            self._nsys_capture_complete = True
+            logger.exception("IndexerSSDManager: NSYS_CAPTURE start failed")
+
+    def finish_nsys_capture_for_layer(self, layer_id: int) -> None:
+        """Stop a gated Nsight Systems capture after the final CSA target.
+
+        Args:
+            layer_id: CSA target whose true-indexer correction just completed.
+
+        Notes:
+            This is a no-op unless ``LMCACHE_NSYS_CAPTURE`` is enabled and a
+            capture was started by the first configured L2 target.
+        """
+        if not self._nsys_capture_active:
+            return
+        enabled_targets = sorted(
+            target
+            for target, lookahead in self._prefetch_lookahead.items()
+            if lookahead == 2
+        )
+        if not enabled_targets or int(layer_id) != enabled_targets[-1]:
+            return
+        try:
+            torch.cuda.profiler.stop()
+            logger.info(
+                "IndexerSSDManager: NSYS_CAPTURE stop target_layer=%d",
+                layer_id,
+            )
+        except Exception:
+            logger.exception("IndexerSSDManager: NSYS_CAPTURE stop failed")
+        finally:
+            self._nsys_capture_active = False
+            self._nsys_capture_complete = True
 
     def layer_initialized(self, layer_id: int) -> bool:
         """Return True when *layer_id* has an initialized SSD/pool cursor."""
@@ -1136,8 +1251,7 @@ class IndexerSSDManager:
             )
         if start % 4 != 0 or end % 4 != 0:
             raise ValueError(
-                f"CSA LMCache range [{start}, {end}) is not aligned to "
-                "compress_ratio 4"
+                f"CSA LMCache range [{start}, {end}) is not aligned to compress_ratio 4"
             )
         if len(layer_ids) > int(memory_tensor.shape[1]):
             raise ValueError(
@@ -1153,10 +1267,7 @@ class IndexerSSDManager:
         total_rows = (total_logical_tokens or end) // 4
         if total_rows <= 0:
             return 0
-        tail_rows = max(
-            1,
-            _env_int("LMCACHE_INDEXER_DIRECT_SEED_TAIL_ROWS", self._pool_size),
-        )
+        tail_rows = self._pool_size
         tail_rows = min(tail_rows, total_rows)
         tail_start = total_rows - tail_rows
         seq_end = seq_start + rows_to_seed
@@ -1176,9 +1287,7 @@ class IndexerSSDManager:
         cpu_ms = (time.perf_counter() - t_cpu0) * 1000.0 if timing else 0.0
         t_contig0 = time.perf_counter() if timing else 0.0
         tensor_cpu = tensor_cpu.contiguous()
-        contiguous_ms = (
-            (time.perf_counter() - t_contig0) * 1000.0 if timing else 0.0
-        )
+        contiguous_ms = (time.perf_counter() - t_contig0) * 1000.0 if timing else 0.0
 
         seeded = 0
         reshape_ms = 0.0
@@ -1210,17 +1319,9 @@ class IndexerSSDManager:
                     f"{self._token_bytes} bytes"
                 )
 
-            store = self._stores[layer_id]
-            t_write0 = time.perf_counter() if timing else 0.0
-            store.write_tokens_contiguous(
-                overlap_start,
-                token_bytes.contiguous().numpy().tobytes(),
-            )
-            if timing:
-                write_ms += (time.perf_counter() - t_write0) * 1000.0
-
             t_load0 = time.perf_counter() if timing else 0.0
             load_ids: List[int] = []
+            tail_complete = False
             finished_tail = overlap_end >= total_rows
             with self._lock:
                 if overlap_start == tail_start:
@@ -1246,24 +1347,37 @@ class IndexerSSDManager:
                     if expected_start >= total_rows:
                         break
                 if chunks and expected_start >= total_rows:
+                    tail_complete = True
                     pool = self._pools[layer_id]
                     pool.reset()
                     load_ids = list(range(tail_start, total_rows))
                     tail_bytes = torch.cat(chunks, dim=0)[: len(load_ids)]
+                    # Persist the assembled tail once per layer. The old path
+                    # wrote every retrieve chunk independently, turning an 8K
+                    # hit into 32 chunks x 30 layers = 960 tiny Tutti writes.
+                    # The tail buffer already owns every chunk, so one
+                    # contiguous write preserves the exact bytes and reduces
+                    # the write count to 30.
+                    t_write0 = time.perf_counter() if timing else 0.0
+                    self._stores[layer_id].write_tokens_contiguous(
+                        tail_start,
+                        tail_bytes.contiguous().numpy().tobytes(),
+                    )
+                    if timing:
+                        write_ms += (time.perf_counter() - t_write0) * 1000.0
                     pool.load_tokens(load_ids, tail_bytes.contiguous())
                     pool.protect_only(load_ids)
             if timing:
                 load_ms += (time.perf_counter() - t_load0) * 1000.0
 
             t_state0 = time.perf_counter() if timing else 0.0
-            if finished_tail:
+            if finished_tail and tail_complete:
                 with self._lock:
                     self._decode_cursor[layer_id] = max(
                         self._decode_cursor.get(layer_id, 0),
                         total_rows,
                     )
                     self._prev_topk[layer_id] = list(load_ids[:1024])
-                    self._ready_futures[layer_id] = None
             if timing:
                 state_ms += (time.perf_counter() - t_state0) * 1000.0
             seeded += 1
@@ -1295,6 +1409,155 @@ class IndexerSSDManager:
             )
         return seeded
 
+    def submit_seed_range_from_lmcache_group(
+        self,
+        layer_ids: Sequence[int],
+        memory_tensor: torch.Tensor,
+        start: int,
+        end: int,
+        total_logical_tokens: Optional[int] = None,
+    ) -> Optional[Future[int]]:
+        """Snapshot a retrieve staging view and seed it after the callback.
+
+        Tutti invokes the GPU connector while holding its loader I/O lock. A
+        direct call to :meth:`seed_range_from_lmcache_group` can therefore
+        deadlock when the indexer store is backed by the same loader: the seed
+        writes raw extents and tries to acquire that lock again. This method
+        synchronously copies only the final HBM-tail overlap to owned CPU
+        memory, then performs all store writes and state updates on the
+        manager's executor after the retrieve callback can return.
+
+        Args:
+            layer_ids: Transformer CSA layer ids in LMCache group order.
+            memory_tensor: Retrieve staging tensor. It may become invalid as
+                soon as the current streaming callback returns.
+            start: Logical token start offset of the retrieve chunk.
+            end: Logical token end offset of the retrieve chunk.
+            total_logical_tokens: Total logical tokens restored for the
+                request. Defaults to ``end``.
+
+        Returns:
+            A future for the number of seeded layers, or ``None`` when this
+            chunk does not overlap the configured direct-seed tail.
+
+        Raises:
+            ValueError: If the tensor shape or token range is incompatible.
+        """
+        if not layer_ids or memory_tensor.numel() == 0 or end <= start:
+            return None
+        if memory_tensor.ndim != 4:
+            raise ValueError(
+                "CSA LMCache group tensor must have shape "
+                "[kv_size, num_layers, rows, hidden_dim], got "
+                f"{tuple(memory_tensor.shape)}"
+            )
+        if start % 4 != 0 or end % 4 != 0:
+            raise ValueError(
+                f"CSA LMCache range [{start}, {end}) is not aligned to compress_ratio 4"
+            )
+        layer_ids_tuple = tuple(int(layer_id) for layer_id in layer_ids)
+        if len(layer_ids_tuple) > int(memory_tensor.shape[1]):
+            raise ValueError(
+                f"CSA LMCache group has {memory_tensor.shape[1]} layers but "
+                f"{len(layer_ids_tuple)} layer ids were provided"
+            )
+
+        seq_start = start // 4
+        rows_in_chunk = min((end - start) // 4, int(memory_tensor.shape[2]))
+        total_rows = int(total_logical_tokens or end) // 4
+        if rows_in_chunk <= 0 or total_rows <= 0:
+            return None
+        tail_rows = self._pool_size
+        tail_start = total_rows - min(tail_rows, total_rows)
+        overlap_start = max(seq_start, tail_start)
+        overlap_end = min(seq_start + rows_in_chunk, total_rows)
+        if overlap_start >= overlap_end:
+            return None
+
+        local_start = overlap_start - seq_start
+        local_end = local_start + (overlap_end - overlap_start)
+        staging_slice = memory_tensor[
+            :,
+            : len(layer_ids_tuple),
+            local_start:local_end,
+            :,
+        ].detach()
+        # ``copy=True`` is required for CPU-backed staging too: contiguous()
+        # alone may return an alias whose storage is recycled after callback.
+        snapshot = staging_slice.to(
+            device="cpu",
+            non_blocking=False,
+            copy=True,
+        ).contiguous()
+
+        def _seed_after_previous(
+            previous_futures: tuple[Future[Any], ...],
+        ) -> int:
+            for previous_future in previous_futures:
+                previous_future.result(timeout=self._prefill_ready_timeout_s)
+            try:
+                return self.seed_range_from_lmcache_group(
+                    layer_ids_tuple,
+                    snapshot,
+                    overlap_start * 4,
+                    overlap_end * 4,
+                    total_logical_tokens=total_rows * 4,
+                )
+            except OSError as exc:
+                # Preserve the old synchronous path's best-effort contract:
+                # an unavailable indexer store must not invalidate an LMCache
+                # hit. The official indexer can repopulate its pool later.
+                logger.warning(
+                    "IndexerSSDManager: deferred direct seed skipped because "
+                    "the indexer store is unavailable: %s",
+                    exc,
+                )
+                return 0
+
+        with self._lock:
+            previous_futures = tuple(
+                dict.fromkeys(
+                    previous
+                    for layer_id in layer_ids_tuple
+                    if (previous := self._ready_futures.get(layer_id)) is not None
+                )
+            )
+            # Capture and publish the dependency atomically so concurrent
+            # retrieve callbacks cannot fork two writers from the same tail.
+            future = self._executor.submit(
+                _seed_after_previous,
+                previous_futures,
+            )
+            for layer_id in layer_ids_tuple:
+                if layer_id in self._ready_futures:
+                    self._ready_futures[layer_id] = future
+        return future
+
+    def wait_for_seed(self, layer_id: int) -> bool:
+        """Wait for the latest deferred LMCache seed of one CSA layer.
+
+        Args:
+            layer_id: Target CSA layer id.
+
+        Returns:
+            ``True`` when no seed is pending or the latest seed completed.
+
+        Raises:
+            TimeoutError: If the configured prefill-ready timeout expires.
+            Exception: Propagates a deferred seed failure to the consumer.
+        """
+        with self._lock:
+            future = self._ready_futures.get(layer_id)
+        if future is None:
+            return True
+        future.result(timeout=self._prefill_ready_timeout_s)
+        if self._device.type == "cuda":
+            torch.cuda.synchronize(self._device)
+        with self._lock:
+            if self._ready_futures.get(layer_id) is future:
+                self._ready_futures[layer_id] = None
+        return True
+
     # ------------------------------------------------------------------
     # Called from DeepseekV4DecoderLayer.forward, before self.ffn()
     # ------------------------------------------------------------------
@@ -1305,226 +1568,92 @@ class IndexerSSDManager:
         residual_f: Optional[torch.Tensor] = None,
         positions: Optional[torch.Tensor] = None,
         llama_4_scaling: Optional[torch.Tensor] = None,
-        residual_proxy: Optional[torch.Tensor] = None,
+        prefetch_level: int = 2,
     ) -> None:
-        """Fire async NVMe reads for the predicted delta of *layer_id*.
+        """Schedule the canonical two-layer CSA prediction.
 
-        When ``LMCACHE_INDEXER_ENABLE_RESIDUAL_PROXY=1``, DeepSeek V4 passes
-        the attention HC-post state from the previous block. The manager runs
-        the target CSA layer's V4 ``HC_pre(...hc_attn...)`` + attention norm +
-        indexer projection on that proxy state to predict token IDs. During
-        prefill, CSA attention-KV prefetch uses only that target-layer proxy
-        prediction; it does not fall back to true top-K from another CSA layer
-        or step. Tokens already in the HBM pool are skipped. Final correctness
-        is handled later by :meth:`correct_true_topk`, after the target layer's
-        true Lightning Indexer result is known.
+        The decoder calls this method once, from the FFN-entry hook exactly two
+        transformer layers before the target CSA layer. GPU proxy scoring is
+        submitted on a side stream and completion/I/O dispatch is handled by
+        the proxy executor, so the source layer never waits for SSD I/O.
 
         Args:
-            layer_id: CSA layer for which to prefetch.
-            residual_f: DeepSeek V4 HC state after attention and before FFN.
-            positions: Decode positions for the current token.
-            llama_4_scaling: Unused compatibility argument for older call sites.
-            residual_proxy: Deprecated compatibility alias for ``residual_f``.
+            layer_id: Target CSA transformer layer.
+            residual_f: Source layer post-attention residual.
+            positions: Query positions aligned with the residual.
+            llama_4_scaling: Optional compatibility input for DSv4 variants.
+            prefetch_level: Must be two. No L1 prediction path exists.
+
+        Raises:
+            ValueError: If the caller requests a non-L2 prediction.
         """
-        proxy_state = residual_f if residual_f is not None else residual_proxy
-        proxy_rows = _proxy_num_rows(proxy_state)
-        is_prefill_proxy = proxy_rows > 1
-        csa_attention_kv_prefetch_attached = (
-            getattr(self, "_csa_attention_kv_manager", None) is not None
+        if prefetch_level != 2:
+            raise ValueError("prefetch_level must be 2")
+        configured_lookahead = self._prefetch_lookahead.get(int(layer_id), 0)
+        if configured_lookahead != 2:
+            self._log_timing(
+                "prefill_fire_async_skip",
+                layer_id,
+                reason="prediction_disabled",
+                configured_lookahead=configured_lookahead,
+            )
+            return
+
+        manager = getattr(self, "_csa_attention_kv_manager", None)
+        if manager is None or residual_f is None or positions is None:
+            self._log_residual_proxy_skip(layer_id, "canonical_l2_inputs_missing")
+            return
+        residual_f, positions, aligned_rows = _flatten_proxy_state_for_positions(
+            residual_f,
+            positions,
         )
-        if is_prefill_proxy:
-            prefill_proxy_allowed = (
-                _PREFILL_RESIDUAL_PROXY_ENABLED
-                or csa_attention_kv_prefetch_attached
-            )
-            if not prefill_proxy_allowed:
-                self._log_residual_proxy_skip(layer_id, "prefill_proxy_disabled")
-                return
-        elif not _DECODE_PREFETCH_ENABLED:
+        if aligned_rows <= 1:
+            # The production L2 pipeline is for cache-hit prefill/recompute.
+            # Decode continues through the official indexer path.
+            self._log_residual_proxy_skip(layer_id, "canonical_l2_requires_prefill")
             return
-        prev = None
+        if self._decode_cursor.get(layer_id, 0) <= 0:
+            self._log_residual_proxy_skip(layer_id, "ssd_uninitialized")
+            return
+
+        request_id = str(getattr(manager, "active_request_id", ""))
+        self.start_nsys_capture_for_layer(layer_id, request_id)
+        fire_key = (int(layer_id), 2)
+        with self._lock:
+            if request_id != self._csa_fired_request_id:
+                self._csa_fired_request_id = request_id
+                self._csa_fired_levels.clear()
+                self._expired_proxy_layers.clear()
+                for target_layer_id in self._csa_layer_ids:
+                    self._last_proxy_blocks[target_layer_id] = None
+            if request_id and fire_key in self._csa_fired_levels:
+                return
+            # Reserve before launching so duplicate decoder hooks cannot race
+            # into two predictions for the same request and target.
+            if request_id:
+                self._csa_fired_levels.add(fire_key)
+
         t0 = time.perf_counter()
-        proxy_ms = 0.0
-        filter_ms = 0.0
-        submit_ms = 0.0
-        cursor = self._decode_cursor.get(layer_id, 0)
-        if cursor <= 0:
-            if layer_id not in self._debug_fire_no_prev_logged:
-                self._debug_fire_no_prev_logged.add(layer_id)
-                logger.debug(
-                    "IndexerSSDManager: fire_async_for_layer layer %d skipped "
-                    "because SSD state is not initialized yet",
-                    layer_id,
-                )
-            return
-        if _RESIDUAL_PROXY_ENABLED and proxy_state is not None and positions is not None:
-            proxy_state, positions, aligned_rows = _flatten_proxy_state_for_positions(
-                proxy_state,
-                positions,
-            )
-            is_prefill_proxy = aligned_rows > 1
-            if (
-                is_prefill_proxy
-                and csa_attention_kv_prefetch_attached
-            ):
-                # Bulk read-ahead mode: the CSA manager's per-request walker
-                # reads every layer's slab in layer order, so the per-layer
-                # proxy prediction (GPU scoring + microbatch fires) is pure
-                # overhead — skip the whole prefill fire path.
-                manager = getattr(self, "_csa_attention_kv_manager", None)
-                if getattr(manager, "bulk_read_ahead_active", False):
-                    return
-                # Fire once per (request, layer): the prediction is over the
-                # fixed NVMe-resident prefix, so chunk 2..N of the same
-                # request would recompute an identical top-K (O(prefix) GPU
-                # work each) only for _submit_reads to drop every block as
-                # already-resident.  See _csa_fired_layers docstring.
-                req_id = str(getattr(manager, "active_request_id", ""))
-                if req_id and req_id != self._csa_fired_request_id:
-                    self._csa_fired_request_id = req_id
-                    self._csa_fired_layers.clear()
-                if req_id and layer_id in self._csa_fired_layers:
-                    self._log_timing(
-                        "prefill_fire_async",
-                        layer_id,
-                        total_ms=f"{(time.perf_counter() - t0) * 1000.0:.3f}",
-                        proxy_ms="0.000",
-                        filter_ms="0.000",
-                        submit_ms="0.000",
-                        rows=aligned_rows,
-                        mode="csa_attention_kv_already_fired_this_request",
-                    )
-                    return
-                submitted = self._submit_csa_attention_kv_proxy_microbatches_async(
-                    layer_id,
-                    proxy_state,
-                    positions,
-                    llama_4_scaling,
-                    microbatch_rows=_CSA_ATTENTION_KV_PROXY_MICROBATCH_ROWS,
-                    fire_start=t0,
-                )
-                if submitted and req_id:
-                    self._csa_fired_layers.add(layer_id)
-                if submitted:
-                    self._log_timing(
-                        "prefill_fire_async",
-                        layer_id,
-                        total_ms=f"{(time.perf_counter() - t0) * 1000.0:.3f}",
-                        proxy_ms="0.000",
-                        filter_ms="0.000",
-                        submit_ms="0.000",
-                        rows=aligned_rows,
-                        microbatch_rows=_CSA_ATTENTION_KV_PROXY_MICROBATCH_ROWS,
-                        prev=0,
-                        missing=0,
-                        mode="csa_attention_kv_microbatch_submit",
-                    )
-                else:
-                    self._log_residual_proxy_skip(
-                        layer_id,
-                        "csa_attention_kv_microbatch_submit_failed",
-                    )
-                return
-            run_native_proxy = True
-            if is_prefill_proxy:
-                original_shape = tuple(proxy_state.shape)
-                # Normal indexer-cache prefill proxy remains experimental.
-                # CSA-attention-KV prefetch still needs the target layer's
-                # learned HC-proxy top-K during cache-hit prefill; it only
-                # mirrors that prediction to Tutti and leaves
-                # prefill_proxy_enabled() false for the old correction path.
-                run_native_proxy = (
-                    _PREFILL_NATIVE_PROXY_TOPK_ENABLED
-                    or csa_attention_kv_prefetch_attached
-                )
-                if layer_id not in self._debug_residual_proxy_attempt_logged:
-                    logger.debug(
-                        "IndexerSSDManager: residual_proxy prefill layer %d "
-                        "using_all_rows=%d original_shape=%s compute_shape=%s "
-                        "native_topk=%s",
-                        layer_id,
-                        aligned_rows,
-                        original_shape,
-                        tuple(proxy_state.shape),
-                        run_native_proxy,
-                    )
-            if layer_id not in self._debug_residual_proxy_attempt_logged:
-                self._debug_residual_proxy_attempt_logged.add(layer_id)
-                logger.debug(
-                    "IndexerSSDManager: residual_proxy_attempt layer %d "
-                    "proxy_shape=%s positions_shape=%s",
-                    layer_id,
-                    tuple(proxy_state.shape),
-                    tuple(positions.shape),
-                )
-            if run_native_proxy:
-                t_proxy0 = time.perf_counter()
-                try:
-                    if self._should_run_proxy_async(proxy_state):
-                        if self._submit_residual_proxy_topk_async(
-                            layer_id,
-                            proxy_state,
-                            positions,
-                            llama_4_scaling,
-                            is_prefill_proxy=is_prefill_proxy,
-                            fire_start=t0,
-                        ):
-                            proxy_ms = (time.perf_counter() - t_proxy0) * 1000.0
-                            self._log_timing(
-                                "prefill_fire_async"
-                                if is_prefill_proxy
-                                else "fire_async",
-                                layer_id,
-                                total_ms=f"{(time.perf_counter() - t0) * 1000.0:.3f}",
-                                proxy_ms=f"{proxy_ms:.3f}",
-                                filter_ms="0.000",
-                                submit_ms="0.000",
-                                prev=0,
-                                missing=0,
-                                mode="proxy_async_submit",
-                            )
-                            return
-                    prev = self._residual_proxy_topk(
-                        layer_id,
-                        proxy_state,
-                        positions,
-                        llama_4_scaling,
-                    )
-                except Exception as exc:
-                    self._log_residual_proxy_skip(
-                        layer_id,
-                        f"native_proxy_exception={type(exc).__name__}",
-                    )
-                    logger.debug(
-                        "IndexerSSDManager: native residual proxy failed for "
-                        "layer %d",
-                        layer_id,
-                        exc_info=True,
-                    )
-                    prev = None
-                proxy_ms = (time.perf_counter() - t_proxy0) * 1000.0
-                self._last_proxy_topk[layer_id] = prev
-            elif is_prefill_proxy:
-                self._last_proxy_topk[layer_id] = None
-        if prev is None:
-            self._last_proxy_topk[layer_id] = None
-            if is_prefill_proxy:
-                self._log_residual_proxy_skip(
-                    layer_id,
-                    "csa_attention_kv_proxy_no_topk"
-                    if csa_attention_kv_prefetch_attached
-                    else "prefill_proxy_no_topk",
-                )
-                return
-            prev = self._prev_topk.get(layer_id)
-        self._submit_predicted_reads(
+        submitted = self._submit_csa_attention_kv_proxy_async(
             layer_id,
-            prev,
-            cursor,
-            is_prefill_proxy=is_prefill_proxy,
+            residual_f,
+            positions,
+            llama_4_scaling,
             fire_start=t0,
-            proxy_ms=proxy_ms,
-            mode="sync",
+            prefetch_level=2,
+        )
+        if not submitted:
+            with self._lock:
+                self._csa_fired_levels.discard(fire_key)
+            self._log_residual_proxy_skip(layer_id, "canonical_l2_submit_failed")
+            return
+        self._log_timing(
+            "prefill_fire_async",
+            layer_id,
+            total_ms=f"{(time.perf_counter() - t0) * 1000.0:.3f}",
+            rows=aligned_rows,
+            mode="canonical_l2_async_submit",
+            prefetch_level=2,
         )
 
     def attach_csa_attention_kv_manager(self, manager: Optional[Any]) -> None:
@@ -1540,52 +1669,148 @@ class IndexerSSDManager:
                 :class:`lmcache.v1.csa_attention_kv_prefetch_manager.CSAAttentionKVPrefetchManager`
                 instance, or ``None``.
         """
+        previous = getattr(self, "_csa_attention_kv_manager", None)
+        if previous is not None and previous is not manager:
+            clear_waiter = getattr(previous, "set_prediction_waiter", None)
+            if callable(clear_waiter):
+                clear_waiter(None)
         self._csa_attention_kv_manager = manager
+        if manager is not None:
+            set_waiter = getattr(manager, "set_prediction_waiter", None)
+            if callable(set_waiter):
+                set_waiter(self.wait_for_csa_attention_kv_prediction)
 
-    def _dispatch_csa_attention_kv_predicted(
+    def fire_residual_prefetch_for_layer(
         self,
         layer_id: int,
-        predicted_token_ids: Sequence[int],
+        residual_f: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        lookahead: int,
     ) -> None:
-        """Forward a predicted top-K to the CSA attention KV prefetcher.
-
-        Predicted token ids (CSA-compressed positions) are converted to
-        block ids using the vLLM IndexerCache block size constant
-        :data:`DEEPGEMM_PAGED_BLOCK_SIZE` (64).  Errors are swallowed and
-        logged so a malformed prediction never breaks the indexer-cache
-        prefetch path that owns this method's call site.
+        """Fire the one canonical L2 residual prediction for a target CSA.
 
         Args:
-            layer_id: CSA layer id whose prediction this is.
-            predicted_token_ids: Compressed token ids forming the predicted
-                top-K.
+            layer_id: Target CSA transformer layer id.
+            residual_f: Source layer's post-attention residual.
+            positions: Query positions aligned with ``residual_f``.
+            lookahead: Source-to-target distance. It must be two.
+
+        Raises:
+            ValueError: If ``lookahead`` is not two.
+        """
+        if lookahead != 2:
+            raise ValueError("lookahead must be 2")
+        configured_lookahead = self._prefetch_lookahead.get(int(layer_id), 0)
+        if configured_lookahead != lookahead:
+            self._log_timing(
+                "residual_prefetch_skip",
+                layer_id,
+                reason=(
+                    "prediction_disabled"
+                    if configured_lookahead == 0
+                    else "non_configured_lookahead"
+                ),
+                configured_lookahead=configured_lookahead,
+                lookahead=lookahead,
+            )
+            return
+        self.wait_for_seed(layer_id)
+        self._log_timing(
+            "l2_submit",
+            layer_id,
+            rows=_proxy_num_rows(residual_f),
+        )
+        with csa_pipeline_nvtx.range(
+            CsaNvtxEvent.L2_PROXY,
+            layer_id=layer_id - 2,
+            target_layer_id=layer_id,
+            request_id=str(
+                getattr(self._csa_attention_kv_manager, "active_request_id", "")
+            ),
+            attributes={"phase": "submit"},
+        ):
+            self.fire_async_for_layer(
+                layer_id,
+                residual_f=residual_f,
+                positions=positions,
+                prefetch_level=2,
+            )
+
+    def layer_fired_for_active_request(self, layer_id: int) -> bool:
+        """Return whether deterministic HCA I/O was scheduled this request."""
+        manager = getattr(self, "_csa_attention_kv_manager", None)
+        request_id = str(getattr(manager, "active_request_id", ""))
+        with self._lock:
+            return (
+                request_id == self._hca_fired_request_id
+                and int(layer_id) in self._hca_fired_layers
+            )
+
+    def fire_async_for_layers(
+        self,
+        layer_ids: Sequence[int],
+        positions: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Schedule deterministic HCA attention-KV reads in the FFN window.
+
+        Args:
+            layer_ids: Upcoming registered HCA transformer layer ids.
+            positions: Unused compatibility argument for decoder hooks.
+        """
+        del positions
+        manager = getattr(self, "_csa_attention_kv_manager", None)
+        fire_layer = getattr(manager, "fire_deterministic_layer", None)
+        track = getattr(manager, "track_layer_submission", None)
+        if not callable(fire_layer):
+            return
+        request_id = str(getattr(manager, "active_request_id", ""))
+        for raw_layer_id in layer_ids:
+            layer_id = int(raw_layer_id)
+            with self._lock:
+                if request_id != self._hca_fired_request_id:
+                    self._hca_fired_request_id = request_id
+                    self._hca_fired_layers.clear()
+                if layer_id in self._hca_fired_layers:
+                    continue
+                self._hca_fired_layers.add(layer_id)
+
+            def _fire(target_layer_id: int = layer_id) -> None:
+                fire_layer(target_layer_id)
+
+            future = self._executor.submit(_fire)
+            if callable(track):
+                track(layer_id, future)
+            self._log_timing(
+                "hca_deterministic_submit",
+                layer_id,
+                request_id=request_id,
+            )
+
+    def drain_for_layer(
+        self,
+        layer_id: int,
+        blocking: bool = True,
+    ) -> bool:
+        """Delegate an HCA consumption gate to the unified KV manager.
+
+        Args:
+            layer_id: Target HCA transformer layer id.
+            blocking: When ``False``, only report whether a scheduled future
+                is already complete; the production attention gate passes
+                ``True`` to preserve correctness.
+
+        Returns:
+            ``True`` when the layer is ready for attention.
         """
         manager = getattr(self, "_csa_attention_kv_manager", None)
-        if manager is None or not predicted_token_ids:
-            return
-        try:
-            block_ids = sorted(
-                {
-                    int(tid) // DEEPGEMM_PAGED_BLOCK_SIZE
-                    for tid in predicted_token_ids
-                    if int(tid) >= 0
-                }
-            )
-            if block_ids:
-                self._log_timing(
-                    "dispatch_csa_attention_kv_predicted",
-                    layer_id,
-                    predicted_tokens=len(predicted_token_ids),
-                    blocks=len(block_ids),
-                )
-                manager.fire_predicted_reads(layer_id, block_ids)
-        except Exception:
-            logger.exception(
-                "Failed to dispatch CSA attention KV predicted reads for "
-                "layer %d (%d ids)",
-                layer_id,
-                len(predicted_token_ids),
-            )
+        wait_for_layer = getattr(manager, "wait_for_layer", None)
+        if not callable(wait_for_layer):
+            return True
+        if not blocking:
+            ready = getattr(manager, "layer_submission_ready", None)
+            return bool(ready(int(layer_id))) if callable(ready) else False
+        return bool(wait_for_layer(int(layer_id)))
 
     def prepare_layer_async(self, layer_id: int) -> None:
         """Submit CSA ready/drain work before the target layer consumes it.
@@ -1605,11 +1830,7 @@ class IndexerSSDManager:
             has_pending = bool(self._pending.get(layer_id))
             if previous_drain is not None and not previous_drain.done():
                 return
-            if (
-                ready_fut is None
-                and not has_pending
-                and previous_drain is None
-            ):
+            if ready_fut is None and not has_pending and previous_drain is None:
                 return
 
         def _prepare() -> None:
@@ -1642,260 +1863,23 @@ class IndexerSSDManager:
 
         drain_future.add_done_callback(_clear_done)
 
-    def _should_run_proxy_async(self, proxy_state: torch.Tensor) -> bool:
-        """Return whether residual-proxy top-k should use async completion."""
-        return (
-            _PROXY_ASYNC_ENABLED
-            and self._proxy_executor is not None
-            and proxy_state.is_cuda
-            and torch.cuda.is_available()
-        )
-
-    def _submit_predicted_reads(
-        self,
-        layer_id: int,
-        prev: Optional[List[int]],
-        cursor: int,
-        *,
-        is_prefill_proxy: bool,
-        fire_start: float,
-        proxy_ms: float,
-        mode: str,
-    ) -> bool:
-        """Filter predicted token IDs and submit missing CSA SSD reads.
-
-        Args:
-            layer_id: CSA layer for which reads should be submitted.
-            prev: Predicted token IDs, or ``None`` when no prediction exists.
-            cursor: Exclusive upper bound for initialized token IDs.
-            is_prefill_proxy: Whether the caller is a prefill proxy path.
-            fire_start: Start timestamp for timing diagnostics.
-            proxy_ms: Time already spent computing/submitting proxy work.
-            mode: Short label recorded in timing logs.
-
-        Returns:
-            True when the prediction was usable, even if all tokens were
-            already resident; False when no prediction existed.
-        """
-        if prev is None:
-            self._last_proxy_topk[layer_id] = None
-            if layer_id not in self._debug_fire_no_prev_logged:
-                self._debug_fire_no_prev_logged.add(layer_id)
-                logger.debug(
-                    "IndexerSSDManager: fire_async_for_layer layer %d has no "
-                    "previous topk yet",
-                    layer_id,
-                )
-            return False
-
-        t_filter0 = time.perf_counter()
-        filtered = [tid for tid in prev if 0 <= tid < cursor]
-        if not filtered:
-            return True
-        # Mirror the prediction to the CSA attention KV prefetcher as soon as
-        # a usable top-K exists. This must not depend on the indexer-cache
-        # pool miss set: the indexer rows can already be resident while the
-        # filtered csa_attention_kv bytes still need Tutti reads.
-        self._dispatch_csa_attention_kv_predicted(layer_id, filtered)
-        csa_attention_kv_prefetch_attached = (
-            getattr(self, "_csa_attention_kv_manager", None) is not None
-        )
-        if (
-            is_prefill_proxy
-            and csa_attention_kv_prefetch_attached
-            and not _PREFILL_RESIDUAL_PROXY_ENABLED
-        ):
-            filter_ms = (time.perf_counter() - t_filter0) * 1000.0
-            self._log_timing(
-                "prefill_fire_async",
-                layer_id,
-                total_ms=f"{(time.perf_counter() - fire_start) * 1000.0:.3f}",
-                proxy_ms=f"{proxy_ms:.3f}",
-                filter_ms=f"{filter_ms:.3f}",
-                submit_ms="0.000",
-                prev=len(filtered),
-                missing=0,
-                mode="csa_attention_kv_only",
-            )
-            return True
-        pool = self._pools[layer_id]
-        store = self._stores[layer_id]
-        with self._lock:
-            pending_token_ids = set(self._inflight_tokens[layer_id])
-        missing = [
-            tid
-            for tid in filtered
-            if not pool.contains(tid) and tid not in pending_token_ids
-        ]
-        filter_ms = (time.perf_counter() - t_filter0) * 1000.0
-        if not missing:
-            if layer_id not in self._debug_fire_active_logged:
-                self._debug_fire_active_logged.add(layer_id)
-                logger.debug(
-                    "IndexerSSDManager: fire_async_for_layer layer %d active, "
-                    "prev_topk=%d, all already resident",
-                    layer_id,
-                    len(filtered),
-                )
-            self._log_timing(
-                "prefill_fire_async" if is_prefill_proxy else "fire_async",
-                layer_id,
-                total_ms=f"{(time.perf_counter() - fire_start) * 1000.0:.3f}",
-                proxy_ms=f"{proxy_ms:.3f}",
-                filter_ms=f"{filter_ms:.3f}",
-                submit_ms="0.000",
-                prev=len(filtered),
-                missing=0,
-                mode=mode,
-            )
-            return True
-        if layer_id not in self._debug_fire_active_logged:
-            self._debug_fire_active_logged.add(layer_id)
-            logger.debug(
-                "IndexerSSDManager: fire_async_for_layer layer %d active, "
-                "prev_topk=%d, missing=%d",
-                layer_id,
-                len(filtered),
-                len(missing),
-            )
-
-        t_submit0 = time.perf_counter()
-        futures = [
-            (tid, self._executor.submit(store.read_token, tid))
-            for tid in missing
-        ]
-        submit_ms = (time.perf_counter() - t_submit0) * 1000.0
-        with self._lock:
-            self._pending[layer_id].extend(futures)
-            self._inflight_tokens[layer_id].update(tid for tid, _ in futures)
-        self.prepare_layer_async(layer_id)
-        self._log_timing(
-            "prefill_fire_async" if is_prefill_proxy else "fire_async",
-            layer_id,
-            total_ms=f"{(time.perf_counter() - fire_start) * 1000.0:.3f}",
-            proxy_ms=f"{proxy_ms:.3f}",
-            filter_ms=f"{filter_ms:.3f}",
-            submit_ms=f"{submit_ms:.3f}",
-            prev=len(filtered),
-            missing=len(missing),
-            mode=mode,
-        )
-        return True
-
-    def _submit_residual_proxy_topk_async(
+    def _submit_csa_attention_kv_proxy_async(
         self,
         layer_id: int,
         residual_f: torch.Tensor,
         positions: torch.Tensor,
         llama_4_scaling: Optional[torch.Tensor],
         *,
-        is_prefill_proxy: bool,
         fire_start: float,
+        prefetch_level: int,
     ) -> bool:
-        """Submit residual-proxy top-k work on a side stream.
-
-        The CUDA work is enqueued immediately, then a background thread waits
-        on the recorded event, copies top-k IDs to CPU, and submits missing SSD
-        reads. This keeps the decoder hook from synchronizing on
-        ``valid.cpu().tolist()`` while MoE/FFN can continue on the default
-        stream.
-        """
-        proxy_executor = self._proxy_executor
-        if proxy_executor is None:
-            return False
-        decoder_layer = self._decoder_layers.get(layer_id)
-        if decoder_layer is None or not self._is_deepseek_v4_layer(decoder_layer):
-            return False
-        device_index = (
-            int(residual_f.device.index)
-            if residual_f.device.index is not None
-            else int(torch.cuda.current_device())
-        )
-        with torch.cuda.device(device_index):
-            proxy_stream = torch.cuda.Stream()
-            current_stream = torch.cuda.current_stream()
-            proxy_stream.wait_stream(current_stream)
-            try:
-                with torch.no_grad():
-                    with torch.cuda.stream(proxy_stream):
-                        residual_f.record_stream(proxy_stream)
-                        positions.record_stream(proxy_stream)
-                        topk_buf, num_rows = self._residual_proxy_topk_gpu(
-                            layer_id,
-                            decoder_layer,
-                            residual_f,
-                            positions,
-                            llama_4_scaling,
-                        )
-                        selected_topk = topk_buf[:num_rows]
-                        valid = selected_topk.reshape(-1)
-                        valid = valid[valid >= 0]
-                        valid_cpu = torch.empty(
-                            (int(valid.numel()),),
-                            dtype=valid.dtype,
-                            device="cpu",
-                            pin_memory=True,
-                        )
-                        valid_cpu.copy_(valid, non_blocking=True)
-                        event = torch.cuda.Event()
-                        event.record(proxy_stream)
-            except Exception:
-                logger.debug(
-                    "IndexerSSDManager: async residual proxy submit failed "
-                    "for layer %d",
-                    layer_id,
-                    exc_info=True,
-                )
-                return False
-
-        cursor = self._decode_cursor.get(layer_id, 0)
-        future = proxy_executor.submit(
-            self._finish_residual_proxy_topk_async,
-            layer_id,
-            valid_cpu,
-            event,
-            cursor,
-            is_prefill_proxy,
-            fire_start,
-        )
-        with self._lock:
-            self._proxy_futures[layer_id].append(future)
-
-        def _clear_done(done_future: Future[None]) -> None:
-            try:
-                done_future.result()
-            except Exception:
-                logger.exception(
-                    "IndexerSSDManager: async residual proxy failed for layer %d",
-                    layer_id,
-                )
-            with self._lock:
-                futures = self._proxy_futures.get(layer_id)
-                if futures is not None and done_future in futures:
-                    futures.remove(done_future)
-
-        future.add_done_callback(_clear_done)
-        return True
-
-    def _submit_csa_attention_kv_proxy_microbatches_async(
-        self,
-        layer_id: int,
-        residual_f: torch.Tensor,
-        positions: torch.Tensor,
-        llama_4_scaling: Optional[torch.Tensor],
-        *,
-        microbatch_rows: int,
-        fire_start: float,
-    ) -> bool:
-        """Submit all-token CSA attention-KV proxy top-k in microbatches."""
-        proxy_executor = self._proxy_executor
+        """Submit one all-row CSA proxy and finish it asynchronously."""
         manager = getattr(self, "_csa_attention_kv_manager", None)
-        if proxy_executor is None or manager is None:
+        if manager is None:
             logger.info(
                 "IndexerSSDManager: CSA attention-KV proxy unavailable "
-                "layer=%d proxy_executor=%s manager=%s",
+                "layer=%d manager=%s",
                 layer_id,
-                proxy_executor is not None,
                 manager is not None,
             )
             return False
@@ -1928,13 +1912,14 @@ class IndexerSSDManager:
             else int(torch.cuda.current_device())
         )
         batches: list[tuple[torch.Tensor, Any, Any, Any]] = []
+        cp_world_size = 1
         selected_rows = 0
         with torch.cuda.device(device_index):
-            # One fresh stream per fire: concurrent fires for different
-            # layers must not share a stream, or wait_stream() chains their
-            # proxy kernels into a serial dependency (measured: steady-state
-            # TTFT regressed ~2.7x with a shared per-device stream).
-            proxy_stream = torch.cuda.Stream()
+            # Reuse one stream per target layer. This preserves concurrency
+            # across lookahead targets without paying stream creation on every
+            # request. Repeated work for the same target remains correctly
+            # ordered on that target's stream.
+            proxy_stream = self._proxy_stream_for(layer_id)
             current_stream = torch.cuda.current_stream()
             proxy_stream.wait_stream(current_stream)
             try:
@@ -1943,86 +1928,82 @@ class IndexerSSDManager:
                         residual_f.record_stream(proxy_stream)
                         if positions.is_cuda:
                             positions.record_stream(proxy_stream)
-                        proxy_rows, proxy_positions, selected_rows = (
-                            _align_proxy_rows(
-                                residual_f,
-                                positions,
-                            )
+                        proxy_rows, proxy_positions, selected_rows = _align_proxy_rows(
+                            residual_f,
+                            positions,
                         )
                         # Keep the target indexer call at the original chunk
                         # granularity.  DeepGEMM's prefill metadata is built
                         # for the current forward chunk, so slicing rows here
                         # makes seq_len disagree with cu_seq_len_k_start.
-                        proxy_start = torch.cuda.Event(enable_timing=True)
-                        proxy_done = torch.cuda.Event(enable_timing=True)
-                        copy_done = torch.cuda.Event(enable_timing=True)
-                        proxy_start.record(proxy_stream)
-                        topk_buf, num_rows = self._residual_proxy_topk_gpu(
+                        timing_enabled = _timing_enabled()
+                        proxy_start = (
+                            torch.cuda.Event(enable_timing=True)
+                            if timing_enabled
+                            else None
+                        )
+                        proxy_done = (
+                            torch.cuda.Event(enable_timing=True)
+                            if timing_enabled
+                            else None
+                        )
+                        copy_done = torch.cuda.Event(enable_timing=timing_enabled)
+                        if proxy_start is not None:
+                            proxy_start.record(proxy_stream)
+                        topk_buf, num_rows, cp_context = self._residual_proxy_topk_gpu(
                             layer_id,
                             decoder_layer,
                             proxy_rows,
                             proxy_positions,
                             llama_4_scaling,
+                            enable_prefill_cp=True,
                         )
-                        proxy_done.record(proxy_stream)
+                        if proxy_done is not None:
+                            proxy_done.record(proxy_stream)
                         selected_topk = topk_buf[:num_rows]
-                        valid = selected_topk.reshape(-1)
-                        # Reduce predicted token ids -> unique compressed-block
-                        # presence bitmap on the GPU. This replaces copying the
-                        # full (~100k element) token-id vector to the host and a
-                        # per-element Python loop in the finish thread: only a
-                        # small fixed-size bitmap (num_blocks bools) crosses to
-                        # CPU, and no data-dependent size is queried on the main
-                        # thread (so no host<->device sync here).
+                        # Reduce the rank-local query shard to a bounded block
+                        # list, then exchange only those fixed-size IDs. This
+                        # preserves the semantic union of all query shards
+                        # without the prefix-sized uint32 bitmap AllReduce.
+                        # Rank exchange runs later on the CPU proxy worker so
+                        # early ranks never occupy a GPU NCCL kernel while
+                        # waiting for a delayed peer.
                         cursor = self._decode_cursor.get(layer_id, 0)
                         num_blocks = (
                             cursor + DEEPGEMM_PAGED_BLOCK_SIZE - 1
                         ) // DEEPGEMM_PAGED_BLOCK_SIZE
                         if num_blocks > 0:
-                            present = torch.zeros(
+                            selected_blocks = _select_rank_local_proxy_blocks(
+                                selected_topk,
+                                cursor,
                                 num_blocks,
-                                dtype=torch.bool,
-                                device=valid.device,
+                                self._proxy_block_budget,
                             )
-                            # Mask first, then divide only the surviving ids so
-                            # peak transient GPU memory stays at ~one filtered
-                            # vector (matches the previous code path and avoids
-                            # OOM at high gpu-memory-utilization). index_fill_
-                            # on an empty index tensor is a safe no-op, so no
-                            # data-dependent .numel() sync is needed here.
-                            sel = valid[(valid >= 0) & (valid < cursor)]
-                            present.index_fill_(
-                                0,
-                                torch.div(
-                                    sel,
-                                    DEEPGEMM_PAGED_BLOCK_SIZE,
-                                    rounding_mode="floor",
-                                ).long(),
-                                True,
+                            if cp_context is not None:
+                                cp_world_size = int(cp_context[1])
+                            # Block IDs fit in int32. Tutti's indexed-read ABI
+                            # is widened only after the bounded CPU exchange.
+                            selected_blocks = selected_blocks.to(torch.int32)
+                            selected_cpu = self._acquire_proxy_cpu_selection(
+                                layer_id,
+                                int(selected_blocks.numel()),
                             )
-                            present_cpu = torch.empty(
-                                (num_blocks,),
-                                dtype=torch.bool,
-                                device="cpu",
-                                pin_memory=True,
-                            )
-                            present_cpu.copy_(present, non_blocking=True)
+                            selected_cpu.copy_(selected_blocks, non_blocking=True)
                             copy_done.record(proxy_stream)
                             batches.append(
-                                (present_cpu, proxy_start, proxy_done, copy_done)
+                                (selected_cpu, proxy_start, proxy_done, copy_done)
                             )
             except Exception as exc:
                 logger.warning(
-                    "IndexerSSDManager: CSA attention-KV proxy microbatch "
+                    "IndexerSSDManager: CSA attention-KV proxy "
                     "submit failed for layer %d residual_shape=%s "
                     "positions_shape=%s selected_rows=%d cursor=%d "
-                    "microbatch_rows=%d exc=%s",
+                    "exc=%s",
                     layer_id,
                     tuple(residual_f.shape),
                     tuple(positions.shape),
                     selected_rows,
                     self._decode_cursor.get(layer_id, 0),
-                    max(1, int(microbatch_rows)),
                     repr(exc),
                     exc_info=True,
                 )
@@ -2032,33 +2013,39 @@ class IndexerSSDManager:
             logger.info(
                 "IndexerSSDManager: CSA attention-KV proxy produced no "
                 "topk layer=%d residual_shape=%s positions_shape=%s "
-                "selected_rows=%d cursor=%d microbatch_rows=%d",
+                "selected_rows=%d cursor=%d",
                 layer_id,
                 tuple(residual_f.shape),
                 tuple(positions.shape),
                 selected_rows,
                 self._decode_cursor.get(layer_id, 0),
-                max(1, int(microbatch_rows)),
             )
             self._log_residual_proxy_skip(layer_id, "csa_attention_kv_empty_topk")
             return False
 
         cursor = self._decode_cursor.get(layer_id, 0)
-        future = proxy_executor.submit(
-            self._finish_csa_attention_kv_proxy_microbatches,
+        request_id = str(getattr(manager, "active_request_id", ""))
+        # Tutti's indexed API currently validates CQ status synchronously on
+        # the host. Reuse the existing I/O executor for that host-only bridge;
+        # proxy scoring itself is already enqueued on its CUDA side stream.
+        future = self._proxy_executor.submit(
+            self._finish_csa_attention_kv_proxy,
             layer_id,
             batches,
             cursor,
             selected_rows,
-            max(1, int(microbatch_rows)),
             fire_start,
+            prefetch_level,
+            request_id,
+            cp_world_size,
         )
         with self._lock:
             self._proxy_futures[layer_id].append(future)
 
         def _clear_done(done_future: Future[None]) -> None:
             try:
-                done_future.result()
+                if not done_future.cancelled():
+                    done_future.result()
             except Exception:
                 logger.exception(
                     "IndexerSSDManager: CSA attention-KV proxy failed for layer %d",
@@ -2072,57 +2059,115 @@ class IndexerSSDManager:
         future.add_done_callback(_clear_done)
         return True
 
-    def _finish_csa_attention_kv_proxy_microbatches(
+    def _finish_csa_attention_kv_proxy(
         self,
         layer_id: int,
         batches: list[tuple[torch.Tensor, Any, Any, Any]],
         cursor: int,
         selected_rows: int,
-        microbatch_rows: int,
         fire_start: float,
+        prefetch_level: int,
+        request_id: str,
+        cp_world_size: int,
     ) -> None:
-        """Convert proxy top-k microbatches to CSA attention-KV block reads."""
+        """Dispatch the bounded union of all rank-local query predictions."""
         manager = getattr(self, "_csa_attention_kv_manager", None)
         if manager is None:
+            for selected_cpu, _proxy_start, _proxy_done, _copy_done in batches:
+                self._release_proxy_cpu_selection(layer_id, selected_cpu)
             return
         t0 = time.perf_counter()
-        seen_blocks: set[int] = set()
-        dispatched_blocks = 0
-        dispatched_batches = 0
+        selected_batches: list[torch.Tensor] = []
         event_wait_ms = 0.0
         proxy_gpu_ms = 0.0
+        id_exchange_ms = 0.0
         d2h_gpu_ms = 0.0
         proxy_total_gpu_ms = 0.0
-        for present_cpu, proxy_start, proxy_done, copy_done in batches:
+        for selected_cpu, proxy_start, proxy_done, copy_done in batches:
             t_wait0 = time.perf_counter()
             copy_done.synchronize()
             event_wait_ms += (time.perf_counter() - t_wait0) * 1000.0
-            try:
-                proxy_gpu_ms += float(proxy_start.elapsed_time(proxy_done))
-                d2h_gpu_ms += float(proxy_done.elapsed_time(copy_done))
-                proxy_total_gpu_ms += float(proxy_start.elapsed_time(copy_done))
-            except RuntimeError:
-                pass
-            # present_cpu is a compressed-block presence bitmap. A single
-            # nonzero turns it into block ids -- this replaces the previous
-            # per-token Python loop over the full (~100k element) top-k vector.
-            candidate_blocks = (
-                torch.nonzero(present_cpu, as_tuple=False).flatten().tolist()
+            if proxy_start is not None and proxy_done is not None:
+                try:
+                    proxy_gpu_ms += float(proxy_start.elapsed_time(proxy_done))
+                    d2h_gpu_ms += float(proxy_done.elapsed_time(copy_done))
+                    proxy_total_gpu_ms += float(proxy_start.elapsed_time(copy_done))
+                except RuntimeError:
+                    pass
+            exchanged_cpu = selected_cpu
+            if cp_world_size > 1:
+                # Gloo blocks only this CPU worker. The dedicated executor
+                # guarantees that every rank enters layer collectives in the
+                # same order even when CUDA side streams finish out of order.
+                import torch.distributed as dist
+                from vllm.distributed import get_tp_group
+
+                exchange_start = time.perf_counter()
+                exchanged_cpu = torch.empty(
+                    int(selected_cpu.numel()) * cp_world_size,
+                    dtype=torch.int32,
+                    device="cpu",
+                )
+                dist.all_gather_into_tensor(
+                    exchanged_cpu,
+                    selected_cpu,
+                    group=get_tp_group().cpu_group,
+                )
+                id_exchange_ms += (time.perf_counter() - exchange_start) * 1000.0
+            selected_batches.append(exchanged_cpu[exchanged_cpu >= 0].to(torch.int64))
+            self._release_proxy_cpu_selection(layer_id, selected_cpu)
+        block_ids_tensor = torch.unique(
+            torch.cat(selected_batches)
+            if selected_batches
+            else torch.empty(0, dtype=torch.int64),
+            sorted=True,
+        )
+        dispatched_blocks = int(block_ids_tensor.numel())
+        dispatched_batches = 0
+        with self._lock:
+            expired = (
+                int(layer_id) in self._expired_proxy_layers
+                or request_id != self._csa_fired_request_id
             )
-            block_ids = [b for b in candidate_blocks if b not in seen_blocks]
-            if not block_ids:
-                continue
-            seen_blocks.update(block_ids)
+            self._last_proxy_blocks[int(layer_id)] = (
+                [int(block_id) for block_id in block_ids_tensor.tolist()]
+                if not expired
+                else None
+            )
+        if dispatched_blocks and not expired:
             self._log_timing(
                 "dispatch_csa_attention_kv_predicted",
                 layer_id,
-                predicted_tokens=len(candidate_blocks) * DEEPGEMM_PAGED_BLOCK_SIZE,
-                blocks=len(block_ids),
-                mode="microbatch",
+                predicted_tokens=(dispatched_blocks * DEEPGEMM_PAGED_BLOCK_SIZE),
+                blocks=dispatched_blocks,
+                mode="single_layer_batch",
             )
-            manager.fire_predicted_reads(layer_id, block_ids)
-            dispatched_blocks += len(block_ids)
-            dispatched_batches += 1
+            io_future = self._proxy_io_executor.submit(
+                manager.fire_predicted_reads,
+                layer_id,
+                block_ids_tensor,
+                prefetch_level=prefetch_level,
+            )
+            with self._lock:
+                self._proxy_futures[layer_id].append(io_future)
+
+            def _clear_io_done(done_future: Future[None]) -> None:
+                try:
+                    if not done_future.cancelled():
+                        done_future.result()
+                except Exception:
+                    logger.exception(
+                        "IndexerSSDManager: CSA attention-KV predicted I/O "
+                        "failed for layer %d",
+                        layer_id,
+                    )
+                with self._lock:
+                    futures = self._proxy_futures.get(layer_id)
+                    if futures is not None and done_future in futures:
+                        futures.remove(done_future)
+
+            io_future.add_done_callback(_clear_io_done)
+            dispatched_batches = 1
         proxy_ms = (time.perf_counter() - t0) * 1000.0
         self._log_timing(
             "prefill_fire_async",
@@ -2132,109 +2177,17 @@ class IndexerSSDManager:
             filter_ms="0.000",
             submit_ms="0.000",
             rows=selected_rows,
-            microbatch_rows=microbatch_rows,
             batches=len(batches),
             dispatched_batches=dispatched_batches,
             blocks=dispatched_blocks,
             event_wait_ms=f"{event_wait_ms:.3f}",
             proxy_gpu_ms=f"{proxy_gpu_ms:.3f}",
+            id_exchange_ms=f"{id_exchange_ms:.3f}",
             d2h_gpu_ms=f"{d2h_gpu_ms:.3f}",
             proxy_total_gpu_ms=f"{proxy_total_gpu_ms:.3f}",
-            mode="csa_attention_kv_microbatch_finish",
+            mode="canonical_l2_async_finish",
+            prefetch_level=prefetch_level,
         )
-
-    def _finish_residual_proxy_topk_async(
-        self,
-        layer_id: int,
-        valid_cpu: torch.Tensor,
-        event: Any,
-        cursor: int,
-        is_prefill_proxy: bool,
-        fire_start: float,
-    ) -> None:
-        """Finish side-stream residual proxy and submit predicted reads."""
-        t0 = time.perf_counter()
-        event.synchronize()
-        token_ids = self._token_ids_from_cpu_topk(valid_cpu)
-        proxy_ms = (time.perf_counter() - t0) * 1000.0
-        self._last_proxy_topk[layer_id] = token_ids
-        if not token_ids:
-            self._log_residual_proxy_skip(layer_id, "empty_token_ids")
-            return
-        if layer_id not in self._debug_residual_proxy_logged:
-            self._debug_residual_proxy_logged.add(layer_id)
-            logger.info(
-                "IndexerSSDManager: residual_proxy layer %d spec_tokens=%d "
-                "mode=async",
-                layer_id,
-                len(token_ids),
-            )
-        self._submit_predicted_reads(
-            layer_id,
-            token_ids,
-            cursor,
-            is_prefill_proxy=is_prefill_proxy,
-            fire_start=fire_start,
-            proxy_ms=proxy_ms,
-            mode="proxy_async_finish",
-        )
-
-    @staticmethod
-    def _token_ids_from_cpu_topk(valid_cpu: torch.Tensor) -> List[int]:
-        """Convert a CPU top-k tensor to a de-duplicated token-id list."""
-        token_ids: List[int] = []
-        seen: Set[int] = set()
-        for tid in valid_cpu.tolist():
-            tid_int = int(tid)
-            if tid_int in seen:
-                continue
-            seen.add(tid_int)
-            token_ids.append(tid_int)
-            if len(token_ids) >= 1024:
-                break
-        return token_ids
-
-    def _residual_proxy_topk(
-        self,
-        layer_id: int,
-        residual_f: torch.Tensor,
-        positions: torch.Tensor,
-        llama_4_scaling: Optional[torch.Tensor],
-    ) -> Optional[List[int]]:
-        """Run the next CSA layer's V4 indexer on attention HC-post state."""
-        decoder_layer = self._decoder_layers.get(layer_id)
-        if decoder_layer is None:
-            self._log_residual_proxy_skip(layer_id, "decoder_layer_missing")
-            return None
-        if not self._is_deepseek_v4_layer(decoder_layer):
-            self._log_residual_proxy_skip(
-                layer_id,
-                f"not_v4_layer={type(decoder_layer).__name__}",
-            )
-            return None
-
-        with torch.no_grad():
-            topk_buf, num_rows = self._residual_proxy_topk_gpu(
-                layer_id,
-                decoder_layer,
-                residual_f,
-                positions,
-                llama_4_scaling,
-            )
-            selected_topk = topk_buf[:num_rows]
-            valid = selected_topk.reshape(-1)
-            valid = valid[valid >= 0]
-            token_ids = self._token_ids_from_cpu_topk(valid.cpu())
-        if not token_ids:
-            self._log_residual_proxy_skip(layer_id, "empty_token_ids")
-        if layer_id not in self._debug_residual_proxy_logged:
-            self._debug_residual_proxy_logged.add(layer_id)
-            logger.info(
-                "IndexerSSDManager: residual_proxy layer %d spec_tokens=%d",
-                layer_id,
-                len(token_ids),
-            )
-        return token_ids
 
     def _residual_proxy_topk_gpu(
         self,
@@ -2243,7 +2196,9 @@ class IndexerSSDManager:
         residual_f: torch.Tensor,
         positions: torch.Tensor,
         llama_4_scaling: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, int]:
+        *,
+        enable_prefill_cp: bool = False,
+    ) -> tuple[torch.Tensor, int, Optional[Tuple[int, int, int, int]]]:
         """Run the V4 proxy indexer and return the GPU top-k buffer."""
         del llama_4_scaling
         residual_f, positions, selected_rows = _align_proxy_rows(
@@ -2255,7 +2210,8 @@ class IndexerSSDManager:
             decoder_layer,
             proxy_hidden,
         )
-        topk_buf = self._v4_proxy_topk_direct(
+        cp_context = self._prefill_cp_context(layer_id) if enable_prefill_cp else None
+        topk_buf, cp_used = self._v4_proxy_topk_direct(
             layer_id,
             proxy_hidden,
             qr,
@@ -2263,8 +2219,20 @@ class IndexerSSDManager:
             positions,
             indexer,
             rotary_emb,
+            prefill_cp_context=cp_context,
         )
-        return topk_buf, selected_rows
+        if cp_used and cp_context is not None:
+            rank, world_size, interleave, oversubscribe = cp_context
+            self._log_timing(
+                "prefill_cp_proxy",
+                layer_id,
+                rows=selected_rows,
+                rank=rank,
+                world_size=world_size,
+                interleave=interleave,
+                oversubscribe=oversubscribe,
+            )
+        return topk_buf, selected_rows, cp_context if cp_used else None
 
     @staticmethod
     def _is_deepseek_v4_layer(decoder_layer: Any) -> bool:
@@ -2285,7 +2253,7 @@ class IndexerSSDManager:
         residual_f: torch.Tensor,
     ) -> torch.Tensor:
         """Compute ``attn_norm(HC_pre(residual_f, hc_attn_*))`` for V4."""
-        attn_norm = getattr(decoder_layer, "attn_norm")
+        attn_norm = decoder_layer.attn_norm
         norm_weight = getattr(attn_norm, "weight", None)
         norm_eps = getattr(attn_norm, "variance_epsilon", None)
         if norm_eps is None:
@@ -2294,9 +2262,9 @@ class IndexerSSDManager:
             try:
                 proxy_hidden, _, _ = decoder_layer.hc_pre(
                     residual_f,
-                    getattr(decoder_layer, "hc_attn_fn"),
-                    getattr(decoder_layer, "hc_attn_scale"),
-                    getattr(decoder_layer, "hc_attn_base"),
+                    decoder_layer.hc_attn_fn,
+                    decoder_layer.hc_attn_scale,
+                    decoder_layer.hc_attn_base,
                     norm_weight=norm_weight.data,
                     norm_eps=float(norm_eps),
                 )
@@ -2305,9 +2273,9 @@ class IndexerSSDManager:
                 pass
         proxy_hidden, _, _ = decoder_layer.hc_pre(
             residual_f,
-            getattr(decoder_layer, "hc_attn_fn"),
-            getattr(decoder_layer, "hc_attn_scale"),
-            getattr(decoder_layer, "hc_attn_base"),
+            decoder_layer.hc_attn_fn,
+            decoder_layer.hc_attn_scale,
+            decoder_layer.hc_attn_base,
         )
         return attn_norm(proxy_hidden)
 
@@ -2317,7 +2285,7 @@ class IndexerSSDManager:
         proxy_hidden: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, Any, Any]:
         """Build read-only V4 proxy scoring inputs for a proxy hidden state."""
-        attn = getattr(decoder_layer, "attn")
+        attn = decoder_layer.attn
         indexer = getattr(attn, "indexer", None)
         if indexer is None:
             mla_attn = getattr(attn, "mla_attn", None)
@@ -2339,16 +2307,16 @@ class IndexerSSDManager:
         qr_kv, _ = fused_wqa_wkv(proxy_hidden)
         q_lora_rank = getattr(attn, "q_lora_rank", None)
         if q_lora_rank is None:
-            q_lora_rank = getattr(mla_attn, "q_lora_rank")
+            q_lora_rank = mla_attn.q_lora_rank
         head_dim = getattr(attn, "head_dim", None)
         if head_dim is None:
-            head_dim = getattr(mla_attn, "head_dim")
+            head_dim = mla_attn.head_dim
         qr, _ = qr_kv.split([int(q_lora_rank), int(head_dim)], dim=-1)
         qr = q_norm(qr)
         indexer_weights, _ = weights_proj(proxy_hidden)
         rotary_emb = getattr(attn, "rotary_emb", None)
         if rotary_emb is None:
-            rotary_emb = getattr(mla_attn, "rotary_emb")
+            rotary_emb = mla_attn.rotary_emb
         return qr, indexer_weights, indexer, rotary_emb
 
     def _v4_proxy_topk_direct(
@@ -2360,7 +2328,9 @@ class IndexerSSDManager:
         positions: torch.Tensor,
         indexer: Any,
         rotary_emb: Any,
-    ) -> torch.Tensor:
+        *,
+        prefill_cp_context: Optional[Tuple[int, int, int, int]] = None,
+    ) -> tuple[torch.Tensor, bool]:
         """Compute V4 proxy top-K without running ``DeepseekV4Indexer.forward``.
 
         The official V4 indexer forward first runs the target layer compressor,
@@ -2394,15 +2364,15 @@ class IndexerSSDManager:
             raise RuntimeError("DeepSeek V4 CSA indexer wq_b is missing")
 
         q, _ = wq_b(qr)
-        n_head = int(getattr(indexer, "n_head"))
-        head_dim = int(getattr(indexer, "head_dim"))
+        n_head = int(indexer.n_head)
+        head_dim = int(indexer.head_dim)
         q = q.view(-1, n_head, head_dim)
         q_quant, score_weights = fused_indexer_q_rope_quant(
             positions,
             q,
             rotary_emb.cos_sin_cache,
             indexer_weights,
-            float(getattr(indexer, "softmax_scale")),
+            float(indexer.softmax_scale),
             n_head**-0.5,
             use_fp4=bool(getattr(indexer, "use_fp4_kv", False)),
         )
@@ -2414,27 +2384,105 @@ class IndexerSSDManager:
         old_topk = getattr(indexer_op, "topk_indices_buffer", None)
         has_skip_insert_attr = hasattr(indexer_op, "skip_k_cache_insert")
         old_skip_insert = (
-            getattr(indexer_op, "skip_k_cache_insert")
-            if has_skip_insert_attr
-            else None
+            indexer_op.skip_k_cache_insert if has_skip_insert_attr else None
         )
+        cp_used = False
         try:
             indexer_op.topk_indices_buffer = topk_buf
             if has_skip_insert_attr:
                 indexer_op.skip_k_cache_insert = True
-            self._call_v4_indexer_op_read_only(
-                layer_id,
-                indexer_op,
-                proxy_hidden,
-                q_quant,
-                score_weights,
-                has_skip_insert_attr=has_skip_insert_attr,
-            )
+            if prefill_cp_context is not None:
+                rank, world_size, interleave_size, oversubscribe = prefill_cp_context
+                try:
+                    from lmcache.v1.csa_prefill_cp_scorer import (
+                        score_prefill_proxy_rank_local,
+                    )
+
+                    score_prefill_proxy_rank_local(
+                        indexer_op,
+                        proxy_hidden,
+                        q_quant,
+                        score_weights,
+                        topk_buf,
+                        rank=rank,
+                        world_size=world_size,
+                        interleave_size=interleave_size,
+                        oversubscribe=oversubscribe,
+                    )
+                    cp_used = True
+                except Exception as exc:
+                    self._log_prefill_cp_fallback(layer_id, repr(exc))
+            if not cp_used:
+                self._call_v4_indexer_op_read_only(
+                    layer_id,
+                    indexer_op,
+                    proxy_hidden,
+                    q_quant,
+                    score_weights,
+                    has_skip_insert_attr=has_skip_insert_attr,
+                )
         finally:
             indexer_op.topk_indices_buffer = old_topk
             if has_skip_insert_attr:
                 indexer_op.skip_k_cache_insert = old_skip_insert
-        return topk_buf
+        return topk_buf, cp_used
+
+    def _prefill_cp_context(
+        self,
+        layer_id: int,
+    ) -> Optional[Tuple[int, int, int, int]]:
+        """Return TP rank data for prefill-only speculative CP scoring."""
+        requested = _env_int("LMCACHE_CSA_PREFETCH_CP_SIZE", 1)
+        if requested <= 1:
+            return None
+        interleave = _env_int("LMCACHE_CSA_PREFETCH_CP_INTERLEAVE", 64)
+        oversubscribe = _env_int("LMCACHE_CSA_PREFETCH_CP_OVERSUBSCRIBE", 1)
+        try:
+            from vllm.distributed import get_tp_group
+
+            tp_group = get_tp_group()
+            native_world = int(tp_group.world_size)
+            native_rank = int(tp_group.rank_in_group)
+        except Exception as exc:
+            self._log_prefill_cp_fallback(layer_id, f"tp_group={exc!r}")
+            return None
+        if (
+            native_world != requested
+            or native_rank < 0
+            or native_rank >= native_world
+            or interleave <= 0
+            or oversubscribe <= 0
+        ):
+            reason = (
+                f"requested={requested},native_world={native_world},"
+                f"rank={native_rank},interleave={interleave},"
+                f"oversubscribe={oversubscribe}"
+            )
+            key = (layer_id, reason)
+            if key not in self._cp_proxy_fallback_logged:
+                self._cp_proxy_fallback_logged.add(key)
+                logger.warning(
+                    "IndexerSSDManager: prefill-only CP proxy disabled for "
+                    "layer %d (%s); "
+                    "falling back to the exact global proxy",
+                    layer_id,
+                    reason,
+                )
+            return None
+        return native_rank, native_world, interleave, oversubscribe
+
+    def _log_prefill_cp_fallback(self, layer_id: int, reason: str) -> None:
+        """Log one prefill-only CP fallback reason per target layer."""
+        key = (int(layer_id), str(reason))
+        if key in self._cp_proxy_fallback_logged:
+            return
+        self._cp_proxy_fallback_logged.add(key)
+        logger.warning(
+            "IndexerSSDManager: prefill-only CP proxy failed for layer %d "
+            "(%s); using the original full-K proxy",
+            layer_id,
+            reason,
+        )
 
     def _call_v4_indexer_op_read_only(
         self,
@@ -2503,9 +2551,7 @@ class IndexerSSDManager:
                 layer_id,
                 "indexer_op_read_only_unsupported",
             )
-            raise RuntimeError(
-                "DeepSeek V4 CSA indexer_op cannot run read-only proxy"
-            )
+            raise RuntimeError("DeepSeek V4 CSA indexer_op cannot run read-only proxy")
         forward(proxy_hidden, q_quant, None, score_weights)
 
     def _log_residual_proxy_skip(self, layer_id: int, reason: str) -> None:
@@ -2524,9 +2570,7 @@ class IndexerSSDManager:
     # Called from SparseAttnIndexer, before scoring
     # ------------------------------------------------------------------
 
-    def prepare_pool(
-        self, layer_id: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def prepare_pool(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Drain pending async reads into the HBM pool for *layer_id*.
 
         Blocks if a post-prefill SSD eviction future is still running so the
@@ -2542,9 +2586,9 @@ class IndexerSSDManager:
         drain_ms = 0.0
         sync_ms = 0.0
         waited_ready = False
-        t_proxy0 = time.perf_counter()
-        self._wait_proxy_futures(layer_id)
-        proxy_wait_ms = (time.perf_counter() - t_proxy0) * 1000.0
+        # Residual-proxy work targets attention KV and is purely speculative.
+        # The official indexer must run immediately instead of joining it here;
+        # the patched target-layer gate checks readiness only after true scoring.
         with self._lock:
             ready_fut = self._ready_futures.get(layer_id)
             drain_fut = self._drain_futures.get(layer_id)
@@ -2599,41 +2643,35 @@ class IndexerSSDManager:
         )
         return pool.pool_tensor, pool.block_table
 
-    def _wait_proxy_futures(self, layer_id: int) -> None:
-        """Wait for side-stream residual proxy work targeting ``layer_id``."""
-        with self._lock:
-            futures = list(self._proxy_futures.get(layer_id, ()))
-        for future in futures:
-            future.result(timeout=self._prefill_ready_timeout_s)
-
     def wait_for_csa_attention_kv_prediction(self, layer_id: int) -> bool:
-        """Wait briefly for async CSA attention-KV prediction dispatch.
+        """Return whether async prediction finished without blocking the target.
 
         The cache-hit prefill path fires the target CSA layer's HC-proxy top-K
-        from the previous decoder layer's FFN/MoE window.  The target layer's
-        true indexer calls this method before computing miss correction so any
-        predicted Tutti reads that finished during the MoE window are visible
-        in the CSA attention-KV manager's resident bitmap.
+        from the previous decoder layer's FFN/MoE window. A late speculative
+        result is expired here and correctness falls back to the target layer's
+        true-topK demand read; speculative work must never turn into a target
+        layer barrier.
 
         Args:
             layer_id: CSA layer whose async proxy prediction should be joined.
 
         Returns:
-            ``True`` if all currently known proxy futures completed before the
-            ready timeout, otherwise ``False``.  A timeout leaves correctness to
-            the true-topK miss path.
+            ``True`` if all currently known proxy futures are already complete,
+            otherwise ``False``. This method never waits.
         """
-        try:
-            self._wait_proxy_futures(layer_id)
-        except Exception:
+        with self._lock:
+            futures = tuple(self._proxy_futures.get(int(layer_id), ()))
+            ready = all(future.done() for future in futures)
+            if not ready:
+                self._expired_proxy_layers.add(int(layer_id))
+        if not ready:
+            for future in futures:
+                future.cancel()
             logger.debug(
-                "IndexerSSDManager: CSA attention-KV prediction wait timed "
-                "out or failed for layer %d",
+                "IndexerSSDManager: dropping late CSA prediction for layer %d",
                 layer_id,
-                exc_info=True,
             )
-            return False
-        return True
+        return ready
 
     def pool_ids_for_layer(self, layer_id: int) -> torch.Tensor:
         """Return pool_ids tensor [pool_size] int64 for *layer_id*.
@@ -2669,7 +2707,9 @@ class IndexerSSDManager:
         translated = torch.full_like(flat_slots, -1, dtype=pool.pool_ids.dtype)
         if valid.any():
             translated[valid] = pool.pool_ids[flat_slots[valid]]
-        return translated.reshape(topk_pool_slots.shape).to(device=topk_pool_slots.device)
+        return translated.reshape(topk_pool_slots.shape).to(
+            device=topk_pool_slots.device
+        )
 
     def record_topk(self, layer_id: int, topk_pool_slots: torch.Tensor) -> None:
         """Record top-k pool slots for use as next step's prediction.
@@ -2711,8 +2751,6 @@ class IndexerSSDManager:
             token_ids_tensor: True global token IDs emitted by the official
                 sparse indexer op.
         """
-        if not _DECODE_PREFETCH_ENABLED:
-            return
         t0 = time.perf_counter()
         collect_ms = 0.0
         drain_ms = 0.0
@@ -2788,6 +2826,79 @@ class IndexerSSDManager:
             missing=len(missing),
         )
 
+    def record_csa_prediction_accuracy(
+        self,
+        layer_id: int,
+        true_topk: torch.Tensor,
+    ) -> None:
+        """Compare the last CSA proxy prediction with the true indexer output.
+
+        Args:
+            layer_id: Transformer-side CSA layer id.
+            true_topk: True Lightning Indexer output containing compressed
+                entry ids. Values outside the initialized prefix are ignored.
+
+        Notes:
+            This diagnostic intentionally synchronizes the small block bitmap
+            to the CPU. It is active only when
+            ``LMCACHE_INDEXER_PROFILE_ACCURACY`` is enabled.
+        """
+        if not _profile_accuracy_enabled():
+            return
+        with self._lock:
+            if self._attention_profile_seen >= self._proxy_profile_limit:
+                return
+            cursor = self._decode_cursor.get(int(layer_id), 0)
+            predicted_blocks = set(self._last_proxy_blocks.get(int(layer_id)) or [])
+        if cursor <= 0 or true_topk.numel() == 0:
+            return
+
+        entries = true_topk.detach().reshape(-1).to(dtype=torch.int64)
+        valid = (entries >= 0) & (entries < cursor)
+        num_blocks = (
+            cursor + DEEPGEMM_PAGED_BLOCK_SIZE - 1
+        ) // DEEPGEMM_PAGED_BLOCK_SIZE
+        true_bitmap = torch.zeros(
+            num_blocks,
+            dtype=torch.bool,
+            device=entries.device,
+        )
+        true_bitmap[entries[valid] // DEEPGEMM_PAGED_BLOCK_SIZE] = True
+        true_blocks = set(
+            true_bitmap.nonzero(as_tuple=False).reshape(-1).cpu().tolist()
+        )
+        if not true_blocks:
+            return
+
+        block_hits = len(true_blocks & predicted_blocks)
+        block_misses = len(true_blocks - predicted_blocks)
+        block_recall = float(block_hits) / float(len(true_blocks))
+        with self._lock:
+            if self._attention_profile_seen >= self._proxy_profile_limit:
+                return
+            self._attention_profile_seen += 1
+            self._attention_profile_hits += block_hits
+            self._attention_profile_total += len(true_blocks)
+            sample = self._attention_profile_seen
+            avg_block_recall = float(self._attention_profile_hits) / float(
+                self._attention_profile_total
+            )
+        logger.info(
+            "IndexerSSDManager: attention_true_topk_profile layer %d "
+            "sample=%d true_tokens=%d true_blocks=%d predicted_blocks=%d "
+            "block_hits=%d block_misses=%d block_recall=%.4f "
+            "avg_block_recall=%.4f",
+            layer_id,
+            sample,
+            int(valid.sum().item()),
+            len(true_blocks),
+            len(predicted_blocks),
+            block_hits,
+            block_misses,
+            block_recall,
+            avg_block_recall,
+        )
+
     def record_attention_topk_slots(
         self,
         layer_id: int,
@@ -2809,14 +2920,10 @@ class IndexerSSDManager:
         should_profile = _profile_accuracy_enabled() and (
             self._attention_profile_seen < self._proxy_profile_limit
         )
-        should_prefill_correct = self.prefill_proxy_enabled() and self.layer_initialized(
-            layer_id
+        should_prefill_correct = (
+            self.prefill_proxy_enabled() and self.layer_initialized(layer_id)
         )
-        should_collect = (
-            should_profile
-            or _timing_enabled()
-            or should_prefill_correct
-        )
+        should_collect = should_profile or _timing_enabled() or should_prefill_correct
         if not should_collect:
             if first_log:
                 self._debug_attention_topk_logged.add(layer_id)
@@ -2853,11 +2960,11 @@ class IndexerSSDManager:
 
         block_ids = {slot // int(block_size) for slot in slot_ids}
         true_set = set(logical_ids)
-        predicted = self._last_proxy_topk.get(layer_id) or []
-        predicted_set = set(predicted)
-        spec_hits = len(true_set & predicted_set)
-        true_misses = len(true_set - predicted_set)
-        recall = float(spec_hits) / float(len(true_set)) if true_set else 0.0
+        true_blocks = {token_id // DEEPGEMM_PAGED_BLOCK_SIZE for token_id in true_set}
+        predicted_blocks = set(self._last_proxy_blocks.get(layer_id) or [])
+        spec_hits = len(true_blocks & predicted_blocks)
+        true_misses = len(true_blocks - predicted_blocks)
+        recall = float(spec_hits) / float(len(true_blocks)) if true_blocks else 0.0
         if should_prefill_correct and logical_ids:
             self._correct_prefill_true_topk(layer_id, logical_ids)
 
@@ -2872,10 +2979,10 @@ class IndexerSSDManager:
                 len(block_ids),
                 int(block_size),
             )
-        if should_profile and true_set:
+        if should_profile and true_blocks:
             self._attention_profile_seen += 1
             self._attention_profile_hits += spec_hits
-            self._attention_profile_total += len(true_set)
+            self._attention_profile_total += len(true_blocks)
             avg_recall = (
                 float(self._attention_profile_hits)
                 / float(self._attention_profile_total)
@@ -2884,12 +2991,14 @@ class IndexerSSDManager:
             )
             logger.info(
                 "IndexerSSDManager: attention_true_topk_profile layer %d "
-                "sample=%d true=%d predicted=%d spec_hits=%d true_misses=%d "
-                "recall=%.4f avg_recall=%.4f physical_blocks=%d",
+                "sample=%d true_tokens=%d true_blocks=%d predicted_blocks=%d "
+                "block_hits=%d block_misses=%d block_recall=%.4f "
+                "avg_block_recall=%.4f physical_blocks=%d",
                 layer_id,
                 self._attention_profile_seen,
                 len(true_set),
-                len(predicted_set),
+                len(true_blocks),
+                len(predicted_blocks),
                 spec_hits,
                 true_misses,
                 recall,
@@ -2902,10 +3011,11 @@ class IndexerSSDManager:
             rows=int(slot_ids_tensor.shape[0]),
             cols=int(slot_ids_tensor.shape[1]) if slot_ids_tensor.ndim > 1 else 1,
             block_size=int(block_size),
-            true=len(true_set),
-            predicted=len(predicted_set),
-            spec_hits=spec_hits,
-            true_misses=true_misses,
+            true_tokens=len(true_set),
+            true_blocks=len(true_blocks),
+            predicted_blocks=len(predicted_blocks),
+            block_hits=spec_hits,
+            block_misses=true_misses,
             physical_blocks=len(block_ids),
         )
 
@@ -3025,9 +3135,7 @@ class IndexerSSDManager:
             when SSD state has not been initialized.
         """
         if len(data) != self._token_bytes:
-            raise ValueError(
-                f"Expected {self._token_bytes} bytes, got {len(data)}"
-            )
+            raise ValueError(f"Expected {self._token_bytes} bytes, got {len(data)}")
         with self._lock:
             token_id = self._decode_cursor.get(layer_id, 0)
             if token_id <= 0:
@@ -3057,6 +3165,7 @@ class IndexerSSDManager:
         slot_mapping: Optional[torch.Tensor] = None,
         block_table: Optional[torch.Tensor] = None,
         timing_event: str = "evict_after_prefill",
+        persist_to_store: bool = True,
     ) -> None:
         """Populate pool + SSD from vLLM's IndexerCache tensor after prefill.
 
@@ -3076,12 +3185,17 @@ class IndexerSSDManager:
             slot_mapping: Optional tensor [seq_len] mapping sequence position i
                 to its physical vLLM slot in *kv_cache_tensor*.  When provided,
                 token i is read from kv_cache_tensor[slot//block_size, slot%block_size].
-                When None, sequential layout (token i = block i//bs, offset i%bs) is assumed.
+                When None, sequential layout is assumed: token i maps to
+                block i//block_size at offset i%block_size.
             block_table: Optional tensor mapping logical block IDs to physical vLLM
                 block IDs.  When provided, it is expanded into a slot mapping for
                 the full compressed IndexerCache sequence.
             timing_event: Timing event name used to distinguish post-prefill
                 eviction from LMCache-hit reuse seeding.
+            persist_to_store: Whether to rewrite the complete SSD layer. Reuse
+                seeding disables this because the cold-store pass already
+                persisted the prefix; only the selected HBM seed rows need to
+                be gathered again.
         """
         t0 = time.perf_counter()
         pool = self._pools[layer_id]
@@ -3099,22 +3213,10 @@ class IndexerSSDManager:
             )
             map_ms = (time.perf_counter() - t_map0) * 1000.0
 
-        t_read0 = time.perf_counter()
-        token_bytes = self._read_packed_tokens(
-            kv_cache_tensor,
-            seq_len,
-            slot_mapping,
-        )
-        read_ms = (time.perf_counter() - t_read0) * 1000.0
-
-        # Write all tokens to SSD as one contiguous range.  Per-token pwrite
-        # calls dominate long-prefill latency.
-        t_write0 = time.perf_counter()
-        store.write_tokens_contiguous(0, token_bytes.contiguous().numpy().tobytes())
-        write_ms = (time.perf_counter() - t_write0) * 1000.0
-
-        # Load seed tokens into HBM pool first
-        t_load0 = time.perf_counter()
+        # Resolve the HBM seed set before gathering cache rows. On a reuse hit
+        # the SSD layer already contains the cold prefix, so gathering and
+        # rewriting all ``seq_len`` rows would serialize prediction behind a
+        # redundant 15+ MiB write per CSA layer.
         load_ids: List[int] = []
         if seed_token_ids:
             load_ids = seed_token_ids[: self._pool_size]
@@ -3123,8 +3225,37 @@ class IndexerSSDManager:
             extra = [tid for tid in range(seq_len) if tid not in seed_set]
             load_ids += extra[: self._pool_size - len(load_ids)]
 
+        t_read0 = time.perf_counter()
+        if persist_to_store:
+            token_bytes = self._read_packed_tokens(
+                kv_cache_tensor,
+                seq_len,
+                slot_mapping,
+            )
+            seed_bytes = token_bytes[load_ids] if load_ids else token_bytes[:0]
+        else:
+            seed_bytes = self._read_packed_token_ids(
+                kv_cache_tensor,
+                load_ids,
+                slot_mapping,
+                seq_len,
+            )
+            token_bytes = None
+        read_ms = (time.perf_counter() - t_read0) * 1000.0
+
+        t_write0 = time.perf_counter()
+        if persist_to_store:
+            assert token_bytes is not None
+            store.write_tokens_contiguous(
+                0,
+                token_bytes.contiguous().numpy().tobytes(),
+            )
+        write_ms = (time.perf_counter() - t_write0) * 1000.0
+
+        # Load seed tokens into HBM pool first.
+        t_load0 = time.perf_counter()
         if load_ids:
-            pool.load_tokens(load_ids, token_bytes[load_ids].contiguous())
+            pool.load_tokens(load_ids, seed_bytes.contiguous())
 
         # Protect seed tokens so they are evicted last
         if seed_token_ids:
@@ -3141,8 +3272,7 @@ class IndexerSSDManager:
         if log_key not in self._debug_evict_logged:
             self._debug_evict_logged.add(log_key)
             logger.info(
-                "IndexerSSDManager: %s complete layer %d seq_len=%d "
-                "seed_tokens=%d",
+                "IndexerSSDManager: %s complete layer %d seq_len=%d seed_tokens=%d",
                 timing_event,
                 layer_id,
                 seq_len,
@@ -3160,35 +3290,7 @@ class IndexerSSDManager:
             seq_len=seq_len,
             seed_tokens=len(seed_token_ids or []),
             load_ids=len(load_ids),
-        )
-
-    def submit_seed_after_reuse(
-        self,
-        layer_id: int,
-        kv_cache_cpu: torch.Tensor,
-        seq_len: int,
-        seed_token_ids: Optional[List[int]] = None,
-        slot_mapping_cpu: Optional[torch.Tensor] = None,
-        block_table_cpu: Optional[torch.Tensor] = None,
-    ) -> None:
-        """Submit CSA SSD/HBM pool initialization after LMCache full-hit reuse.
-
-        Args:
-            layer_id: CSA layer index.
-            kv_cache_cpu: Retrieved IndexerCache tensor already on CPU.
-            seq_len: Number of valid compressed CSA tokens in the reused prefix.
-            seed_token_ids: Token IDs to prioritize in the HBM pool.
-            slot_mapping_cpu: Slot mapping tensor already on CPU.
-            block_table_cpu: Block table tensor already on CPU.
-        """
-        self.submit_evict_after_prefill(
-            layer_id,
-            kv_cache_cpu,
-            seq_len,
-            seed_token_ids,
-            slot_mapping_cpu,
-            block_table_cpu,
-            timing_event="reuse_prefetch_seed",
+            persist_to_store=int(persist_to_store),
         )
 
     def submit_evict_after_prefill(
@@ -3200,6 +3302,7 @@ class IndexerSSDManager:
         slot_mapping_cpu: Optional[torch.Tensor] = None,
         block_table_cpu: Optional[torch.Tensor] = None,
         timing_event: str = "evict_after_prefill",
+        persist_to_store: bool = True,
     ) -> None:
         """Submit :meth:`evict_after_prefill` to the I/O thread pool.
 
@@ -3217,6 +3320,8 @@ class IndexerSSDManager:
             block_table_cpu: Block table tensor already on CPU.
             timing_event: Timing event name passed to
                 :meth:`evict_after_prefill`.
+            persist_to_store: Whether the worker must rewrite the complete SSD
+                layer before publishing the HBM seed pool.
         """
         with self._lock:
             previous_future = self._ready_futures.get(layer_id)
@@ -3242,6 +3347,7 @@ class IndexerSSDManager:
                     slot_mapping_cpu,
                     block_table_cpu,
                     timing_event=timing_event,
+                    persist_to_store=persist_to_store,
                 )
             except Exception:
                 logger.exception(
@@ -3266,8 +3372,7 @@ class IndexerSSDManager:
         with self._lock:
             self._ready_futures[layer_id] = future
         logger.info(
-            "IndexerSSDManager: submit_%s layer %d seq_len=%d "
-            "seed_tokens=%d",
+            "IndexerSSDManager: submit_%s layer %d seq_len=%d seed_tokens=%d",
             timing_event,
             layer_id,
             seq_len,
@@ -3313,9 +3418,7 @@ class IndexerSSDManager:
         block_size = kv_cache_tensor.shape[1]
         flat_block = kv_cache_tensor[block_idx].reshape(-1)
         value_start = block_offset * self._head_dim
-        scale_start = block_size * self._head_dim + (
-            block_offset * self._scale_bytes
-        )
+        scale_start = block_size * self._head_dim + (block_offset * self._scale_bytes)
         value = flat_block[value_start : value_start + self._head_dim]
         scale = flat_block[scale_start : scale_start + self._scale_bytes]
         return torch.cat((value, scale))
@@ -3345,9 +3448,52 @@ class IndexerSSDManager:
         block_offsets = slots % block_size
         flat_blocks = kv_cache_tensor.reshape(kv_cache_tensor.shape[0], -1)
 
-        value_offsets = (
-            block_offsets.unsqueeze(1) * self._head_dim
-            + torch.arange(self._head_dim, dtype=torch.long, device=device)
+        value_offsets = block_offsets.unsqueeze(1) * self._head_dim + torch.arange(
+            self._head_dim, dtype=torch.long, device=device
+        )
+        scale_offsets = (
+            block_size * self._head_dim
+            + block_offsets.unsqueeze(1) * self._scale_bytes
+            + torch.arange(self._scale_bytes, dtype=torch.long, device=device)
+        )
+        values = flat_blocks[block_ids.unsqueeze(1), value_offsets]
+        scales = flat_blocks[block_ids.unsqueeze(1), scale_offsets]
+        return torch.cat((values, scales), dim=1)
+
+    def _read_packed_token_ids(
+        self,
+        kv_cache_tensor: torch.Tensor,
+        token_ids: Sequence[int],
+        slot_mapping: Optional[torch.Tensor],
+        seq_len: int,
+    ) -> torch.Tensor:
+        """Gather selected logical tokens from a packed IndexerCache."""
+        device = kv_cache_tensor.device
+        logical_ids = torch.as_tensor(token_ids, dtype=torch.long, device=device)
+        if logical_ids.numel() == 0:
+            return torch.empty(
+                (0, self._token_bytes),
+                dtype=torch.uint8,
+                device=device,
+            )
+        if bool(((logical_ids < 0) | (logical_ids >= seq_len)).any().item()):
+            raise ValueError("seed token id is outside the reused prefix")
+        if slot_mapping is None:
+            slots = logical_ids
+        else:
+            mapping = slot_mapping.to(device=device, dtype=torch.long)
+            slots = mapping.index_select(0, logical_ids)
+            if bool((slots < 0).any().item()):
+                raise ValueError("seed token maps to a negative physical slot")
+
+        block_size = int(kv_cache_tensor.shape[1])
+        block_ids = torch.div(slots, block_size, rounding_mode="floor")
+        block_offsets = slots - block_ids * block_size
+        flat_blocks = kv_cache_tensor.reshape(kv_cache_tensor.shape[0], -1)
+        value_offsets = block_offsets.unsqueeze(1) * self._head_dim + torch.arange(
+            self._head_dim,
+            dtype=torch.long,
+            device=device,
         )
         scale_offsets = (
             block_size * self._head_dim
@@ -3385,9 +3531,19 @@ class IndexerSSDManager:
                     pool.insert(tid, data)
                     insert_ms += (time.perf_counter() - t_insert0) * 1000.0
             except Exception as exc:
+                if isinstance(exc, _SpeculativeReadCancelled):
+                    logger.debug(
+                        "IndexerSSDManager: speculative read cancelled for "
+                        "token %d layer %d",
+                        tid,
+                        layer_id,
+                    )
+                    continue
                 logger.warning(
                     "IndexerSSDManager: async read failed for token %d layer %d: %r",
-                    tid, layer_id, exc,
+                    tid,
+                    layer_id,
+                    exc,
                 )
                 # Fallback: synchronous read
                 try:
@@ -3430,11 +3586,15 @@ class IndexerSSDManager:
                 self._drain_futures[lid] = None
                 self._proxy_futures[lid] = []
                 self._decode_cursor[lid] = 0
+                self._last_proxy_blocks[lid] = None
 
     def close(self) -> None:
         """Shut down I/O thread pool and close SSD files."""
-        if self._proxy_executor is not None:
-            self._proxy_executor.shutdown(wait=True)
+        if self._closed:
+            return
+        self._closed = True
+        self._proxy_executor.shutdown(wait=True)
+        self._proxy_io_executor.shutdown(wait=True)
         self._executor.shutdown(wait=True)
         for store in self._stores.values():
             store.close()
@@ -3478,7 +3638,8 @@ class IndexerSSDManager:
 
         for name, module in model.named_modules():
             if isinstance(module, indexer_cache_classes):
-                # Extract layer index from prefix like "model.layers.3.self_attn.indexer.k_cache"
+                # Extract the layer index from a prefix such as
+                # "model.layers.3.self_attn.indexer.k_cache".
                 parts = name.split(".")
                 for i, p in enumerate(parts):
                     if p == "layers" and i + 1 < len(parts):
@@ -3515,3 +3676,66 @@ class IndexerSSDManager:
             io_workers=io_workers,
             device=device,
         )
+
+    def _proxy_stream_for(self, layer_id: int) -> torch.cuda.Stream:
+        """Return the reusable CUDA proxy stream for a target layer.
+
+        A per-layer stream keeps independent lookahead targets concurrent while
+        naturally ordering repeated work for the same target. Streams are
+        created lazily on the manager's active CUDA device and retained for the
+        manager lifetime.
+
+        Args:
+            layer_id: Target CSA layer whose proxy work will use the stream.
+
+        Returns:
+            Reusable CUDA stream dedicated to ``layer_id``.
+        """
+        with self._proxy_streams_lock:
+            stream = self._proxy_streams.get(int(layer_id))
+            if stream is None:
+                stream = torch.cuda.Stream()
+                self._proxy_streams[int(layer_id)] = stream
+            return stream
+
+    def _acquire_proxy_cpu_selection(
+        self,
+        layer_id: int,
+        selection_size: int,
+    ) -> torch.Tensor:
+        """Acquire a pinned fixed-size block list for the Tutti bridge.
+
+        Args:
+            layer_id: Target CSA layer id.
+            selection_size: Required number of block-id slots.
+
+        Returns:
+            A pinned CPU int32 tensor with exactly ``selection_size`` entries.
+        """
+        with self._proxy_buffers_lock:
+            pool = self._proxy_cpu_selection_pool.setdefault(int(layer_id), [])
+            for index, buffer in enumerate(pool):
+                if int(buffer.numel()) == int(selection_size):
+                    pool.pop(index)
+                    return buffer
+        return torch.empty(
+            (int(selection_size),),
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=True,
+        )
+
+    def _release_proxy_cpu_selection(
+        self,
+        layer_id: int,
+        buffer: torch.Tensor,
+    ) -> None:
+        """Return one completed pinned block list to the bounded layer pool.
+
+        Args:
+            layer_id: Target CSA layer id.
+            buffer: Selection whose asynchronous device copy has completed.
+        """
+        with self._proxy_buffers_lock:
+            pool = self._proxy_cpu_selection_pool.setdefault(int(layer_id), [])
+            pool[:] = [buffer]

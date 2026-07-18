@@ -2,6 +2,8 @@
 
 #include "mp_mem_kernels.cuh"
 
+#include <cstdint>
+
 namespace {
 
 /**
@@ -232,6 +234,70 @@ __global__ void multi_layer_block_transfer_kernel(
       shape_desc, lmcache_chunk_size);
 }
 
+template <typename ScalarType, bool lmcache_to_engine, GPUKVFormat format>
+__global__ void multi_layer_block_transfer_batched_kernel(
+    const int64_t* __restrict__ lmcache_object_ptrs,
+    ScalarType** __restrict__ paged_buffer_ptrs,
+    const int64_t* engine_block_ids, const int num_blocks_per_object,
+    const PageBufferShapeDesc shape_desc, const int lmcache_chunk_size,
+    const int skip_prefix_n_blocks) {
+  const int flat_block_idx = blockIdx.y;
+  if (flat_block_idx < skip_prefix_n_blocks) {
+    return;
+  }
+  const int obj_idx = flat_block_idx / num_blocks_per_object;
+  const int block_idx_in_object = flat_block_idx % num_blocks_per_object;
+  const int engine_block_idx = engine_block_ids[flat_block_idx];
+  auto* lmcache_object =
+      reinterpret_cast<ScalarType*>(lmcache_object_ptrs[obj_idx]);
+  multi_layer_block_transfer_single_block<ScalarType, lmcache_to_engine,
+                                          format>(
+      lmcache_object, paged_buffer_ptrs, engine_block_idx,
+      block_idx_in_object * shape_desc.bs, shape_desc, lmcache_chunk_size);
+}
+
+template <typename ScalarType>
+__global__ void scatter_rows_from_object_ptrs_kernel(
+    const int64_t* __restrict__ source_ptrs, uint8_t* __restrict__ destination,
+    const int64_t* __restrict__ destination_rows, int64_t total_rows,
+    int rows_per_object, int scalars_per_row, int row_bytes,
+    int64_t destination_rows_limit, int64_t destination_stride0,
+    int64_t destination_stride1, int logical_slots_per_block) {
+  const int64_t scalar_idx =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t total_scalars = total_rows * scalars_per_row;
+  if (scalar_idx >= total_scalars) {
+    return;
+  }
+
+  const int64_t row_idx = scalar_idx / scalars_per_row;
+  const int scalar_in_row = scalar_idx % scalars_per_row;
+  const int64_t object_idx = row_idx / rows_per_object;
+  const int row_in_object = row_idx % rows_per_object;
+  const int64_t destination_row = destination_rows[row_idx];
+  if (destination_row < 0 || destination_row >= destination_rows_limit) {
+    return;
+  }
+
+  const auto* source = reinterpret_cast<const uint8_t*>(
+      static_cast<uintptr_t>(source_ptrs[object_idx]));
+  const auto* source_row =
+      reinterpret_cast<const ScalarType*>(source + row_in_object * row_bytes);
+
+  int64_t destination_offset;
+  if (logical_slots_per_block > 0) {
+    const int64_t block_idx = destination_row / logical_slots_per_block;
+    const int64_t slot_idx = destination_row % logical_slots_per_block;
+    destination_offset =
+        block_idx * destination_stride0 + slot_idx * destination_stride1;
+  } else {
+    destination_offset = destination_row * destination_stride0;
+  }
+  auto* destination_row_ptr =
+      reinterpret_cast<ScalarType*>(destination + destination_offset);
+  destination_row_ptr[scalar_in_row] = source_row[scalar_in_row];
+}
+
 #define LAUNCH_KERNEL(DIRECTION, FORMAT)                                 \
   multi_layer_block_transfer_kernel<ScalarType, DIRECTION, FORMAT>       \
       <<<grid, block, 0, stream>>>(lmcache_obj4, paged_buffer_ptrs,      \
@@ -327,6 +393,112 @@ void multi_layer_block_kv_transfer_templated(
   }
 }
 
+#define LAUNCH_BATCHED_KERNEL(DIRECTION, FORMAT)                           \
+  multi_layer_block_transfer_batched_kernel<ScalarType, DIRECTION, FORMAT> \
+      <<<grid, block, 0, stream>>>(lmcache_object_ptrs, paged_buffer_ptrs, \
+                                   block_ids_ptr, num_blocks_per_object,   \
+                                   shape_desc, lmcache_chunk_size,         \
+                                   skip_prefix_n_blocks);                  \
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+#define DISPATCH_BATCHED_FORMAT(DIRECTION)                                  \
+  switch (gpu_kv_format) {                                                  \
+    case GPUKVFormat::NB_NL_TWO_BS_NH_HS:                                   \
+      LAUNCH_BATCHED_KERNEL(DIRECTION, GPUKVFormat::NB_NL_TWO_BS_NH_HS);    \
+      break;                                                                \
+    case GPUKVFormat::NL_X_TWO_NB_BS_NH_HS:                                 \
+      LAUNCH_BATCHED_KERNEL(DIRECTION, GPUKVFormat::NL_X_TWO_NB_BS_NH_HS);  \
+      break;                                                                \
+    case GPUKVFormat::NL_X_NB_TWO_BS_NH_HS:                                 \
+      LAUNCH_BATCHED_KERNEL(DIRECTION, GPUKVFormat::NL_X_NB_TWO_BS_NH_HS);  \
+      break;                                                                \
+    case GPUKVFormat::NL_X_NB_BS_HS:                                        \
+      LAUNCH_BATCHED_KERNEL(DIRECTION, GPUKVFormat::NL_X_NB_BS_HS);         \
+      break;                                                                \
+    case GPUKVFormat::TWO_X_NL_X_NBBS_NH_HS:                                \
+      LAUNCH_BATCHED_KERNEL(DIRECTION, GPUKVFormat::TWO_X_NL_X_NBBS_NH_HS); \
+      break;                                                                \
+    case GPUKVFormat::NL_X_NBBS_ONE_HS:                                     \
+      LAUNCH_BATCHED_KERNEL(DIRECTION, GPUKVFormat::NL_X_NBBS_ONE_HS);      \
+      break;                                                                \
+    case GPUKVFormat::NB_NL_TWO_NH_BS_HS:                                   \
+      LAUNCH_BATCHED_KERNEL(DIRECTION, GPUKVFormat::NB_NL_TWO_NH_BS_HS);    \
+      break;                                                                \
+    default:                                                                \
+      TORCH_CHECK(false, "Unsupported GPUKVFormat: ",                       \
+                  static_cast<int>(gpu_kv_format));                         \
+  }
+
+template <typename ScalarType>
+void multi_layer_block_kv_transfer_batched_templated(
+    const torch::Tensor& paged_buffer_ptrs_tensor,
+    const torch::Tensor& lmcache_objects_ptrs_tensor,
+    const torch::Tensor& block_ids, const torch::Device& device,
+    TransferDirection direction, PageBufferShapeDesc shape_desc,
+    int lmcache_chunk_size, GPUKVFormat gpu_kv_format,
+    int skip_prefix_n_blocks) {
+  TORCH_CHECK(paged_buffer_ptrs_tensor.is_cuda(),
+              "paged_buffer_ptrs_tensor must be a CUDA tensor");
+  TORCH_CHECK(paged_buffer_ptrs_tensor.scalar_type() == torch::kInt64,
+              "paged_buffer_ptrs_tensor must be int64");
+  TORCH_CHECK(paged_buffer_ptrs_tensor.is_contiguous(),
+              "paged_buffer_ptrs_tensor must be contiguous");
+  TORCH_CHECK(lmcache_objects_ptrs_tensor.is_cuda(),
+              "lmcache_objects_ptrs_tensor must be a CUDA tensor");
+  TORCH_CHECK(lmcache_objects_ptrs_tensor.scalar_type() == torch::kInt64,
+              "lmcache_objects_ptrs_tensor must be int64");
+  TORCH_CHECK(lmcache_objects_ptrs_tensor.is_contiguous(),
+              "lmcache_objects_ptrs_tensor must be contiguous");
+  TORCH_CHECK(block_ids.is_cuda(), "block_ids must be a CUDA tensor");
+  TORCH_CHECK(block_ids.scalar_type() == torch::kInt64,
+              "block_ids must be int64");
+  TORCH_CHECK(block_ids.is_contiguous(), "block_ids must be contiguous");
+  TORCH_CHECK(paged_buffer_ptrs_tensor.device() == block_ids.device() &&
+                  lmcache_objects_ptrs_tensor.device() == block_ids.device(),
+              "pointer tensors and block_ids must be on the same device");
+
+  const int num_objects = static_cast<int>(lmcache_objects_ptrs_tensor.numel());
+  TORCH_CHECK(num_objects >= 1, "Expected at least one LMCache object");
+  const int total_blocks = static_cast<int>(block_ids.numel());
+  TORCH_CHECK(total_blocks > 0, "block_ids must not be empty");
+  TORCH_CHECK(total_blocks <= 65535,
+              "block_ids length exceeds CUDA grid y limit: ", total_blocks);
+  TORCH_CHECK(total_blocks % num_objects == 0, "block_ids length (",
+              total_blocks, ") must be divisible by num_objects (", num_objects,
+              ")");
+  const int num_blocks_per_object = total_blocks / num_objects;
+  TORCH_CHECK(num_blocks_per_object * shape_desc.bs == lmcache_chunk_size,
+              "blocks_per_object * block_size (",
+              num_blocks_per_object * shape_desc.bs,
+              ") must equal lmcache_chunk_size (", lmcache_chunk_size, ")");
+  TORCH_CHECK(skip_prefix_n_blocks >= 0 && skip_prefix_n_blocks <= total_blocks,
+              "skip_prefix_n_blocks must be in [0, ", total_blocks, "]");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  auto** paged_buffer_ptrs = reinterpret_cast<ScalarType**>(
+      paged_buffer_ptrs_tensor.data_ptr<int64_t>());
+  const int64_t* lmcache_object_ptrs =
+      lmcache_objects_ptrs_tensor.data_ptr<int64_t>();
+  const int64_t* block_ids_ptr = block_ids.data_ptr<int64_t>();
+
+  const int elements_per_head = shape_desc.hs * shape_desc.element_size /
+                                static_cast<int>(sizeof(ScalarType));
+  const int thread_dim_x = std::min(elements_per_head, 32);
+  const int thread_dim_y = shape_desc.nh;
+  const dim3 block(thread_dim_x, thread_dim_y);
+  const dim3 grid(shape_desc.kv_size, total_blocks, shape_desc.nl);
+
+  if (direction == TransferDirection::H2D) {
+    DISPATCH_BATCHED_FORMAT(true);
+  } else {
+    DISPATCH_BATCHED_FORMAT(false);
+  }
+}
+
+#undef DISPATCH_BATCHED_FORMAT
+#undef LAUNCH_BATCHED_KERNEL
+
 #undef DISPATCH_FORMAT
 #undef LAUNCH_KERNEL
 
@@ -338,6 +510,14 @@ void multi_layer_block_kv_transfer_templated(
         paged_buffer_ptrs_tensor, lmcache_objects_ptrs, block_ids, device, \
         direction, shape_desc, lmcache_chunk_size, gpu_kv_format,          \
         skip_prefix_n_blocks);                                             \
+  } while (0)
+
+#define LAUNCH_BATCHED_TEMPLATED(type)                                    \
+  do {                                                                    \
+    multi_layer_block_kv_transfer_batched_templated<type>(                \
+        paged_buffer_ptrs_tensor, lmcache_objects_ptrs_tensor, block_ids, \
+        device, direction, shape_desc, lmcache_chunk_size, gpu_kv_format, \
+        skip_prefix_n_blocks);                                            \
   } while (0)
 
 void multi_layer_block_kv_transfer(
@@ -359,4 +539,121 @@ void multi_layer_block_kv_transfer(
   }
 }
 
+void multi_layer_block_kv_transfer_batched(
+    const torch::Tensor& paged_buffer_ptrs_tensor,
+    const torch::Tensor& lmcache_objects_ptrs_tensor,
+    const torch::Tensor& block_ids, const torch::Device& device,
+    TransferDirection direction, PageBufferShapeDesc shape_desc,
+    int lmcache_chunk_size, GPUKVFormat gpu_kv_format,
+    int skip_prefix_n_blocks) {
+  const int head_bytes = shape_desc.hs * shape_desc.element_size;
+  TORCH_CHECK(head_bytes % sizeof(uint16_t) == 0, "head_size * element_size (",
+              head_bytes, ") must be divisible by 2 for vectorized access");
+
+  if (head_bytes % sizeof(uint4) == 0) {
+    LAUNCH_BATCHED_TEMPLATED(uint4);
+  } else if (head_bytes % sizeof(uint32_t) == 0) {
+    LAUNCH_BATCHED_TEMPLATED(uint32_t);
+  } else {
+    LAUNCH_BATCHED_TEMPLATED(uint16_t);
+  }
+}
+
+void scatter_rows_from_object_ptrs(const torch::Tensor& source_ptrs,
+                                   const torch::Tensor& destination,
+                                   const torch::Tensor& destination_rows,
+                                   int rows_per_object, int row_bytes,
+                                   int logical_slots_per_block,
+                                   bool source_ptrs_aligned) {
+  TORCH_CHECK(source_ptrs.is_cuda(), "source_ptrs must be a CUDA tensor");
+  TORCH_CHECK(source_ptrs.scalar_type() == torch::kInt64,
+              "source_ptrs must be int64");
+  TORCH_CHECK(source_ptrs.is_contiguous(), "source_ptrs must be contiguous");
+  TORCH_CHECK(destination.is_cuda(), "destination must be a CUDA tensor");
+  TORCH_CHECK(destination.scalar_type() == torch::kUInt8,
+              "destination must be uint8");
+  TORCH_CHECK(destination_rows.is_cuda(),
+              "destination_rows must be a CUDA tensor");
+  TORCH_CHECK(destination_rows.scalar_type() == torch::kInt64,
+              "destination_rows must be int64");
+  TORCH_CHECK(destination_rows.is_contiguous(),
+              "destination_rows must be contiguous");
+  TORCH_CHECK(source_ptrs.device() == destination.device() &&
+                  source_ptrs.device() == destination_rows.device(),
+              "source_ptrs, destination, and destination_rows must share a "
+              "CUDA device");
+  TORCH_CHECK(source_ptrs.dim() == 1, "source_ptrs must be one-dimensional");
+  TORCH_CHECK(destination_rows.dim() == 1,
+              "destination_rows must be one-dimensional");
+  TORCH_CHECK(rows_per_object > 0, "rows_per_object must be positive");
+  TORCH_CHECK(row_bytes > 0, "row_bytes must be positive");
+  TORCH_CHECK(logical_slots_per_block >= 0,
+              "logical_slots_per_block must be non-negative");
+  TORCH_CHECK(destination.dim() >= 2,
+              "destination must have at least two dimensions");
+  TORCH_CHECK(destination.stride(destination.dim() - 1) == 1,
+              "destination innermost dimension must be contiguous");
+
+  const int64_t num_objects = source_ptrs.numel();
+  const int64_t total_rows = destination_rows.numel();
+  TORCH_CHECK(num_objects > 0, "source_ptrs must not be empty");
+  TORCH_CHECK(total_rows == num_objects * rows_per_object,
+              "destination_rows length (", total_rows,
+              ") must equal source_ptrs length * rows_per_object (",
+              num_objects * rows_per_object, ")");
+
+  int64_t destination_rows_limit = destination.size(0);
+  int64_t destination_stride1 = 0;
+  if (logical_slots_per_block > 0) {
+    TORCH_CHECK(destination.dim() >= 3,
+                "slot-addressed destination must have at least 3 dimensions");
+    TORCH_CHECK(destination.size(1) >= logical_slots_per_block,
+                "destination slot dimension is smaller than "
+                "logical_slots_per_block");
+    destination_rows_limit =
+        destination.size(0) * static_cast<int64_t>(logical_slots_per_block);
+    destination_stride1 = destination.stride(1);
+  }
+  TORCH_CHECK(destination.size(destination.dim() - 1) >= row_bytes,
+              "destination row width is smaller than row_bytes");
+
+  const at::cuda::OptionalCUDAGuard device_guard(destination.device());
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  constexpr int threads = 256;
+  constexpr int vector_bytes = sizeof(uint64_t);
+  const auto destination_ptr =
+      reinterpret_cast<uintptr_t>(destination.data_ptr<uint8_t>());
+  const bool destination_aligned =
+      destination_ptr % vector_bytes == 0 &&
+      destination.stride(0) % vector_bytes == 0 &&
+      (logical_slots_per_block == 0 || destination_stride1 % vector_bytes == 0);
+  const int64_t scalar_size = source_ptrs_aligned && destination_aligned &&
+                                      row_bytes % vector_bytes == 0
+                                  ? static_cast<int64_t>(vector_bytes)
+                                  : static_cast<int64_t>(sizeof(uint8_t));
+  const int scalars_per_row = row_bytes / scalar_size;
+  const int64_t total_scalars = total_rows * scalars_per_row;
+  const int blocks = static_cast<int>((total_scalars + threads - 1) / threads);
+
+  if (scalar_size == static_cast<int64_t>(sizeof(uint64_t))) {
+    scatter_rows_from_object_ptrs_kernel<uint64_t>
+        <<<blocks, threads, 0, stream>>>(
+            source_ptrs.data_ptr<int64_t>(), destination.data_ptr<uint8_t>(),
+            destination_rows.data_ptr<int64_t>(), total_rows, rows_per_object,
+            scalars_per_row, row_bytes, destination_rows_limit,
+            destination.stride(0), destination_stride1,
+            logical_slots_per_block);
+  } else {
+    scatter_rows_from_object_ptrs_kernel<uint8_t>
+        <<<blocks, threads, 0, stream>>>(
+            source_ptrs.data_ptr<int64_t>(), destination.data_ptr<uint8_t>(),
+            destination_rows.data_ptr<int64_t>(), total_rows, rows_per_object,
+            scalars_per_row, row_bytes, destination_rows_limit,
+            destination.stride(0), destination_stride1,
+            logical_slots_per_block);
+  }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 #undef LAUNCH_TEMPLATED
+#undef LAUNCH_BATCHED_TEMPLATED

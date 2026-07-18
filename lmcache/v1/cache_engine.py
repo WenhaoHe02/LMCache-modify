@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 import asyncio
 import gc
 import inspect
+import logging
 import multiprocessing
 import os
 import subprocess
@@ -82,6 +83,24 @@ from lmcache.v1.token_database import (
 )
 
 logger = init_logger(__name__)
+
+
+class _TuttiProfileLogFilter(logging.Filter):
+    """Suppress Tutti profile-only records when profiling is disabled."""
+
+    _PREFIXES = (
+        "TUTTI_OBJECT_STORE_PROFILE",
+        "LMCACHE_RETRIEVE_PROFILE",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Return whether a log record should be emitted."""
+        value = os.getenv("LMCACHE_TUTTI_PROFILE", "0")
+        enabled = value.lower() in {"1", "true", "yes", "on"}
+        return enabled or not str(record.msg).startswith(self._PREFIXES)
+
+
+logger.addFilter(_TuttiProfileLogFilter())
 
 _DSV4_HCA_DEFERRED_RETRIEVE_ROLE = "hca_deferred_retrieve"
 
@@ -211,8 +230,7 @@ def _maybe_remount_after_tutti_failure(
             return True
         except (OSError, subprocess.CalledProcessError) as exc:
             logger.warning(
-                "Tutti remount attempt failed: source=%s mount=%s "
-                "cmd=%s error=%s",
+                "Tutti remount attempt failed: source=%s mount=%s cmd=%s error=%s",
                 source,
                 mount_point,
                 cmd,
@@ -268,10 +286,9 @@ class LMCacheEngine:
         self.gpu_connector = gpu_connector
         self.broadcast_fn = broadcast_fn
         self.broadcast_object_fn = broadcast_object_fn
-        self.dsv4_optimized_kv = (
-            _as_bool(config.get_extra_config_value("dsv4_optimized_kv", False))
-            or _env_flag("LMCACHE_DSV4_OPTIMIZED_KV")
-        )
+        self.dsv4_optimized_kv = _as_bool(
+            config.get_extra_config_value("dsv4_optimized_kv", False)
+        ) or _env_flag("LMCACHE_DSV4_OPTIMIZED_KV")
         self.dsv4_optimized_tail_tokens = max(
             int(
                 config.get_extra_config_value(
@@ -590,12 +607,8 @@ class LMCacheEngine:
             )
             return
 
-        n_slots: int = int(
-            self.config.get_extra_config_value("tutti_n_slots", 16)
-        )
-        slot_mb: int = int(
-            self.config.get_extra_config_value("tutti_slot_mb", 32)
-        )
+        n_slots: int = int(self.config.get_extra_config_value("tutti_n_slots", 16))
+        slot_mb: int = int(self.config.get_extra_config_value("tutti_slot_mb", 32))
         nsid: int = int(self.config.get_extra_config_value("tutti_nsid", 1))
         cuda_device: int = worker_idx
 
@@ -668,6 +681,7 @@ class LMCacheEngine:
                 )
                 if health_poll_timeout_s > 0 and health_port > 0:
                     import urllib.request
+
                     url = f"http://127.0.0.1:{health_port}/health"
                     deadline = time.monotonic() + health_poll_timeout_s
                     ready = False
@@ -688,7 +702,8 @@ class LMCacheEngine:
                             time.sleep(health_poll_interval_s)
                     if ready:
                         logger.info(
-                            "Tutti startup warmup: server ready, initializing (worker=%d)",
+                            "Tutti startup warmup: server ready, initializing "
+                            "(worker=%d)",
                             worker_idx,
                         )
                     else:
@@ -824,8 +839,7 @@ class LMCacheEngine:
                 required_paths = [
                     disk_backend.dict[key].path
                     for key in keys or []
-                    if key in disk_backend.dict
-                    and disk_backend.dict[key] is not None
+                    if key in disk_backend.dict and disk_backend.dict[key] is not None
                 ]
                 if required_paths:
                     paths = list(dict.fromkeys(required_paths))
@@ -858,6 +872,12 @@ class LMCacheEngine:
                 raw_region_extents = FiemapHelper.query_extents(
                     disk_backend.kv_object_tutti_raw_region_path
                 )
+                # Preserve the filesystem path as an alias in the loader's
+                # pre-bind cache. Lazy indexer attachment happens after snvme
+                # unmounts the filesystem and must not issue FIEMAP again.
+                initial_lba_cache[
+                    disk_backend.kv_object_tutti_raw_region_path
+                ] = list(raw_region_extents)
                 disk_backend.set_kv_object_tutti_raw_region_extents(
                     [
                         (
@@ -873,12 +893,23 @@ class LMCacheEngine:
                     "scan_ms=%.3f",
                     disk_backend.kv_object_tutti_raw_region_path,
                     len(raw_region_extents),
-                    sum(
-                        extent.n_sectors * 512
-                        for extent in raw_region_extents
-                    )
+                    sum(extent.n_sectors * 512 for extent in raw_region_extents)
                     / 1024**2,
                     (time.perf_counter() - raw_region_start) * 1000.0,
+                )
+            indexer_region_paths = [
+                path.strip()
+                for path in os.getenv(
+                    "LMCACHE_INDEXER_TUTTI_RAW_REGION_PATH", ""
+                ).split(",")
+                if path.strip()
+            ]
+            if indexer_region_paths:
+                indexer_region_path = indexer_region_paths[
+                    self.metadata.local_worker_id % len(indexer_region_paths)
+                ]
+                initial_lba_cache[indexer_region_path] = (
+                    FiemapHelper.query_extents(indexer_region_path)
                 )
             missing_required_paths = [
                 path for path in required_paths if path not in initial_lba_cache
@@ -929,8 +960,7 @@ class LMCacheEngine:
                     (time.perf_counter() - debug_start) * 1000.0,
                 )
             logger.info(
-                "Tutti lazy pre-scan: %d recovered, %d files scanned, "
-                "%d LBAs cached",
+                "Tutti lazy pre-scan: %d recovered, %d files scanned, %d LBAs cached",
                 n_recovered,
                 len(paths),
                 len(initial_lba_cache),
@@ -1111,6 +1141,20 @@ class LMCacheEngine:
         on_batch_loaded: Optional[
             Callable[[int, List[Optional[MemoryObj]]], None]
         ] = None,
+        on_raw_batch_loaded: Optional[
+            Callable[
+                [
+                    int,
+                    List[int],
+                    List[int],
+                    List[int],
+                    torch.Tensor,
+                    List[List[torch.Size]],
+                    List[List[torch.dtype]],
+                ],
+                None,
+            ]
+        ] = None,
     ) -> List[Optional[MemoryObj]]:
         """Fast-path disk load via GPU-direct NVMe (Tutti).
 
@@ -1139,17 +1183,22 @@ class LMCacheEngine:
             on_batch_loaded: Optional callback invoked after each Tutti staging
                 batch is read. When supplied, memory objects are staging views
                 that must be consumed before the callback returns.
+            on_raw_batch_loaded: Optional callback invoked directly from the
+                Tutti completion path. It receives staging offsets plus the
+                effective shape/dtype layout and avoids constructing per-key
+                ``TensorMemoryObj`` wrappers. Mutually exclusive with
+                ``on_batch_loaded``.
 
         Returns:
             List of MemoryObj (GPU-resident TensorMemoryObj) or None per key.
         """
         if self.storage_manager is None:
-            raise RuntimeError(
-                "_tutti_batched_get called but storage_manager is None"
-            )
+            raise RuntimeError("_tutti_batched_get called but storage_manager is None")
         if self._tutti_loader is None:
-            raise RuntimeError(
-                "_tutti_batched_get called but _tutti_loader is None"
+            raise RuntimeError("_tutti_batched_get called but _tutti_loader is None")
+        if on_batch_loaded is not None and on_raw_batch_loaded is not None:
+            raise ValueError(
+                "on_batch_loaded and on_raw_batch_loaded are mutually exclusive"
             )
 
         profile_start = time.perf_counter()
@@ -1158,17 +1207,15 @@ class LMCacheEngine:
         from lmcache.v1.gpu_connector.tutti_direct_loader import LbaRecord
         from lmcache.utils import DiskCacheMetadata
 
-        disk_backend = self.storage_manager.storage_backends.get(
-            "LocalDiskBackend"
-        )
+        disk_backend = self.storage_manager.storage_backends.get("LocalDiskBackend")
         if not isinstance(disk_backend, LocalDiskBackend):
             return [None] * len(keys)
 
         disk_metas: List[Optional[DiskCacheMetadata]] = []
         tutti_file_offsets: Optional[List[int]] = None
-        tutti_read_ranges: Optional[
-            List[Optional[Tuple[KVObjectByteRange, ...]]]
-        ] = None
+        tutti_read_ranges: Optional[List[Optional[Tuple[KVObjectByteRange, ...]]]] = (
+            None
+        )
         metadata_start = time.perf_counter()
         with disk_backend.disk_lock:
             for key in keys:
@@ -1192,9 +1239,8 @@ class LMCacheEngine:
         ):
             first_unreadable = len(kv_object_records)
             for index, record in enumerate(kv_object_records):
-                if (
-                    record is None
-                    or not disk_backend.kv_object_record_raw_readable(record)
+                if record is None or not disk_backend.kv_object_record_raw_readable(
+                    record
                 ):
                     first_unreadable = index
                     break
@@ -1491,6 +1537,64 @@ class LMCacheEngine:
 
         load_start = time.perf_counter()
         try:
+            loader_raw_callback = None
+            if on_raw_batch_loaded is not None:
+
+                def _forward_raw_batch(
+                    batch_start: int,
+                    completed_indices: List[int],
+                    completed_offsets: List[int],
+                    completed_nbytes: List[int],
+                    staging: torch.Tensor,
+                ) -> None:
+                    completed_shapes: List[List[torch.Size]] = []
+                    completed_dtypes: List[List[torch.dtype]] = []
+                    for local_index in completed_indices:
+                        key_index = batch_start + local_index
+                        disk_meta = disk_metas[key_index]
+                        if disk_meta is None:
+                            raise RuntimeError(
+                                "Tutti raw callback completed a key without "
+                                "disk metadata"
+                            )
+                        shapes = (
+                            tutti_shapes_per_key[key_index]
+                            if tutti_shapes_per_key is not None
+                            else None
+                        )
+                        if shapes is None:
+                            shapes = disk_meta.shapes
+                        if shapes is None:
+                            if disk_meta.shape is None:
+                                raise RuntimeError(
+                                    "Tutti raw callback is missing object shapes"
+                                )
+                            shapes = [disk_meta.shape]
+                        dtypes = disk_meta.dtypes
+                        if dtypes is None:
+                            if disk_meta.dtype is None:
+                                raise RuntimeError(
+                                    "Tutti raw callback is missing object dtypes"
+                                )
+                            dtypes = [disk_meta.dtype] * len(shapes)
+                        if len(shapes) != len(dtypes):
+                            raise RuntimeError(
+                                "Tutti raw callback shape/dtype counts differ"
+                            )
+                        completed_shapes.append(list(shapes))
+                        completed_dtypes.append(list(dtypes))
+                    on_raw_batch_loaded(
+                        batch_start,
+                        completed_indices,
+                        completed_offsets,
+                        completed_nbytes,
+                        staging,
+                        completed_shapes,
+                        completed_dtypes,
+                    )
+
+                loader_raw_callback = _forward_raw_batch
+
             results = self._tutti_loader.load_chunks_to_hbm(
                 keys,
                 disk_metas,  # type: ignore[arg-type]
@@ -1498,22 +1602,25 @@ class LMCacheEngine:
                 file_offsets=tutti_file_offsets,
                 read_ranges_per_key=tutti_read_ranges,
                 on_batch_loaded=on_batch_loaded,
-                # Whole-call lock: the CSA bulk walker lazy-starts at the
-                # first CSA gate (compute phase, queue idle) since V24, so
-                # nothing waits behind this retrieve anymore.  Per-batch
-                # locking here (V21-V23) fragmented the retrieve to
-                # ~2 GB/s without helping anyone.
+                on_raw_batch_loaded=loader_raw_callback,
+                # Keep foreground retrieve as one queue owner. Per-batch
+                # locking fragments sequential NVMe throughput; speculative
+                # staged reads are admitted by the loader's priority gate.
             )
         except Exception:
             logger.exception(
                 "Tutti direct load failed for %d LocalDiskBackend keys; "
                 "falling back to %s",
                 len(keys),
-                "CPU filesystem path"
-                if self._tutti_can_cpu_fallback
-                else "cache miss",
+                "CPU filesystem path" if self._tutti_can_cpu_fallback else "cache miss",
             )
-            if self._tutti_can_cpu_fallback:
+            # A streaming callback may already have materialized an earlier
+            # batch into the final KV cache. Its caller tracks that prefix and
+            # cannot consume a second list of CPU fallback objects safely.
+            streaming_callback = (
+                on_batch_loaded is not None or on_raw_batch_loaded is not None
+            )
+            if self._tutti_can_cpu_fallback and not streaming_callback:
                 fallback_results = self.storage_manager.batched_get(
                     keys=keys,
                     location="LocalDiskBackend",
@@ -1524,7 +1631,7 @@ class LMCacheEngine:
                 return fallback_results
             return [None] * original_key_count
         load_ms = (time.perf_counter() - load_start) * 1000.0
-        streaming = on_batch_loaded is not None
+        streaming = on_batch_loaded is not None or on_raw_batch_loaded is not None
         loaded = (
             len(keys)
             if streaming
@@ -1624,8 +1731,7 @@ class LMCacheEngine:
                 )
                 if delay_s > 0:
                     logger.info(
-                        "Tutti warmup waiting %.3f sec for request cleanup: "
-                        "req_id=%s",
+                        "Tutti warmup waiting %.3f sec for request cleanup: req_id=%s",
                         delay_s,
                         req_id,
                     )
@@ -1664,9 +1770,7 @@ class LMCacheEngine:
                     and not self._tutti_warmup_started
                 )
                 if should_start:
-                    req_keys = list(
-                        self._tutti_store_warmup_keys.get(req_key, set())
-                    )
+                    req_keys = list(self._tutti_store_warmup_keys.get(req_key, set()))
             if should_start and req_keys:
                 thread = threading.Thread(
                     target=_warm_after_store,
@@ -1916,6 +2020,45 @@ class LMCacheEngine:
         with store_stats.profile_from_gpu():
             self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
 
+        # The V28 HCA walker consumes one whole prefix layer at a time.  Once
+        # every chunk is resident on CPU, persist a layer-major sidecar keyed
+        # by the final prefix hash.  This is deliberately synchronous on the
+        # cold-store path: retrieve must never observe metadata for a partial
+        # layer snapshot, and the sidecar is tiny compared with full KV.
+        if (
+            (
+                _env_flag("LMCACHE_DSV4_HCA_WALKER")
+                or _env_flag("LMCACHE_INDEXER_ENABLE_PREFETCH")
+            )
+            and starts
+            and starts[0] == 0
+            and ends[-1] == num_to_store_tokens
+        ):
+            disk_backend = self.storage_manager.storage_backends.get(
+                "LocalDiskBackend"
+            )
+            store_snapshot = getattr(
+                disk_backend,
+                "store_attention_layer_major_snapshot",
+                None,
+            )
+            if callable(store_snapshot):
+                try:
+                    stored_layers = int(store_snapshot(keys[-1], memory_objs))
+                    logger.info(
+                        "DSv4 attention layer-major snapshot key=%s layers=%d "
+                        "chunks=%d tokens=%d",
+                        keys[-1].to_string(),
+                        stored_layers,
+                        len(memory_objs),
+                        num_to_store_tokens,
+                    )
+                except Exception:
+                    logger.exception(
+                        "DSv4 attention layer-major snapshot store failed for %s",
+                        keys[-1].to_string(),
+                    )
+
         with store_stats.profile_put():
             transfer_spec = kwargs.get("transfer_spec", None)
             is_last_prefill = bool(
@@ -1937,9 +2080,7 @@ class LMCacheEngine:
             }
             if tutti_warmup_callback is not None:
                 try:
-                    put_signature = inspect.signature(
-                        self.storage_manager.batched_put
-                    )
+                    put_signature = inspect.signature(self.storage_manager.batched_put)
                 except (TypeError, ValueError):
                     put_signature = None
                 supports_store_callback = (
@@ -2053,8 +2194,7 @@ class LMCacheEngine:
         locations = list(block_mapping)
         disk_location_index = locations.index("LocalDiskBackend")
         preceding_hit_chunks = sum(
-            len(block_mapping[location])
-            for location in locations[:disk_location_index]
+            len(block_mapping[location]) for location in locations[:disk_location_index]
         )
         disk_keys = block_mapping["LocalDiskBackend"]
         records = disk_backend.get_kv_object_records(disk_keys)
@@ -2082,9 +2222,7 @@ class LMCacheEngine:
             * 1024
             * int(self._tutti_config["n_slots"])
         )
-        for index, (key, record) in enumerate(
-            zip(disk_keys, records, strict=True)
-        ):
+        for index, (key, record) in enumerate(zip(disk_keys, records, strict=True)):
             if (
                 hca_deferred_readable_limit is not None
                 and index >= hca_deferred_readable_limit
@@ -2339,16 +2477,9 @@ class LMCacheEngine:
         """Return per-group shapes for a retrieve chunk, applying both the
         DSv4-optimized tail-only masking from
         :meth:`_dsv4_store_shapes_for_range` and the additional
-        ``csa_attention_kv`` zero-shape when the CSA attention KV prefetcher
-        is attached AND the operator has opted in to the filter via
-        ``LMCACHE_DSV4_CSA_ATTENTION_KV_FILTER=1``.
-
-        The filter is a separate opt-in from the prefetcher's attach so the
-        prefetcher can be wired and observed in production without breaking
-        attention when its read path is still being validated.  Once the
-        prefetcher reliably populates the correct csa_attention_kv bytes in
-        vLLM's MLA K cache slots, the operator can flip the filter on to
-        save the ~100 MiB synchronous scatter at retrieve time.
+        ``csa_attention_kv`` zero-shape when the canonical CSA attention KV
+        prefetcher is attached. Attachment and retrieve filtering are one
+        atomic mode; a half-enabled pipeline is not supported.
 
         Args:
             shapes: Original per-group shapes from
@@ -2372,8 +2503,6 @@ class LMCacheEngine:
             total_tokens,
         )
         if not self._dsv4_csa_attention_kv_prefetch_active():
-            return base
-        if not _env_flag("LMCACHE_DSV4_CSA_ATTENTION_KV_FILTER"):
             return base
         klg_manager = self.metadata.kv_layer_groups_manager
         if klg_manager is None or not klg_manager.kv_layer_groups:
@@ -2533,12 +2662,15 @@ class LMCacheEngine:
             return
         try:
             manager.register_request_chunks(req_id, chunks_by_layer)
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "Failed to register CSA attention KV chunks for request %s; "
-                "the prefetcher will fall back to warn-and-skip on reads",
+                "filtered attention KV cannot be consumed safely",
                 req_id,
             )
+            raise RuntimeError(
+                "CSA attention KV read-plan registration failed"
+            ) from exc
 
     def _dsv4_build_csa_attention_kv_chunks(
         self,
@@ -2618,24 +2750,143 @@ class LMCacheEngine:
         if not layer_ids_for_group:
             return {}
 
-        keys = [key for key, _, _ in blocks]
-        object_records = disk_backend.get_kv_object_records(keys, roles=None)
-
         # Pre-materialise slot_mapping CPU view; the per-chunk physical
-        # block id lookup needs Python ints, not GPU tensor elements.
-        slot_mapping_cpu: Optional[list[int]] = None
+        # block id lookup is vectorized for layer-major records.
+        slot_mapping_cpu: Optional[torch.Tensor] = None
         if slot_mapping is not None:
             try:
                 if isinstance(slot_mapping, torch.Tensor):
-                    slot_mapping_cpu = slot_mapping.detach().to("cpu").tolist()
+                    slot_mapping_cpu = slot_mapping.detach().to(
+                        device="cpu",
+                        dtype=torch.int64,
+                    ).reshape(-1)
                 else:
-                    slot_mapping_cpu = [int(s) for s in slot_mapping]
+                    slot_mapping_cpu = torch.as_tensor(
+                        slot_mapping,
+                        dtype=torch.int64,
+                    ).reshape(-1)
             except Exception:
                 logger.warning(
                     "DSv4 CSA chunk builder: failed to materialise "
                     "slot_mapping; physical_block_ids will be empty"
                 )
                 slot_mapping_cpu = None
+
+        compress_ratio = int(csa_group.compress_ratio)
+        compressed_block_size = 64
+        kv_size = int(csa_group.shape_desc.kv_size)
+        csa_dtype = dtypes[csa_group_idx]
+        bytes_per_token = (
+            kv_size * int(csa_group.hidden_dim_size) * int(csa_dtype.itemsize)
+        )
+        contiguous_prefix = bool(blocks) and kv_size == 1
+        expected_start = int(blocks[0][1]) if blocks else 0
+        total_rows = 0
+        for _key, start, end in blocks:
+            if int(start) != expected_start or int(end) < int(start):
+                contiguous_prefix = False
+                break
+            total_rows += (int(end) - int(start)) // compress_ratio
+            expected_start = int(end)
+        total_compressed_blocks = total_rows // compressed_block_size
+        tokens_per_compressed_block = compress_ratio * compressed_block_size
+        object_layer_ids = [int(v) for v in csa_group.layer_indices]
+        if (
+            contiguous_prefix
+            and slot_mapping_cpu is not None
+            and total_rows > 0
+            and total_rows % compressed_block_size == 0
+            and len(layer_ids_for_group) == len(object_layer_ids)
+        ):
+            positions = (
+                torch.arange(total_compressed_blocks, dtype=torch.int64)
+                * tokens_per_compressed_block
+                + int(blocks[0][1])
+            )
+            if (
+                positions.numel() > 0
+                and int(positions[-1]) < int(slot_mapping_cpu.numel())
+            ):
+                slots = slot_mapping_cpu.index_select(0, positions)
+                if bool(torch.all(slots >= 0)):
+                    physical_rows = torch.div(
+                        slots,
+                        tokens_per_compressed_block,
+                        rounding_mode="floor",
+                    )
+                    prefix_key = blocks[-1][0]
+                    layer_records = disk_backend.get_csa_layer_major_records(
+                        prefix_key,
+                        object_layer_ids,
+                    )
+                    expected_nbytes = total_rows * bytes_per_token
+                    if len(layer_records) == len(layer_ids_for_group) and all(
+                        record is not None
+                        and bool(record.raw_extents)
+                        and int(record.length) == expected_nbytes
+                        for record in layer_records
+                    ):
+                        physical_block_ids = tuple(
+                            int(v) for v in physical_rows.tolist()
+                        )
+                        result: dict[int, list[Any]] = {}
+                        for manager_layer_id, record in zip(
+                            layer_ids_for_group,
+                            layer_records,
+                            strict=True,
+                        ):
+                            assert record is not None
+                            disk_meta = DiskCacheMetadata(
+                                path=disk_backend.kv_object_tutti_path(
+                                    record.pool_id
+                                ),
+                                size=int(record.aligned_length),
+                                fmt=MemoryFormat.BINARY_BUFFER,
+                                shape=torch.Size(
+                                    (int(record.aligned_length),)
+                                ),
+                                dtype=torch.uint8,
+                            )
+                            result[int(manager_layer_id)] = [
+                                CSAAttentionKVChunkLoc(
+                                    first_compressed_block=0,
+                                    n_compressed_blocks=(
+                                        total_compressed_blocks
+                                    ),
+                                    key=prefix_key,
+                                    disk_meta=disk_meta,
+                                    layer_byte_offset=int(record.offset),
+                                    bytes_per_block=(
+                                        compressed_block_size
+                                        * bytes_per_token
+                                    ),
+                                    raw_extents=tuple(
+                                        (
+                                            int(fo),
+                                            int(slba),
+                                            int(n_sectors),
+                                        )
+                                        for fo, slba, n_sectors in (
+                                            record.raw_extents
+                                        )
+                                    ),
+                                    physical_block_ids=physical_block_ids,
+                                    read_length=expected_nbytes,
+                                    layer_major=True,
+                                )
+                            ]
+                        logger.info(
+                            "DSv4 CSA layer-major read plan key=%s "
+                            "layers=%d blocks=%d bytes_per_layer=%d",
+                            prefix_key.to_string(),
+                            len(result),
+                            total_compressed_blocks,
+                            expected_nbytes,
+                        )
+                        return result
+
+        keys = [key for key, _, _ in blocks]
+        object_records = disk_backend.get_kv_object_records(keys, roles=None)
 
         chunks_by_layer: dict[int, list[Any]] = {
             int(layer_id): [] for layer_id in layer_ids_for_group
@@ -2752,14 +3003,11 @@ class LMCacheEngine:
                 dtype=torch.uint8,
             )
             record_end = int(record.offset) + int(record.aligned_length)
-            for layer_slot_idx, transformer_layer_id in enumerate(
-                layer_ids_for_group
-            ):
+            for layer_slot_idx, transformer_layer_id in enumerate(layer_ids_for_group):
                 if layer_slot_idx >= num_layers_in_group:
                     break
                 layer_byte_offset_in_pool = (
-                    pool_byte_offset
-                    + layer_slot_idx * bytes_per_layer_in_chunk
+                    pool_byte_offset + layer_slot_idx * bytes_per_layer_in_chunk
                 )
                 layer_byte_end_in_pool = (
                     layer_byte_offset_in_pool
@@ -2867,9 +3115,15 @@ class LMCacheEngine:
                 break
         if hca_group_idx is None or hca_group is None:
             return {}
-        layer_ids_for_group = self.gpu_connector._dsv4_layer_ids_for_group(  # noqa: SLF001
-            hca_group
-        )
+        layer_pairs = tuple(self.gpu_connector.dsv4_hca_layer_object_ids())
+        if layer_pairs:
+            layer_ids_for_group = [int(pair[0]) for pair in layer_pairs]
+            object_layer_ids = [int(pair[1]) for pair in layer_pairs]
+        else:
+            layer_ids_for_group = self.gpu_connector._dsv4_layer_ids_for_group(  # noqa: SLF001
+                hca_group
+            )
+            object_layer_ids = [int(v) for v in hca_group.layer_indices]
         if not layer_ids_for_group:
             return {}
         if slot_mapping is None:
@@ -2880,13 +3134,17 @@ class LMCacheEngine:
             return {}
         try:
             if isinstance(slot_mapping, torch.Tensor):
-                slot_mapping_cpu = slot_mapping.detach().to("cpu").tolist()
+                slot_mapping_cpu = slot_mapping.detach().to(
+                    device="cpu",
+                    dtype=torch.int64,
+                ).reshape(-1)
             else:
-                slot_mapping_cpu = [int(s) for s in slot_mapping]
+                slot_mapping_cpu = torch.as_tensor(
+                    slot_mapping,
+                    dtype=torch.int64,
+                ).reshape(-1)
         except Exception:
-            logger.warning(
-                "DSv4 HCA chunk builder: failed to materialise slot_mapping"
-            )
+            logger.warning("DSv4 HCA chunk builder: failed to materialise slot_mapping")
             return {}
 
         keys = [key for key, _, _ in blocks]
@@ -2903,6 +3161,112 @@ class LMCacheEngine:
             return {}
         tokens_per_entry = compress_ratio
         tokens_per_physical_block = compress_ratio * hca_block_size
+
+        # Preferred V28 layout: one content-addressed object per HCA layer
+        # containing all compressed entries for the cached prefix.  Resolve
+        # every destination row in native tensor operations, then describe
+        # the layer with one logical NVMe range.  No 1,874-chunk Python plan
+        # is built on the hit path.
+        contiguous_prefix = bool(blocks)
+        expected_start = int(blocks[0][1]) if blocks else 0
+        total_entries = 0
+        for _key, start, end in blocks:
+            if int(start) != expected_start or int(end) < int(start):
+                contiguous_prefix = False
+                break
+            chunk_entries = (int(end) - int(start)) // compress_ratio
+            total_entries += chunk_entries
+            expected_start = int(end)
+        kv_size = int(hca_group.shape_desc.kv_size)
+        token_bytes = (
+            kv_size
+            * int(hca_group.hidden_dim_size)
+            * int(dtypes[hca_group_idx].itemsize)
+        )
+        if (
+            contiguous_prefix
+            and total_entries > 0
+            and len(layer_ids_for_group) == len(object_layer_ids)
+            and int(blocks[0][1]) + (total_entries - 1) * compress_ratio
+            < int(slot_mapping_cpu.numel())
+        ):
+            positions = (
+                torch.arange(total_entries, dtype=torch.int64) * compress_ratio
+                + int(blocks[0][1])
+            )
+            slots = slot_mapping_cpu.index_select(0, positions)
+            if bool(torch.all(slots >= 0)):
+                entry_ids = torch.arange(total_entries, dtype=torch.int64)
+                physical_rows = (
+                    torch.div(
+                        slots,
+                        tokens_per_physical_block,
+                        rounding_mode="floor",
+                    )
+                    * hca_block_size
+                    + torch.remainder(entry_ids, hca_block_size)
+                )
+                prefix_key = blocks[-1][0]
+                layer_records = disk_backend.get_hca_layer_major_records(
+                    prefix_key,
+                    object_layer_ids,
+                )
+                expected_nbytes = total_entries * token_bytes
+                if len(layer_records) == len(layer_ids_for_group) and all(
+                    record is not None
+                    and bool(record.raw_extents)
+                    and int(record.length) == expected_nbytes
+                    for record in layer_records
+                ):
+                    physical_block_ids = tuple(
+                        int(v) for v in physical_rows.tolist()
+                    )
+                    layer_major_chunks: dict[int, list[Any]] = {}
+                    for manager_layer_id, record in zip(
+                        layer_ids_for_group,
+                        layer_records,
+                        strict=True,
+                    ):
+                        assert record is not None
+                        synth_path = disk_backend.kv_object_tutti_path(record.pool_id)
+                        synth_disk_meta = DiskCacheMetadata(
+                            path=synth_path,
+                            size=int(record.aligned_length),
+                            fmt=MemoryFormat.BINARY_BUFFER,
+                            shape=torch.Size((int(record.aligned_length),)),
+                            dtype=torch.uint8,
+                        )
+                        layer_major_chunks[int(manager_layer_id)] = [
+                            CSAAttentionKVChunkLoc(
+                                first_compressed_block=0,
+                                n_compressed_blocks=total_entries,
+                                key=prefix_key,
+                                disk_meta=synth_disk_meta,
+                                layer_byte_offset=int(record.offset),
+                                bytes_per_block=token_bytes,
+                                raw_extents=tuple(
+                                    (int(fo), int(slba), int(n_sectors))
+                                    for fo, slba, n_sectors in record.raw_extents
+                                ),
+                                physical_block_ids=physical_block_ids,
+                                read_length=expected_nbytes,
+                                layer_major=True,
+                            )
+                        ]
+                    logger.info(
+                        "DSv4 HCA layer-major read plan key=%s layers=%d "
+                        "entries=%d bytes_per_layer=%d",
+                        prefix_key.to_string(),
+                        len(layer_major_chunks),
+                        total_entries,
+                        expected_nbytes,
+                    )
+                    return layer_major_chunks
+                logger.warning(
+                    "DSv4 HCA layer-major snapshot unavailable for key=%s; "
+                    "falling back to aligned chunk-major records",
+                    prefix_key.to_string(),
+                )
 
         chunks_by_layer: dict[int, list[Any]] = {
             int(layer_id): [] for layer_id in layer_ids_for_group
@@ -2981,9 +3345,7 @@ class LMCacheEngine:
                 (int(fo), int(slba), int(n_sectors))
                 for fo, slba, n_sectors in record.raw_extents
             )
-            for layer_slot_idx, transformer_layer_id in enumerate(
-                layer_ids_for_group
-            ):
+            for layer_slot_idx, transformer_layer_id in enumerate(layer_ids_for_group):
                 if layer_slot_idx >= num_layers_in_group:
                     break
                 true_offset = (
@@ -2992,9 +3354,7 @@ class LMCacheEngine:
                 aligned_offset = true_offset & ~511
                 payload_skip = true_offset - aligned_offset
                 payload_len = entries_per_layer * token_bytes
-                read_length = (
-                    (payload_skip + payload_len + 511) // 512
-                ) * 512
+                read_length = ((payload_skip + payload_len + 511) // 512) * 512
                 if aligned_offset + read_length > record_end:
                     # Clamp the rounded-up window to the record end; the
                     # loader treats tail ranges leniently but overrunning
@@ -3284,9 +3644,7 @@ class LMCacheEngine:
         ]
         readable = 0
         for index, _block in enumerate(blocks):
-            compact = (
-                compact_records[index] if index < len(compact_records) else None
-            )
+            compact = compact_records[index] if index < len(compact_records) else None
             if not self._dsv4_kv_object_record_readable(disk_backend, compact):
                 break
             slab = slab_records[index] if index < len(slab_records) else None
@@ -3390,9 +3748,7 @@ class LMCacheEngine:
                     slab_chunks_by_layer[int(manager_layer_id)] = source_chunks
             if len(slab_chunks_by_layer) == len(layer_pairs):
                 for path, records_for_path in raw_lba_cache.items():
-                    combined_raw_lba_cache.setdefault(path, []).extend(
-                        records_for_path
-                    )
+                    combined_raw_lba_cache.setdefault(path, []).extend(records_for_path)
                 for manager_layer_id, source_chunks in slab_chunks_by_layer.items():
                     object_source_entries.append(
                         (
@@ -3450,9 +3806,7 @@ class LMCacheEngine:
                 if not source_chunks:
                     continue
                 for path, records_for_path in raw_lba_cache.items():
-                    combined_raw_lba_cache.setdefault(path, []).extend(
-                        records_for_path
-                    )
+                    combined_raw_lba_cache.setdefault(path, []).extend(records_for_path)
                 object_source_entries.append(
                     (
                         manager_layer_id,
@@ -3872,9 +4226,7 @@ class LMCacheEngine:
                         ret_mask,
                         **kwargs,
                     )
-            process_tokens_ms = (
-                time.perf_counter() - process_tokens_start
-            ) * 1000.0
+            process_tokens_ms = (time.perf_counter() - process_tokens_start) * 1000.0
 
         if self.save_only_first_rank:
             broadcast_start = time.perf_counter()
@@ -3943,9 +4295,7 @@ class LMCacheEngine:
         # need_to_load: 512 - 288 = 224 tokens
         # retrieved: 256 tokens
         if not self._is_passive():
-            profile_total_ms = (
-                time.perf_counter() - retrieve_profile_start
-            ) * 1000.0
+            profile_total_ms = (time.perf_counter() - retrieve_profile_start) * 1000.0
             logger.info(
                 "[req_id=%s] Retrieved %d out of %d required tokens "
                 "(from %d total tokens). size: %.4f gb, "
@@ -4611,6 +4961,15 @@ class LMCacheEngine:
         """Close the cache engine and free all the resources"""
         logger.info("Closing LMCacheEngine...")
 
+        try:
+            from lmcache.integration.vllm.vllm_v1_adapter import (
+                close_vllm_prefetch_managers,
+            )
+
+            close_vllm_prefetch_managers()
+        except ImportError:
+            pass
+
         if self.lmcache_worker is not None:
             try:
                 logger.info("Closing lmcache_worker...")
@@ -4780,10 +5139,7 @@ class LMCacheEngine:
                     if csa_disk_backend is not None:
                         self._register_csa_attention_kv_chunks(
                             blocks,
-                            [
-                                csa_disk_backend.dict.get(key)
-                                for key, _, _ in blocks
-                            ],
+                            [csa_disk_backend.dict.get(key) for key, _, _ in blocks],
                             total_tokens,
                             kwargs.get("req_id", "unknown"),
                             slot_mapping=kwargs.get("slot_mapping"),
@@ -4843,8 +5199,7 @@ class LMCacheEngine:
                                     for _, start, end in blocks
                                 ]
                                 shapes_per_key = [
-                                    shapes
-                                    for shapes, _read_ranges in retrieve_views
+                                    shapes for shapes, _read_ranges in retrieve_views
                                 ]
                                 if use_hca_deferred_compact:
                                     kv_object_roles = [
@@ -4866,8 +5221,15 @@ class LMCacheEngine:
                     stream_tutti_retrieve = (
                         self.gpu_connector is not None
                         and not self.save_only_first_rank
-                        and not _env_flag(
-                            "LMCACHE_TUTTI_DISABLE_STREAMING_RETRIEVE"
+                    )
+                    raw_tutti_retrieve = (
+                        stream_tutti_retrieve
+                        and callable(
+                            getattr(
+                                self.gpu_connector,
+                                "batched_raw_to_gpu",
+                                None,
+                            )
                         )
                     )
                     streaming_consumed = False
@@ -4877,6 +5239,7 @@ class LMCacheEngine:
                     def _consume_tutti_batch(
                         batch_start: int,
                         batch_results: List[Optional[MemoryObj]],
+                        retrieve_blocks: List[Tuple[CacheEngineKey, int, int]] = blocks,
                     ) -> None:
                         nonlocal last_failed_block_start
                         nonlocal streaming_consumed, streaming_failed
@@ -4889,11 +5252,11 @@ class LMCacheEngine:
                         batch_sizes: List[int] = []
                         for offset, memory_obj in enumerate(batch_results):
                             block_index = batch_start + offset
-                            if block_index >= len(blocks):
+                            if block_index >= len(retrieve_blocks):
                                 if memory_obj is not None:
                                     memory_obj.ref_count_down()
                                 continue
-                            _key, start, end = blocks[block_index]
+                            _key, start, end = retrieve_blocks[block_index]
                             if streaming_failed or memory_obj is None:
                                 if memory_obj is not None:
                                     memory_obj.ref_count_down()
@@ -4936,6 +5299,84 @@ class LMCacheEngine:
                             tot_kv_size += size
                             streamed_blocks += 1
 
+                    def _consume_tutti_raw_batch(
+                        batch_start: int,
+                        completed_indices: List[int],
+                        completed_offsets: List[int],
+                        completed_nbytes: List[int],
+                        staging: torch.Tensor,
+                        completed_shapes: List[List[torch.Size]],
+                        completed_dtypes: List[List[torch.dtype]],
+                        retrieve_blocks: List[Tuple[CacheEngineKey, int, int]] = blocks,
+                    ) -> None:
+                        nonlocal streaming_consumed, streaming_failed
+                        nonlocal streamed_blocks, tot_kv_size
+                        nonlocal last_failed_block_start
+
+                        streaming_consumed = True
+                        restore_offsets: List[int] = []
+                        restore_nbytes: List[int] = []
+                        restore_starts: List[int] = []
+                        restore_ends: List[int] = []
+                        restore_shapes: List[List[torch.Size]] = []
+                        restore_dtypes: List[List[torch.dtype]] = []
+                        restore_sizes: List[int] = []
+                        for completed_pos, local_index in enumerate(completed_indices):
+                            block_index = batch_start + local_index
+                            if block_index >= len(retrieve_blocks):
+                                continue
+                            _key, start, end = retrieve_blocks[block_index]
+                            restore_offsets.append(completed_offsets[completed_pos])
+                            restore_nbytes.append(completed_nbytes[completed_pos])
+                            restore_starts.append(start)
+                            restore_ends.append(end)
+                            restore_shapes.append(completed_shapes[completed_pos])
+                            restore_dtypes.append(completed_dtypes[completed_pos])
+                            restore_sizes.append(completed_nbytes[completed_pos])
+
+                        if not restore_offsets:
+                            return
+                        raw_restore = getattr(
+                            self.gpu_connector,
+                            "batched_raw_to_gpu",
+                            None,
+                        )
+                        if not callable(raw_restore):
+                            raise RuntimeError(
+                                "raw Tutti retrieve selected without a GPU "
+                                "connector raw restore method"
+                            )
+                        try:
+                            raw_restore(
+                                staging,
+                                restore_offsets,
+                                restore_nbytes,
+                                restore_starts,
+                                restore_ends,
+                                restore_shapes,
+                                restore_dtypes,
+                                **kwargs,
+                            )
+                        except Exception:
+                            streaming_failed = True
+                            if restore_starts:
+                                failed_start = restore_starts[0]
+                                if (
+                                    last_failed_block_start is None
+                                    or last_failed_block_start > failed_start
+                                ):
+                                    last_failed_block_start = failed_start
+                            raise
+                        for start, end, size in zip(
+                            restore_starts,
+                            restore_ends,
+                            restore_sizes,
+                            strict=True,
+                        ):
+                            ret_mask[start:end] = True
+                            tot_kv_size += size
+                            streamed_blocks += 1
+
                     memory_objs = self._tutti_batched_get(
                         keys,
                         shapes_per_key=shapes_per_key,
@@ -4943,8 +5384,11 @@ class LMCacheEngine:
                         kv_object_roles=kv_object_roles,
                         on_batch_loaded=(
                             _consume_tutti_batch
-                            if stream_tutti_retrieve
+                            if stream_tutti_retrieve and not raw_tutti_retrieve
                             else None
+                        ),
+                        on_raw_batch_loaded=(
+                            _consume_tutti_raw_batch if raw_tutti_retrieve else None
                         ),
                     )
                     if streaming_consumed:
@@ -4956,8 +5400,7 @@ class LMCacheEngine:
                             ):
                                 last_failed_block_start = missing_start
                         logger.info(
-                            "TUTTI_PROFILE streaming_retrieve blocks=%d/%d "
-                            "failed=%s",
+                            "TUTTI_PROFILE streaming_retrieve blocks=%d/%d failed=%s",
                             streamed_blocks,
                             len(blocks),
                             streaming_failed,

@@ -33,7 +33,7 @@ future reader does not reload stale context.
 For prefill cache-hit reuse with:
 
 ```text
-LMCACHE_DSV4_CSA_ATTENTION_KV_FILTER=1
+LMCACHE_INDEXER_ENABLE_PREFETCH=1
 ```
 
 LMCache should not synchronously scatter all `csa_attention_kv` during

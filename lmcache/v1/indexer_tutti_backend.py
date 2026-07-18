@@ -43,10 +43,12 @@ The CSA-layer-id → slot-index mapping is contiguous in CSA layer order
 from __future__ import annotations
 
 # Standard
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional, Sequence
-
 import threading
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
+
+# Third Party
+import torch
 
 # First Party
 from lmcache.logging import init_logger
@@ -69,6 +71,11 @@ _NVME_LBS: int = 512
 def _align_up(value: int, alignment: int) -> int:
     """Round ``value`` up to ``alignment`` bytes."""
     return ((value + alignment - 1) // alignment) * alignment
+
+
+def _align_down(value: int, alignment: int) -> int:
+    """Round ``value`` down to ``alignment`` bytes."""
+    return (value // alignment) * alignment
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,7 +180,10 @@ class TuttiIndexerStorage:
         slot_bytes = _align_up(max_seq_len * token_bytes, _NVME_LBS)
         sorted_layers = sorted(int(lid) for lid in layer_ids)
         total_required = slot_bytes * len(sorted_layers)
-        provided_bytes = sum(int(n_sectors) * _NVME_LBS for _, _, n_sectors in raw_region_extents)
+        provided_bytes = sum(
+            int(n_sectors) * _NVME_LBS
+            for _, _, n_sectors in raw_region_extents
+        )
         if provided_bytes < total_required:
             raise ValueError(
                 f"Tutti indexer raw region is too small: have {provided_bytes} bytes, "
@@ -295,29 +305,89 @@ class TuttiIndexerStorage:
                 f"outside slot capacity {slot.max_seq_len}"
             )
 
-        absolute_offset = slot.absolute_byte_offset(start_token_id)
-        aligned_offset = _align_up(absolute_offset, _NVME_LBS)
-        if absolute_offset != aligned_offset:
-            # The legacy flat-file layout is dense (132B per token, no
-            # alignment) so unaligned starts are routine.  Tutti raw writes
-            # require sector alignment, so pad the leading bytes by reading
-            # the existing sector first.  We do NOT support this path in the
-            # initial scaffold; callers must align to 512B boundaries.
-            raise ValueError(
-                f"Unaligned indexer write at offset {absolute_offset}; the "
-                "Tutti backend currently requires sector-aligned starts. "
-                "Adjust caller to align start_token_id*token_bytes to "
-                f"{_NVME_LBS}B."
+        with self._write_lock:
+            absolute_offset = slot.absolute_byte_offset(start_token_id)
+            payload_end = absolute_offset + len(payload)
+            aligned_start = _align_down(absolute_offset, _NVME_LBS)
+            aligned_end = _align_up(payload_end, _NVME_LBS)
+            write_payload = payload
+            if aligned_start != absolute_offset or aligned_end != payload_end:
+                existing = self._read_aligned_bytes(
+                    slot,
+                    aligned_start,
+                    aligned_end - aligned_start,
+                    start_token_id,
+                    n_tokens,
+                )
+                merged = bytearray(existing)
+                payload_start = absolute_offset - aligned_start
+                merged[payload_start : payload_start + len(payload)] = payload
+                write_payload = bytes(merged)
+            sub_extents = self._extents_for_range(
+                aligned_start,
+                len(write_payload),
+            )
+            self._tutti_loader.store_bytes_to_raw_extents(
+                write_payload,
+                raw_extents=sub_extents,
+                base_file_offset=aligned_start,
+                logical_nbytes=len(write_payload),
             )
 
-        sub_extents = self._extents_for_range(absolute_offset, len(payload))
-        with self._write_lock:
-            self._tutti_loader.store_bytes_to_raw_extents(
-                payload,
-                raw_extents=sub_extents,
-                base_file_offset=absolute_offset,
-                logical_nbytes=len(payload),
+    def _read_aligned_bytes(
+        self,
+        slot: TuttiIndexerLayerSlot,
+        absolute_offset: int,
+        nbytes: int,
+        start_token_id: int,
+        n_tokens: int,
+    ) -> bytes:
+        """Read an aligned range used to preserve edge sectors on writes."""
+        synthetic_key = _synthesize_indexer_read_key(
+            slot.layer_id,
+            start_token_id,
+            start_token_id + n_tokens - 1,
+        )
+        disk_meta = DiskCacheMetadata(
+            path=self._raw_region_path,
+            size=nbytes,
+            fmt=MemoryFormat.BINARY_BUFFER,
+            shape=torch.Size((nbytes,)),
+            dtype=torch.uint8,
+        )
+        memory_objs = self._tutti_loader.load_chunks_to_hbm(
+            [synthetic_key],
+            [disk_meta],
+            shapes_per_key=None,
+            file_offsets=[0],
+            read_ranges_per_key=[
+                (
+                    KVObjectByteRange(
+                        offset=absolute_offset,
+                        length=nbytes,
+                        target_offset=0,
+                    ),
+                )
+            ],
+            io_priority="demand",
+        )
+        if not memory_objs or memory_objs[0] is None:
+            raise RuntimeError("Tutti edge-sector read returned no payload")
+        memory_obj = memory_objs[0]
+        try:
+            tensor = memory_obj.raw_tensor
+            if tensor is None:
+                raise RuntimeError("Tutti edge-sector read has no raw tensor")
+            host = tensor.reshape(-1)[:nbytes].cpu().numpy().tobytes()
+        finally:
+            ref_count_down = getattr(memory_obj, "ref_count_down", None)
+            if callable(ref_count_down):
+                ref_count_down()
+        if len(host) != nbytes:
+            raise RuntimeError(
+                f"Tutti edge-sector read returned {len(host)}/{nbytes} bytes"
             )
+        return host
 
     def build_read_request(
         self,
@@ -366,6 +436,8 @@ class TuttiIndexerStorage:
             path=self._raw_region_path,
             size=logical_nbytes,
             fmt=MemoryFormat.BINARY_BUFFER,
+            shape=torch.Size((logical_nbytes,)),
+            dtype=torch.uint8,
         )
         return TuttiIndexerReadRequest(
             key=synthetic_key,
@@ -375,6 +447,45 @@ class TuttiIndexerStorage:
             token_runs=tuple(token_runs),
             token_bytes=slot.token_bytes,
             total_nbytes=logical_nbytes,
+        )
+
+    def load_read_request(
+        self,
+        request: "TuttiIndexerReadRequest",
+        *,
+        io_priority: str = "demand",
+        should_continue: Optional[Callable[[], bool]] = None,
+        deadline_monotonic: Optional[float] = None,
+    ) -> list[Any]:
+        """Load one prepared indexer request through the shared Tutti loader.
+
+        Args:
+            request: Descriptor returned by :meth:`build_read_request`.
+            io_priority: Tutti admission class, either ``demand`` or
+                ``speculative``.
+            should_continue: Optional cancellation predicate checked before
+                each speculative microbatch.
+            deadline_monotonic: Optional absolute ``time.perf_counter()``
+                deadline for speculative submission.
+
+        Returns:
+            Loader results parallel to the request's synthetic key list.
+
+        Raises:
+            RuntimeError: If Tutti reports a submission or completion error.
+        """
+        if request.is_empty:
+            return []
+        return self._tutti_loader.load_chunks_to_hbm(
+            [request.key],
+            [request.disk_meta],
+            shapes_per_key=None,
+            file_offsets=[request.file_offset],
+            read_ranges_per_key=[request.read_ranges],
+            io_priority=io_priority,
+            max_batch_ios=8 if io_priority == "speculative" else None,
+            should_continue=should_continue,
+            deadline_monotonic=deadline_monotonic,
         )
 
     def _extents_for_range(

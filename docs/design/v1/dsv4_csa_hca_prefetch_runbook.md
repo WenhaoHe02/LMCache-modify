@@ -312,8 +312,8 @@ finishes inside the MoE window, the predicted reads are fully hidden.
 Only two cases are needed for the current report:
 
 ```text
-off: LMCACHE_DSV4_CSA_ATTENTION_KV_FILTER=0
-on:  LMCACHE_DSV4_CSA_ATTENTION_KV_FILTER=1
+off: LMCACHE_INDEXER_ENABLE_PREFETCH=0
+on:  LMCACHE_INDEXER_ENABLE_PREFETCH=1
 ```
 
 Run `off` once as baseline. Then run `on`. Between rounds, unload/reset the

@@ -4,6 +4,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 import asyncio
+import logging
 import os
 import threading
 import time
@@ -55,8 +56,23 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
+class _TuttiProfileLogFilter(logging.Filter):
+    """Suppress KV object-store profile records when profiling is disabled."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Return whether a log record should be emitted."""
+        value = os.getenv("LMCACHE_TUTTI_PROFILE", "0")
+        enabled = value.lower() in {"1", "true", "yes", "on"}
+        return enabled or not str(record.msg).startswith("KV_OBJECT_STORE_PROFILE")
+
+
+logger.addFilter(_TuttiProfileLogFilter())
+
 _DSV4_HCA_DEFERRED_RETRIEVE_ROLE = "hca_deferred_retrieve"
 _DSV4_HCA_SLAB_ROLE = "hca_attention_kv_slab"
+_DSV4_HCA_LAYER_MAJOR_ROLE = "hca_attention_kv_layer_major"
+_DSV4_CSA_LAYER_MAJOR_ROLE = "csa_attention_kv_layer_major"
 
 KVObjectRawWriter = Callable[
     [KVObjectRecord, memoryview],
@@ -482,6 +498,213 @@ class LocalDiskBackend(StorageBackendInterface):
             for index, key in enumerate(keys)
         ]
         return self.kv_object_metadata_store.get_many(object_ids, ready_only=True)
+
+    def get_hca_layer_major_records(
+        self,
+        key: CacheEngineKey,
+        layer_ids: Sequence[int],
+    ) -> list[Optional[KVObjectRecord]]:
+        """Return layer-major HCA records for one complete cached prefix.
+
+        Args:
+            key: Content-addressed key of the last chunk in the prefix.
+            layer_ids: KV-object layer identifiers in request order.
+
+        Returns:
+            One READY record per layer id, with ``None`` for misses.
+        """
+        return self.get_kv_object_records(
+            [key] * len(layer_ids),
+            layer_ids=layer_ids,
+            roles=[_DSV4_HCA_LAYER_MAJOR_ROLE] * len(layer_ids),
+        )
+
+    def get_csa_layer_major_records(
+        self,
+        key: CacheEngineKey,
+        layer_ids: Sequence[int],
+    ) -> list[Optional[KVObjectRecord]]:
+        """Return layer-major CSA records for one complete cached prefix.
+
+        Args:
+            key: Content-addressed key of the last chunk in the prefix.
+            layer_ids: KV-object layer identifiers in request order.
+
+        Returns:
+            One READY record per layer id, with ``None`` for misses.
+        """
+        return self.get_kv_object_records(
+            [key] * len(layer_ids),
+            layer_ids=layer_ids,
+            roles=[_DSV4_CSA_LAYER_MAJOR_ROLE] * len(layer_ids),
+        )
+
+    def store_attention_layer_major_snapshot(
+        self,
+        prefix_key: CacheEngineKey,
+        memory_objs: Sequence[MemoryObj],
+    ) -> int:
+        """Persist one contiguous object per CSA/HCA layer for a full prefix.
+
+        Source chunks are supplied in token order.  Their HCA layer slices
+        are gathered in that same order, changing the cold-store layout from
+        ``chunk -> layer`` to ``layer -> all prefix entries``.  Each resulting
+        object is allocated by the shared dense object-pool allocator, so it
+        cannot overlap full-KV or other sidecar objects.
+
+        Args:
+            prefix_key: Content-addressed key of the prefix's last chunk.
+            memory_objs: CPU memory objects for every chunk in the prefix,
+                ordered by token position.
+
+        Returns:
+            Number of attention layer objects that are READY after the call.
+            Zero means the object store or its Tutti raw writer is unavailable.
+        """
+        if (
+            not memory_objs
+            or not self.kv_object_store_enabled
+            or self.kv_object_pool_layout is None
+            or self.kv_object_metadata_store is None
+        ):
+            return 0
+        raw_writer = (
+            self.kv_object_tutti_raw_writer
+            if self.kv_object_tutti_raw_cold_store_enabled
+            else None
+        )
+        if self.kv_object_tutti_raw_cold_store_enabled and raw_writer is None:
+            logger.info(
+                "KV_OBJECT_STORE_PROFILE op=write_attention_layer_major key=%s "
+                "status=skip reason=raw_writer_missing",
+                prefix_key.to_string(),
+            )
+            return 0
+
+        layer_segments: dict[tuple[str, int], list[memoryview]] = {}
+        for memory_obj in memory_objs:
+            buffer = memory_obj.byte_array
+            group_ranges = self._object_group_ranges_for_offset(memory_obj, 0)
+            for layer_id, role, byte_ranges in self._object_layer_view_specs(
+                memory_obj,
+                group_ranges,
+            ):
+                if role not in {"csa_attention_kv", "hca_attention_kv"}:
+                    continue
+                segments = layer_segments.setdefault(
+                    (role, int(layer_id)),
+                    [],
+                )
+                for byte_range in byte_ranges:
+                    start = int(byte_range.offset)
+                    end = start + int(byte_range.length)
+                    segments.append(buffer[start:end])
+        if not layer_segments:
+            return 0
+
+        start_time = time.perf_counter()
+        ready_count = 0
+        total_bytes = 0
+        with self.kv_object_store_lock:
+            for (source_role, layer_id), segments in sorted(
+                layer_segments.items()
+            ):
+                payload_nbytes = sum(len(segment) for segment in segments)
+                if payload_nbytes <= 0:
+                    continue
+                object_role = (
+                    _DSV4_CSA_LAYER_MAJOR_ROLE
+                    if source_role == "csa_attention_kv"
+                    else _DSV4_HCA_LAYER_MAJOR_ROLE
+                )
+                object_id = self._key_to_object_id(
+                    prefix_key,
+                    layer_id=layer_id,
+                    role=object_role,
+                )
+                existing = self.kv_object_metadata_store.get(object_id)
+                if (
+                    existing is not None
+                    and existing.state == KVObjectState.READY
+                    and existing.length == payload_nbytes
+                ):
+                    ready_count += 1
+                    total_bytes += payload_nbytes
+                    continue
+                if (
+                    raw_writer is not None
+                    and not self.kv_object_payload_fits_tutti_staging(
+                        payload_nbytes
+                    )
+                ):
+                    logger.warning(
+                        "KV_OBJECT_STORE_PROFILE op=write_attention_layer_major "
+                        "key=%s role=%s layer=%d status=skip "
+                        "reason=staging_capacity "
+                        "bytes=%d staging_bytes=%s",
+                        prefix_key.to_string(),
+                        source_role,
+                        layer_id,
+                        payload_nbytes,
+                        self.kv_object_tutti_raw_staging_bytes,
+                    )
+                    continue
+                if existing is None or existing.length != payload_nbytes:
+                    if raw_writer is not None:
+                        offset, _end_offset, aligned_length = (
+                            self.kv_object_pool_layout.next_allocation_bounds(
+                                payload_nbytes
+                            )
+                        )
+                        if not self.kv_object_raw_region_covers(
+                            offset,
+                            aligned_length,
+                        ):
+                            logger.warning(
+                                "KV_OBJECT_STORE_PROFILE "
+                                "op=write_attention_layer_major key=%s "
+                                "role=%s layer=%d "
+                                "status=skip reason=raw_region_full bytes=%d",
+                                prefix_key.to_string(),
+                                source_role,
+                                layer_id,
+                                payload_nbytes,
+                            )
+                            continue
+                    record = self.kv_object_pool_layout.allocate(
+                        object_id,
+                        length=payload_nbytes,
+                        shape=(payload_nbytes,),
+                        dtype="torch.uint8",
+                    )
+                else:
+                    record = existing
+
+                # ``bytearray.join`` performs the chunk gather in native code;
+                # no Python byte-by-byte packing occurs on the cold path.
+                payload = bytearray().join(segments)
+                payload_view = memoryview(payload)
+                if raw_writer is not None:
+                    raw_extents, _write_ms = raw_writer(record, payload_view)
+                    ready_record = record.with_raw_extents(raw_extents).mark_ready()
+                else:
+                    if self.kv_object_pool_io is None:
+                        continue
+                    self.kv_object_pool_io.write_object(record, payload_view)
+                    ready_record = record.mark_ready()
+                self.kv_object_metadata_store.put(ready_record)
+                ready_count += 1
+                total_bytes += payload_nbytes
+
+        logger.info(
+            "KV_OBJECT_STORE_PROFILE op=write_attention_layer_major key=%s "
+            "layers=%d bytes=%d total_ms=%.3f",
+            prefix_key.to_string(),
+            ready_count,
+            total_bytes,
+            (time.perf_counter() - start_time) * 1000.0,
+        )
+        return ready_count
 
     def get_kv_object_pool_paths(self) -> dict[str, Path]:
         """Return object pool paths keyed by pool id."""

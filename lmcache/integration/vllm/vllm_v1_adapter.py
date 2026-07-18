@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections.abc import Callable, Iterable
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from types import MethodType
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
@@ -50,6 +49,11 @@ from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
+from lmcache.v1.csa_pipeline_nvtx import CsaNvtxEvent, csa_pipeline_nvtx
+from lmcache.v1.csa_prefetch_policy import (
+    CSAPrefetchLookaheadPolicy,
+    build_residual_prefetch_sources,
+)
 from lmcache.v1.manager import LMCacheManager
 
 if TYPE_CHECKING:
@@ -68,43 +72,19 @@ logger = init_logger(__name__)
 
 
 _INDEXER_PREFETCH_MANAGER: Any = None
-_HCA_PREFETCH_MANAGER: Any = None
 _CSA_ATTENTION_KV_PREFETCH_MANAGER: Any = None
 # Tutti loader recorded by the loader-ready callback (may run on a background
-# daemon thread). Consumed on the main thread by _maybe_lazy_attach_csa_prefetch
-# so the CSA attention-KV manager attaches once the lazily-created loader exists.
+# daemon thread). Main-thread lazy attach consumes it for the independent
+# indexer and CSA attention-KV managers.
 _CSA_PREFETCH_PENDING_LOADER: Any = None
 _CSA_PREFETCH_PENDING_LOCK = threading.Lock()
+_INDEXER_PREFETCH_PENDING_LOADER: Any = None
+_INDEXER_PREFETCH_PENDING_LOCK = threading.Lock()
 _DEEPSEEK_DECODER_LAYER_CACHE: tuple[Any, ...] = ()
 _LMCACHE_DEEPSEEK_DECODER_LAYER_REGISTRY: Any = weakref.WeakSet()
 _DEEPSEEK_DECODER_REGISTRY_HOOK_INSTALLED: bool = False
-_HCA_ATTACH_ATTEMPTED: bool = False
 _OVERLAP_HOOK_ERROR_LOGGED: set[tuple[str, int, str]] = set()
 _SCHEDULER_HMA_INVALID_BLOCK_PATCH_INSTALLED: bool = False
-_TTFT_PROFILE_FORWARD_LOGGED: set[tuple[str, int]] = set()
-_TTFT_PROFILE_HC_PRE_LOGGED: set[tuple[str, int]] = set()
-_TTFT_PROFILE_HC_POST_LOGGED: set[tuple[str, int]] = set()
-_TTFT_PROFILE_MHC_FUSED_LOGGED: set[tuple[str, int]] = set()
-
-
-def _ttft_profile_enabled() -> bool:
-    """Return whether request-level TTFT stage markers should be logged."""
-    value = os.environ.get("LMCACHE_TTFT_STAGE_PROFILE", "")
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
-def _ttft_profile_request_id() -> str:
-    """Return the best-effort active request id for TTFT stage markers."""
-    try:
-        manager = _get_current_lmcache_connector_metadata()
-    except Exception:
-        manager = None
-    requests = getattr(manager, "requests", ()) if manager is not None else ()
-    for request in requests:
-        req_id = getattr(request, "req_id", None)
-        if req_id:
-            return str(req_id)
-    return "unknown"
 
 
 def _block_ids_at_index(block_id_groups: tuple[list[int], ...], idx: int) -> set[int]:
@@ -390,83 +370,52 @@ def _indexer_prefetch_enabled() -> bool:
     return value.lower() in {"1", "true", "yes", "on"}
 
 
-def _hca_prefetch_enabled() -> bool:
-    """Return whether deterministic HCA prefetch is explicitly enabled."""
-    value = os.environ.get("LMCACHE_HCA_ENABLE_PREFETCH", "")
-    return value.lower() in {"1", "true", "yes", "on"}
+def close_vllm_prefetch_managers() -> None:
+    """Close and detach process-local Tutti prefetch managers.
 
-
-def _hca_decode_hook_enabled() -> bool:
-    """Return whether the legacy HCA decode hook is explicitly enabled."""
-    value = os.environ.get("LMCACHE_HCA_ENABLE_DECODE_HOOK", "")
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
-def _hca_pinned_bounce_enabled() -> bool:
-    """Return whether transient pinned-bounce HCA I/O may run.
-
-    CPU pinned memory is allowed only as a temporary I/O buffer. It is not an
-    LMCache tier, resident set, or cache-hit source.
+    The operation is idempotent and clears both adapter-owned and
+    manager-module global references before releasing resources.
     """
-    value = os.environ.get("LMCACHE_HCA_ENABLE_PINNED_BOUNCE", "")
-    return value.lower() in {"1", "true", "yes", "on"}
+    global _CSA_ATTENTION_KV_PREFETCH_MANAGER, _INDEXER_PREFETCH_MANAGER
+
+    csa_manager = _CSA_ATTENTION_KV_PREFETCH_MANAGER
+    _CSA_ATTENTION_KV_PREFETCH_MANAGER = None
+    try:
+        from lmcache.v1.csa_attention_kv_prefetch_manager import (
+            set_csa_attention_kv_prefetch_manager,
+        )
+
+        set_csa_attention_kv_prefetch_manager(None)
+    except ImportError:
+        pass
+    if csa_manager is not None:
+        try:
+            csa_manager.close()
+        except Exception:
+            logger.exception("Failed to close the CSA/HCA Tutti prefetch manager")
+
+    indexer_manager = _INDEXER_PREFETCH_MANAGER
+    _INDEXER_PREFETCH_MANAGER = None
+    try:
+        from lmcache.v1.indexer_ssd_manager import set_indexer_ssd_manager
+
+        set_indexer_ssd_manager(None)
+    except ImportError:
+        pass
+    if indexer_manager is not None:
+        try:
+            indexer_manager.close()
+        except Exception:
+            logger.exception("Failed to close IndexerSSDManager")
 
 
-def _hca_active_prefire_enabled() -> bool:
-    """Return whether HCA may prefire all active-request layers at once.
-
-    This is intentionally opt-in. HCA overlap is only useful while the model is
-    inside the compute/communication window before the target HCA attention.
-    Firing every later layer as soon as request slots are known can consume the
-    same NVMe, pinned-buffer, executor, and H2D bandwidth that CSA or nearer HCA
-    deadlines need. The default path only installs slot maps; FFN-entry hooks
-    submit HCA reads for the configured near-layer lookahead.
-    """
-    if _env_flag("LMCACHE_HCA_DISABLE_ACTIVE_PREFIRE"):
-        return False
-    return _env_flag("LMCACHE_HCA_ACTIVE_PREFIRE")
-
-
-def _hca_overlap_lookahead() -> int:
-    """Return how many near HCA layers each FFN-entry hook may fire.
-
-    The default is deliberately one layer: HCA I/O should live inside the
-    current FFN/MoE/communication window for the nearest upcoming HCA
-    attention. Larger lookahead is an explicit experiment because it can
-    consume NVMe, executor, pinned-buffer, and copy bandwidth needed by CSA or
-    by the layer whose attention deadline is nearest.
-    """
-    return max(1, _env_int("LMCACHE_HCA_OVERLAP_LOOKAHEAD", 1))
-
-
-def _hca_prepare_lookahead() -> int:
-    """Return how many near HCA layers should be opportunistically drained."""
-    return max(1, _env_int("LMCACHE_HCA_PREPARE_LOOKAHEAD", _hca_overlap_lookahead()))
-
-
-def _hca_blocking_drain_enabled() -> bool:
-    """Return whether final HCA attention drain should wait for pending I/O."""
-    value = os.environ.get("LMCACHE_HCA_BLOCKING_DRAIN")
-    if value is None:
-        return False
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
-def _hca_skip_retrieve_ttft_drain_enabled() -> bool:
-    """Return whether full-hit TTFT should skip duplicate HCA active drains."""
-    value = os.environ.get("LMCACHE_HCA_SKIP_RETRIEVE_TTFT_DRAIN")
-    return value is not None and value.lower() in {"1", "true", "yes", "on"}
-
-
-def _vllm_kv_reuse_seed_enabled() -> bool:
-    """Return whether reuse prefetch may seed by copying vLLM KV to CPU.
-
-    DSv4 optimized KV retrieve can seed CSA/HCA object stores directly from
-    LMCache chunks while moving those chunks to HBM.  Copying vLLM's KV cache
-    back to CPU after a full LMCache hit duplicates that work and can leak into
-    the first-token critical path, so it stays opt-in for ablation.
-    """
-    return _env_flag("LMCACHE_REUSE_PREFETCH_SEED_FROM_VLLM_KV")
+def _csa_prefetch_lookahead_policy() -> CSAPrefetchLookaheadPolicy:
+    """Return the per-target policy, defaulting to deep-only L2 prefetch."""
+    value = os.environ.get(
+        "LMCACHE_CSA_PREFETCH_LOOKAHEAD_BY_LAYER",
+        "profile80",
+    )
+    return CSAPrefetchLookaheadPolicy(value)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -939,22 +888,30 @@ def _install_decoder_forward_position_hook(decoder_layer: Any) -> bool:
         self._lmcache_pre_ffn_overlap_fired = False
         self._lmcache_python_pre_ffn_overlap_fired = False
         self._lmcache_hc_post_call_index = 0
-        if _ttft_profile_enabled():
-            req_id = _ttft_profile_request_id()
-            layer_id = int(getattr(self, "layer_idx", -1))
-            key = (req_id, layer_id)
-            if key not in _TTFT_PROFILE_FORWARD_LOGGED:
-                _TTFT_PROFILE_FORWARD_LOGGED.add(key)
-                logger.info(
-                    "LMCACHE_TTFT_STAGE req_id=%s event=decoder_forward_enter "
-                    "layer=%d t=%.9f",
-                    req_id,
-                    layer_id,
-                    time.perf_counter(),
-                )
         try:
             return original_forward(*args, **kwargs)
         finally:
+            full_nsys_manager = _CSA_ATTENTION_KV_PREFETCH_MANAGER
+            full_nsys_scope = os.getenv(
+                "LMCACHE_NSYS_FULL_CAPTURE_SCOPE",
+                "decoder",
+            ).lower()
+            if (
+                full_nsys_scope == "decoder"
+                and getattr(
+                    self,
+                    "_lmcache_nsys_full_capture_last_layer",
+                    False,
+                )
+                and full_nsys_manager is not None
+            ):
+                finish_capture = getattr(
+                    full_nsys_manager,
+                    "finish_full_nsys_capture",
+                    None,
+                )
+                if callable(finish_capture):
+                    finish_capture()
             if previous_source is None:
                 try:
                     delattr(self, "_lmcache_forward_position_source")
@@ -1025,6 +982,9 @@ def _fire_decoder_ffn_overlap(
         None,
     )
     next_csa = getattr(decoder_layer, "_lmcache_next_csa_layer_id", -1)
+    csa_prefetch_level = getattr(
+        decoder_layer, "_lmcache_next_csa_prefetch_level", 1
+    )
     if indexer_manager is not None and isinstance(next_csa, int) and next_csa >= 0:
         try:
             if positions is not None:
@@ -1047,35 +1007,25 @@ def _fire_decoder_ffn_overlap(
                     if callable(csa_kv_attached_fn)
                     else False
                 )
-                prefill_proxy_enabled = getattr(
-                    indexer_manager,
-                    "prefill_proxy_enabled",
-                    None,
-                )
-                prefill_proxy_allowed = (
-                    bool(prefill_proxy_enabled())
-                    if callable(prefill_proxy_enabled)
-                    else False
-                )
-                if not (csa_kv_attached or prefill_proxy_allowed):
+                if not csa_kv_attached:
                     indexer_manager = None
             if indexer_manager is not None:
-                if _ttft_profile_enabled():
-                    logger.info(
-                        "LMCACHE_TTFT_STAGE event=csa_overlap_hook_fire "
-                        "source=%s source_layer=%d target_layer=%d "
-                        "rows=%d t=%.9f",
-                        source,
-                        int(layer_id),
-                        int(next_csa),
-                        rows,
-                        time.perf_counter(),
-                    )
-                indexer_manager.fire_async_for_layer(
-                    next_csa,
-                    residual_f=residual_after_attention,
-                    positions=positions,
+                fire_residual = getattr(
+                    indexer_manager,
+                    "fire_residual_prefetch_for_layer",
+                    None,
                 )
+                if callable(fire_residual):
+                    fire_residual(
+                        next_csa,
+                        residual_after_attention,
+                        positions,
+                        lookahead=int(csa_prefetch_level),
+                    )
+                else:
+                    raise RuntimeError(
+                        "IndexerSSDManager lacks the canonical L2 prefetch API"
+                    )
                 fired = True
         except Exception as exc:
             _log_overlap_hook_error_once("CSA", int(layer_id), exc)
@@ -1084,12 +1034,6 @@ def _fire_decoder_ffn_overlap(
     hca_targets = getattr(decoder_layer, "_lmcache_next_hca_layer_ids", ())
     if hca_manager is not None and isinstance(hca_targets, tuple) and hca_targets:
         try:
-            prepare_ready = getattr(hca_manager, "prepare_ready_layers", None)
-            if callable(prepare_ready):
-                prepare_ready(_hca_prepare_lookahead())
-            prepare_active = getattr(hca_manager, "prepare_active_request_layers", None)
-            if callable(prepare_active):
-                prepare_active(_hca_prepare_lookahead())
             hca_fired = getattr(hca_manager, "layer_fired_for_active_request", None)
             fire_layers = getattr(hca_manager, "fire_async_for_layers", None)
             pending_targets = tuple(
@@ -1104,13 +1048,12 @@ def _fire_decoder_ffn_overlap(
                 for next_hca in pending_targets:
                     hca_manager.fire_async_for_layer(next_hca, positions)
             prepare_hca_layers = getattr(hca_manager, "prepare_layers_async", None)
-            prepare_targets = hca_targets[:_hca_prepare_lookahead()]
             if callable(prepare_hca_layers):
-                prepare_hca_layers(prepare_targets)
+                prepare_hca_layers(hca_targets)
             else:
                 prepare_hca = getattr(hca_manager, "prepare_layer_async", None)
                 if callable(prepare_hca):
-                    for next_hca in prepare_targets:
+                    for next_hca in hca_targets:
                         prepare_hca(next_hca)
             fired = True
         except Exception as exc:
@@ -1161,19 +1104,6 @@ def _install_decoder_hc_pre_overlap_hook(decoder_layer: Any) -> bool:
             args,
             kwargs,
         ):
-            if _ttft_profile_enabled():
-                req_id = _ttft_profile_request_id()
-                layer_id = int(getattr(self, "layer_idx", -1))
-                key = (req_id, layer_id)
-                if key not in _TTFT_PROFILE_HC_PRE_LOGGED:
-                    _TTFT_PROFILE_HC_PRE_LOGGED.add(key)
-                    logger.info(
-                        "LMCACHE_TTFT_STAGE req_id=%s event=hc_pre_enter "
-                        "layer=%d t=%.9f",
-                        req_id,
-                        layer_id,
-                        time.perf_counter(),
-                    )
             positions = _positions_for_overlap(self, hidden_states)
             _maybe_fire_decoder_ffn_overlap(self, hidden_states, positions, "hc_pre")
         return original_hc_pre(hidden_states, *args, **kwargs)
@@ -1204,19 +1134,6 @@ def _install_decoder_hc_post_overlap_hook(decoder_layer: Any) -> bool:
         call_index = int(getattr(self, "_lmcache_hc_post_call_index", 0))
         self._lmcache_hc_post_call_index = call_index + 1
         if call_index == 0 and isinstance(result, torch.Tensor):
-            if _ttft_profile_enabled():
-                req_id = _ttft_profile_request_id()
-                layer_id = int(getattr(self, "layer_idx", -1))
-                key = (req_id, layer_id)
-                if key not in _TTFT_PROFILE_HC_POST_LOGGED:
-                    _TTFT_PROFILE_HC_POST_LOGGED.add(key)
-                    logger.info(
-                        "LMCACHE_TTFT_STAGE req_id=%s event=hc_post_attention "
-                        "layer=%d t=%.9f",
-                        req_id,
-                        layer_id,
-                        time.perf_counter(),
-                    )
             positions = _positions_for_overlap(self, result)
             _maybe_fire_decoder_ffn_overlap(self, result, positions, "hc_post")
         return result
@@ -1251,19 +1168,6 @@ def _install_decoder_mhc_fused_post_pre_overlap_hook(decoder_layer: Any) -> bool
                 residual_after_attention = candidate
         if residual_after_attention is None:
             return result
-        if _ttft_profile_enabled():
-            req_id = _ttft_profile_request_id()
-            layer_id = int(getattr(decoder_layer, "layer_idx", -1))
-            key = (req_id, layer_id)
-            if key not in _TTFT_PROFILE_MHC_FUSED_LOGGED:
-                _TTFT_PROFILE_MHC_FUSED_LOGGED.add(key)
-                logger.info(
-                    "LMCACHE_TTFT_STAGE req_id=%s event=mhc_fused_ffn_pre "
-                    "layer=%d t=%.9f",
-                    req_id,
-                    layer_id,
-                    time.perf_counter(),
-                )
         positions = _positions_for_overlap(decoder_layer, residual_after_attention)
         _maybe_fire_decoder_ffn_overlap(
             decoder_layer,
@@ -1326,9 +1230,11 @@ def _configure_decoder_csa_overlap(
     decoder_layer: Any,
     manager: Any,
     next_csa_layer_id: int,
+    prefetch_level: int = 1,
 ) -> bool:
     decoder_layer._lmcache_indexer_prefetch_manager = manager
     decoder_layer._lmcache_next_csa_layer_id = next_csa_layer_id
+    decoder_layer._lmcache_next_csa_prefetch_level = int(prefetch_level)
     native_hook = callable(
         getattr(decoder_layer, "_lmcache_fire_pre_ffn_overlap", None)
     )
@@ -1357,73 +1263,6 @@ def _configure_decoder_hca_overlap(
     return _install_decoder_pre_ffn_overlap_hooks(decoder_layer) or native_hook
 
 
-def _install_hca_attention_drain_hook(
-    hca_layer: Any,
-    manager: Any,
-    layer_id: int,
-) -> bool:
-    """Install a final safety drain before the target HCA attention runs."""
-    hca_layer._lmcache_hca_prefetch_manager = manager
-    hca_layer._lmcache_hca_layer_id = layer_id
-    if getattr(hca_layer, "_lmcache_hca_drain_installed", False):
-        return True
-    original_forward = getattr(hca_layer, "forward", None)
-    if not callable(original_forward):
-        return False
-
-    def _lmcache_hca_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
-        active_manager = getattr(self, "_lmcache_hca_prefetch_manager", manager)
-        active_layer_id = getattr(self, "_lmcache_hca_layer_id", layer_id)
-        prepare_ready = getattr(active_manager, "prepare_ready_layers", None)
-        if callable(prepare_ready):
-            prepare_ready(_hca_prepare_lookahead())
-        drain = getattr(active_manager, "drain_for_layer", None)
-        if callable(drain):
-            drain(
-                active_layer_id,
-                blocking=_hca_blocking_drain_enabled(),
-            )
-        return original_forward(*args, **kwargs)
-
-    hca_layer._lmcache_original_forward = original_forward
-    hca_layer.forward = MethodType(_lmcache_hca_forward, hca_layer)
-    hca_layer._lmcache_hca_drain_installed = True
-    return True
-
-
-def _compressed_slot_mapping(
-    slot_mapping: torch.Tensor,
-    seq_len: int,
-    compress_ratio: int,
-    compressed_block_size: int,
-) -> torch.Tensor:
-    """Map logical token slots to compressed IndexerCache slots."""
-    compressed_len = seq_len // compress_ratio
-    if compressed_len <= 0:
-        return torch.empty(0, dtype=torch.long)
-    token_positions = torch.arange(
-        compress_ratio - 1,
-        seq_len,
-        compress_ratio,
-        dtype=torch.long,
-    )
-    if token_positions.numel() > compressed_len:
-        token_positions = token_positions[:compressed_len]
-    token_slots = slot_mapping[:seq_len].to(device="cpu", dtype=torch.long)
-    token_slots = token_slots[token_positions]
-    valid = token_slots >= 0
-    compressed_slots = torch.full_like(token_slots, -1)
-    if bool(valid.any().item()):
-        logical_block_size = compressed_block_size * compress_ratio
-        block_numbers = token_slots[valid] // logical_block_size
-        block_offsets = token_slots[valid] % logical_block_size
-        compressed_slots[valid] = (
-            block_numbers * compressed_block_size
-            + block_offsets // compress_ratio
-        )
-    return compressed_slots
-
-
 def _indexer_tutti_backend_enabled() -> bool:
     """Return whether the CSA indexer should use the Tutti GPU-direct backend.
 
@@ -1432,6 +1271,31 @@ def _indexer_tutti_backend_enabled() -> bool:
     """
     value = os.environ.get("LMCACHE_INDEXER_TUTTI_BACKEND", "")
     return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _indexer_worker_rank(tutti_loader: Optional[Any] = None) -> int:
+    """Return the worker rank, preferring the loader's actual CUDA device.
+
+    Args:
+        tutti_loader: Optional active Tutti loader.
+
+    Returns:
+        Non-negative worker rank.
+
+    Raises:
+        ValueError: If neither the loader nor rank environment is valid.
+    """
+    loader_device = getattr(tutti_loader, "cuda_device", None)
+    if isinstance(loader_device, int) and loader_device >= 0:
+        return loader_device
+    rank_value = os.environ.get("LOCAL_RANK") or os.environ.get("RANK") or "0"
+    try:
+        rank = int(rank_value)
+    except ValueError as exc:
+        raise ValueError(f"invalid indexer worker rank {rank_value!r}") from exc
+    if rank < 0:
+        raise ValueError(f"invalid negative indexer worker rank {rank}")
+    return rank
 
 
 def _maybe_build_indexer_tutti_storage(
@@ -1463,14 +1327,23 @@ def _maybe_build_indexer_tutti_storage(
             "available; falling back to the file backend"
         )
         return None
-    raw_region_path = os.environ.get("LMCACHE_INDEXER_TUTTI_RAW_REGION_PATH", "")
-    if not raw_region_path:
+    raw_region_csv = os.environ.get("LMCACHE_INDEXER_TUTTI_RAW_REGION_PATH", "")
+    raw_region_paths = [
+        path.strip() for path in raw_region_csv.split(",") if path.strip()
+    ]
+    if not raw_region_paths:
         logger.warning(
             "LMCACHE_INDEXER_TUTTI_BACKEND is set but "
             "LMCACHE_INDEXER_TUTTI_RAW_REGION_PATH is empty; falling back to "
             "the file backend"
         )
         return None
+    try:
+        rank_index = _indexer_worker_rank(tutti_loader)
+    except ValueError as exc:
+        logger.warning("Cannot select indexer raw region: %s", exc)
+        return None
+    raw_region_path = raw_region_paths[rank_index % len(raw_region_paths)]
     try:
         from lmcache.v1.gpu_connector.tutti_direct_loader import FiemapHelper
         from lmcache.v1.indexer_tutti_backend import TuttiIndexerStorage
@@ -1481,16 +1354,22 @@ def _maybe_build_indexer_tutti_storage(
         )
         return None
 
-    try:
-        lba_records = FiemapHelper.query_extents(raw_region_path)
-    except Exception as exc:
-        logger.warning(
-            "Failed to query FIEMAP for indexer raw region %s: %s; falling "
-            "back to file backend",
-            raw_region_path,
-            exc,
-        )
-        return None
+    cached_records = getattr(tutti_loader, "get_lba_records", lambda _path: [])(
+        raw_region_path
+    )
+    if cached_records:
+        lba_records = cached_records
+    else:
+        try:
+            lba_records = FiemapHelper.query_extents(raw_region_path)
+        except Exception as exc:
+            logger.warning(
+                "Failed to query FIEMAP for indexer raw region %s: %s; falling "
+                "back to file backend",
+                raw_region_path,
+                exc,
+            )
+            return None
     if not lba_records:
         logger.warning(
             "Indexer raw region %s reported no LBA extents; falling back to "
@@ -1503,7 +1382,7 @@ def _maybe_build_indexer_tutti_storage(
         (int(record.file_offset), int(record.slba), int(record.n_sectors))
         for record in lba_records
     ]
-    rank_suffix = os.environ.get("LOCAL_RANK") or os.environ.get("RANK") or "0"
+    rank_suffix = str(rank_index)
     synthetic_path = f"tutti://csa_indexer_rank_{rank_suffix}"
 
     try:
@@ -1526,7 +1405,12 @@ def _maybe_build_indexer_tutti_storage(
     return storage
 
 
-def _shard_indexer_ssd_dir(base_csv: str, rank_suffix: str) -> str:
+def _shard_indexer_ssd_dir(
+    base_csv: str,
+    rank_suffix: str,
+    *,
+    create_dirs: bool = True,
+) -> str:
     """Select this worker's indexer SSD base directory from a CSV of paths.
 
     ``LMCACHE_INDEXER_SSD_DIR`` (and ``LMCACHE_HCA_SSD_DIR``) may be a single
@@ -1540,6 +1424,9 @@ def _shard_indexer_ssd_dir(base_csv: str, rank_suffix: str) -> str:
         base_csv: One path, or a comma-separated list of per-drive paths.
         rank_suffix: This worker's local rank as a string, used to derive the
             GPU device index for ``by_gpu`` sharding.
+        create_dirs: Whether to create the configured directories. Tutti
+            callers disable this after the backing filesystems are unmounted
+            for direct device binding.
 
     Returns:
         The single base directory selected for this worker (no ``rank_N``
@@ -1556,7 +1443,7 @@ def _shard_indexer_ssd_dir(base_csv: str, rank_suffix: str) -> str:
         base_csv,
         strategy="by_gpu",
         dst_device=f"cuda:{rank_suffix}",
-        create_dirs=True,
+        create_dirs=create_dirs,
     )
     return sharder.selected
 
@@ -1577,6 +1464,13 @@ def _attach_indexer_prefetch(tutti_loader: Optional[Any] = None) -> None:
 
     if not _indexer_prefetch_enabled():
         return
+    if _INDEXER_PREFETCH_MANAGER is not None:
+        return
+    if _indexer_tutti_backend_enabled() and tutti_loader is None:
+        logger.debug(
+            "IndexerSSDManager waiting for the Tutti loader before attach"
+        )
+        return
 
     base_store_dir = os.environ.get("LMCACHE_INDEXER_SSD_DIR", "")
     if not base_store_dir:
@@ -1586,8 +1480,16 @@ def _attach_indexer_prefetch(tutti_loader: Optional[Any] = None) -> None:
         )
         return
 
-    rank_suffix = os.environ.get("LOCAL_RANK") or os.environ.get("RANK") or "0"
-    selected_base = _shard_indexer_ssd_dir(base_store_dir, rank_suffix)
+    try:
+        rank_suffix = str(_indexer_worker_rank(tutti_loader))
+    except ValueError as exc:
+        logger.warning("Cannot attach IndexerSSDManager: %s", exc)
+        return
+    selected_base = _shard_indexer_ssd_dir(
+        base_store_dir,
+        rank_suffix,
+        create_dirs=not _indexer_tutti_backend_enabled(),
+    )
     store_dir = os.path.join(selected_base, f"rank_{rank_suffix}")
 
     try:
@@ -1656,7 +1558,15 @@ def _attach_indexer_prefetch(tutti_loader: Optional[Any] = None) -> None:
         tutti_storage=tutti_storage,
     )
 
+    lookahead_policy = _csa_prefetch_lookahead_policy()
+    disabled_csa_layers = (
+        lookahead_policy.disabled_targets(csa_layer_ids)
+        if lookahead_policy is not None
+        else set()
+    )
     for layer_id, indexer_op in csa_info:
+        if layer_id in disabled_csa_layers:
+            continue
         indexer_op.ssd_manager = manager
         indexer_op.csa_layer_id = layer_id
 
@@ -1672,17 +1582,59 @@ def _attach_indexer_prefetch(tutti_loader: Optional[Any] = None) -> None:
 
     attached_decoders = 0
     early_overlap_hooks = 0
-    csa_layer_id_set = set(csa_layer_ids)
+    source_prefetch: dict[int, tuple[int, int]] = {}
+    source_prefetch = build_residual_prefetch_sources(
+        csa_layer_ids,
+        lookahead_policy,
+    )
+    manager.configure_prefetch_lookahead(
+        {
+            target: lookahead_policy.lookahead_for(target)
+            for target in csa_layer_ids
+        }
+    )
     for decoder_layer in decoder_layers:
         decoder_layer_id = getattr(decoder_layer, "layer_idx", -1)
-        next_layer_id = decoder_layer_id + 1
-        next_csa = next_layer_id if next_layer_id in csa_layer_id_set else -1
+        next_csa, prefetch_level = source_prefetch.get(
+            int(decoder_layer_id), (-1, 2)
+        )
         attach = getattr(decoder_layer, "attach_indexer_prefetch", None)
         if callable(attach):
-            attach(manager, next_csa)
+            # Native adjacent-L1 prediction was removed. The Python FFN hook
+            # owns the one canonical L2 scheduling point.
+            attach(manager, -1)
             attached_decoders += 1
-        if _configure_decoder_csa_overlap(decoder_layer, manager, next_csa):
+        if _configure_decoder_csa_overlap(
+            decoder_layer,
+            manager,
+            next_csa,
+            prefetch_level,
+        ):
             early_overlap_hooks += 1
+
+    if os.getenv("LMCACHE_NSYS_FULL_CAPTURE", "0").lower() in {
+        "1",
+        "on",
+        "true",
+        "yes",
+    }:
+        indexed_decoders = [
+            layer
+            for layer in decoder_layers
+            if isinstance(getattr(layer, "layer_idx", None), int)
+        ]
+        if indexed_decoders:
+            last_decoder = max(
+                indexed_decoders,
+                key=lambda layer: int(layer.layer_idx),
+            )
+            last_decoder._lmcache_nsys_full_capture_last_layer = True
+            _install_decoder_forward_position_hook(last_decoder)
+            logger.info(
+                "IndexerSSDManager: full nsys capture stop hook attached "
+                "to decoder layer %d",
+                int(last_decoder.layer_idx),
+            )
 
     if attached_decoders != len(decoder_layers) and early_overlap_hooks == 0:
         logger.warning(
@@ -1695,206 +1647,31 @@ def _attach_indexer_prefetch(tutti_loader: Optional[Any] = None) -> None:
 
     logger.info(
         "IndexerSSDManager: enabled CSA prefetch on %d native decoder hooks, "
-        "%d FFN-entry early-overlap hooks, and attached %d CSA indexers, "
-        "pool_size=%d, store=%s",
+        "%d FFN-entry early-overlap hooks, managed_indexers=%d "
+        "native_indexers=%d pool_size=%d, store=%s",
         attached_decoders,
         early_overlap_hooks,
-        len(csa_layer_ids),
+        len(csa_layer_ids) - len(disabled_csa_layers),
+        len(disabled_csa_layers),
         pool_size,
         store_dir,
     )
-
-
-def _attach_hca_prefetch() -> None:
-    """Attach transient pinned-bounce HCA prefetch when enabled.
-
-    HCA rows are deterministic for a reused prefix, so the request may submit
-    their SSD/NVMe reads as soon as the current request's compressed slot
-    mapping is known. vLLM drains the read before the target HCA attention.
-    This path may use CPU pinned memory only as a transient bounce buffer;
-    pinned payloads must not be treated as cache residency or hit state.
-    """
-    global _HCA_ATTACH_ATTEMPTED, _HCA_PREFETCH_MANAGER
-
-    if not _hca_prefetch_enabled():
-        return
-    if _HCA_PREFETCH_MANAGER is not None:
-        return
-    if not _hca_pinned_bounce_enabled():
-        logger.info(
-            "LMCACHE_HCA_ENABLE_PREFETCH=1 but no GPU-direct path is wired in "
-            "this build. Set LMCACHE_HCA_ENABLE_PINNED_BOUNCE=1 to use a "
-            "transient pinned I/O buffer; it is not a CPU KV cache."
-        )
-        return
-
-    hca_ssd_csv = os.environ.get("LMCACHE_HCA_SSD_DIR", "")
-    hca_nested_suffix = ""
-    if not hca_ssd_csv:
-        hca_ssd_csv = os.environ.get("LMCACHE_INDEXER_SSD_DIR", "")
-        if hca_ssd_csv:
-            # Fall back to a subdir under the (possibly sharded) indexer dir.
-            # The "hca" suffix is applied per-shard after selection so a
-            # comma-separated indexer CSV shards correctly instead of being
-            # treated as one path.
-            hca_nested_suffix = "hca"
-    if not hca_ssd_csv:
-        logger.warning(
-            "LMCACHE_HCA_ENABLE_PREFETCH is set, but neither "
-            "LMCACHE_HCA_SSD_DIR nor LMCACHE_INDEXER_SSD_DIR is set; "
-            "skipping HCA prefetch"
-        )
-        return
-
-    try:
-        from lmcache.v1.hca_prefetch_manager import HCAPrefetchManager
-    except ImportError as exc:
-        logger.warning("HCAPrefetchManager is unavailable: %s", exc)
-        return
-
-    decoder_layers = _deepseek_decoder_layers()
-
-    if not decoder_layers:
-        if not _HCA_ATTACH_ATTEMPTED:
-            logger.warning(
-                "HCA prefetch requested, but no registered DeepSeek decoder "
-                "layers were found"
-            )
-        _HCA_ATTACH_ATTEMPTED = True
-        return
-
-    _HCA_ATTACH_ATTEMPTED = True
-
-    hca_info: list[tuple[int, Any]] = []
-    for decoder_layer in decoder_layers:
-        layer_id = getattr(decoder_layer, "layer_idx", -1)
-        hca_layer = _decoder_hca_attention(decoder_layer)
-        if isinstance(layer_id, int) and layer_id >= 0 and hca_layer is not None:
-            hca_info.append((layer_id, hca_layer))
-
-    if not hca_info:
-        logger.warning(
-            "HCA prefetch requested, but registered DeepSeek decoder layers "
-            "have no compress_ratio=128 HCA attention caches"
-        )
-        return
-
-    hca_info.sort(key=lambda item: item[0])
-    hca_layer_ids = [layer_id for layer_id, _ in hca_info]
-    rank_suffix = os.environ.get("LOCAL_RANK") or os.environ.get("RANK") or "0"
-    selected_base = _shard_indexer_ssd_dir(hca_ssd_csv, rank_suffix)
-    if hca_nested_suffix:
-        selected_base = os.path.join(selected_base, hca_nested_suffix)
-    store_dir = os.path.join(selected_base, f"rank_{rank_suffix}")
-
-    manager = HCAPrefetchManager(
-        store_dir=store_dir,
-        max_seq_len=_env_int(
-            "LMCACHE_HCA_MAX_SEQ_LEN",
-            _env_int("LMCACHE_INDEXER_MAX_SEQ_LEN", 131072),
-        ),
-        io_workers=_env_int(
-            "LMCACHE_HCA_IO_WORKERS",
-            _env_int("LMCACHE_INDEXER_IO_WORKERS", 8),
-        ),
-        resident_budget_blocks=_env_int("LMCACHE_HCA_RESIDENT_BUDGET_BLOCKS", 0),
-        prefetch_window_tokens=_env_int("LMCACHE_HCA_PREFETCH_WINDOW_TOKENS", 0),
-    )
-    for layer_id, hca_layer in hca_info:
-        manager.register_hca_layer(layer_id, hca_layer)
-
-    hca_drain_hooks = 0
-    for layer_id, hca_layer in hca_info:
-        if _install_hca_attention_drain_hook(hca_layer, manager, layer_id):
-            hca_drain_hooks += 1
-
-    attached_decoders = 0
-    early_overlap_hooks = 0
-    hca_set = set(hca_layer_ids)
-    for decoder_layer in decoder_layers:
-        decoder_layer_id = getattr(decoder_layer, "layer_idx", -1)
-        if not isinstance(decoder_layer_id, int) or decoder_layer_id < 0:
-            continue
-        current_hca = decoder_layer_id if decoder_layer_id in hca_set else -1
-        next_hca = next(
-            (
-                hca_layer_id
-                for hca_layer_id in hca_layer_ids
-                if hca_layer_id > decoder_layer_id
-            ),
-            -1,
-        )
-        next_hca_layers = tuple(
-            hca_layer_id
-            for hca_layer_id in hca_layer_ids
-            if hca_layer_id > decoder_layer_id
-        )[:_hca_overlap_lookahead()]
-        attach = getattr(decoder_layer, "attach_hca_prefetch", None)
-        if callable(attach):
-            attach(manager, current_hca, next_hca)
-            attached_decoders += 1
-        if _configure_decoder_hca_overlap(
-            decoder_layer,
-            manager,
-            next_hca,
-            next_hca_layers,
-        ):
-            early_overlap_hooks += 1
-
-    if attached_decoders == 0 and early_overlap_hooks == 0:
-        logger.warning(
-            "HCA prefetch requested, but DeepSeek decoder layers do not expose "
-            "attach_hca_prefetch(); attention-drain HCA overlap is disabled"
-        )
-        return
-
-    _HCA_PREFETCH_MANAGER = manager
     logger.info(
-        "HCAPrefetchManager: enabled pinned-transient HCA state; "
-        "native_decoder_hooks=%d FFN-entry early-overlap hooks=%d "
-        "attention-drain hooks=%d HCA caches=%d store=%s",
-        attached_decoders,
-        early_overlap_hooks,
-        hca_drain_hooks,
-        len(hca_layer_ids),
-        store_dir,
+        "IndexerSSDManager: canonical L2 policy=%s two_layer_targets=%s "
+        "demand_only_targets=%s",
+        lookahead_policy.specification,
+        sorted(lookahead_policy.two_layer_targets(csa_layer_ids)),
+        sorted(lookahead_policy.disabled_targets(csa_layer_ids)),
     )
-
-
-def _ensure_hca_prefetch_attached() -> Any:
-    """Attach HCA prefetch lazily and return the active manager if available."""
-    global _HCA_PREFETCH_MANAGER
-
-    if _HCA_PREFETCH_MANAGER is None:
-        _attach_hca_prefetch()
-    return _HCA_PREFETCH_MANAGER
 
 
 def _csa_attention_kv_prefetch_enabled() -> bool:
-    """Return whether CSA attention KV prefetch should be attached.
+    """Return whether the canonical Tutti CSA/HCA pipeline is enabled.
 
-    Gated on three flags:
-
-    * ``LMCACHE_INDEXER_ENABLE_PREFETCH`` — IndexerSSDManager must be active
-      because the attention KV prefetcher takes its predicted top-K from the
-      indexer's HC-proxy.
-    * ``LMCACHE_INDEXER_FULL_OVERLAP`` — high-level master switch for the
-      full spec prefetch pipeline; defaults to off.
-    * ``LMCACHE_DSV4_CSA_ATTENTION_KV_FILTER`` — explicit acknowledgement
-      that the operator wants the synchronous ``csa_attention_kv`` scatter
-      replaced by prefetcher writes.  Until this flag is set the prefetcher
-      stays detached because attaching it without the retrieve-side filter
-      would have prefetcher writes race the synchronous scatter and either
-      duplicate work or corrupt vLLM's K cache slots if the read path is
-      not yet fully validated.
+    ``LMCACHE_INDEXER_ENABLE_PREFETCH`` is the single feature gate. Manager
+    attachment and retrieve filtering are enabled or disabled together.
     """
-    if not _indexer_prefetch_enabled():
-        return False
-    value = os.environ.get("LMCACHE_INDEXER_FULL_OVERLAP", "")
-    if value.lower() not in {"1", "true", "yes", "on"}:
-        return False
-    filter_value = os.environ.get("LMCACHE_DSV4_CSA_ATTENTION_KV_FILTER", "")
-    return filter_value.lower() in {"1", "true", "yes", "on"}
+    return _indexer_prefetch_enabled()
 
 
 def _attach_csa_attention_kv_prefetch(tutti_loader: Optional[Any] = None) -> None:
@@ -1976,7 +1753,6 @@ def _attach_csa_attention_kv_prefetch(tutti_loader: Optional[Any] = None) -> Non
 
     csa_layer_entries.sort(key=lambda entry: entry[0])
     csa_layer_ids = [layer_id for layer_id, _, _, _ in csa_layer_entries]
-
     # Probe the first attention to derive token_bytes/compressed_block_size.
     probe_kv_cache = getattr(csa_layer_entries[0][1], "kv_cache", None)
     if not isinstance(probe_kv_cache, torch.Tensor) or probe_kv_cache.ndim != 3:
@@ -2007,23 +1783,7 @@ def _attach_csa_attention_kv_prefetch(tutti_loader: Optional[Any] = None) -> Non
             # patch_indexer_forward wraps the SparseAttnIndexer op exposed
             # via ``attn.indexer.indexer_op`` (the leaf module that runs the
             # actual Lightning Indexer kernel and returns top-K indices).
-            # If a downstream model surfaces a different leaf, the
-            # ``LMCACHE_CSA_ATTENTION_KV_INDEXER_PATCH_TARGET`` env can
-            # request that we patch the parent ``indexer`` module instead.
-            target_module = indexer_op
-            override = os.environ.get(
-                "LMCACHE_CSA_ATTENTION_KV_INDEXER_PATCH_TARGET",
-                "indexer_op",
-            )
-            if override == "outer":
-                attn = (
-                    getattr(decoder_layer, "self_attn", None)
-                    or getattr(decoder_layer, "attn", None)
-                )
-                outer_indexer = getattr(attn, "indexer", None) if attn else None
-                if outer_indexer is not None:
-                    target_module = outer_indexer
-            manager.patch_indexer_forward(target_module, int(layer_id))
+            manager.patch_indexer_forward(indexer_op, int(layer_id))
             patched_layers += 1
         except Exception:
             logger.exception(
@@ -2094,6 +1854,45 @@ def _attach_csa_attention_kv_prefetch(tutti_loader: Optional[Any] = None) -> Non
         )
 
     indexer_manager.attach_csa_attention_kv_manager(manager)
+    if hca_registered:
+        hca_set = set(manager.hca_layer_ids)
+        for decoder_layer in decoder_layers:
+            layer_id = getattr(decoder_layer, "layer_idx", -1)
+            if not isinstance(layer_id, int):
+                continue
+            native_attach = getattr(decoder_layer, "attach_hca_prefetch", None)
+            if callable(native_attach):
+                try:
+                    # The legacy native mapping chooses the next HCA anywhere
+                    # ahead. Disable it; the Python staged hook below owns the
+                    # exact adjacent-layer schedule through the unified manager.
+                    native_attach(None, -1, -1)
+                except Exception:
+                    logger.debug(
+                        "Could not detach legacy native HCA prefetch for "
+                        "layer %d",
+                        layer_id,
+                        exc_info=True,
+                    )
+            next_hca = layer_id + 1
+            if next_hca in hca_set:
+                _configure_decoder_hca_overlap(
+                    decoder_layer,
+                    indexer_manager,
+                    next_hca,
+                    (next_hca,),
+                )
+            else:
+                # Disable the legacy "next HCA anywhere ahead" mapping. In
+                # staged mode HCA is deterministic and is submitted only from
+                # its immediately preceding CSA FFN, so it cannot steal I/O
+                # from a nearer target CSA prediction deadline.
+                _configure_decoder_hca_overlap(
+                    decoder_layer,
+                    None,
+                    -1,
+                    (),
+                )
     set_csa_attention_kv_prefetch_manager(manager)
     _CSA_ATTENTION_KV_PREFETCH_MANAGER = manager
     logger.info(
@@ -2128,8 +1927,8 @@ def _ensure_csa_attention_kv_prefetch_attached(
     return _CSA_ATTENTION_KV_PREFETCH_MANAGER
 
 
-def _csa_prefetch_set_pending_loader(tutti_loader: Any) -> None:
-    """Loader-ready callback: record the Tutti loader for a later main-thread attach.
+def _prefetch_set_pending_loader(tutti_loader: Any) -> None:
+    """Record the Tutti loader for later main-thread prefetch attachment.
 
     Registered with the cache engine via ``register_tutti_loader_ready_callback``
     and may be invoked from the Tutti warmup daemon thread. It therefore only
@@ -2140,9 +1939,28 @@ def _csa_prefetch_set_pending_loader(tutti_loader: Any) -> None:
     Args:
         tutti_loader: The freshly created :class:`TuttiDirectLoader`.
     """
-    global _CSA_PREFETCH_PENDING_LOADER
+    global _CSA_PREFETCH_PENDING_LOADER, _INDEXER_PREFETCH_PENDING_LOADER
     with _CSA_PREFETCH_PENDING_LOCK:
         _CSA_PREFETCH_PENDING_LOADER = tutti_loader
+    with _INDEXER_PREFETCH_PENDING_LOCK:
+        _INDEXER_PREFETCH_PENDING_LOADER = tutti_loader
+
+
+def _maybe_lazy_attach_indexer_prefetch(engine: Any) -> None:
+    """Attach the Tutti indexer manager after the loader becomes available.
+
+    Args:
+        engine: Active LMCache engine used as a fallback loader source.
+    """
+    if _INDEXER_PREFETCH_MANAGER is not None:
+        return
+    with _INDEXER_PREFETCH_PENDING_LOCK:
+        loader = _INDEXER_PREFETCH_PENDING_LOADER
+    if loader is None:
+        loader = getattr(engine, "_tutti_loader", None) if engine is not None else None
+    if loader is None:
+        return
+    _attach_indexer_prefetch(tutti_loader=loader)
 
 
 def _maybe_lazy_attach_csa_prefetch(engine: Any) -> None:
@@ -2705,21 +2523,6 @@ class LMCacheConnectorV1Impl:
         self.force_skip_save = bool(os.environ.get("LMCACHE_FORCE_SKIP_SAVE", False))
         self._requests_priority: dict[str, int] = {}
         self._invalid_block_ids: set[int] = set()
-        self._reuse_prefetch_seen: set[tuple[Any, ...]] = set()
-        self._reuse_prefetch_executor: Optional[ThreadPoolExecutor] = None
-        self._reuse_prefetch_async = _env_flag(
-            "LMCACHE_REUSE_PREFETCH_ASYNC"
-        ) or _env_flag("LMCACHE_INDEXER_REUSE_PREFETCH_ASYNC")
-        if self._reuse_prefetch_async:
-            workers = max(1, _env_int("LMCACHE_REUSE_PREFETCH_ASYNC_WORKERS", 1))
-            self._reuse_prefetch_executor = ThreadPoolExecutor(
-                max_workers=workers,
-                thread_name_prefix="lmcache-reuse-prefetch",
-            )
-            logger.info(
-                "LMCache async reuse prefetch seed enabled with %d worker(s)",
-                workers,
-            )
         self._kv_cache_layer_names: tuple[str, ...] = ()
         self._vllm_kv_cache_group_layer_names: tuple[tuple[str, ...], ...] = ()
         self._vllm_kv_cache_group_block_sizes: tuple[int, ...] = ()
@@ -2891,16 +2694,24 @@ class LMCacheConnectorV1Impl:
             else None
         )
         _attach_indexer_prefetch(tutti_loader=engine_tutti_loader)
-        _attach_hca_prefetch()
         _attach_csa_attention_kv_prefetch(tutti_loader=engine_tutti_loader)
         # The Tutti loader is usually still None here (created lazily after the
         # warmup delay), so the attach above no-ops. Register a callback so the
         # CSA attention-KV manager attaches on the main thread once the loader
         # is created. See _maybe_lazy_attach_csa_prefetch / start_load_kv.
         if (
-            _CSA_ATTENTION_KV_PREFETCH_MANAGER is None
-            and self.lmcache_engine is not None
-            and _csa_attention_kv_prefetch_enabled()
+            self.lmcache_engine is not None
+            and (
+                (
+                    _CSA_ATTENTION_KV_PREFETCH_MANAGER is None
+                    and _csa_attention_kv_prefetch_enabled()
+                )
+                or (
+                    _INDEXER_PREFETCH_MANAGER is None
+                    and _indexer_prefetch_enabled()
+                    and _indexer_tutti_backend_enabled()
+                )
+            )
         ):
             register_cb = getattr(
                 self.lmcache_engine,
@@ -2908,7 +2719,7 @@ class LMCacheConnectorV1Impl:
                 None,
             )
             if callable(register_cb):
-                register_cb(_csa_prefetch_set_pending_loader)
+                register_cb(_prefetch_set_pending_loader)
 
     def _capture_vllm_hma_layout(self) -> None:
         """Capture vLLM HMA group metadata for LMCache GPU transfers."""
@@ -2995,8 +2806,6 @@ class LMCacheConnectorV1Impl:
     def _start_load_kv_impl(
         self, forward_context: "ForwardContext", **kwargs
     ) -> None:
-        start_load_profile_enabled = _ttft_profile_enabled()
-        start_load_t0 = time.perf_counter() if start_load_profile_enabled else 0.0
         self.current_layer = 0
 
         if len(self.kv_caches) == 0:
@@ -3032,8 +2841,24 @@ class LMCacheConnectorV1Impl:
         # Attach the CSA attention-KV prefetch manager if the Tutti loader
         # became ready after register_kv_caches. Runs on the main thread before
         # the model forward; idempotent no-op once attached.
+        if _INDEXER_PREFETCH_MANAGER is None:
+            _maybe_lazy_attach_indexer_prefetch(self.lmcache_engine)
         if _CSA_ATTENTION_KV_PREFETCH_MANAGER is None:
             _maybe_lazy_attach_csa_prefetch(self.lmcache_engine)
+
+        full_nsys_manager = _CSA_ATTENTION_KV_PREFETCH_MANAGER
+        if full_nsys_manager is not None:
+            start_capture = getattr(
+                full_nsys_manager,
+                "start_full_nsys_capture_for_request",
+                None,
+            )
+            if callable(start_capture):
+                for request in metadata.requests:
+                    load_spec = request.load_spec
+                    if load_spec is not None and load_spec.can_load:
+                        start_capture(str(request.req_id))
+                        break
 
         self.layerwise_retrievers = []
 
@@ -3055,11 +2880,6 @@ class LMCacheConnectorV1Impl:
             if request.load_spec is None or not request.load_spec.can_load:
                 continue
 
-            request_profile_t0 = (
-                time.perf_counter() if start_load_profile_enabled else 0.0
-            )
-            retrieve_ms = 0.0
-            post_retrieve_ms = 0.0
             tokens = request.token_ids
             # TODO: have a pre-allocated buffer to hold the slot_mappings
             slot_mapping = request.slot_mapping.to(self.device)
@@ -3105,7 +2925,6 @@ class LMCacheConnectorV1Impl:
                     next(layerwise_retriever)
                     self.layerwise_retrievers.append((layerwise_retriever, request))
             else:
-                retrieve_t0 = time.perf_counter() if start_load_profile_enabled else 0.0
                 ret_token_mask = self.lmcache_engine.retrieve(
                     tokens[:lmcache_cached_tokens],
                     token_mask[:lmcache_cached_tokens],
@@ -3116,20 +2935,11 @@ class LMCacheConnectorV1Impl:
                     req_id=request.req_id,
                     **hma_kwargs,
                 )
-                if start_load_profile_enabled:
-                    retrieve_ms = (time.perf_counter() - retrieve_t0) * 1000.0
 
                 # Check the result
-                post_retrieve_t0 = (
-                    time.perf_counter() if start_load_profile_enabled else 0.0
-                )
                 num_retrieved_tokens = ret_token_mask.sum().item()
                 num_expected_tokens = (
                     lmcache_cached_tokens - request.load_spec.vllm_cached_tokens
-                )
-                retrieved_lmcache_cached_tokens = (
-                    request.load_spec.vllm_cached_tokens
-                    + int(num_retrieved_tokens)
                 )
                 if num_retrieved_tokens < num_expected_tokens:
                     logger.error(
@@ -3153,80 +2963,6 @@ class LMCacheConnectorV1Impl:
                         slot_mapping[:lmcache_cached_tokens],
                     )
                     self._invalid_block_ids.update(missing_blocks)
-                    if num_retrieved_tokens > 0:
-                        self._maybe_seed_indexer_reuse_prefetch(
-                            request,
-                            retrieved_lmcache_cached_tokens,
-                            request.slot_mapping,
-                        )
-                else:
-                    skip_hca_retrieve_drain = (
-                        _hca_skip_retrieve_ttft_drain_enabled()
-                        and request.load_spec.vllm_cached_tokens == 0
-                        and num_retrieved_tokens == num_expected_tokens
-                        and num_expected_tokens > 0
-                    )
-                    if skip_hca_retrieve_drain:
-                        manager = _ensure_hca_prefetch_attached()
-                        suspend_active = (
-                            getattr(manager, "suspend_active_request", None)
-                            if manager is not None
-                            else None
-                        )
-                        if callable(suspend_active):
-                            suspend_active()
-                        logger.info(
-                            "HCAPrefetchManager: skip active HCA prefetch for "
-                            "LMCache retrieve TTFT request=%s tokens=%d",
-                            request.req_id,
-                            num_expected_tokens,
-                        )
-                    else:
-                        self._prepare_hca_active_slots(
-                            request,
-                            lmcache_cached_tokens,
-                            request.slot_mapping,
-                        )
-                    self._maybe_seed_indexer_reuse_prefetch(
-                        request,
-                        lmcache_cached_tokens,
-                        request.slot_mapping,
-                    )
-                    if _vllm_kv_reuse_seed_enabled():
-                        self._maybe_seed_hca_reuse_prefetch(
-                            request,
-                            lmcache_cached_tokens,
-                            request.slot_mapping,
-                        )
-                        logger.debug(
-                            "LMCACHE_REUSE_PREFETCH_SEED_FROM_VLLM_KV is "
-                            "deprecated for DSv4 CSA reuse; HCA VLLM-KV "
-                            "seed remains opt-in for ablation"
-                        )
-                if start_load_profile_enabled:
-                    post_retrieve_ms = (
-                        time.perf_counter() - post_retrieve_t0
-                    ) * 1000.0
-                    logger.info(
-                        "LMCACHE_TTFT_STAGE req_id=%s event=start_load_request "
-                        "retrieve_ms=%.3f post_retrieve_ms=%.3f total_ms=%.3f "
-                        "tokens=%d retrieved=%d expected=%d t=%.9f",
-                        request.req_id,
-                        retrieve_ms,
-                        post_retrieve_ms,
-                        (time.perf_counter() - request_profile_t0) * 1000.0,
-                        len(tokens),
-                        int(num_retrieved_tokens),
-                        int(num_expected_tokens),
-                        time.perf_counter(),
-                    )
-        if start_load_profile_enabled:
-            logger.info(
-                "LMCACHE_TTFT_STAGE event=start_load_total total_ms=%.3f "
-                "t=%.9f",
-                (time.perf_counter() - start_load_t0) * 1000.0,
-                time.perf_counter(),
-            )
 
     def record_failed_blocks(
         self,
@@ -3302,403 +3038,6 @@ class LMCacheConnectorV1Impl:
         )
         return missing_blocks
 
-    def _submit_reuse_prefetch_task(
-        self,
-        label: str,
-        request_id: str,
-        task: Callable[[], None],
-    ) -> bool:
-        """Submit a reuse-prefetch seed task to the optional background worker."""
-        executor = self._reuse_prefetch_executor
-        if executor is None:
-            return False
-
-        try:
-            future: Future[None] = executor.submit(task)
-        except RuntimeError:
-            logger.exception(
-                "LMCache async reuse prefetch submit failed for %s request %s",
-                label,
-                request_id,
-            )
-            return False
-
-        def _log_done(done_future: Future[None]) -> None:
-            try:
-                done_future.result()
-            except Exception:
-                logger.exception(
-                    "LMCache async reuse prefetch task failed for %s request %s",
-                    label,
-                    request_id,
-                )
-
-        future.add_done_callback(_log_done)
-        return True
-
-    def _maybe_seed_indexer_reuse_prefetch(
-        self,
-        request: ReqMeta,
-        lmcache_cached_tokens: int,
-        slot_mapping: torch.Tensor,
-    ) -> None:
-        """Seed CSA prefetch state after LMCache loads a reused prefill prefix."""
-        manager = _INDEXER_PREFETCH_MANAGER
-        if manager is None:
-            return
-        reuse_prefetch_enabled = getattr(manager, "reuse_prefetch_enabled", None)
-        if (
-            not callable(reuse_prefetch_enabled)
-            or not reuse_prefetch_enabled()
-        ):
-            return
-        if lmcache_cached_tokens <= request.load_spec.vllm_cached_tokens:
-            return
-
-        min_hit_tokens = max(
-            0, _env_int("LMCACHE_INDEXER_REUSE_PREFETCH_MIN_HIT_TOKENS", 1024)
-        )
-        if lmcache_cached_tokens < min_hit_tokens:
-            return
-
-        if self._reuse_prefetch_executor is not None:
-            slot_mapping_cpu = slot_mapping.detach().to(device="cpu", dtype=torch.long)
-
-            def _seed_indexer_async() -> None:
-                self._maybe_seed_indexer_reuse_prefetch_sync(
-                    request,
-                    lmcache_cached_tokens,
-                    slot_mapping_cpu,
-                )
-
-            if self._submit_reuse_prefetch_task(
-                "CSA",
-                request.req_id,
-                _seed_indexer_async,
-            ):
-                logger.debug(
-                    "IndexerSSDManager: submitted async reuse prefetch seed "
-                    "for request %s lmcache_tokens=%d",
-                    request.req_id,
-                    lmcache_cached_tokens,
-                )
-                return
-
-        self._maybe_seed_indexer_reuse_prefetch_sync(
-            request,
-            lmcache_cached_tokens,
-            slot_mapping,
-        )
-
-    def _maybe_seed_indexer_reuse_prefetch_sync(
-        self,
-        request: ReqMeta,
-        lmcache_cached_tokens: int,
-        slot_mapping: torch.Tensor,
-    ) -> None:
-        """Synchronously seed CSA prefetch state after an LMCache prefix hit."""
-        manager = _INDEXER_PREFETCH_MANAGER
-        if manager is None:
-            return
-        reuse_prefetch_enabled = getattr(manager, "reuse_prefetch_enabled", None)
-        if (
-            not callable(reuse_prefetch_enabled)
-            or not reuse_prefetch_enabled()
-        ):
-            return
-        if lmcache_cached_tokens <= request.load_spec.vllm_cached_tokens:
-            return
-
-        min_hit_tokens = max(
-            0, _env_int("LMCACHE_INDEXER_REUSE_PREFETCH_MIN_HIT_TOKENS", 1024)
-        )
-        if lmcache_cached_tokens < min_hit_tokens:
-            return
-
-        csa_entries: list[tuple[int, Any]] = []
-        for decoder_layer in _deepseek_decoder_layers():
-            layer_id = getattr(decoder_layer, "layer_idx", -1)
-            indexer_op = _decoder_csa_indexer(decoder_layer)
-            if isinstance(layer_id, int) and layer_id >= 0 and indexer_op is not None:
-                csa_entries.append((layer_id, indexer_op))
-
-        if not csa_entries:
-            return
-
-        csa_entries.sort(key=lambda item: item[0])
-        submitted = 0
-        covered = 0
-        for layer_id, indexer_op in csa_entries:
-            key = (request.req_id, layer_id)
-            if key in self._reuse_prefetch_seen:
-                continue
-            k_cache = getattr(getattr(indexer_op, "k_cache", None), "kv_cache", None)
-            if not isinstance(k_cache, torch.Tensor) or k_cache.numel() == 0:
-                continue
-            compress_ratio = int(
-                getattr(getattr(indexer_op, "k_cache", None), "compress_ratio", 1)
-            )
-            if compress_ratio <= 1:
-                continue
-            compressed_seq_len = lmcache_cached_tokens // compress_ratio
-            if compressed_seq_len <= 0:
-                continue
-            has_layer_rows = getattr(manager, "has_layer_rows", None)
-            if callable(has_layer_rows) and has_layer_rows(
-                layer_id,
-                compressed_seq_len,
-            ):
-                self._reuse_prefetch_seen.add(key)
-                covered += 1
-                continue
-            compressed_block_size = int(k_cache.shape[1])
-            compressed_slots = _compressed_slot_mapping(
-                slot_mapping,
-                lmcache_cached_tokens,
-                compress_ratio,
-                compressed_block_size,
-            )
-            if compressed_slots.numel() < compressed_seq_len:
-                continue
-            if bool((compressed_slots[:compressed_seq_len] < 0).any().item()):
-                logger.info(
-                    "IndexerSSDManager: skip reuse prefetch layer %d request %s "
-                    "because compressed slot mapping has gaps",
-                    layer_id,
-                    request.req_id,
-                )
-                continue
-            max_seed_tokens = max(
-                0,
-                _env_int("LMCACHE_INDEXER_REUSE_PREFETCH_MAX_TAIL_TOKENS", 4096),
-            )
-            pool_size = max(1, _env_int("LMCACHE_INDEXER_POOL_SIZE", 2048))
-            if max_seed_tokens > 0:
-                pool_size = min(pool_size, max_seed_tokens)
-            tail = min(compressed_seq_len, pool_size)
-            start = max(0, compressed_seq_len - tail)
-            seed_token_ids = list(range(start, compressed_seq_len))
-
-            self._reuse_prefetch_seen.add(key)
-            submit_seed = getattr(manager, "submit_seed_after_reuse", None)
-            if not callable(submit_seed):
-                submit_seed = manager.submit_evict_after_prefill
-            submit_seed(
-                layer_id,
-                k_cache.detach().cpu(),
-                compressed_seq_len,
-                seed_token_ids,
-                slot_mapping_cpu=compressed_slots[:compressed_seq_len],
-            )
-            submitted += 1
-
-        if submitted > 0:
-            logger.info(
-                "IndexerSSDManager: reuse prefetch seeded %d CSA layers for "
-                "request %s lmcache_tokens=%d compressed_tokens~=%d",
-                submitted,
-                request.req_id,
-                lmcache_cached_tokens,
-                lmcache_cached_tokens // 4,
-            )
-        elif covered > 0:
-            logger.debug(
-                "IndexerSSDManager: reuse prefetch already covered %d CSA "
-                "layers for request %s lmcache_tokens=%d compressed_tokens~=%d",
-                covered,
-                request.req_id,
-                lmcache_cached_tokens,
-                lmcache_cached_tokens // 4,
-            )
-
-    def _maybe_seed_hca_reuse_prefetch(
-        self,
-        request: ReqMeta,
-        lmcache_cached_tokens: int,
-        slot_mapping: torch.Tensor,
-    ) -> None:
-        """Seed HCA deterministic prefetch state after an LMCache prefix hit."""
-        manager = _ensure_hca_prefetch_attached()
-        if manager is None:
-            return
-        if lmcache_cached_tokens <= request.load_spec.vllm_cached_tokens:
-            return
-        min_hit_tokens = max(
-            0,
-            _env_int(
-                "LMCACHE_HCA_REUSE_PREFETCH_MIN_HIT_TOKENS",
-                _env_int("LMCACHE_INDEXER_REUSE_PREFETCH_MIN_HIT_TOKENS", 1024),
-            ),
-        )
-        if lmcache_cached_tokens < min_hit_tokens:
-            return
-
-        hca_entries: list[tuple[int, Any]] = []
-        for decoder_layer in _deepseek_decoder_layers():
-            layer_id = getattr(decoder_layer, "layer_idx", -1)
-            hca_layer = _decoder_hca_attention(decoder_layer)
-            if isinstance(layer_id, int) and layer_id >= 0 and hca_layer is not None:
-                hca_entries.append((layer_id, hca_layer))
-
-        if not hca_entries:
-            return
-
-        submitted = 0
-        hca_entries.sort(key=lambda item: item[0])
-        for layer_id, hca_layer in hca_entries:
-            key = (request.req_id, "hca", layer_id)
-            if key in self._reuse_prefetch_seen:
-                continue
-            kv_cache = getattr(hca_layer, "kv_cache", None)
-            if not isinstance(kv_cache, torch.Tensor) or kv_cache.numel() == 0:
-                continue
-            compress_ratio = int(getattr(hca_layer, "compress_ratio", 1))
-            if compress_ratio != 128:
-                continue
-            compressed_seq_len = lmcache_cached_tokens // compress_ratio
-            if compressed_seq_len <= 0:
-                continue
-            compressed_block_size = int(kv_cache.shape[1])
-            compressed_slots = _compressed_slot_mapping(
-                slot_mapping,
-                lmcache_cached_tokens,
-                compress_ratio,
-                compressed_block_size,
-            )
-            if compressed_slots.numel() < compressed_seq_len:
-                continue
-            if bool((compressed_slots[:compressed_seq_len] < 0).any().item()):
-                logger.info(
-                    "HCAPrefetchManager: skip reuse seed layer %d request %s "
-                    "because compressed slot mapping has gaps",
-                    layer_id,
-                    request.req_id,
-                )
-                continue
-            self._reuse_prefetch_seen.add(key)
-            set_slots = getattr(manager, "set_active_request_slots", None)
-            if callable(set_slots):
-                set_slots(
-                    layer_id,
-                    compressed_seq_len,
-                    compressed_slots[:compressed_seq_len],
-                )
-            has_seeded_rows = getattr(manager, "has_seeded_rows", None)
-            already_seeded = (
-                callable(has_seeded_rows)
-                and has_seeded_rows(layer_id, compressed_seq_len)
-            )
-            if already_seeded:
-                submitted += 1
-            else:
-                seed = getattr(manager, "submit_seed_after_reuse", None)
-                if not callable(seed):
-                    continue
-                seed(
-                    layer_id,
-                    kv_cache.detach().cpu(),
-                    compressed_seq_len,
-                    compressed_slots[:compressed_seq_len],
-                    fire_seq_len=lmcache_cached_tokens,
-                )
-                submitted += 1
-            fire_for_seq_len = getattr(manager, "fire_for_seq_len", None)
-            if already_seeded and callable(fire_for_seq_len):
-                fire_for_seq_len(layer_id, lmcache_cached_tokens)
-
-        if submitted > 0:
-            logger.info(
-                "HCAPrefetchManager: reuse prefetch prepared %d HCA "
-                "layers for request %s lmcache_tokens=%d compressed_tokens~=%d",
-                submitted,
-                request.req_id,
-                lmcache_cached_tokens,
-                lmcache_cached_tokens // 128,
-            )
-
-    def _prepare_hca_active_slots(
-        self,
-        request: ReqMeta,
-        lmcache_cached_tokens: int,
-        slot_mapping: torch.Tensor,
-    ) -> None:
-        """Install current-request compressed slot maps for HCA prefetch."""
-        manager = _ensure_hca_prefetch_attached()
-        if manager is None or request.load_spec is None:
-            return
-        if lmcache_cached_tokens <= request.load_spec.vllm_cached_tokens:
-            return
-        set_slots = getattr(manager, "set_active_request_slots", None)
-        if not callable(set_slots):
-            return
-        begin_active = getattr(manager, "begin_active_request", None)
-        if callable(begin_active):
-            begin_active()
-
-        compressed_slots_by_block_size: dict[int, torch.Tensor] = {}
-        prepared = 0
-        for decoder_layer in _deepseek_decoder_layers():
-            layer_id = getattr(decoder_layer, "layer_idx", -1)
-            hca_layer = _decoder_hca_attention(decoder_layer)
-            if (
-                not isinstance(layer_id, int)
-                or layer_id < 0
-                or hca_layer is None
-            ):
-                continue
-            kv_cache = getattr(hca_layer, "kv_cache", None)
-            if not isinstance(kv_cache, torch.Tensor) or kv_cache.numel() == 0:
-                continue
-            compress_ratio = int(getattr(hca_layer, "compress_ratio", 1))
-            if compress_ratio != 128:
-                continue
-            compressed_seq_len = lmcache_cached_tokens // compress_ratio
-            if compressed_seq_len <= 0:
-                continue
-            compressed_block_size = int(kv_cache.shape[1])
-            compressed_slots = compressed_slots_by_block_size.get(
-                compressed_block_size
-            )
-            if compressed_slots is None:
-                compressed_slots = _compressed_slot_mapping(
-                    slot_mapping,
-                    lmcache_cached_tokens,
-                    compress_ratio,
-                    compressed_block_size,
-                )
-                compressed_slots_by_block_size[compressed_block_size] = (
-                    compressed_slots
-                )
-            if compressed_slots.numel() < compressed_seq_len:
-                continue
-            active_slots = compressed_slots[:compressed_seq_len]
-            if bool((active_slots < 0).any().item()):
-                continue
-            set_slots(layer_id, compressed_seq_len, active_slots)
-            prepared += 1
-        fired = 0
-        fire_active = getattr(manager, "fire_active_request_layers", None)
-        if (
-            prepared > 0
-            and callable(fire_active)
-            and _hca_active_prefire_enabled()
-        ):
-            fired = int(fire_active())
-            prepare_active = getattr(manager, "prepare_active_request_layers", None)
-            if callable(prepare_active):
-                prepare_active(_hca_prepare_lookahead())
-        if prepared > 0:
-            logger.debug(
-                "HCAPrefetchManager: prepared active slot maps for %d HCA "
-                "layers and prefired %d layers request %s lmcache_tokens=%d "
-                "compressed_tokens~=%d",
-                prepared,
-                fired,
-                request.req_id,
-                lmcache_cached_tokens,
-                lmcache_cached_tokens // 128,
-            )
-
     @_lmcache_nvtx_annotate
     def wait_for_layer_load(self, layer_name: str) -> None:
         """Blocking until the KV for a specific layer is loaded into vLLM's
@@ -3721,32 +3060,26 @@ class LMCacheConnectorV1Impl:
                 manager, "hca_layer_ids", ()
             ):
                 try:
-                    manager.wait_for_layer(layer_id)
-                except Exception:
+                    if not manager.wait_for_layer(layer_id):
+                        raise RuntimeError(
+                            f"HCA walker did not complete layer {layer_id}"
+                        )
+                except Exception as exc:
                     logger.exception(
-                        "HCA walker gate failed for layer %s; attention may "
-                        "read stale HCA KV",
+                        "HCA walker gate failed for layer %s; aborting "
+                        "request before attention",
                         layer_name,
                     )
+                    raise RuntimeError(
+                        f"HCA KV is unavailable for {layer_name}"
+                    ) from exc
 
         if self.layerwise_retrievers:
             logger.debug(f"Waiting for layer {self.current_layer} to be loaded")
 
         # Wait for the layer to be loaded
         for layerwise_retriever, request in self.layerwise_retrievers:
-            profile_t0 = time.perf_counter() if _ttft_profile_enabled() else 0.0
             ret_token_mask = next(layerwise_retriever)
-            if _ttft_profile_enabled():
-                logger.info(
-                    "LMCACHE_TTFT_STAGE req_id=%s event=wait_for_layer_load "
-                    "layer=%d layer_name=%s total_ms=%.3f t=%.9f",
-                    request.req_id,
-                    self.current_layer,
-                    layer_name,
-                    (time.perf_counter() - profile_t0) * 1000.0,
-                    time.perf_counter(),
-                )
-
             if ret_token_mask is not None:
                 num_retrieved_tokens = ret_token_mask.sum().item()
                 logger.info(f"Retrieved {num_retrieved_tokens} tokens")
@@ -4099,6 +3432,23 @@ class LMCacheConnectorV1Impl:
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
+        if (
+            os.getenv("LMCACHE_NSYS_FULL_CAPTURE_SCOPE", "decoder").lower()
+            == "connector"
+        ):
+            manager = _CSA_ATTENTION_KV_PREFETCH_MANAGER
+            finish_capture = getattr(manager, "finish_full_nsys_capture", None)
+            if callable(finish_capture) and bool(
+                getattr(manager, "full_nsys_capture_active", False)
+            ):
+                if (
+                    torch.distributed.is_available()
+                    and torch.distributed.is_initialized()
+                ):
+                    torch.distributed.barrier(
+                        device_ids=[torch.cuda.current_device()],
+                    )
+                finish_capture()
         return None, None
 
     def get_block_ids_with_load_errors(self) -> set[int]:
@@ -4110,12 +3460,7 @@ class LMCacheConnectorV1Impl:
     def shutdown(self):
         """Shutdown the connector by delegating to LMCacheManager."""
         logger.info("Starting LMCacheConnector shutdown...")
-        if self._reuse_prefetch_executor is not None:
-            self._reuse_prefetch_executor.shutdown(
-                wait=False,
-                cancel_futures=True,
-            )
-            self._reuse_prefetch_executor = None
+        close_vllm_prefetch_managers()
         self._manager.stop_services()
 
     ###################

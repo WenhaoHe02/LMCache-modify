@@ -45,18 +45,6 @@ import lmcache.c_ops as lmc_ops
 logger = init_logger(__name__)
 
 
-def _dsv4_vectorized_consume_enabled() -> bool:
-    """Return True when batched H2D scatter batches kernels per group.
-
-    V29: the per-chunk ``to_gpu`` loop costs ~1 ms host work per chunk
-    (measured 1.3-1.9 s per steady 480K retrieve against 146 ms of NVMe
-    time).  Default off — the flag flips retrieve scatter to one kernel
-    per group per Tutti staging batch.
-    """
-    value = os.environ.get("LMCACHE_DSV4_VECTORIZED_CONSUME", "")
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
 class GPUConnectorInterface(metaclass=abc.ABCMeta):
     @abc.abstractmethod
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
@@ -153,7 +141,9 @@ class GPUConnectorInterface(metaclass=abc.ABCMeta):
         """
         return ()
 
-    def dsv4_hca_layer_object_ids(self, **kwargs: object) -> tuple[tuple[int, int], ...]:
+    def dsv4_hca_layer_object_ids(
+        self, **kwargs: object
+    ) -> tuple[tuple[int, int], ...]:
         """Return ``(manager_layer_id, object_layer_id)`` HCA mappings.
 
         ``manager_layer_id`` names the vLLM attention layer used by
@@ -656,11 +646,9 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         klg_manager = self.metadata.kv_layer_groups_manager
         if klg_manager is None or not klg_manager.kv_layer_groups:
             return False
-        return (
-            self.group_kv_cache_pointers_on_gpu is not None
-            and len(self.group_kv_cache_pointers_on_gpu)
-            == len(klg_manager.kv_layer_groups)
-        )
+        return self.group_kv_cache_pointers_on_gpu is not None and len(
+            self.group_kv_cache_pointers_on_gpu
+        ) == len(klg_manager.kv_layer_groups)
 
     @staticmethod
     def _read_env_flag(name: str) -> bool:
@@ -784,10 +772,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         if klg_manager is None:
             self._dsv4_layout_valid = False
             return False
-        roles = {
-            self._dsv4_group_role(group)
-            for group in klg_manager.kv_layer_groups
-        }
+        roles = {self._dsv4_group_role(group) for group in klg_manager.kv_layer_groups}
         required = {
             "swa_cache",
             "hca_attention_kv",
@@ -934,7 +919,9 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
             )
         )
 
-    def dsv4_hca_layer_object_ids(self, **kwargs: object) -> tuple[tuple[int, int], ...]:
+    def dsv4_hca_layer_object_ids(
+        self, **kwargs: object
+    ) -> tuple[tuple[int, int], ...]:
         """Return HCA manager layer ids mapped to KV-object layer ids."""
         self._update_hma_metadata(**kwargs)
         if not self._dsv4_optimized_layout_is_valid():
@@ -960,7 +947,6 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                     for layer_idx in group.layer_indices
                 )
         return tuple(dict.fromkeys(layer_ids))
-
 
     def _prepare_csa_direct_seed_for_group(
         self,
@@ -995,13 +981,23 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         if manager is None:
             if not self._dsv4_csa_seed_fallback_logged:
                 logger.info(
-                    "CSA direct LMCache seed skipped: no IndexerSSDManager "
-                    "is attached"
+                    "CSA direct LMCache seed skipped: no IndexerSSDManager is attached"
                 )
                 self._dsv4_csa_seed_fallback_logged = True
             return
-        seed = getattr(manager, "seed_range_from_lmcache_group", None)
-        if not callable(seed):
+        submit_seed = getattr(
+            manager,
+            "submit_seed_range_from_lmcache_group",
+            None,
+        )
+        if not callable(submit_seed):
+            if not self._dsv4_csa_seed_fallback_logged:
+                logger.warning(
+                    "CSA direct LMCache seed skipped: attached manager lacks "
+                    "deferred seed submission; synchronous seeding inside a "
+                    "Tutti retrieve callback is unsafe"
+                )
+                self._dsv4_csa_seed_fallback_logged = True
             return
         slot_mapping = kwargs.get("slot_mapping")
         total_logical_tokens = kwargs.get("lmcache_cached_tokens", None)
@@ -1013,7 +1009,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
             )
         total_logical_tokens = int(total_logical_tokens)
         try:
-            seeded = seed(
+            seed_future = submit_seed(
                 layer_ids,
                 memory_tensor,
                 start,
@@ -1034,12 +1030,12 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                 )
                 self._dsv4_csa_seed_fallback_logged = True
             return
-        if seeded <= 0:
+        if seed_future is None:
             return
         if not self._dsv4_csa_seed_logged:
             logger.info(
                 "CSA direct LMCache seed active: seeded IndexerSSDManager "
-                "from LMCache csa_indexer_cache group during retrieve"
+                "from an owned CPU snapshot after the retrieve callback"
             )
             self._dsv4_csa_seed_logged = True
 
@@ -1203,9 +1199,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         self.group_tmp_buffer_flat = new_flat
         self.group_tmp_buffer_offsets = new_offsets
         self.group_tmp_buffer_capacities = new_capacities
-        self.group_tmp_buffer = [
-            self._group_tmp_view(idx) for idx in range(num_groups)
-        ]
+        self.group_tmp_buffer = [self._group_tmp_view(idx) for idx in range(num_groups)]
         logger.info(
             "VLLMPagedMemGPUConnectorV3 grew temporary buffer for KV group %d "
             "to %d bytes",
@@ -1365,13 +1359,65 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
             logical_block_size,
         )
 
-    def _slot_mapping_to_block_ids(
+    def _hma_block_ids_for_ranges(
         self,
-        slot_mapping: torch.Tensor,
-        start: int,
-        end: int,
-    ) -> torch.Tensor:
-        token_slots = slot_mapping[start:end]
+        group_idx: int,
+        ranges: Sequence[tuple[int, int]],
+        block_ids_by_group: tuple[list[int], ...],
+    ) -> Optional[torch.Tensor]:
+        """Build one HMA block-id tensor for a batch of token ranges."""
+        if not block_ids_by_group:
+            return None
+
+        vllm_group_idx = self._vllm_group_for_lmcache_group(group_idx)
+        if vllm_group_idx is None:
+            vllm_group_idx = 0
+        if vllm_group_idx >= len(block_ids_by_group):
+            raise ValueError(
+                f"LMCache KV group {group_idx} maps to vLLM HMA group "
+                f"{vllm_group_idx}, but only {len(block_ids_by_group)} block-id "
+                "groups were provided"
+            )
+        source_ids = block_ids_by_group[vllm_group_idx]
+        if not source_ids:
+            return None
+
+        logical_block_size = int(
+            self.layout_hints.get(
+                "inference_engine_logical_block_size",
+                self.block_size,
+            )
+        )
+        if self._vllm_group_block_sizes:
+            logical_block_size = self._vllm_group_block_sizes[vllm_group_idx]
+        if logical_block_size <= 0:
+            raise ValueError(
+                f"Invalid vLLM HMA logical block size {logical_block_size}"
+            )
+
+        selected: list[int] = []
+        for start, end in ranges:
+            if start % logical_block_size != 0 or end % logical_block_size != 0:
+                raise ValueError(
+                    f"LMCache transfer [{start}, {end}) is not aligned to vLLM "
+                    f"HMA logical block_size {logical_block_size}"
+                )
+            block_start = start // logical_block_size
+            block_end = end // logical_block_size
+            range_ids = source_ids[block_start:block_end]
+            expected = block_end - block_start
+            if len(range_ids) != expected:
+                raise ValueError(
+                    "Insufficient vLLM HMA block ids for batched LMCache group "
+                    f"{group_idx}: vllm_group={vllm_group_idx}, "
+                    f"range=[{start}, {end}), block_size={logical_block_size}, "
+                    f"need={expected}, available={len(source_ids)}"
+                )
+            selected.extend(range_ids)
+        return torch.tensor(selected, dtype=torch.long, device=self.device)
+
+    def _token_slots_to_block_ids(self, token_slots: torch.Tensor) -> torch.Tensor:
+        """Convert contiguous token slots into inference-engine block ids."""
         if token_slots.numel() == 0:
             return torch.empty(0, dtype=torch.long, device=self.device)
         valid = token_slots >= 0
@@ -1398,7 +1444,9 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
             dtype=token_slots.dtype,
             device=token_slots.device,
         )
-        if not bool(torch.equal(slot_offsets, expected_offsets.expand_as(slot_offsets))):
+        if not bool(
+            torch.equal(slot_offsets, expected_offsets.expand_as(slot_offsets))
+        ):
             raise ValueError(
                 "VLLMPagedMemGPUConnectorV3 block transfer requires contiguous "
                 "slot offsets within each inference-engine block"
@@ -1406,6 +1454,29 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         block_starts = block_slots[:, 0]
         block_ids = block_starts // logical_block_size
         return block_ids.to(device=self.device, dtype=torch.long, non_blocking=True)
+
+    def _slot_mapping_to_block_ids(
+        self,
+        slot_mapping: torch.Tensor,
+        start: int,
+        end: int,
+    ) -> torch.Tensor:
+        return self._token_slots_to_block_ids(slot_mapping[start:end])
+
+    def _slot_mapping_ranges_to_block_ids(
+        self,
+        slot_mapping: torch.Tensor,
+        ranges: Sequence[tuple[int, int]],
+    ) -> torch.Tensor:
+        """Build one block-id tensor for non-contiguous token ranges."""
+        if not ranges:
+            return torch.empty(0, dtype=torch.long, device=self.device)
+        if len(ranges) == 1:
+            start, end = ranges[0]
+            token_slots = slot_mapping[start:end]
+        else:
+            token_slots = torch.cat([slot_mapping[start:end] for start, end in ranges])
+        return self._token_slots_to_block_ids(token_slots)
 
     def _transfer_group(
         self,
@@ -1466,7 +1537,6 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         gpu.copy_(cpu)
         self._single_layer_ptr_cache[cache_key] = gpu
         return gpu
-
 
     @_lmcache_nvtx_annotate
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
@@ -1646,26 +1716,265 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
-        if _dsv4_vectorized_consume_enabled():
-            try:
-                self._batched_to_gpu_vectorized(
-                    memory_objs, starts, ends, **kwargs
-                )
-                return
-            except Exception:
-                # A vectorized-path failure must NEVER fail the retrieve:
-                # an exception here propagates into the Tutti streaming
-                # callback, marks the whole retrieve failed, and vLLM
-                # recomputes 480K tokens from scratch (measured 40-53 s
-                # hits on the first V29 run).  Log loudly and redo this
-                # batch on the proven per-chunk path.
-                logger.exception(
-                    "Vectorized batched_to_gpu failed; falling back to "
-                    "per-chunk transfers for this batch"
-                )
+        try:
+            self._batched_to_gpu_vectorized(memory_objs, starts, ends, **kwargs)
+            return
+        except Exception:
+            # A vectorized-path failure must NEVER fail the retrieve: redo this
+            # batch on the proven per-chunk path instead of forcing recompute.
+            logger.exception(
+                "Vectorized batched_to_gpu failed; falling back to "
+                "per-chunk transfers for this batch"
+            )
         with torch.cuda.stream(self.load_stream):
             for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
                 self.to_gpu(memory_obj, start, end, **kwargs)
+        self.load_stream.synchronize()
+
+    def batched_raw_to_gpu(
+        self,
+        staging: torch.Tensor,
+        source_offsets: List[int],
+        source_nbytes: List[int],
+        starts: List[int],
+        ends: List[int],
+        shapes_per_object: List[List[torch.Size]],
+        dtypes_per_object: List[List[torch.dtype]],
+        **kwargs: object,
+    ) -> None:
+        """Restore a Tutti staging batch without constructing memory objects.
+
+        Tutti owns ``staging`` only until this method returns. Full chunks are
+        grouped by LMCache layer group and restored with one pointer-batched
+        transfer per group. Irregular first/tail chunks use the existing
+        single-object transfer semantics so prefix skips and HMA block sizes
+        remain correct.
+
+        Args:
+            staging: Flat CUDA byte tensor containing completed NVMe reads.
+            source_offsets: Byte offset of each object inside ``staging``.
+            source_nbytes: Valid logical bytes for each object.
+            starts: Inclusive logical token starts for the objects.
+            ends: Exclusive logical token ends for the objects.
+            shapes_per_object: Stored LMCache group shapes for each object.
+            dtypes_per_object: Dtypes paired with ``shapes_per_object``.
+            kwargs: Normal V3 restore arguments, including ``slot_mapping``.
+
+        Raises:
+            ValueError: If descriptors disagree or a staged object is short.
+            RuntimeError: If paged KV pointers are unavailable.
+        """
+        descriptor_lengths = {
+            len(source_offsets),
+            len(source_nbytes),
+            len(starts),
+            len(ends),
+            len(shapes_per_object),
+            len(dtypes_per_object),
+        }
+        if len(descriptor_lengths) != 1:
+            raise ValueError("raw Tutti batch descriptors must have equal lengths")
+        if not source_offsets:
+            return
+        if not staging.is_cuda or staging.dtype != torch.uint8:
+            raise ValueError("raw Tutti staging must be a CUDA uint8 tensor")
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs")
+        slot_mapping = kwargs["slot_mapping"]
+        if not isinstance(slot_mapping, torch.Tensor):
+            raise ValueError("slot_mapping must be a torch.Tensor")
+
+        self.initialize_kvcaches_ptr(**kwargs)
+        self._initialize_kv_cache_pointers()
+        if (
+            self.group_kv_cache_pointers_on_gpu is None
+            or self.metadata.kv_layer_groups_manager is None
+        ):
+            raise RuntimeError("KV cache pointers unavailable in raw Tutti restore")
+
+        klg_manager = self.metadata.kv_layer_groups_manager
+        num_groups = klg_manager.num_groups
+        group_ptrs: list[list[int]] = [[] for _ in range(num_groups)]
+        group_ranges: list[list[tuple[int, int]]] = [[] for _ in range(num_groups)]
+        block_ids_by_group = self._normalize_hma_block_ids(
+            kwargs.get("block_ids_by_group")
+        )
+        vllm_cached = int(kwargs.get("vllm_cached_tokens", 0))
+
+        with torch.cuda.stream(self.load_stream):
+            self._update_hma_metadata(**kwargs)
+            self._log_dsv4_optimized_policy_once()
+            for object_idx, (start, end) in enumerate(zip(starts, ends, strict=True)):
+                shapes = shapes_per_object[object_idx]
+                dtypes = dtypes_per_object[object_idx]
+                if len(shapes) != num_groups or len(dtypes) != num_groups:
+                    raise ValueError(
+                        "raw Tutti object group count does not match connector "
+                        f"metadata: shapes={len(shapes)} dtypes={len(dtypes)} "
+                        f"groups={num_groups}"
+                    )
+                object_offset = int(source_offsets[object_idx])
+                object_nbytes = int(source_nbytes[object_idx])
+                group_offset = 0
+                skip_prefix_n_tokens = min(
+                    end - start,
+                    max(0, vllm_cached - start),
+                )
+                can_batch = skip_prefix_n_tokens == 0 and (
+                    end - start == self.chunk_size
+                )
+
+                for group_idx, (shape, dtype) in enumerate(
+                    zip(shapes, dtypes, strict=True)
+                ):
+                    group_nbytes = int(shape.numel()) * dtype.itemsize
+                    next_group_offset = group_offset + group_nbytes
+                    if next_group_offset > object_nbytes:
+                        raise ValueError(
+                            "raw Tutti object is shorter than its group layout: "
+                            f"object={object_idx} group={group_idx} "
+                            f"need={next_group_offset} have={object_nbytes}"
+                        )
+                    if group_nbytes == 0:
+                        group_offset = next_group_offset
+                        continue
+                    source = (
+                        staging.narrow(
+                            0,
+                            object_offset + group_offset,
+                            group_nbytes,
+                        )
+                        .view(dtype)
+                        .view(shape)
+                    )
+                    group_offset = next_group_offset
+                    group = klg_manager.kv_layer_groups[group_idx]
+                    role = self._dsv4_group_role(group)
+                    if self._prepare_hca_defer_for_group(
+                        group_idx,
+                        group,
+                        source,
+                        start,
+                        end,
+                        role,
+                        **kwargs,
+                    ):
+                        continue
+                    self._prepare_csa_direct_seed_for_group(
+                        group_idx,
+                        group,
+                        source,
+                        start,
+                        end,
+                        role,
+                        **kwargs,
+                    )
+                    if not self._should_transfer_group_to_gpu(
+                        group_idx,
+                        start,
+                        end,
+                        **kwargs,
+                    ):
+                        continue
+                    if can_batch:
+                        group_ptrs[group_idx].append(source.data_ptr())
+                        group_ranges[group_idx].append((start, end))
+                        continue
+
+                    hma_block_ids = self._hma_block_ids_for_group(
+                        group_idx,
+                        start,
+                        end,
+                        **kwargs,
+                    )
+                    if hma_block_ids is None:
+                        logical_block_size = int(
+                            self.layout_hints.get(
+                                "inference_engine_logical_block_size",
+                                self.block_size,
+                            )
+                        )
+                        if skip_prefix_n_tokens % logical_block_size != 0:
+                            raise ValueError(
+                                "raw Tutti prefix skip is not aligned to "
+                                f"logical block size {logical_block_size}"
+                            )
+                        block_ids = self._slot_mapping_to_block_ids(
+                            slot_mapping,
+                            start,
+                            end,
+                        )
+                        skip_prefix_n_blocks = (
+                            skip_prefix_n_tokens // logical_block_size
+                        )
+                    else:
+                        block_ids, group_block_size = hma_block_ids
+                        if skip_prefix_n_tokens % group_block_size != 0:
+                            raise ValueError(
+                                "raw Tutti prefix skip is not aligned to HMA "
+                                f"block size {group_block_size}"
+                            )
+                        skip_prefix_n_blocks = skip_prefix_n_tokens // group_block_size
+                    self._transfer_group(
+                        group_idx,
+                        source,
+                        block_ids,
+                        lmc_ops.TransferDirection.H2D,
+                        skip_prefix_n_blocks,
+                    )
+
+            batched_transfer = getattr(
+                lmc_ops,
+                "multi_layer_block_kv_transfer_batched",
+                None,
+            )
+            for group_idx, ptrs in enumerate(group_ptrs):
+                if not ptrs:
+                    continue
+                group = klg_manager.kv_layer_groups[group_idx]
+                block_ids = self._hma_block_ids_for_ranges(
+                    group_idx,
+                    group_ranges[group_idx],
+                    block_ids_by_group,
+                )
+                if block_ids is None:
+                    block_ids = self._slot_mapping_ranges_to_block_ids(
+                        slot_mapping,
+                        group_ranges[group_idx],
+                    )
+                if batched_transfer is not None:
+                    ptrs_tensor = torch.tensor(
+                        ptrs,
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                    batched_transfer(
+                        self.group_kv_cache_pointers_on_gpu[group_idx],
+                        ptrs_tensor,
+                        block_ids,
+                        self.device,
+                        lmc_ops.TransferDirection.H2D,
+                        group.shape_desc,
+                        group.physical_chunk_size,
+                        self.gpu_kv_format,
+                        0,
+                    )
+                    continue
+                blocks_per_object = block_ids.numel() // len(ptrs)
+                for ptr_start in range(0, len(ptrs), 4):
+                    block_start = ptr_start * blocks_per_object
+                    block_end = min(ptr_start + 4, len(ptrs)) * blocks_per_object
+                    lmc_ops.multi_layer_block_kv_transfer(
+                        self.group_kv_cache_pointers_on_gpu[group_idx],
+                        ptrs[ptr_start : ptr_start + 4],
+                        block_ids[block_start:block_end],
+                        self.device,
+                        lmc_ops.TransferDirection.H2D,
+                        group.shape_desc,
+                        group.physical_chunk_size,
+                        self.gpu_kv_format,
+                        0,
+                    )
         self.load_stream.synchronize()
 
     def _batched_to_gpu_vectorized(
@@ -1717,18 +2026,17 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
 
         vllm_cached = kwargs.get("vllm_cached_tokens", 0)
 
-        # Per group: parallel pointer and block-id accumulators.
+        # Per group: parallel pointer and logical token-range accumulators.
         group_ptrs: list[list[int]] = [[] for _ in range(num_groups)]
-        group_block_ids: list[list[torch.Tensor]] = [
-            [] for _ in range(num_groups)
-        ]
+        group_ranges: list[list[tuple[int, int]]] = [[] for _ in range(num_groups)]
 
         with torch.cuda.stream(self.load_stream):
             self._update_hma_metadata(**kwargs)
             self._log_dsv4_optimized_policy_once()
-            for memory_obj, start, end in zip(
-                memory_objs, starts, ends, strict=False
-            ):
+            block_ids_by_group = self._normalize_hma_block_ids(
+                kwargs.get("block_ids_by_group")
+            )
+            for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
                 if memory_obj is None or memory_obj.raw_tensor is None:
                     continue
                 skip_prefix_n_tokens = min(
@@ -1761,35 +2069,56 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                     self._prepare_csa_direct_seed_for_group(
                         i, group, memory_obj_tensor, start, end, role, **kwargs
                     )
-                    if not self._should_transfer_group_to_gpu(
-                        i, start, end, **kwargs
-                    ):
+                    if not self._should_transfer_group_to_gpu(i, start, end, **kwargs):
                         continue
-                    hma_block_ids = self._hma_block_ids_for_group(
-                        i, start, end, **kwargs
-                    )
-                    if hma_block_ids is None:
-                        block_ids = self._slot_mapping_to_block_ids(
-                            slot_mapping, start, end
-                        )
-                    else:
-                        block_ids, _ = hma_block_ids
                     group_ptrs[i].append(memory_obj_tensor.data_ptr())
-                    group_block_ids[i].append(block_ids)
+                    group_ranges[i].append((start, end))
 
             for i in range(num_groups):
                 if not group_ptrs[i]:
                     continue
                 group = klg_manager.kv_layer_groups[i]
-                # The transfer kernel accepts at most 4 source pointers per
-                # call ("Expected 1-4 LMCache objects"); feed it in slices.
                 ptrs = group_ptrs[i]
-                ids = group_block_ids[i]
+                block_ids = self._hma_block_ids_for_ranges(
+                    i,
+                    group_ranges[i],
+                    block_ids_by_group,
+                )
+                if block_ids is None:
+                    block_ids = self._slot_mapping_ranges_to_block_ids(
+                        slot_mapping,
+                        group_ranges[i],
+                    )
+                batched_transfer = getattr(
+                    lmc_ops, "multi_layer_block_kv_transfer_batched", None
+                )
+                if batched_transfer is not None:
+                    ptrs_tensor = torch.tensor(
+                        ptrs, dtype=torch.int64, device=self.device
+                    )
+                    batched_transfer(
+                        self.group_kv_cache_pointers_on_gpu[i],
+                        ptrs_tensor,
+                        block_ids,
+                        self.device,
+                        lmc_ops.TransferDirection.H2D,
+                        group.shape_desc,
+                        group.physical_chunk_size,
+                        self.gpu_kv_format,
+                        0,
+                    )
+                    continue
+
+                # Compatibility with an older c_ops build. The legacy
+                # transfer passes pointers by value and accepts at most four.
+                blocks_per_object = block_ids.numel() // len(ptrs)
                 for s in range(0, len(ptrs), 4):
+                    block_start = s * blocks_per_object
+                    block_end = min(s + 4, len(ptrs)) * blocks_per_object
                     lmc_ops.multi_layer_block_kv_transfer(
                         self.group_kv_cache_pointers_on_gpu[i],
                         ptrs[s : s + 4],
-                        torch.cat(ids[s : s + 4]),
+                        block_ids[block_start:block_end],
                         self.device,
                         lmc_ops.TransferDirection.H2D,
                         group.shape_desc,

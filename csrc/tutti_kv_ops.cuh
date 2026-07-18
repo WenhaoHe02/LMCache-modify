@@ -40,6 +40,25 @@ void tutti_submit_batch_sgl_read(
     at::Tensor byte_lens,
     int64_t stream_ptr);
 
+// Submit indexed fixed-size READs without materialising per-I/O descriptor
+// tensors on the host. selected_ids indexes slba_table; staging IOVAs are
+// derived from a persistent GPU-page IOVA table and a fixed staging stride.
+void tutti_submit_indexed_sgl_read(
+    int64_t sq_dev_ptr,
+    int64_t cq_dev_ptr,
+    int64_t sq_db_ptr,
+    int64_t cq_db_ptr,
+    int64_t sq_tail_ptr,
+    int q_depth,
+    int qid,
+    int64_t nsid,
+    at::Tensor staging_page_iovas,
+    int64_t staging_stride,
+    at::Tensor slba_table,
+    at::Tensor selected_ids,
+    int byte_len,
+    int64_t stream_ptr);
+
 // Batch-submit N NVMe SGL WRITE commands from a single GPU thread.
 //
 // The arguments match tutti_submit_batch_sgl_read(); data is transferred from
@@ -58,11 +77,9 @@ void tutti_submit_batch_sgl_write(
     at::Tensor byte_lens,
     int64_t stream_ptr);
 
-// Poll for n_ios NVMe CQE completions in submission order.
-//
-// Spins on the CQE phase bit for each slot in sequence.  On timeout
-// (*timed_out = 1), returns immediately leaving head/phase at the last
-// successfully consumed CQE position.
+// Poll for n_ios NVMe CQE completions in parallel. Threads wait on strided CQ
+// slots; after the whole batch is visible, one thread advances head/phase and
+// writes the CQ doorbell once. On timeout, head/phase remain unchanged.
 //
 // Args:
 //   sq_dev_ptr / cq_dev_ptr / sq_db_ptr / cq_db_ptr: same as submit.
@@ -75,16 +92,8 @@ void tutti_submit_batch_sgl_write(
 //   timed_out_ptr:  Managed/pinned int32_t – set to 1 on timeout.
 //   max_iters:      Per-CQE spin budget before declaring a timeout.
 //   stream_ptr:     cudaStream_t cast to int64_t (0 = default stream).
-void tutti_poll_batch(
-    int64_t sq_dev_ptr,
-    int64_t cq_dev_ptr,
-    int64_t sq_db_ptr,
-    int64_t cq_db_ptr,
-    int64_t cq_head_ptr,
-    int64_t cq_phase_ptr,
-    int q_depth,
-    int n_ios,
-    at::Tensor status_out,
-    int64_t timed_out_ptr,
-    int64_t max_iters,
-    int64_t stream_ptr);
+void tutti_poll_batch(int64_t sq_dev_ptr, int64_t cq_dev_ptr, int64_t sq_db_ptr,
+                      int64_t cq_db_ptr, int64_t cq_head_ptr,
+                      int64_t cq_phase_ptr, int q_depth, int n_ios,
+                      at::Tensor status_out, int64_t timed_out_ptr,
+                      int64_t max_iters, int64_t stream_ptr);

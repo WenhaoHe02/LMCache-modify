@@ -182,7 +182,9 @@ HBM 残留(内容没变,vLLM 分配器只是换了行)→ ~250ms GPU 内搬迁�
 
 **稳态 hit 解剖(r2 hit-5 = 5.586s 全实测)**:pre-retrieve 2.84s
 (51%,HTTP+tokenize 496K,与 KV 系统无关)+ retrieve 2.52s(45%,
-1.35GB 碎成 1874 个小读 @0.6GB/s)+ compute 0.23s(21 个 gate 全
+1.35GB/2.52s = 0.6GB/s 是**端到端有效吞吐,不是 SSD 带宽**;NVMe
+mega-batch 两批合计约 146ms,数据面约 9-11GB/s,其余主要是 1874 个对象的
+Python callback/descriptor 构造和 scatter)+ compute 0.23s(21 个 gate 全
 <0.1ms)。**下一杠杆:indexer 组合并大读或进 walker,可再省 ~2s。**
 
 三个已解的硬问题(细节在 findings):512B 对齐(payload_skip)、

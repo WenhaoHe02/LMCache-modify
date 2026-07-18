@@ -10,10 +10,13 @@ import ctypes
 import os
 import sys
 import tempfile
+import threading
+import time
 import types
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Optional
+from dataclasses import FrozenInstanceError
+from typing import Any, Optional
 from unittest.mock import MagicMock, patch
 
 # Third Party
@@ -32,7 +35,7 @@ if "lmcache.v1.gpu_connector" not in sys.modules:
     _gc_dir = os.path.join(_root, "lmcache", "v1", "gpu_connector")
 
     _gc_stub = types.ModuleType("lmcache.v1.gpu_connector")
-    _gc_stub.__path__ = [_gc_dir]       # makes it act as a package
+    _gc_stub.__path__ = [_gc_dir]  # makes it act as a package
     _gc_stub.__package__ = "lmcache.v1.gpu_connector"
     sys.modules["lmcache.v1.gpu_connector"] = _gc_stub
 
@@ -41,18 +44,20 @@ from lmcache.v1.gpu_connector.tutti_direct_loader import (  # noqa: E402
     FiemapHelper,
     LbaRecord,
     TuttiDirectLoader,
-    _cuda_host_get_device_pointer,
-    _cuda_host_register,
-    _cuda_malloc_managed,
     _ioc,
-    _IOW,
-    _IOR,
     _IOWR,
     _make_memory_obj_metadata,
+    _raw_write_window_ready,
+    _tutti_profile_enabled,
 )
 from lmcache.v1.kv_object_store import KVObjectByteRange  # noqa: E402
 from lmcache.utils import CacheEngineKey, DiskCacheMetadata  # noqa: E402
-from lmcache.v1.memory_management import MemoryFormat, MemoryObjMetadata, TensorMemoryObj  # noqa: E402
+from lmcache.v1.memory_management import (
+    MemoryFormat,
+    MemoryObj,
+    MemoryObjMetadata,
+    TensorMemoryObj,
+)  # noqa: E402
 
 
 @contextmanager
@@ -117,13 +122,48 @@ class TestIocHelpers:
         assert (v >> 30) == 3
 
 
+class TestRawWriteWindow:
+    """Verify that overdue background writes never bypass active readers."""
+
+    def test_idle_writer_can_run_after_slack(self) -> None:
+        assert _raw_write_window_ready(0, 0.051, 0.1, 0.05, 2.0)
+
+    def test_overdue_writer_can_bypass_slack_without_reader(self) -> None:
+        assert _raw_write_window_ready(0, 0.0, 2.1, 0.05, 2.0)
+
+    def test_overdue_writer_cannot_bypass_waiting_reader(self) -> None:
+        assert not _raw_write_window_ready(1, 10.0, 100.0, 0.05, 2.0)
+
+
+class TestTuttiProfileGate:
+    """Verify that hot-path profiling is disabled unless explicitly enabled."""
+
+    def test_explicit_profile_off_overrides_csa_timing(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "LMCACHE_TUTTI_PROFILE": "0",
+                "LMCACHE_CSA_ATTENTION_KV_TIMING": "1",
+            },
+        ):
+            assert not _tutti_profile_enabled()
+
+    def test_falls_back_to_csa_timing(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"LMCACHE_CSA_ATTENTION_KV_TIMING": "true"},
+            clear=True,
+        ):
+            assert _tutti_profile_enabled()
+
+
 # ── LbaRecord ────────────────────────────────────────────────────────────────
 
 
 class TestLbaRecord:
     def test_frozen(self) -> None:
         rec = LbaRecord(slba=1024, n_sectors=256)
-        with pytest.raises(Exception):
+        with pytest.raises(FrozenInstanceError):
             rec.slba = 999  # type: ignore[misc]
 
     def test_fields(self) -> None:
@@ -144,8 +184,6 @@ class TestFiemapHelper:
         extents: list[tuple[int, int, int]],  # (logical, physical, length)
     ) -> bytes:
         """Build the raw bytes that the kernel would write back via FIEMAP ioctl."""
-        import ctypes as ct
-
         # Reproduce the struct layout from the module.
         hdr_size = ctypes.sizeof(_tdl._FiemapHeader)
         ext_size = ctypes.sizeof(_tdl._FiemapExtent)
@@ -275,7 +313,7 @@ class TestMakeMemoryObjMetadata:
                 t.numel() * t.element_size()
                 for t in [
                     torch.empty(shape, dtype=dtype)
-                    for shape, dtype in zip(s, d)
+                    for shape, dtype in zip(s, d, strict=True)
                 ]
             ),
             shape=s[0] if len(s) == 1 else None,
@@ -380,6 +418,29 @@ def _make_loader(n_slots: int = 4, slot_mb: int = 32, q_depth: Optional[int] = N
     return loader, ctrl
 
 
+class _FakeCudaInt64Tensor:
+    """Small CUDA-tensor protocol stub for indexed-loader CPU tests."""
+
+    dtype = torch.int64
+    is_cuda = True
+    device = torch.device("cuda:0")
+
+    def __init__(self, values: list[int]) -> None:
+        self.values = values
+
+    def is_contiguous(self) -> bool:
+        """Match the tensor contiguity API used by the public loader."""
+        return True
+
+    def numel(self) -> int:
+        """Return the logical element count."""
+        return len(self.values)
+
+    def __getitem__(self, index: slice) -> "_FakeCudaInt64Tensor":
+        """Return a sliced protocol stub."""
+        return _FakeCudaInt64Tensor(self.values[index])
+
+
 def _disk_meta_for(size_bytes: int, path: str = "/tmp/fake.kv") -> DiskCacheMetadata:
     return DiskCacheMetadata(
         path=path,
@@ -405,6 +466,52 @@ def _fake_key(i: int = 0) -> CacheEngineKey:
 class TestTuttiDirectLoaderLoadBatch:
     """Test _load_batch logic via heavy mocking of c_ops and FIEMAP."""
 
+    def test_indexed_read_keeps_one_queue_slot_free_and_uses_ready_event(
+        self,
+    ) -> None:
+        """Indexed batches use q_depth-1 and avoid the caller-stream wait."""
+        loader, _ctrl = _make_loader(n_slots=2, slot_mb=1, q_depth=4)
+        loader._staging_page_iovas_gpu = torch.ones(64, dtype=torch.int64)
+        loader._io_stream = MagicMock()
+        loader._io_stream.cuda_stream = 123
+        ready_event = MagicMock()
+        selected_ids = _FakeCudaInt64Tensor(list(range(7)))
+        slba_table = _FakeCudaInt64Tensor(list(range(7)))
+        batch_sizes: list[int] = []
+
+        def consume(
+            _batch_start: int,
+            batch_ids: _FakeCudaInt64Tensor,
+            _staging_stride: int,
+            _logical_nbytes: int,
+            _staging: torch.Tensor,
+        ) -> None:
+            batch_sizes.append(batch_ids.numel())
+
+        with patch.object(_tdl, "_c_ops") as mock_c:
+            mock_c.tutti_submit_indexed_sgl_read = MagicMock()
+
+            def fake_poll(**kwargs: Any) -> None:
+                n_ios = int(kwargs["n_ios"])
+                loader._status_buf[:n_ios] = 0
+
+            mock_c.tutti_poll_batch.side_effect = fake_poll
+            with (
+                patch("torch.cuda.device"),
+                patch("torch.cuda.current_stream") as current_stream,
+            ):
+                loader.load_indexed_chunks_to_hbm(
+                    selected_ids,  # type: ignore[arg-type]
+                    slba_table,  # type: ignore[arg-type]
+                    512,
+                    consume,  # type: ignore[arg-type]
+                    input_ready_event=ready_event,
+                )
+
+        assert batch_sizes == [3, 3, 1]
+        loader._io_stream.wait_event.assert_called_once_with(ready_event)
+        current_stream.assert_not_called()
+
     def _run_load(
         self,
         loader: TuttiDirectLoader,
@@ -412,6 +519,7 @@ class TestTuttiDirectLoaderLoadBatch:
         metas: list[Optional[DiskCacheMetadata]],
         fiemap_lba: int = 0,
         nvme_status: int = 0,  # 0 = success, non-zero = error after phase strip
+        **load_kwargs: Any,
     ) -> list:
         """
         Run _load_batch with mocked FIEMAP and c_ops.
@@ -430,9 +538,7 @@ class TestTuttiDirectLoaderLoadBatch:
             return [LbaRecord(slba=fiemap_lba, n_sectors=n_sectors)]
 
         # Patch FIEMAP so no real ioctl is issued.
-        with patch.object(
-            _tdl.FiemapHelper, "query_extents", side_effect=fake_fiemap
-        ):
+        with patch.object(_tdl.FiemapHelper, "query_extents", side_effect=fake_fiemap):
             # Patch c_ops submit/poll to be no-ops but set status_buf correctly.
             with patch.object(_tdl, "_c_ops") as mock_c:
 
@@ -445,7 +551,7 @@ class TestTuttiDirectLoaderLoadBatch:
 
                 # Patch CUDA helpers so tests run without a GPU.
                 with _patch_cuda_runtime_for_cpu_tests():
-                    return loader._load_batch(keys, metas)
+                    return loader._load_batch(keys, metas, **load_kwargs)
 
     def test_all_valid_returns_memory_objs(self) -> None:
         loader, _ctrl = _make_loader(n_slots=4)
@@ -472,6 +578,42 @@ class TestTuttiDirectLoaderLoadBatch:
         # key 0 had None meta → None; key 1 should have a result
         assert results[0] is None
         assert results[1] is not None
+
+    def test_raw_callback_skips_memory_object_wrapping(self) -> None:
+        loader, _ctrl = _make_loader(n_slots=4)
+        size = 512 * 4
+        keys = [_fake_key(0), _fake_key(1)]
+        metas = [
+            _disk_meta_for(size, path="/tmp/raw_0.kv"),
+            _disk_meta_for(size, path="/tmp/raw_1.kv"),
+        ]
+        callbacks: list[tuple[list[int], list[int], list[int], torch.Tensor]] = []
+
+        def consume_raw(
+            indices: list[int],
+            offsets: list[int],
+            nbytes: list[int],
+            staging: torch.Tensor,
+        ) -> None:
+            callbacks.append((indices, offsets, nbytes, staging))
+
+        with patch.object(_tdl, "_make_memory_obj_metadata") as make_metadata:
+            results = self._run_load(
+                loader,
+                keys,
+                metas,
+                on_raw_batch_loaded=consume_raw,
+            )
+
+        assert results == [None, None]
+        assert len(callbacks) == 1
+        indices, offsets, nbytes, staging = callbacks[0]
+        assert indices == [0, 1]
+        assert offsets == [0, 1 << 16]
+        assert nbytes == [size, size]
+        assert staging.dtype == torch.uint8
+        assert staging.numel() >= offsets[-1] + nbytes[-1]
+        make_metadata.assert_not_called()
 
     def test_all_none_metas(self) -> None:
         loader, _ctrl = _make_loader(n_slots=4)
@@ -558,9 +700,7 @@ class TestTuttiDirectLoaderLoadBatch:
             ),
         ]
 
-        with patch.object(
-            _tdl.FiemapHelper, "query_extents", return_value=extents
-        ):
+        with patch.object(_tdl.FiemapHelper, "query_extents", return_value=extents):
             with patch.object(_tdl, "_c_ops") as mock_c:
                 mock_c.tutti_submit_batch_sgl_read = MagicMock()
 
@@ -578,6 +718,99 @@ class TestTuttiDirectLoaderLoadBatch:
         assert submit_kwargs["byte_lens"].cpu().tolist() == [32 * 1024, 32 * 1024]
         assert submit_kwargs["slbas"].cpu().tolist() == [100, 200]
 
+    def test_layer_major_read_splits_at_controller_max_data_size(self) -> None:
+        loader, _ctrl = _make_loader(n_slots=3, slot_mb=32, q_depth=32)
+        size = 70_042_624
+        max_io = 4 * 1024 * 1024
+        keys = [_fake_key(0)]
+        metas = [_disk_meta_for(size)]
+
+        with patch.object(
+            _tdl.FiemapHelper,
+            "query_extents",
+            return_value=[LbaRecord(slba=100, n_sectors=size // 512)],
+        ):
+            with patch.object(_tdl, "_c_ops") as mock_c:
+                mock_c.tutti_submit_batch_sgl_read = MagicMock()
+
+                def fake_poll(**kwargs: Any) -> None:
+                    n_ios = kwargs.get("n_ios", 0)
+                    loader._status_buf[:n_ios] = 0
+
+                mock_c.tutti_poll_batch.side_effect = fake_poll
+                with _patch_cuda_runtime_for_cpu_tests():
+                    results = loader._load_batch(keys, metas)
+
+        assert results[0] is not None
+        submit_kwargs = mock_c.tutti_submit_batch_sgl_read.call_args.kwargs
+        byte_lens = submit_kwargs["byte_lens"].cpu().tolist()
+        slbas = submit_kwargs["slbas"].cpu().tolist()
+        assert len(byte_lens) == 17
+        assert byte_lens == [max_io] * 16 + [size - 16 * max_io]
+        assert sum(byte_lens) == size
+        assert slbas == [100 + i * (max_io // 512) for i in range(17)]
+
+    def test_sparse_range_resolution_is_cached_and_versioned(self) -> None:
+        loader, _ctrl = _make_loader(n_slots=2, q_depth=8)
+        path = "tutti://range-cache"
+        nbytes = 37_376
+        first_records = [
+            LbaRecord(
+                slba=100,
+                n_sectors=nbytes // 512,
+                file_offset=0,
+            )
+        ]
+        loader.register_lba_cache({path: first_records})
+
+        with patch.object(
+            loader,
+            "_extents_overlapping",
+            wraps=loader._extents_overlapping,
+        ) as overlapping:
+            first = loader._resolve_range_ios(path, 0, nbytes)
+            second = loader._resolve_range_ios(path, 0, nbytes)
+            assert first == second == ((100, nbytes, 0),)
+            assert overlapping.call_count == 1
+
+            # Re-registering the path represents a changed physical layout.
+            # The versioned key must not return the stale SLBA template.
+            loader.register_lba_cache(
+                {
+                    path: [
+                        LbaRecord(
+                            slba=900,
+                            n_sectors=nbytes // 512,
+                            file_offset=0,
+                        )
+                    ]
+                }
+            )
+            refreshed = loader._resolve_range_ios(path, 0, nbytes)
+            assert refreshed == ((900, nbytes, 0),)
+            assert overlapping.call_count == 2
+            assert loader._resolved_range_cache_hits == 1
+            assert loader._resolved_range_cache_misses == 2
+
+    def test_status_fast_path_preserves_error_fallback(self) -> None:
+        loader, _ctrl = _make_loader(n_slots=2, q_depth=8)
+        loader._status_buf[0] = 0
+        loader._check_nvme_status(
+            op_name="READ",
+            n_ios=1,
+            paths=["ok"],
+            gpu_has_error=torch.tensor(False),
+        )
+
+        loader._status_buf[0] = 2
+        with pytest.raises(RuntimeError, match="NVMe READ failed"):
+            loader._check_nvme_status(
+                op_name="READ",
+                n_ios=1,
+                paths=["bad"],
+                gpu_has_error=torch.tensor(True),
+            )
+
     def test_timeout_raises(self) -> None:
         loader, _ctrl = _make_loader(n_slots=2)
         size = 512 * 4
@@ -587,9 +820,7 @@ class TestTuttiDirectLoaderLoadBatch:
         def fake_fiemap(path):
             return [LbaRecord(slba=0, n_sectors=size // 512)]
 
-        with patch.object(
-            _tdl.FiemapHelper, "query_extents", side_effect=fake_fiemap
-        ):
+        with patch.object(_tdl.FiemapHelper, "query_extents", side_effect=fake_fiemap):
             with patch.object(_tdl, "_c_ops") as mock_c:
                 mock_c.tutti_submit_batch_sgl_read = MagicMock()
                 mock_c.tutti_poll_batch = MagicMock()
@@ -609,6 +840,290 @@ class TestTuttiDirectLoaderLoadChunksToHbm:
         loader, _ctrl = _make_loader()
         assert loader.load_chunks_to_hbm([], []) == []
 
+    def test_callbacks_are_mutually_exclusive(self) -> None:
+        loader, _ctrl = _make_loader()
+
+        def consume_raw(*_args: Any) -> None:
+            return None
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            loader.load_chunks_to_hbm(
+                [],
+                [],
+                on_batch_loaded=lambda _start, _results: None,
+                on_raw_batch_loaded=consume_raw,
+            )
+
+    def test_raw_callback_reports_global_batch_start(self) -> None:
+        loader, _ctrl = _make_loader(n_slots=2, q_depth=2)
+        size = 512 * 4
+        keys = [_fake_key(i) for i in range(3)]
+        metas = [_disk_meta_for(size, path=f"/tmp/raw_batch_{i}.kv") for i in range(3)]
+        callbacks: list[tuple[int, list[int], list[int]]] = []
+
+        def fake_fiemap(_path: str) -> list[LbaRecord]:
+            return [LbaRecord(slba=0, n_sectors=size // 512)]
+
+        def consume_raw(
+            batch_start: int,
+            indices: list[int],
+            offsets: list[int],
+            _nbytes: list[int],
+            _staging: torch.Tensor,
+        ) -> None:
+            callbacks.append((batch_start, indices, offsets))
+
+        with patch.object(
+            _tdl.FiemapHelper,
+            "query_extents",
+            side_effect=fake_fiemap,
+        ):
+            with patch.object(_tdl, "_c_ops") as mock_c:
+                mock_c.tutti_submit_batch_sgl_read = MagicMock()
+
+                def fake_poll(**kwargs: Any) -> None:
+                    n_ios = kwargs.get("n_ios", 0)
+                    kwargs["status_out"][:n_ios] = 0
+
+                mock_c.tutti_poll_batch.side_effect = fake_poll
+                with _patch_cuda_runtime_for_cpu_tests():
+                    results = loader.load_chunks_to_hbm(
+                        keys,
+                        metas,
+                        on_raw_batch_loaded=consume_raw,
+                    )
+
+        assert results == [None, None, None]
+        assert callbacks == [
+            (0, [0], [0]),
+            (1, [0], [0]),
+            (2, [0], [0]),
+        ]
+
+    def test_speculative_read_yields_to_demand_reader(self) -> None:
+        loader, _ctrl = _make_loader(n_slots=2, q_depth=2)
+        size = 512 * 4
+        demand_started = threading.Event()
+        release_demand = threading.Event()
+        demand_done: list[list[Optional[MemoryObj]]] = []
+        demand_error: list[BaseException] = []
+
+        def fake_fiemap(_path: str) -> list[LbaRecord]:
+            return [LbaRecord(slba=0, n_sectors=size // 512)]
+
+        def fake_poll(**kwargs: Any) -> None:
+            demand_started.set()
+            assert release_demand.wait(timeout=5.0)
+            n_ios = kwargs.get("n_ios", 0)
+            kwargs["status_out"][:n_ios] = 0
+
+        def run_demand() -> None:
+            try:
+                demand_done.append(
+                    loader.load_chunks_to_hbm(
+                        [_fake_key(0)],
+                        [_disk_meta_for(size, path="/tmp/demand.kv")],
+                        on_raw_batch_loaded=lambda *_args: None,
+                        io_priority="demand",
+                    )
+                )
+            except BaseException as exc:
+                demand_error.append(exc)
+
+        with patch.object(
+            _tdl.FiemapHelper,
+            "query_extents",
+            side_effect=fake_fiemap,
+        ):
+            with patch.object(_tdl, "_c_ops") as mock_c:
+                mock_c.tutti_submit_batch_sgl_read = MagicMock()
+                mock_c.tutti_poll_batch.side_effect = fake_poll
+                with _patch_cuda_runtime_for_cpu_tests():
+                    demand_thread = threading.Thread(target=run_demand)
+                    demand_thread.start()
+                    assert demand_started.wait(timeout=5.0)
+                    results = loader.load_chunks_to_hbm(
+                        [_fake_key(1)],
+                        [_disk_meta_for(size, path="/tmp/speculative.kv")],
+                        lock_per_batch=True,
+                        on_raw_batch_loaded=lambda *_args: None,
+                        io_priority="speculative",
+                    )
+                    release_demand.set()
+                    demand_thread.join(timeout=5.0)
+
+        assert not demand_thread.is_alive()
+        assert demand_error == []
+        assert demand_done == [[None]]
+        assert results == [None]
+
+    def test_speculative_read_yields_to_store_writer(self, monkeypatch) -> None:
+        monkeypatch.setenv("LMCACHE_TUTTI_WRITE_SLACK_SEC", "60")
+        monkeypatch.setenv("LMCACHE_TUTTI_WRITE_MAX_DELAY_SEC", "60")
+        loader, _ctrl = _make_loader(n_slots=2, q_depth=2)
+        store_started = threading.Event()
+        release_store = threading.Event()
+        store_error: list[BaseException] = []
+
+        def fake_store(**_kwargs: Any) -> list[LbaRecord]:
+            store_started.set()
+            assert release_store.wait(timeout=5.0)
+            return [LbaRecord(slba=0, n_sectors=1)]
+
+        def run_store() -> None:
+            try:
+                loader.store_bytes_to_raw_extents(
+                    b"x" * 512,
+                    raw_extents=[LbaRecord(slba=0, n_sectors=1)],
+                    base_file_offset=0,
+                )
+            except BaseException as exc:
+                store_error.append(exc)
+
+        with patch.object(_tdl, "_HAS_WRITE_C_OPS", True):
+            with patch.object(
+                loader,
+                "_store_bytes_to_raw_extents_locked",
+                side_effect=fake_store,
+            ):
+                store_thread = threading.Thread(target=run_store)
+                store_thread.start()
+                assert store_started.wait(timeout=5.0)
+                results = loader.load_chunks_to_hbm(
+                    [_fake_key(0)],
+                    [_disk_meta_for(512 * 4)],
+                    lock_per_batch=True,
+                    on_raw_batch_loaded=lambda *_args: None,
+                    io_priority="speculative",
+                )
+                release_store.set()
+                store_thread.join(timeout=5.0)
+
+        assert not store_thread.is_alive()
+        assert store_error == []
+        assert results == [None]
+
+    def test_speculative_io_cap_splits_batches(self) -> None:
+        loader, _ctrl = _make_loader(n_slots=4, q_depth=4)
+        size = 512 * 4
+        keys = [_fake_key(i) for i in range(3)]
+        metas = [
+            _disk_meta_for(size, path=f"/tmp/speculative_{i}.kv") for i in range(3)
+        ]
+        callbacks: list[int] = []
+
+        with patch.object(
+            _tdl.FiemapHelper,
+            "query_extents",
+            return_value=[LbaRecord(slba=0, n_sectors=size // 512)],
+        ):
+            with patch.object(_tdl, "_c_ops") as mock_c:
+                mock_c.tutti_submit_batch_sgl_read = MagicMock()
+
+                def fake_poll(**kwargs: Any) -> None:
+                    n_ios = kwargs.get("n_ios", 0)
+                    kwargs["status_out"][:n_ios] = 0
+
+                mock_c.tutti_poll_batch.side_effect = fake_poll
+                with _patch_cuda_runtime_for_cpu_tests():
+                    loader.load_chunks_to_hbm(
+                        keys,
+                        metas,
+                        lock_per_batch=True,
+                        on_raw_batch_loaded=(
+                            lambda _start, indices, *_args: callbacks.append(
+                                len(indices)
+                            )
+                        ),
+                        io_priority="speculative",
+                        max_batch_ios=1,
+                    )
+
+        assert callbacks == [1, 1, 1]
+
+    def test_speculative_oversized_object_is_not_submitted(self) -> None:
+        loader, _ctrl = _make_loader(n_slots=2, q_depth=4)
+        key = _fake_key(0)
+        meta = _disk_meta_for(512 * 4)
+
+        with patch.object(loader, "_estimate_chunk_ios", return_value=2):
+            with patch.object(loader, "_load_batch") as load_batch:
+                results = loader.load_chunks_to_hbm(
+                    [key],
+                    [meta],
+                    lock_per_batch=True,
+                    on_raw_batch_loaded=lambda *_args: None,
+                    io_priority="speculative",
+                    max_batch_ios=1,
+                )
+
+        assert results == [None]
+        load_batch.assert_not_called()
+
+    def test_speculative_cancellation_stops_before_submission(self) -> None:
+        loader, _ctrl = _make_loader(n_slots=2, q_depth=2)
+        key = _fake_key(0)
+        meta = _disk_meta_for(512 * 4)
+
+        with patch.object(loader, "_load_batch") as load_batch:
+            results = loader.load_chunks_to_hbm(
+                [key],
+                [meta],
+                lock_per_batch=True,
+                on_raw_batch_loaded=lambda *_args: None,
+                io_priority="speculative",
+                should_continue=lambda: False,
+            )
+
+        assert results == [None]
+        load_batch.assert_not_called()
+
+    def test_speculative_deadline_stops_before_submission(self) -> None:
+        loader, _ctrl = _make_loader(n_slots=2, q_depth=2)
+        key = _fake_key(0)
+        meta = _disk_meta_for(512 * 4)
+
+        with patch.object(loader, "_load_batch") as load_batch:
+            results = loader.load_chunks_to_hbm(
+                [key],
+                [meta],
+                lock_per_batch=True,
+                on_raw_batch_loaded=lambda *_args: None,
+                io_priority="speculative",
+                deadline_monotonic=time.perf_counter() - 1.0,
+            )
+
+        assert results == [None]
+        load_batch.assert_not_called()
+
+    def test_speculative_budget_never_delays_announced_demand(self) -> None:
+        loader, _ctrl = _make_loader(n_slots=2, q_depth=2)
+        key = _fake_key(0)
+        meta = _disk_meta_for(512 * 4)
+        loader._speculative_tokens = 0
+        loader._speculative_rate_bytes_per_s = 1
+        loader._hp_readers = 1
+
+        with patch.object(loader, "_load_batch") as load_batch:
+            results = loader.load_chunks_to_hbm(
+                [key],
+                [meta],
+                lock_per_batch=True,
+                on_raw_batch_loaded=lambda *_args: None,
+                io_priority="speculative",
+                deadline_monotonic=time.perf_counter() + 1.0,
+            )
+
+        assert results == [None]
+        load_batch.assert_not_called()
+
+    @pytest.mark.parametrize("argument", ["max_batch_bytes", "max_batch_ios"])
+    def test_batch_limits_must_be_positive(self, argument: str) -> None:
+        loader, _ctrl = _make_loader()
+
+        with pytest.raises(ValueError, match=f"{argument} must be positive"):
+            loader.load_chunks_to_hbm([], [], **{argument: 0})
+
     def test_batch_chunking(self) -> None:
         """More keys than n_slots → multiple sub-batches processed."""
         n_slots = 2
@@ -617,15 +1132,18 @@ class TestTuttiDirectLoaderLoadChunksToHbm:
         n_keys = 5  # > n_slots, forces two batches
         keys = [_fake_key(i) for i in range(n_keys)]
         metas = [_disk_meta_for(size) for _ in range(n_keys)]
+        submitted_batch_sizes: list[int] = []
 
         def fake_fiemap(path):
             return [LbaRecord(slba=0, n_sectors=size // 512)]
 
-        with patch.object(
-            _tdl.FiemapHelper, "query_extents", side_effect=fake_fiemap
-        ):
+        with patch.object(_tdl.FiemapHelper, "query_extents", side_effect=fake_fiemap):
             with patch.object(_tdl, "_c_ops") as mock_c:
-                mock_c.tutti_submit_batch_sgl_read = MagicMock()
+                mock_c.tutti_submit_batch_sgl_read.side_effect = (
+                    lambda **kwargs: submitted_batch_sizes.append(
+                        int(kwargs["staging_iovas"].numel())
+                    )
+                )
 
                 def fake_poll(**kwargs):
                     n_ios = kwargs.get("n_ios", 0)
@@ -640,6 +1158,8 @@ class TestTuttiDirectLoaderLoadChunksToHbm:
         # All five should succeed
         for r in results:
             assert r is not None
+        assert submitted_batch_sizes == [1, 1, 1, 1, 1]
+        assert max(submitted_batch_sizes) < loader._q_depth()
 
     def test_small_chunks_pack_beyond_slot_count(self) -> None:
         """Small chunks use queue/staging capacity instead of fixed slot count."""
@@ -652,9 +1172,7 @@ class TestTuttiDirectLoaderLoadChunksToHbm:
         def fake_fiemap(path):
             return [LbaRecord(slba=0, n_sectors=size // 512)]
 
-        with patch.object(
-            _tdl.FiemapHelper, "query_extents", side_effect=fake_fiemap
-        ):
+        with patch.object(_tdl.FiemapHelper, "query_extents", side_effect=fake_fiemap):
             with patch.object(_tdl, "_c_ops") as mock_c:
                 mock_c.tutti_submit_batch_sgl_read = MagicMock()
 
@@ -682,9 +1200,7 @@ class TestTuttiDirectLoaderLoadChunksToHbm:
         def fake_fiemap(path):
             return [LbaRecord(slba=0, n_sectors=size // 512)]
 
-        with patch.object(
-            _tdl.FiemapHelper, "query_extents", side_effect=fake_fiemap
-        ):
+        with patch.object(_tdl.FiemapHelper, "query_extents", side_effect=fake_fiemap):
             with patch.object(_tdl, "_c_ops") as mock_c:
                 mock_c.tutti_submit_batch_sgl_read = MagicMock()
 
@@ -717,9 +1233,7 @@ class TestTuttiDirectLoaderLoadChunksToHbm:
             LbaRecord(slba=200, n_sectors=1, file_offset=1024),
         ]
 
-        with patch.object(
-            _tdl.FiemapHelper, "query_extents", return_value=extents
-        ):
+        with patch.object(_tdl.FiemapHelper, "query_extents", return_value=extents):
             with patch.object(_tdl, "_c_ops") as mock_c:
                 mock_c.tutti_submit_batch_sgl_read = MagicMock()
 
@@ -818,20 +1332,15 @@ class TestTuttiDirectLoaderCreate:
     def test_create_n_slots_gt_q_depth_raises(self) -> None:
         mock_session = _make_mock_session(q_depth=8)
 
-        with patch.object(_tdl, "_HAS_C_OPS", True), patch.object(
-            _tdl, "SnvmeSession", return_value=mock_session
-        ), patch.object(
-            _tdl, "_cuda_malloc_device", return_value=1 << 20
-        ), patch.object(
-            _tdl, "_get_cudart", return_value=MagicMock()
-        ), patch.object(
-            _tdl, "_cuda_malloc_managed", return_value=id(b"x")
-        ), patch(
-            "ctypes.c_uint16.from_address", return_value=MagicMock()
-        ), patch(
-            "ctypes.c_uint8.from_address", return_value=MagicMock()
-        ), patch(
-            "ctypes.c_int32.from_address", return_value=MagicMock()
+        with (
+            patch.object(_tdl, "_HAS_C_OPS", True),
+            patch.object(_tdl, "SnvmeSession", return_value=mock_session),
+            patch.object(_tdl, "_cuda_malloc_device", return_value=1 << 20),
+            patch.object(_tdl, "_get_cudart", return_value=MagicMock()),
+            patch.object(_tdl, "_cuda_malloc_managed", return_value=id(b"x")),
+            patch("ctypes.c_uint16.from_address", return_value=MagicMock()),
+            patch("ctypes.c_uint8.from_address", return_value=MagicMock()),
+            patch("ctypes.c_int32.from_address", return_value=MagicMock()),
         ):
             with _patch_cuda_runtime_for_cpu_tests():
                 with pytest.raises(RuntimeError, match="n_slots"):
@@ -851,8 +1360,6 @@ class TestTuttiDirectLoaderClose:
     def test_close_frees_managed_ptrs(self) -> None:
         loader, _ctrl = _make_loader()
         freed = []
-
-        original_free = _tdl._cuda_free
 
         def spy_free(ptr):
             freed.append(ptr)
@@ -875,6 +1382,14 @@ class TestTuttiDirectLoaderClose:
 
 
 class TestStagingHelpers:
+    def test_cuda_device_is_public(self) -> None:
+        loader, _ctrl = _make_loader()
+        assert loader.cuda_device == 0
+
+    def test_io_stream_is_public(self) -> None:
+        loader, _ctrl = _make_loader()
+        assert loader.io_stream is None
+
     def test_staging_slice_correct_offset(self) -> None:
         loader, _ctrl = _make_loader(n_slots=4)
         # Slot 0: bytes [0, slot_bytes)

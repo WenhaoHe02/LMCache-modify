@@ -425,3 +425,219 @@ def test_block_transfer_skip_prefix(gpu_kv_format, nl, nh, hs, is_mla, dtype):
             assert block.abs().sum().item() == 0, (
                 f"Skipped block {i}, layer {layer_idx} is not zero"
             )
+
+
+def test_batched_block_transfer_supports_more_than_four_objects():
+    """The GPU pointer-batch path transfers all objects in one launch."""
+    if not hasattr(lmc_ops, "multi_layer_block_kv_transfer_batched"):
+        pytest.skip("lmcache.c_ops was built without batched pointer support")
+
+    device = torch.device("cuda")
+    nl = 2
+    nb = 64
+    bs = 4
+    nh = 1
+    hs = 8
+    num_objects = 9
+    tokens_per_object = 8
+    blocks_per_object = tokens_per_object // bs
+    total_blocks = num_objects * blocks_per_object
+
+    target = create_zero_vllm_tensors(
+        FMT_MLA, nl, nb, bs, nh, hs, torch.bfloat16, device
+    )
+    memory_objects = create_memory_objects(
+        1,
+        nl,
+        tokens_per_object,
+        hs,
+        num_objects,
+        torch.bfloat16,
+        device,
+    )
+    for object_index, memory_object in enumerate(memory_objects):
+        memory_object.fill_(object_index + 1)
+
+    shape_desc = lmc_ops.PageBufferShapeDesc()
+    shape_desc.kv_size = 1
+    shape_desc.nl = nl
+    shape_desc.nb = nb
+    shape_desc.bs = bs
+    shape_desc.nh = nh
+    shape_desc.hs = hs
+    shape_desc.element_size = target[0].element_size()
+
+    paged_buffer_ptrs = torch.tensor(
+        [tensor.data_ptr() for tensor in target],
+        dtype=torch.int64,
+        device=device,
+    )
+    object_ptrs = torch.tensor(
+        [tensor.data_ptr() for tensor in memory_objects],
+        dtype=torch.int64,
+        device=device,
+    )
+    block_ids = torch.arange(total_blocks, dtype=torch.int64, device=device)
+
+    lmc_ops.multi_layer_block_kv_transfer_batched(
+        paged_buffer_ptrs,
+        object_ptrs,
+        block_ids,
+        device,
+        lmc_ops.TransferDirection.H2D,
+        shape_desc,
+        tokens_per_object,
+        FMT_MLA,
+        0,
+    )
+    torch.cuda.synchronize()
+
+    for object_index in range(num_objects):
+        value = object_index + 1
+        first_block = object_index * blocks_per_object
+        last_block = first_block + blocks_per_object
+        for layer_tensor in target:
+            expected = torch.full_like(layer_tensor[first_block:last_block], value)
+            assert torch.equal(layer_tensor[first_block:last_block], expected)
+
+
+def test_scatter_rows_from_object_ptrs_flat_destination():
+    """Raw object pointers scatter into arbitrary flat destination rows."""
+    if not hasattr(lmc_ops, "scatter_rows_from_object_ptrs"):
+        pytest.skip("lmcache.c_ops was built without raw row scatter support")
+
+    device = torch.device("cuda")
+    num_objects = 3
+    rows_per_object = 4
+    row_bytes = 16
+    destination_rows = torch.tensor(
+        [7, 2, 10, 0, 8, 5, 1, 11, 4, 9, 3, 6],
+        dtype=torch.int64,
+        device=device,
+    )
+    backing_tensors = []
+    source_rows = []
+    for object_index in range(num_objects):
+        backing = torch.empty(
+            rows_per_object * row_bytes + 1,
+            dtype=torch.uint8,
+            device=device,
+        )
+        rows = backing[1:].view(rows_per_object, row_bytes)
+        rows.fill_(object_index + 1)
+        backing_tensors.append(backing)
+        source_rows.append(rows)
+
+    source_ptrs = torch.tensor(
+        [rows.data_ptr() for rows in source_rows],
+        dtype=torch.int64,
+        device=device,
+    )
+    destination = torch.zeros(
+        num_objects * rows_per_object,
+        row_bytes,
+        dtype=torch.uint8,
+        device=device,
+    )
+
+    lmc_ops.scatter_rows_from_object_ptrs(
+        source_ptrs,
+        destination,
+        destination_rows,
+        rows_per_object,
+        row_bytes,
+        0,
+        False,
+    )
+    torch.cuda.synchronize()
+
+    expected = torch.zeros_like(destination)
+    for source_index, destination_row in enumerate(destination_rows.cpu().tolist()):
+        object_index = source_index // rows_per_object
+        expected[destination_row].fill_(object_index + 1)
+    assert torch.equal(destination, expected)
+
+    aligned_sources = [rows.clone() for rows in source_rows]
+    aligned_ptrs = torch.tensor(
+        [rows.data_ptr() for rows in aligned_sources],
+        dtype=torch.int64,
+        device=device,
+    )
+    destination_backing = torch.zeros(
+        num_objects * rows_per_object * row_bytes + 1,
+        dtype=torch.uint8,
+        device=device,
+    )
+    unaligned_destination = destination_backing[1:].view(
+        num_objects * rows_per_object,
+        row_bytes,
+    )
+    lmc_ops.scatter_rows_from_object_ptrs(
+        aligned_ptrs,
+        unaligned_destination,
+        destination_rows,
+        rows_per_object,
+        row_bytes,
+        0,
+        True,
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(unaligned_destination, expected)
+
+
+def test_scatter_rows_from_object_ptrs_slot_destination():
+    """Logical rows map through a strided HCA block/slot destination."""
+    if not hasattr(lmc_ops, "scatter_rows_from_object_ptrs"):
+        pytest.skip("lmcache.c_ops was built without raw row scatter support")
+
+    device = torch.device("cuda")
+    num_objects = 2
+    rows_per_object = 3
+    row_bytes = 24
+    num_blocks = 4
+    slots_per_block = 2
+    sources = [
+        torch.full(
+            (rows_per_object, row_bytes),
+            object_index + 11,
+            dtype=torch.uint8,
+            device=device,
+        )
+        for object_index in range(num_objects)
+    ]
+    source_ptrs = torch.tensor(
+        [source.data_ptr() for source in sources],
+        dtype=torch.int64,
+        device=device,
+    )
+    logical_rows = torch.tensor(
+        [6, 1, 4, 0, 7, 3],
+        dtype=torch.int64,
+        device=device,
+    )
+    destination = torch.zeros(
+        slots_per_block,
+        num_blocks,
+        row_bytes,
+        dtype=torch.uint8,
+        device=device,
+    ).permute(1, 0, 2)
+
+    lmc_ops.scatter_rows_from_object_ptrs(
+        source_ptrs,
+        destination,
+        logical_rows,
+        rows_per_object,
+        row_bytes,
+        slots_per_block,
+        True,
+    )
+    torch.cuda.synchronize()
+
+    expected = torch.zeros_like(destination)
+    for source_index, logical_row in enumerate(logical_rows.cpu().tolist()):
+        object_index = source_index // rows_per_object
+        block_index = logical_row // slots_per_block
+        slot_index = logical_row % slots_per_block
+        expected[block_index, slot_index].fill_(object_index + 11)
+    assert torch.equal(destination, expected)
