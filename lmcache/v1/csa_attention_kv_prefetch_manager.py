@@ -1564,15 +1564,11 @@ class CSAAttentionKVPrefetchManager:
                 dtype=torch.int64,
                 device="cpu",
             ).reshape(-1)
-            n_blocks = state.chunks[0].n_compressed_blocks
-            if int(selected.numel()) == n_blocks and torch.equal(
+            return self._issue_layer_major_read(
+                state,
                 selected,
-                torch.arange(n_blocks, dtype=torch.int64),
-            ):
-                return self._issue_layer_major_full_read(
-                    state,
-                    io_priority=io_priority,
-                )
+                io_priority=io_priority,
+            )
         if (
             state.indexed_slba_table is not None
             and state.indexed_dst_rows_table is not None
@@ -1941,23 +1937,95 @@ class CSAAttentionKVPrefetchManager:
         # release and no drain event is needed.
         return None, [], completed_ids
 
-    def _issue_layer_major_full_read(
+    def _issue_layer_major_read(
         self,
         state: CSAAttentionKVLayerState,
+        selected_block_ids: torch.Tensor,
         *,
         io_priority: str,
     ) -> Tuple[Optional[torch.cuda.Event], List[Any], torch.Tensor]:
-        """Read and scatter one complete layer-major attention KV object."""
+        """Read and scatter selected rows from a layer-major KV object.
+
+        A long-prefix layer can resolve to more physical extents than the
+        Tutti NVMe queue can hold.  Submit bounded logical block segments
+        instead of one oversized key so the loader never launches a submit
+        kernel with more commands than its SQ/CQ and status buffers.
+        """
         chunk = state.chunks[0]
-        dst_rows = state.layer_major_dst_rows_table
-        if dst_rows is None:
+        dst_rows_table = state.layer_major_dst_rows_table
+        if dst_rows_table is None:
             raise RuntimeError("layer-major destination rows are unavailable")
-        n_blocks = int(chunk.n_compressed_blocks)
+        selected = selected_block_ids.to(device="cpu", dtype=torch.int64).reshape(-1)
+        available_blocks = int(chunk.n_compressed_blocks)
         block_nbytes = int(chunk.bytes_per_block)
-        payload_nbytes = n_blocks * block_nbytes
-        read_nbytes = int(chunk.read_length or payload_nbytes)
-        if payload_nbytes <= 0 or read_nbytes < payload_nbytes:
-            raise RuntimeError("invalid layer-major read length")
+        if selected.numel() == 0:
+            return None, [], selected
+        if block_nbytes <= 0:
+            raise RuntimeError("invalid layer-major block size")
+        if int(selected[0]) < 0 or int(selected[-1]) >= available_blocks:
+            raise RuntimeError("layer-major selected block id is out of range")
+
+        # One compressed block normally resolves to at most a handful of
+        # extents.  A 256-block bound stays well below the 1023 usable entries
+        # of the production Tutti queue even on fragmented object-store files,
+        # while keeping the number of callbacks small for a 480K prefix.
+        blocks_per_segment = min(int(selected.numel()), 256)
+        segments = [
+            selected[start : start + blocks_per_segment]
+            for start in range(0, int(selected.numel()), blocks_per_segment)
+        ]
+        scatter_stream = self._scatter_stream_for(state.k_cache_tensor.device)
+        if dst_rows_table.device.type == "cuda":
+            # Build destination rows on the same private stream that consumes
+            # them.  Creating these tensors on the caller's current stream and
+            # immediately launching the fused scatter on ``scatter_stream``
+            # leaves no CUDA dependency between the producer and consumer.
+            # The fastest rank can then dereference an unfinished index tensor;
+            # the illegal access is reported later by the next I/O-stream sync.
+            with torch.inference_mode(), torch.cuda.stream(scatter_stream):
+                segment_rows = [
+                    dst_rows_table.index_select(
+                        0,
+                        segment.to(
+                            device=dst_rows_table.device,
+                            non_blocking=True,
+                        ),
+                    )
+                    for segment in segments
+                ]
+            scatter_stream.synchronize()
+        else:
+            segment_rows = [
+                dst_rows_table.index_select(0, segment) for segment in segments
+            ]
+
+        def _ranges_for_segment(
+            segment: torch.Tensor,
+        ) -> Tuple[KVObjectByteRange, ...]:
+            ranges: List[KVObjectByteRange] = []
+            ids = segment.tolist()
+            target_offset = 0
+            run_start = int(ids[0])
+            run_length = 1
+            for block_id in ids[1:] + [None]:
+                if block_id is not None and int(block_id) == run_start + run_length:
+                    run_length += 1
+                    continue
+                length = run_length * block_nbytes
+                ranges.append(
+                    KVObjectByteRange(
+                        offset=(
+                            int(chunk.layer_byte_offset) + run_start * block_nbytes
+                        ),
+                        length=length,
+                        target_offset=target_offset,
+                    )
+                )
+                target_offset += length
+                if block_id is not None:
+                    run_start = int(block_id)
+                    run_length = 1
+            return tuple(ranges)
 
         def _restore_lba_cache() -> None:
             if self._pending_raw_lba_cache:
@@ -1970,58 +2038,60 @@ class CSAAttentionKVPrefetchManager:
                 int(state.k_cache_tensor.shape[0]),
                 -1,
             )
-        scatter_stream = self._scatter_stream_for(state.k_cache_tensor.device)
-        completed = False
+        completed_block_ids: List[int] = []
 
         def _scatter_tensor_batch(
-            _batch_start: int,
+            batch_start: int,
             batch_results: List[Optional[Any]],
         ) -> None:
-            nonlocal completed
-            if not batch_results or batch_results[0] is None:
-                raise RuntimeError("layer-major Tutti read returned no payload")
-            memory_obj = batch_results[0]
-            assert memory_obj is not None
-            tensor = memory_obj.raw_tensor
-            if tensor is None:
-                raise RuntimeError("layer-major Tutti read has no raw tensor")
-            source = (
-                tensor.view(torch.uint8)
-                .reshape(-1)[:payload_nbytes]
-                .view(
-                    n_blocks,
-                    block_nbytes,
-                )
-            )
             with torch.inference_mode(), torch.cuda.stream(scatter_stream):
-                if state.block_slot_scatter:
-                    slot_size = state.block_slot_size
-                    block_ids = torch.div(
-                        dst_rows,
-                        slot_size,
-                        rounding_mode="floor",
+                for offset_in_batch, memory_obj in enumerate(batch_results):
+                    if memory_obj is None:
+                        raise RuntimeError(
+                            "layer-major Tutti segment returned no payload"
+                        )
+                    key_index = batch_start + offset_in_batch
+                    segment = segments[key_index]
+                    segment_blocks = int(segment.numel())
+                    segment_nbytes = segment_blocks * block_nbytes
+                    tensor = memory_obj.raw_tensor
+                    if tensor is None:
+                        raise RuntimeError(
+                            "layer-major Tutti segment has no raw tensor"
+                        )
+                    flat = tensor.view(torch.uint8).reshape(-1)
+                    if int(flat.numel()) < segment_nbytes:
+                        raise RuntimeError(
+                            "layer-major Tutti segment returned a short payload"
+                        )
+                    source = flat[:segment_nbytes].view(
+                        segment_blocks,
+                        block_nbytes,
                     )
-                    slot_ids = dst_rows - block_ids * slot_size
-                    k_cache.index_put_((block_ids, slot_ids), source)
-                else:
-                    k_cache.index_copy_(0, dst_rows, source)
+                    rows = segment_rows[key_index]
+                    if state.block_slot_scatter:
+                        slot_size = state.block_slot_size
+                        block_ids = torch.div(
+                            rows,
+                            slot_size,
+                            rounding_mode="floor",
+                        )
+                        slot_ids = rows - block_ids * slot_size
+                        k_cache.index_put_((block_ids, slot_ids), source)
+                    else:
+                        k_cache.index_copy_(0, rows, source)
+                    completed_block_ids.extend(int(value) for value in segment.tolist())
             scatter_stream.synchronize()
-            completed = True
 
         def _scatter_raw_batch(
-            _batch_start: int,
+            batch_start: int,
             completed_indices: List[int],
             completed_offsets: List[int],
             completed_nbytes: List[int],
             staging: torch.Tensor,
         ) -> None:
-            nonlocal completed
             if not completed_indices:
                 raise RuntimeError("layer-major raw Tutti read did not complete")
-            if int(completed_nbytes[0]) < payload_nbytes:
-                raise RuntimeError(
-                    "layer-major raw Tutti read returned a short payload"
-                )
             if _csa_c_ops is None:
                 raise RuntimeError("layer-major raw scatter requires lmcache.c_ops")
             scatter = getattr(
@@ -2031,39 +2101,49 @@ class CSAAttentionKVPrefetchManager:
             )
             if scatter is None:
                 raise RuntimeError("layer-major fused scatter op is unavailable")
-            source_ptr = int(staging.data_ptr()) + int(completed_offsets[0])
             with torch.inference_mode(), torch.cuda.stream(scatter_stream):
-                source_ptrs = torch.tensor(
-                    [source_ptr],
-                    dtype=torch.int64,
-                    device=state.k_cache_tensor.device,
-                )
-                scatter(
-                    source_ptrs,
-                    k_cache,
-                    dst_rows,
-                    n_blocks,
-                    block_nbytes,
-                    state.block_slot_size if state.block_slot_scatter else 0,
-                    source_ptr % 8 == 0,
-                )
+                for local_index, offset, nbytes in zip(
+                    completed_indices,
+                    completed_offsets,
+                    completed_nbytes,
+                    strict=True,
+                ):
+                    key_index = batch_start + local_index
+                    segment = segments[key_index]
+                    segment_blocks = int(segment.numel())
+                    segment_nbytes = segment_blocks * block_nbytes
+                    if int(nbytes) < segment_nbytes:
+                        raise RuntimeError(
+                            "layer-major raw Tutti segment returned a short payload"
+                        )
+                    source_ptr = int(staging.data_ptr()) + int(offset)
+                    source_ptrs = torch.tensor(
+                        [source_ptr],
+                        dtype=torch.int64,
+                        device=state.k_cache_tensor.device,
+                    )
+                    scatter(
+                        source_ptrs,
+                        k_cache,
+                        segment_rows[key_index],
+                        segment_blocks,
+                        block_nbytes,
+                        state.block_slot_size if state.block_slot_scatter else 0,
+                        source_ptr % 8 == 0,
+                    )
+                    completed_block_ids.extend(int(value) for value in segment.tolist())
             scatter_stream.synchronize()
-            completed = True
 
         load_kwargs: Dict[str, Any] = {
             "shapes_per_key": None,
-            "file_offsets": [0],
+            "file_offsets": [0] * len(segments),
             "read_ranges_per_key": [
-                (
-                    KVObjectByteRange(
-                        offset=int(chunk.layer_byte_offset),
-                        length=read_nbytes,
-                        target_offset=0,
-                    ),
-                )
+                _ranges_for_segment(segment) for segment in segments
             ],
             "io_priority": io_priority,
             "before_batch": _restore_lba_cache,
+            "max_batch_ios": 256,
+            "max_batch_bytes": 128 * 1024**2,
         }
         if _csa_c_ops is not None and hasattr(
             _csa_c_ops, "scatter_rows_from_object_ptrs"
@@ -2072,18 +2152,21 @@ class CSAAttentionKVPrefetchManager:
         else:
             load_kwargs["on_batch_loaded"] = _scatter_tensor_batch
         self._tutti_loader.load_chunks_to_hbm(
-            [chunk.key],
-            [chunk.disk_meta],
+            [chunk.key] * len(segments),
+            [chunk.disk_meta] * len(segments),
             **load_kwargs,
         )
-        completed_ids = (
-            torch.arange(n_blocks, dtype=torch.int64)
-            if completed
-            else torch.empty(0, dtype=torch.int64)
+        completed_ids = torch.as_tensor(
+            sorted(set(completed_block_ids)),
+            dtype=torch.int64,
         )
-        if completed:
+        if completed_ids.numel():
             with torch.inference_mode(), torch.cuda.stream(scatter_stream):
-                state.in_pool_bitmap[:n_blocks].fill_(True)
+                bitmap_ids = completed_ids.to(
+                    device=state.in_pool_bitmap.device,
+                    non_blocking=True,
+                )
+                state.in_pool_bitmap.index_fill_(0, bitmap_ids, True)
             scatter_stream.synchronize()
         return None, [], completed_ids
 

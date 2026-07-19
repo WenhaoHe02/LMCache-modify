@@ -222,3 +222,69 @@ def test_correction_ignores_preallocated_topk_tail_rows() -> None:
     assert result is workspace
     assert len(observed) == 1
     assert observed[0].tolist() == [[1, 2], [3, 4]]
+
+
+def test_layer_major_full_read_is_split_into_bounded_segments() -> None:
+    """A full-layer demand fallback must not exceed the Tutti queue."""
+    captured: dict[str, object] = {}
+
+    class _Loader:
+        def ensure_lba_cache(self, _records: object) -> None:
+            return
+
+        def load_chunks_to_hbm(
+            self,
+            keys: list[object],
+            disk_metas: list[object],
+            **kwargs: object,
+        ) -> list[None]:
+            captured.update(keys=keys, disk_metas=disk_metas, **kwargs)
+            return [None] * len(keys)
+
+    manager = object.__new__(CSAAttentionKVPrefetchManager)
+    manager._tutti_loader = _Loader()
+    manager._pending_raw_lba_cache = {}
+    manager._scatter_stream_for = MethodType(
+        lambda _self, _device: None,
+        manager,
+    )
+    state = SimpleNamespace(
+        chunks=[
+            SimpleNamespace(
+                key="layer-object",
+                disk_meta="metadata",
+                n_compressed_blocks=600,
+                bytes_per_block=4096,
+                read_length=600 * 4096,
+                layer_byte_offset=8192,
+            )
+        ],
+        layer_major_dst_rows_table=torch.arange(600, dtype=torch.int64),
+        block_slot_scatter=False,
+        k_cache_tensor=torch.zeros((600, 4096), dtype=torch.uint8),
+        in_pool_bitmap=torch.zeros(600, dtype=torch.bool),
+    )
+
+    _, _, completed = manager._issue_layer_major_read(
+        state,
+        torch.arange(600, dtype=torch.int64),
+        io_priority="demand",
+    )
+
+    assert completed.numel() == 0
+    assert captured["keys"] == ["layer-object"] * 3
+    assert captured["disk_metas"] == ["metadata"] * 3
+    ranges = captured["read_ranges_per_key"]
+    assert isinstance(ranges, list)
+    assert [entry[0].length for entry in ranges] == [
+        256 * 4096,
+        256 * 4096,
+        88 * 4096,
+    ]
+    assert [entry[0].offset for entry in ranges] == [
+        8192,
+        8192 + 256 * 4096,
+        8192 + 512 * 4096,
+    ]
+    assert captured["max_batch_ios"] == 256
+    assert captured["max_batch_bytes"] == 128 * 1024**2

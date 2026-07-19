@@ -1685,25 +1685,28 @@ class TuttiDirectLoader:
         n_ios: int,
         io_stream: Optional[torch.cuda.Stream],
     ) -> Optional[torch.Tensor]:
-        """Enqueue a one-bit CQ status reduction after the poll kernel.
+        """Return no device-side CQ status reduction.
+
+        CQ status words are written by the GPU polling kernel, but launching
+        an eager PyTorch reduction over that buffer from inside model forward
+        is not safe on the production Tutti path.  In particular, the first
+        layer-2 demand read can run while vLLM owns other CUDA streams; the
+        reduction was the first operation to report ``cudaErrorIllegalAddress``
+        even with ``CUDA_LAUNCH_BLOCKING=1``.  The caller already synchronizes
+        the I/O stream and :meth:`_check_nvme_status` handles ``None`` by
+        copying only the valid status words to the CPU.  Keep that small,
+        deterministic check instead of injecting another GPU kernel into the
+        model-forward critical section.
 
         Args:
             n_ios: Number of valid status entries.
             io_stream: Stream on which ``tutti_poll_batch`` was launched.
 
         Returns:
-            A scalar CUDA boolean tensor, or ``None`` for CPU-backed unit
-            tests and compatibility environments.
+            Always ``None`` so the caller performs the post-sync CPU check.
         """
-        if n_ios <= 0 or not self._status_buf.is_cuda:
-            return None
-        with torch.cuda.device(self._cuda_device):
-            if io_stream is not None:
-                with torch.cuda.stream(io_stream):
-                    statuses = self._status_buf[:n_ios]
-                    return torch.any(((statuses >> 1) & 0x7FFF) != 0)
-            statuses = self._status_buf[:n_ios]
-            return torch.any(((statuses >> 1) & 0x7FFF) != 0)
+        del n_ios, io_stream
+        return None
 
     def _estimate_chunk_ios(
         self,
