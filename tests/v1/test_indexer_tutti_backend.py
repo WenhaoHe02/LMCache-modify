@@ -56,6 +56,10 @@ class FakeTuttiLoader:
         """Record the synthetic raw-region extent table."""
         self.registered = records
 
+    def ensure_lba_cache(self, records: dict[str, list[Any]]) -> None:
+        """Record an idempotent extent-table restore."""
+        self.registered = records
+
     def load_chunks_to_hbm(self, *_args: Any, **kwargs: Any) -> list[Any]:
         """Record one read and return configured results."""
         self.calls.append(kwargs)
@@ -465,8 +469,92 @@ def test_deterministic_hca_submission_is_exposed_to_target_gate() -> None:
     assert submitted == [3]
 
 
-def test_deferred_direct_seed_owns_staging_and_waits_outside_loader_lock() -> None:
-    """Retrieve-held loader lock cannot deadlock deferred indexer seeding."""
+def test_native_indexer_stream_orders_and_schedules_demanded_layer() -> None:
+    """A late gate queues every unscheduled layer through its target."""
+    submitted: list[tuple[int, str]] = []
+    waited: list[int] = []
+    tracked: dict[int, Any] = {}
+
+    def fire(layer_id: int, *, label: str) -> bool:
+        submitted.append((layer_id, label))
+        return True
+
+    fake_loader = SimpleNamespace(
+        register_layer=MagicMock(),
+        register_request_chunks=MagicMock(),
+        fire_deterministic_layer=fire,
+        track_layer_submission=lambda layer_id, future: tracked.update(
+            {layer_id: future}
+        ),
+        wait_for_layer=lambda layer_id, timeout_s: waited.append(layer_id) or True,
+        close=MagicMock(),
+    )
+    with tempfile.TemporaryDirectory() as store_dir:
+        manager = IndexerSSDManager(
+            csa_layer_ids=[2, 4, 6, 8, 10, 12],
+            store_dir=store_dir,
+            pool_size=8,
+            token_bytes=4,
+            max_seq_len=32,
+            io_workers=1,
+            device=torch.device("cpu"),
+        )
+        try:
+            with patch(
+                "lmcache.v1.csa_attention_kv_prefetch_manager."
+                "CSAAttentionKVPrefetchManager",
+                return_value=fake_loader,
+            ):
+                manager.attach_native_indexer_cache_loader(
+                    SimpleNamespace(),
+                    {
+                        2: torch.empty((1, 64, 4), dtype=torch.uint8),
+                        4: torch.empty((1, 64, 4), dtype=torch.uint8),
+                        6: torch.empty((1, 64, 4), dtype=torch.uint8),
+                        8: torch.empty((1, 64, 4), dtype=torch.uint8),
+                        10: torch.empty((1, 64, 4), dtype=torch.uint8),
+                        12: torch.empty((1, 64, 4), dtype=torch.uint8),
+                    },
+                )
+                chunks = {
+                    2: [SimpleNamespace(end_compressed_block=3)],
+                    4: [SimpleNamespace(end_compressed_block=3)],
+                    6: [SimpleNamespace(end_compressed_block=3)],
+                    8: [SimpleNamespace(end_compressed_block=3)],
+                    10: [SimpleNamespace(end_compressed_block=3)],
+                    12: [SimpleNamespace(end_compressed_block=3)],
+                }
+                assert manager.register_native_indexer_stream("request-a", chunks)
+                for future in tracked.values():
+                    future.result(timeout=2.0)
+                assert manager.native_indexer_stream_active()
+                assert manager.has_layer_rows(2, 3 * 64)
+                # The initial Stage0+window covers only 2/4/6/8.  A direct
+                # demand for 12 must queue both 10 and 12 before waiting.
+                assert manager.wait_for_native_indexer_layer(12)
+                for future in tracked.values():
+                    future.result(timeout=2.0)
+        finally:
+            manager.close()
+
+    fake_loader.register_request_chunks.assert_called_once_with(
+        "request-a",
+        chunks,
+        start_profile_capture=False,
+    )
+    assert submitted == [
+        (2, "indexer_native_stream"),
+        (4, "indexer_native_stream"),
+        (6, "indexer_native_stream"),
+        (8, "indexer_native_stream"),
+        (10, "indexer_native_stream"),
+        (12, "indexer_native_stream"),
+    ]
+    assert waited == [2, 4, 12]
+
+
+def test_deferred_direct_seed_publishes_hbm_before_persistence() -> None:
+    """Retrieve-held loader lock does not delay direct-seed HBM readiness."""
     loader = FakeTuttiLoader()
     storage = make_storage(loader)
     manager = IndexerSSDManager(
@@ -493,16 +581,14 @@ def test_deferred_direct_seed_owns_staging_and_waits_outside_loader_lock() -> No
         assert future is not None
         staging.fill_(255)
         assert loader.store_started.wait(timeout=2.0)
-        assert not future.done()
-    finally:
-        loader._io_lock.release()
-
-    try:
         assert future.result(timeout=2.0) == 1
         assert manager.wait_for_seed(2)
         assert manager.has_layer_rows(2, 2)
+        assert loader.stored_payloads == []
     finally:
-        manager.close()
+        loader._io_lock.release()
+
+    manager.close()
 
     assert list(loader.stored_payloads[0][: len(expected)]) == expected
 

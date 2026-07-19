@@ -125,6 +125,31 @@ def create_object_store_metadata() -> LMCacheMetadata:
     return metadata
 
 
+def create_indexer_object_store_metadata() -> LMCacheMetadata:
+    """Create metadata with a compact CSA indexer-cache layer group."""
+    metadata = create_test_metadata()
+    indexer_group = KVLayerGroupInfo(
+        layer_indices=[0, 1],
+        shape_desc=_make_shape_desc(
+            kv_size=1,
+            nl=2,
+            nb=1,
+            bs=8,
+            nh=1,
+            hs=132,
+            dtype=torch.uint8,
+        ),
+        dtype=torch.uint8,
+        compress_ratio=4,
+        physical_chunk_size=8,
+    )
+    metadata.kv_layer_groups_manager = SimpleNamespace(
+        kv_layer_groups=[indexer_group],
+        num_groups=1,
+    )
+    return metadata
+
+
 def create_test_key(key_id: int = 0) -> CacheEngineKey:
     """Create a test CacheEngineKey."""
     return CacheEngineKey(
@@ -354,7 +379,7 @@ class TestKVObjectStoreLocalDiskBackend:
         memory_objs: list[MemoryObj] = []
         for chunk_id in range(2):
             memory_obj = allocator.allocate(
-                [torch.Size([2, 2, 2, 4])],
+                [torch.Size([2, 2, 8, 4])],
                 [torch.uint8],
                 fmt=MemoryFormat.KV_2LTD,
             )
@@ -363,16 +388,19 @@ class TestKVObjectStoreLocalDiskBackend:
             assert tensor is not None
             for kv_id in range(2):
                 for layer_id in range(2):
-                    tensor[kv_id, layer_id].fill_(
-                        chunk_id * 40 + kv_id * 10 + layer_id
-                    )
+                    tensor[kv_id, layer_id].fill_(chunk_id * 40 + kv_id * 10 + layer_id)
             memory_objs.append(memory_obj)
 
+        first_key = create_test_key(298)
         prefix_key = create_test_key(299)
-        assert backend.store_attention_layer_major_snapshot(
-            prefix_key,
-            memory_objs,
-        ) == 2
+        assert (
+            backend.store_attention_layer_major_snapshot(
+                prefix_key,
+                memory_objs,
+                prefix_keys=[first_key, prefix_key],
+            )
+            == 2
+        )
         records = backend.get_csa_layer_major_records(prefix_key, [0, 1])
         record0, record1 = records
         assert record0 is not None
@@ -380,8 +408,87 @@ class TestKVObjectStoreLocalDiskBackend:
         assert backend.kv_object_pool_io is not None
         payload0 = backend.kv_object_pool_io.read_object(record0)
         payload1 = backend.kv_object_pool_io.read_object(record1)
+        # compress_ratio=4: only the first two of each plane's eight rows
+        # are active and therefore published in the compact sidecar.
         assert payload0 == bytes([0] * 8 + [10] * 8 + [40] * 8 + [50] * 8)
         assert payload1 == bytes([1] * 8 + [11] * 8 + [41] * 8 + [51] * 8)
+
+        probed = backend.get_csa_layer_major_records_for_keys(
+            [first_key, prefix_key],
+            layer_id=0,
+        )
+        assert probed[0] is not None
+        assert probed[0].offset == record0.offset
+        assert probed[0].length == record0.length // 2
+        assert probed[1] == record0
+
+        backend.local_cpu_backend.memory_allocator.close()
+
+    def test_indexer_layer_major_snapshot_removes_padding(
+        self,
+        temp_disk_path: str,
+        async_loop: asyncio.AbstractEventLoop,
+        local_cpu_backend: LocalCPUBackend,
+    ) -> None:
+        """Indexer sidecars store only compressed rows for every layer."""
+        config = create_test_config(temp_disk_path)
+        config.extra_config = {
+            "kv_object_store_enable": True,
+            "kv_object_store_slot_mb": 2,
+            "kv_object_store_capacity": 4,
+        }
+        with patch(
+            "os.statvfs",
+            return_value=SimpleNamespace(f_bsize=4096),
+            create=True,
+        ):
+            backend = LocalDiskBackend(
+                config=config,
+                loop=async_loop,
+                local_cpu_backend=local_cpu_backend,
+                dst_device="cuda:0",
+                metadata=create_indexer_object_store_metadata(),
+            )
+        allocator = AdHocMemoryAllocator(device="cpu")
+        memory_objs: list[MemoryObj] = []
+        for chunk_id in range(2):
+            memory_obj = allocator.allocate(
+                [torch.Size([1, 2, 8, 132])],
+                [torch.uint8],
+                fmt=MemoryFormat.KV_2LTD,
+            )
+            assert memory_obj is not None
+            tensor = memory_obj.get_tensor(0)
+            assert tensor is not None
+            tensor[0, 0].fill_(10 + chunk_id)
+            tensor[0, 1].fill_(20 + chunk_id)
+            memory_objs.append(memory_obj)
+
+        first_key = create_test_key(398)
+        prefix_key = create_test_key(399)
+        assert (
+            backend.store_attention_layer_major_snapshot(
+                prefix_key,
+                memory_objs,
+                prefix_keys=[first_key, prefix_key],
+            )
+            == 2
+        )
+        record0, record1 = backend.get_indexer_layer_major_records(
+            prefix_key,
+            [0, 1],
+        )
+        assert record0 is not None
+        assert record1 is not None
+        assert record0.length == 2 * 2 * 132
+        assert record1.length == 2 * 2 * 132
+        probed = backend.get_indexer_layer_major_records_for_keys(
+            [first_key, prefix_key],
+            layer_id=0,
+        )
+        assert probed[0] is not None
+        assert probed[0].length == 2 * 132
+        assert probed[1] == record0
 
         backend.local_cpu_backend.memory_allocator.close()
 

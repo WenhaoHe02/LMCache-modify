@@ -73,6 +73,7 @@ _DSV4_HCA_DEFERRED_RETRIEVE_ROLE = "hca_deferred_retrieve"
 _DSV4_HCA_SLAB_ROLE = "hca_attention_kv_slab"
 _DSV4_HCA_LAYER_MAJOR_ROLE = "hca_attention_kv_layer_major"
 _DSV4_CSA_LAYER_MAJOR_ROLE = "csa_attention_kv_layer_major"
+_DSV4_INDEXER_LAYER_MAJOR_ROLE = "csa_indexer_cache_layer_major"
 
 KVObjectRawWriter = Callable[
     [KVObjectRecord, memoryview],
@@ -265,9 +266,7 @@ class LocalDiskBackend(StorageBackendInterface):
         self._hca_write_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="lmcache-hca-disk-write"
         )
-        self._diagnose_contains_misses = _env_flag(
-            "LMCACHE_DISK_CONTAINS_DIAGNOSTICS"
-        )
+        self._diagnose_contains_misses = _env_flag("LMCACHE_DISK_CONTAINS_DIAGNOSTICS")
         self._contains_miss_log_counts: dict[str, int] = {}
         self._object_write_skip_log_counts: dict[str, int] = {}
         self.kv_object_tutti_raw_enabled = _env_flag(
@@ -310,12 +309,8 @@ class LocalDiskBackend(StorageBackendInterface):
                 capacity = int(
                     config.extra_config.get("kv_object_store_capacity", capacity)
                 )
-                raw_slot_mb = int(
-                    config.extra_config.get("tutti_slot_mb", raw_slot_mb)
-                )
-                raw_n_slots = int(
-                    config.extra_config.get("tutti_n_slots", raw_n_slots)
-                )
+                raw_slot_mb = int(config.extra_config.get("tutti_slot_mb", raw_slot_mb))
+                raw_n_slots = int(config.extra_config.get("tutti_n_slots", raw_n_slots))
                 self.kv_object_tutti_raw_enabled = bool(
                     config.extra_config.get(
                         "kv_object_store_tutti_raw_enable",
@@ -352,8 +347,7 @@ class LocalDiskBackend(StorageBackendInterface):
                         raw_region_text = str(raw_region_config)
                         if "," in raw_region_text:
                             regions = [
-                                item.strip()
-                                for item in raw_region_text.split(",")
+                                item.strip() for item in raw_region_text.split(",")
                             ]
                             if rank_id >= len(regions):
                                 raise ValueError(
@@ -539,12 +533,95 @@ class LocalDiskBackend(StorageBackendInterface):
             roles=[_DSV4_CSA_LAYER_MAJOR_ROLE] * len(layer_ids),
         )
 
+    def get_csa_layer_major_records_for_keys(
+        self,
+        keys: Sequence[CacheEngineKey],
+        layer_id: int,
+    ) -> list[Optional[KVObjectRecord]]:
+        """Return CSA layer-major records for candidate segment-end keys.
+
+        Args:
+            keys: Ordered content-addressed keys to probe.
+            layer_id: KV-object layer identifier shared by all probes.
+
+        Returns:
+            One READY record per key, with ``None`` where that key does not
+            terminate a stored layer-major segment.
+        """
+        return self.get_kv_object_records(
+            list(keys),
+            layer_ids=[int(layer_id)] * len(keys),
+            roles=[_DSV4_CSA_LAYER_MAJOR_ROLE] * len(keys),
+        )
+
+    def get_indexer_layer_major_records(
+        self,
+        key: CacheEngineKey,
+        layer_ids: Sequence[int],
+    ) -> list[Optional[KVObjectRecord]]:
+        """Return compact layer-major CSA indexer records for one prefix.
+
+        Args:
+            key: Content-addressed key terminating the stored segment.
+            layer_ids: Indexer object-layer identifiers in request order.
+
+        Returns:
+            One READY record per layer id, with ``None`` for misses.
+        """
+        return self.get_kv_object_records(
+            [key] * len(layer_ids),
+            layer_ids=layer_ids,
+            roles=[_DSV4_INDEXER_LAYER_MAJOR_ROLE] * len(layer_ids),
+        )
+
+    def get_indexer_layer_major_records_for_keys(
+        self,
+        keys: Sequence[CacheEngineKey],
+        layer_id: int,
+    ) -> list[Optional[KVObjectRecord]]:
+        """Probe compact CSA indexer segments ending at candidate keys.
+
+        Args:
+            keys: Ordered content-addressed segment-end keys.
+            layer_id: Object-layer identifier shared by all probes.
+
+        Returns:
+            One READY record per key, with ``None`` for misses.
+        """
+        return self.get_kv_object_records(
+            list(keys),
+            layer_ids=[int(layer_id)] * len(keys),
+            roles=[_DSV4_INDEXER_LAYER_MAJOR_ROLE] * len(keys),
+        )
+
+    def get_hca_layer_major_records_for_keys(
+        self,
+        keys: Sequence[CacheEngineKey],
+        layer_id: int,
+    ) -> list[Optional[KVObjectRecord]]:
+        """Return HCA layer-major records for candidate segment-end keys.
+
+        Args:
+            keys: Ordered content-addressed keys to probe.
+            layer_id: KV-object layer identifier shared by all probes.
+
+        Returns:
+            One READY record per key, with ``None`` where that key does not
+            terminate a stored layer-major prefix view.
+        """
+        return self.get_kv_object_records(
+            list(keys),
+            layer_ids=[int(layer_id)] * len(keys),
+            roles=[_DSV4_HCA_LAYER_MAJOR_ROLE] * len(keys),
+        )
+
     def store_attention_layer_major_snapshot(
         self,
         prefix_key: CacheEngineKey,
         memory_objs: Sequence[MemoryObj],
+        prefix_keys: Optional[Sequence[CacheEngineKey]] = None,
     ) -> int:
-        """Persist one contiguous object per CSA/HCA layer for a full prefix.
+        """Persist compact layer-major CSA/HCA/indexer sidecar objects.
 
         Source chunks are supplied in token order.  Their HCA layer slices
         are gathered in that same order, changing the cold-store layout from
@@ -556,9 +633,14 @@ class LocalDiskBackend(StorageBackendInterface):
             prefix_key: Content-addressed key of the prefix's last chunk.
             memory_objs: CPU memory objects for every chunk in the prefix,
                 ordered by token position.
+            prefix_keys: Optional content-addressed key for every source chunk.
+                When supplied, metadata-only prefix views are published for
+                each key. They all reference the same physical layer-major
+                object and let retrieval stop inside a long store batch without
+                copying data or reading beyond the requested prefix.
 
         Returns:
-            Number of attention layer objects that are READY after the call.
+            Number of layer-major sidecar objects READY after the call.
             Zero means the object store or its Tutti raw writer is unavailable.
         """
         if (
@@ -581,24 +663,51 @@ class LocalDiskBackend(StorageBackendInterface):
             )
             return 0
 
+        if prefix_keys is not None and len(prefix_keys) != len(memory_objs):
+            raise ValueError("prefix_keys and memory_objs must have the same length")
         layer_segments: dict[tuple[str, int], list[memoryview]] = {}
+        layer_chunk_nbytes: dict[tuple[str, int], list[int]] = {}
         for memory_obj in memory_objs:
             buffer = memory_obj.byte_array
             group_ranges = self._object_group_ranges_for_offset(memory_obj, 0)
+            compression_ratios = self._object_layer_compression_ratios(memory_obj)
             for layer_id, role, byte_ranges in self._object_layer_view_specs(
                 memory_obj,
                 group_ranges,
             ):
-                if role not in {"csa_attention_kv", "hca_attention_kv"}:
+                if role not in {
+                    "csa_attention_kv",
+                    "hca_attention_kv",
+                    "csa_indexer_cache",
+                }:
                     continue
+                compression_ratio = compression_ratios.get(
+                    (role, int(layer_id)),
+                    1,
+                )
                 segments = layer_segments.setdefault(
                     (role, int(layer_id)),
                     [],
                 )
+                chunk_nbytes = 0
                 for byte_range in byte_ranges:
                     start = int(byte_range.offset)
-                    end = start + int(byte_range.length)
+                    # DSv4 allocates every compressed cache group with the
+                    # logical chunk row count.  Only the leading
+                    # ``rows / compress_ratio`` rows of each K/V plane hold
+                    # data; the remaining rows are allocation padding.  A
+                    # layer-major sidecar must remove that padding, otherwise
+                    # CSA/HCA objects are inflated by 4x/128x and retrieval's
+                    # compact offsets drift after the first layer/chunk.
+                    compact_length = int(byte_range.length) // compression_ratio
+                    if compact_length <= 0:
+                        continue
+                    end = start + compact_length
                     segments.append(buffer[start:end])
+                    chunk_nbytes += compact_length
+                layer_chunk_nbytes.setdefault((role, int(layer_id)), []).append(
+                    chunk_nbytes
+                )
         if not layer_segments:
             return 0
 
@@ -606,17 +715,15 @@ class LocalDiskBackend(StorageBackendInterface):
         ready_count = 0
         total_bytes = 0
         with self.kv_object_store_lock:
-            for (source_role, layer_id), segments in sorted(
-                layer_segments.items()
-            ):
+            for (source_role, layer_id), segments in sorted(layer_segments.items()):
                 payload_nbytes = sum(len(segment) for segment in segments)
                 if payload_nbytes <= 0:
                     continue
-                object_role = (
-                    _DSV4_CSA_LAYER_MAJOR_ROLE
-                    if source_role == "csa_attention_kv"
-                    else _DSV4_HCA_LAYER_MAJOR_ROLE
-                )
+                object_role = {
+                    "csa_attention_kv": _DSV4_CSA_LAYER_MAJOR_ROLE,
+                    "hca_attention_kv": _DSV4_HCA_LAYER_MAJOR_ROLE,
+                    "csa_indexer_cache": _DSV4_INDEXER_LAYER_MAJOR_ROLE,
+                }[source_role]
                 object_id = self._key_to_object_id(
                     prefix_key,
                     layer_id=layer_id,
@@ -633,9 +740,7 @@ class LocalDiskBackend(StorageBackendInterface):
                     continue
                 if (
                     raw_writer is not None
-                    and not self.kv_object_payload_fits_tutti_staging(
-                        payload_nbytes
-                    )
+                    and not self.kv_object_payload_fits_tutti_staging(payload_nbytes)
                 ):
                     logger.warning(
                         "KV_OBJECT_STORE_PROFILE op=write_attention_layer_major "
@@ -693,6 +798,31 @@ class LocalDiskBackend(StorageBackendInterface):
                     self.kv_object_pool_io.write_object(record, payload_view)
                     ready_record = record.mark_ready()
                 self.kv_object_metadata_store.put(ready_record)
+                if prefix_keys is not None:
+                    prefix_nbytes = 0
+                    for alias_key, chunk_nbytes in zip(
+                        prefix_keys,
+                        layer_chunk_nbytes[(source_role, layer_id)],
+                        strict=True,
+                    ):
+                        prefix_nbytes += int(chunk_nbytes)
+                        alias_object_id = self._key_to_object_id(
+                            alias_key,
+                            layer_id=layer_id,
+                            role=object_role,
+                        )
+                        alias_record = KVObjectRecord(
+                            object_id=alias_object_id,
+                            pool_id=ready_record.pool_id,
+                            offset=ready_record.offset,
+                            length=prefix_nbytes,
+                            aligned_length=ready_record.aligned_length,
+                            shape=(prefix_nbytes,),
+                            dtype=ready_record.dtype,
+                            state=KVObjectState.READY,
+                            raw_extents=ready_record.raw_extents,
+                        )
+                        self.kv_object_metadata_store.put(alias_record)
                 ready_count += 1
                 total_bytes += payload_nbytes
 
@@ -882,9 +1012,7 @@ class LocalDiskBackend(StorageBackendInterface):
 
         covered_bytes = sum(
             n_sectors * 512
-            for _file_offset, _slba, n_sectors in self._raw_extents_for_record(
-                record
-            )
+            for _file_offset, _slba, n_sectors in self._raw_extents_for_record(record)
         )
         return covered_bytes == expected_bytes
 
@@ -929,9 +1057,7 @@ class LocalDiskBackend(StorageBackendInterface):
         for byte_range in record.read_ranges:
             range_length = byte_range.length
             range_dma_length = ((range_length + 511) // 512) * 512
-            is_tail_range = (
-                byte_range.target_offset + range_length == record.length
-            )
+            is_tail_range = byte_range.target_offset + range_length == record.length
             if byte_range.offset % 512 != 0 or (
                 range_dma_length != range_length and not is_tail_range
             ):
@@ -1041,10 +1167,7 @@ class LocalDiskBackend(StorageBackendInterface):
         raw_writer: Optional[KVObjectRawWriter],
     ) -> bool:
         """Materialize the non-HCA DSv4 retrieve payload as a compact object."""
-        if (
-            self.kv_object_pool_layout is None
-            or self.kv_object_metadata_store is None
-        ):
+        if self.kv_object_pool_layout is None or self.kv_object_metadata_store is None:
             return False
         group_ranges = self._object_group_ranges_for_offset(memory_obj, 0)
         if not group_ranges:
@@ -1093,9 +1216,9 @@ class LocalDiskBackend(StorageBackendInterface):
         for byte_range in selected_ranges:
             source_start = byte_range.target_offset
             source_end = source_start + byte_range.length
-            compact_payload[target_offset : target_offset + byte_range.length] = (
-                buffer[source_start:source_end].tobytes()
-            )
+            compact_payload[target_offset : target_offset + byte_range.length] = buffer[
+                source_start:source_end
+            ].tobytes()
             target_offset += byte_range.length
 
         object_id = self._key_to_object_id(
@@ -1201,10 +1324,7 @@ class LocalDiskBackend(StorageBackendInterface):
         raw_writer: Optional[KVObjectRawWriter],
     ) -> bool:
         """Materialize the whole HCA group as one slab object."""
-        if (
-            self.kv_object_pool_layout is None
-            or self.kv_object_metadata_store is None
-        ):
+        if self.kv_object_pool_layout is None or self.kv_object_metadata_store is None:
             return False
         group_ranges = self._object_group_ranges_for_offset(memory_obj, 0)
         if not group_ranges:
@@ -1407,6 +1527,26 @@ class LocalDiskBackend(StorageBackendInterface):
             ):
                 specs.append((int(layer_id), role, byte_ranges))
         return specs
+
+    def _object_layer_compression_ratios(
+        self,
+        memory_obj: MemoryObj,
+    ) -> dict[tuple[str, int], int]:
+        """Return compression ratios keyed by object role and layer id."""
+        klg_manager = (
+            self.metadata.kv_layer_groups_manager if self.metadata is not None else None
+        )
+        if klg_manager is None or not klg_manager.kv_layer_groups:
+            return {}
+        dtypes = memory_obj.metadata.dtypes or []
+        ratios: dict[tuple[str, int], int] = {}
+        for group_idx, group in enumerate(klg_manager.kv_layer_groups):
+            dtype = dtypes[group_idx] if group_idx < len(dtypes) else group.dtype
+            role = self._kv_group_role(group, dtype)
+            compression_ratio = max(1, int(group.compress_ratio))
+            for layer_id in group.layer_indices:
+                ratios[(role, int(layer_id))] = compression_ratio
+        return ratios
 
     def _object_group_view_specs(
         self,
@@ -2211,13 +2351,11 @@ class LocalDiskBackend(StorageBackendInterface):
                 ) -> None:
                     try:
                         with self.kv_object_store_lock:
-                            compact_written = (
-                                self._write_hca_deferred_retrieve_object(
-                                    _key,
-                                    _memory_obj,
-                                    _buffer,
-                                    _raw_writer,
-                                )
+                            compact_written = self._write_hca_deferred_retrieve_object(
+                                _key,
+                                _memory_obj,
+                                _buffer,
+                                _raw_writer,
                             )
                             slab_written = self._write_hca_slab_object(
                                 _key,
@@ -2432,9 +2570,7 @@ class LocalDiskBackend(StorageBackendInterface):
         if self.kv_object_store_enabled and self.kv_object_tutti_raw_enabled:
             object_state = "metadata_store_missing"
             if self.kv_object_metadata_store is not None:
-                record = self.kv_object_metadata_store.get(
-                    self._key_to_object_id(key)
-                )
+                record = self.kv_object_metadata_store.get(self._key_to_object_id(key))
                 if record is None:
                     object_state = "no_record"
                 else:
@@ -2539,7 +2675,7 @@ class LocalDiskBackend(StorageBackendInterface):
                     continue
                 if not fname.startswith(prefix):
                     continue
-                key_str = metadata.model_name + "@" + fname[len(prefix):-3]
+                key_str = metadata.model_name + "@" + fname[len(prefix) : -3]
                 try:
                     key = parse_cache_key(key_str)
                 except Exception:

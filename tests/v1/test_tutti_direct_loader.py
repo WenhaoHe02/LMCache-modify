@@ -854,6 +854,28 @@ class TestTuttiDirectLoaderLoadChunksToHbm:
                 on_raw_batch_loaded=consume_raw,
             )
 
+    def test_before_batch_runs_under_whole_call_lock(self) -> None:
+        loader, _ctrl = _make_loader()
+        callback_lock_states: list[bool] = []
+
+        def before_batch() -> None:
+            callback_lock_states.append(loader._io_lock.locked())
+
+        with patch.object(
+            loader,
+            "_load_chunks_to_hbm_locked",
+            return_value=[None],
+        ) as load_locked:
+            results = loader.load_chunks_to_hbm(
+                [_fake_key(0)],
+                [_disk_meta_for(512 * 4)],
+                before_batch=before_batch,
+            )
+
+        assert results == [None]
+        assert callback_lock_states == [True]
+        load_locked.assert_called_once()
+
     def test_raw_callback_reports_global_batch_start(self) -> None:
         loader, _ctrl = _make_loader(n_slots=2, q_depth=2)
         size = 512 * 4
@@ -1003,6 +1025,25 @@ class TestTuttiDirectLoaderLoadChunksToHbm:
         assert store_error == []
         assert results == [None]
 
+    def test_parked_store_writer_does_not_cancel_speculative_read(self) -> None:
+        """A writer waiting for idle time cannot suppress CSA prefetch."""
+        loader, _ctrl = _make_loader(n_slots=2, q_depth=2)
+        with loader._reader_gate:
+            loader._writers_waiting = 1
+
+        with patch.object(loader, "_load_batch", return_value=[None]) as load_batch:
+            results = loader.load_chunks_to_hbm(
+                [_fake_key(0)],
+                [_disk_meta_for(512 * 4)],
+                lock_per_batch=True,
+                on_raw_batch_loaded=lambda *_args: None,
+                io_priority="speculative",
+                throttle_speculative=False,
+            )
+
+        load_batch.assert_called_once()
+        assert results == [None]
+
     def test_speculative_io_cap_splits_batches(self) -> None:
         loader, _ctrl = _make_loader(n_slots=4, q_depth=4)
         size = 512 * 4
@@ -1117,6 +1158,45 @@ class TestTuttiDirectLoaderLoadChunksToHbm:
         assert results == [None]
         load_batch.assert_not_called()
 
+    def test_bounded_speculative_read_can_bypass_token_bucket(self) -> None:
+        """A compute-window read may opt out of the background rate limit."""
+        loader, _ctrl = _make_loader(n_slots=2, q_depth=2)
+        loader._speculative_tokens = 0
+        loader._speculative_rate_bytes_per_s = 1
+
+        with patch.object(loader, "_load_batch", return_value=[None]) as load_batch:
+            loader.load_chunks_to_hbm(
+                [_fake_key(0)],
+                [_disk_meta_for(512 * 4)],
+                lock_per_batch=True,
+                on_batch_loaded=lambda *_args: None,
+                io_priority="speculative",
+                deadline_monotonic=time.perf_counter() + 0.01,
+                throttle_speculative=False,
+            )
+
+        load_batch.assert_called_once()
+
+    def test_speculative_batches_sleep_only_for_announced_waiters(self) -> None:
+        """Back-to-back lookahead batches do not pay an unconditional sleep."""
+        loader, _ctrl = _make_loader(n_slots=2, q_depth=2)
+        keys = [_fake_key(0), _fake_key(1)]
+        metas = [_disk_meta_for(512 * 4), _disk_meta_for(512 * 4)]
+
+        with patch.object(loader, "_load_batch", return_value=[None]):
+            with patch.object(_tdl.time, "sleep") as sleep:
+                loader.load_chunks_to_hbm(
+                    keys,
+                    metas,
+                    lock_per_batch=True,
+                    on_batch_loaded=lambda *_args: None,
+                    io_priority="speculative",
+                    max_batch_ios=1,
+                    throttle_speculative=False,
+                )
+
+        sleep.assert_not_called()
+
     @pytest.mark.parametrize("argument", ["max_batch_bytes", "max_batch_ios"])
     def test_batch_limits_must_be_positive(self, argument: str) -> None:
         loader, _ctrl = _make_loader()
@@ -1139,10 +1219,8 @@ class TestTuttiDirectLoaderLoadChunksToHbm:
 
         with patch.object(_tdl.FiemapHelper, "query_extents", side_effect=fake_fiemap):
             with patch.object(_tdl, "_c_ops") as mock_c:
-                mock_c.tutti_submit_batch_sgl_read.side_effect = (
-                    lambda **kwargs: submitted_batch_sizes.append(
-                        int(kwargs["staging_iovas"].numel())
-                    )
+                mock_c.tutti_submit_batch_sgl_read.side_effect = lambda **kwargs: (
+                    submitted_batch_sizes.append(int(kwargs["staging_iovas"].numel()))
                 )
 
                 def fake_poll(**kwargs):

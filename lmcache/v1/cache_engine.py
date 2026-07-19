@@ -875,9 +875,9 @@ class LMCacheEngine:
                 # Preserve the filesystem path as an alias in the loader's
                 # pre-bind cache. Lazy indexer attachment happens after snvme
                 # unmounts the filesystem and must not issue FIEMAP again.
-                initial_lba_cache[
-                    disk_backend.kv_object_tutti_raw_region_path
-                ] = list(raw_region_extents)
+                initial_lba_cache[disk_backend.kv_object_tutti_raw_region_path] = list(
+                    raw_region_extents
+                )
                 disk_backend.set_kv_object_tutti_raw_region_extents(
                     [
                         (
@@ -908,8 +908,8 @@ class LMCacheEngine:
                 indexer_region_path = indexer_region_paths[
                     self.metadata.local_worker_id % len(indexer_region_paths)
                 ]
-                initial_lba_cache[indexer_region_path] = (
-                    FiemapHelper.query_extents(indexer_region_path)
+                initial_lba_cache[indexer_region_path] = FiemapHelper.query_extents(
+                    indexer_region_path
                 )
             missing_required_paths = [
                 path for path in required_paths if path not in initial_lba_cache
@@ -2020,23 +2020,21 @@ class LMCacheEngine:
         with store_stats.profile_from_gpu():
             self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
 
-        # The V28 HCA walker consumes one whole prefix layer at a time.  Once
-        # every chunk is resident on CPU, persist a layer-major sidecar keyed
-        # by the final prefix hash.  This is deliberately synchronous on the
-        # cold-store path: retrieve must never observe metadata for a partial
-        # layer snapshot, and the sidecar is tiny compared with full KV.
+        # Persist one layer-major sidecar segment for every completed store
+        # batch. Long prefills arrive in several batches; keeping every
+        # segment lets sparse reads coalesce adjacent block ids across the
+        # layer instead of issuing one command per token-major KV object.
+        # Publication remains synchronous so retrieve never sees partial
+        # segment metadata.
         if (
             (
                 _env_flag("LMCACHE_DSV4_HCA_WALKER")
                 or _env_flag("LMCACHE_INDEXER_ENABLE_PREFETCH")
             )
-            and starts
-            and starts[0] == 0
-            and ends[-1] == num_to_store_tokens
+            and bool(starts)
+            and bool(ends)
         ):
-            disk_backend = self.storage_manager.storage_backends.get(
-                "LocalDiskBackend"
-            )
+            disk_backend = self.storage_manager.storage_backends.get("LocalDiskBackend")
             store_snapshot = getattr(
                 disk_backend,
                 "store_attention_layer_major_snapshot",
@@ -2044,7 +2042,13 @@ class LMCacheEngine:
             )
             if callable(store_snapshot):
                 try:
-                    stored_layers = int(store_snapshot(keys[-1], memory_objs))
+                    stored_layers = int(
+                        store_snapshot(
+                            keys[-1],
+                            memory_objs,
+                            prefix_keys=keys,
+                        )
+                    )
                     logger.info(
                         "DSv4 attention layer-major snapshot key=%s layers=%d "
                         "chunks=%d tokens=%d",
@@ -2515,6 +2519,19 @@ class LMCacheEngine:
         # HCA layers registered — otherwise nobody would load those bytes
         # and attention would consume stale K rows.
         hca_walker = _env_flag("LMCACHE_DSV4_HCA_WALKER")
+        native_indexer_stream = False
+        try:
+            from lmcache.v1.indexer_ssd_manager import get_indexer_ssd_manager
+
+            indexer_manager = get_indexer_ssd_manager()
+            active = getattr(
+                indexer_manager,
+                "native_indexer_stream_active",
+                None,
+            )
+            native_indexer_stream = bool(callable(active) and active())
+        except ImportError:
+            native_indexer_stream = False
         if hca_walker:
             try:
                 from lmcache.v1.csa_attention_kv_prefetch_manager import (
@@ -2544,8 +2561,10 @@ class LMCacheEngine:
             strict=True,
         ):
             role = self._dsv4_group_role(group, dtype)
-            if role == "csa_attention_kv" or (
-                hca_walker and role == "hca_attention_kv"
+            if (
+                role == "csa_attention_kv"
+                or (hca_walker and role == "hca_attention_kv")
+                or (native_indexer_stream and role == "csa_indexer_cache")
             ):
                 filtered.append(self._zero_token_shape(shape))
             else:
@@ -2637,6 +2656,33 @@ class LMCacheEngine:
             )
             if manager is None:
                 return
+        # The request-level capture owner is the canonical CSA/HCA manager,
+        # but compact indexer Stage0 runs before its chunk registration. Start
+        # capture here so the trace includes the front-of-pipeline I/O.
+        manager.start_full_nsys_capture_for_request(str(req_id))
+        # Register the compact native-indexer plan first. Shape filtering is
+        # allowed to remove the padded ``csa_indexer_cache`` group only after
+        # this call proves complete sidecar coverage and Stage0 has landed.
+        try:
+            from lmcache.v1.indexer_ssd_manager import get_indexer_ssd_manager
+
+            indexer_manager = get_indexer_ssd_manager()
+        except ImportError:
+            indexer_manager = None
+        if indexer_manager is not None:
+            indexer_chunks = self._dsv4_build_indexer_cache_chunks(
+                blocks,
+                total_tokens,
+                slot_mapping=slot_mapping,
+            )
+            register_indexer = getattr(
+                indexer_manager,
+                "register_native_indexer_stream",
+                None,
+            )
+            if callable(register_indexer):
+                register_indexer(req_id, indexer_chunks)
+
         chunks_by_layer = self._dsv4_build_csa_attention_kv_chunks(
             blocks,
             disk_metas,
@@ -2671,6 +2717,237 @@ class LMCacheEngine:
             raise RuntimeError(
                 "CSA attention KV read-plan registration failed"
             ) from exc
+
+    def _dsv4_build_indexer_cache_chunks(
+        self,
+        blocks: list[tuple[CacheEngineKey, int, int]],
+        total_tokens: int,
+        slot_mapping: Optional[torch.Tensor] = None,
+    ) -> dict[int, list[Any]]:
+        """Build a complete compact layer-major native-indexer read plan.
+
+        Unlike the legacy fallback in the CSA attention planner, this method
+        accepts only compact sidecars with dense segment coverage. Returning
+        an empty mapping is the safety signal that keeps the ordinary padded
+        LMCache indexer group in the synchronous retrieve.
+
+        Args:
+            blocks: Ordered cached-prefix chunks for the active request.
+            total_tokens: Total logical tokens in the request.
+            slot_mapping: vLLM physical slot mapping for the request.
+
+        Returns:
+            Per-transformer-layer compact read descriptors, or an empty
+            mapping when any layer, segment, extent, or physical mapping is
+            incomplete.
+        """
+        del total_tokens  # Sidecars describe only the supplied cached prefix.
+        try:
+            from lmcache.v1.csa_attention_kv_prefetch_manager import (
+                CSAAttentionKVChunkLoc,
+            )
+        except ImportError:
+            return {}
+        if not blocks or self.gpu_connector is None or self.storage_manager is None:
+            return {}
+        disk_backend = self.storage_manager.storage_backends.get("LocalDiskBackend")
+        if disk_backend is None or not getattr(
+            disk_backend,
+            "kv_object_store_enabled",
+            False,
+        ):
+            return {}
+        klg_manager = self.metadata.kv_layer_groups_manager
+        if klg_manager is None or not klg_manager.kv_layer_groups:
+            return {}
+        dtypes = self.metadata.get_dtypes()
+        indexer_group: Optional[Any] = None
+        indexer_dtype: Optional[torch.dtype] = None
+        for group, dtype in zip(
+            klg_manager.kv_layer_groups,
+            dtypes,
+            strict=True,
+        ):
+            if self._dsv4_group_role(group, dtype) == "csa_indexer_cache":
+                indexer_group = group
+                indexer_dtype = dtype
+                break
+        if indexer_group is None or indexer_dtype is None:
+            return {}
+        manager_layer_ids = self.gpu_connector._dsv4_layer_ids_for_group(  # noqa: SLF001
+            indexer_group
+        )
+        object_layer_ids = [int(value) for value in indexer_group.layer_indices]
+        if not manager_layer_ids or len(manager_layer_ids) != len(object_layer_ids):
+            return {}
+        if slot_mapping is None:
+            return {}
+        try:
+            if isinstance(slot_mapping, torch.Tensor):
+                slots_cpu = (
+                    slot_mapping.detach()
+                    .to(
+                        device="cpu",
+                        dtype=torch.int64,
+                    )
+                    .reshape(-1)
+                )
+            else:
+                slots_cpu = torch.as_tensor(
+                    slot_mapping,
+                    dtype=torch.int64,
+                ).reshape(-1)
+        except Exception:
+            return {}
+
+        compression_ratio = int(indexer_group.compress_ratio)
+        block_size = 64
+        kv_size = int(indexer_group.shape_desc.kv_size)
+        token_bytes = (
+            kv_size * int(indexer_group.hidden_dim_size) * int(indexer_dtype.itemsize)
+        )
+        bytes_per_block = block_size * token_bytes
+        tokens_per_block = compression_ratio * block_size
+        if compression_ratio <= 0 or kv_size != 1 or bytes_per_block <= 0:
+            return {}
+
+        expected_start = int(blocks[0][1])
+        block_ends: list[int] = []
+        block_cursor = 0
+        for _key, start, end in blocks:
+            chunk_tokens = int(end) - int(start)
+            if (
+                int(start) != expected_start
+                or chunk_tokens <= 0
+                or chunk_tokens % tokens_per_block
+            ):
+                return {}
+            block_cursor += chunk_tokens // tokens_per_block
+            block_ends.append(block_cursor)
+            expected_start = int(end)
+        total_blocks = block_cursor
+        positions = torch.arange(
+            total_blocks, dtype=torch.int64
+        ) * tokens_per_block + int(blocks[0][1])
+        if positions.numel() == 0 or int(positions[-1]) >= int(slots_cpu.numel()):
+            return {}
+        selected_slots = slots_cpu.index_select(0, positions)
+        if not bool(torch.all(selected_slots >= 0)):
+            return {}
+        physical_blocks = torch.div(
+            selected_slots,
+            tokens_per_block,
+            rounding_mode="floor",
+        )
+
+        probe = getattr(
+            disk_backend,
+            "get_indexer_layer_major_records_for_keys",
+            None,
+        )
+        get_layers = getattr(
+            disk_backend,
+            "get_indexer_layer_major_records",
+            None,
+        )
+        if not callable(probe) or not callable(get_layers):
+            return {}
+        candidate_keys = [key for key, _start, _end in blocks]
+        candidate_records = probe(candidate_keys, object_layer_ids[0])
+        segment_candidates: dict[int, tuple[int, CacheEngineKey]] = {}
+        for block_index, record in enumerate(candidate_records):
+            if (
+                record is None
+                or not record.raw_extents
+                or int(record.length) % bytes_per_block
+            ):
+                continue
+            segment_blocks = int(record.length) // bytes_per_block
+            segment_end = block_ends[block_index]
+            segment_start = segment_end - segment_blocks
+            if segment_start < 0 or segment_end > total_blocks:
+                continue
+            current = segment_candidates.get(segment_start)
+            if current is None or segment_end > current[0]:
+                segment_candidates[segment_start] = (
+                    segment_end,
+                    candidate_keys[block_index],
+                )
+
+        segments: list[tuple[int, int, CacheEngineKey]] = []
+        cursor = 0
+        while cursor < total_blocks:
+            candidate = segment_candidates.get(cursor)
+            if candidate is None:
+                logger.warning(
+                    "DSv4 compact indexer coverage failed covered=%d/%d "
+                    "ready=%d keys=%d",
+                    cursor,
+                    total_blocks,
+                    sum(record is not None for record in candidate_records),
+                    len(candidate_keys),
+                )
+                return {}
+            segment_end, segment_key = candidate
+            segments.append((cursor, segment_end, segment_key))
+            cursor = segment_end
+
+        result: dict[int, list[Any]] = {
+            int(layer_id): [] for layer_id in manager_layer_ids
+        }
+        for segment_start, segment_end, segment_key in segments:
+            layer_records = get_layers(segment_key, object_layer_ids)
+            expected_nbytes = (segment_end - segment_start) * bytes_per_block
+            if len(layer_records) != len(manager_layer_ids):
+                return {}
+            physical_segment = tuple(
+                int(value)
+                for value in physical_blocks[segment_start:segment_end].tolist()
+            )
+            for manager_layer_id, record in zip(
+                manager_layer_ids,
+                layer_records,
+                strict=True,
+            ):
+                if (
+                    record is None
+                    or not record.raw_extents
+                    or int(record.length) != expected_nbytes
+                ):
+                    return {}
+                disk_meta = DiskCacheMetadata(
+                    path=disk_backend.kv_object_tutti_path(record.pool_id),
+                    size=int(record.aligned_length),
+                    fmt=MemoryFormat.BINARY_BUFFER,
+                    shape=torch.Size((int(record.aligned_length),)),
+                    dtype=torch.uint8,
+                )
+                result[int(manager_layer_id)].append(
+                    CSAAttentionKVChunkLoc(
+                        first_compressed_block=segment_start,
+                        n_compressed_blocks=segment_end - segment_start,
+                        key=segment_key,
+                        disk_meta=disk_meta,
+                        layer_byte_offset=int(record.offset),
+                        bytes_per_block=bytes_per_block,
+                        raw_extents=tuple(
+                            (int(offset), int(slba), int(n_sectors))
+                            for offset, slba, n_sectors in record.raw_extents
+                        ),
+                        physical_block_ids=physical_segment,
+                        read_length=expected_nbytes,
+                        layer_major=True,
+                    )
+                )
+        logger.info(
+            "DSv4 compact native indexer read plan layers=%d segments=%d "
+            "blocks=%d bytes_per_layer=%d",
+            len(result),
+            len(segments),
+            total_blocks,
+            total_blocks * bytes_per_block,
+        )
+        return result
 
     def _dsv4_build_csa_attention_kv_chunks(
         self,
@@ -2756,10 +3033,14 @@ class LMCacheEngine:
         if slot_mapping is not None:
             try:
                 if isinstance(slot_mapping, torch.Tensor):
-                    slot_mapping_cpu = slot_mapping.detach().to(
-                        device="cpu",
-                        dtype=torch.int64,
-                    ).reshape(-1)
+                    slot_mapping_cpu = (
+                        slot_mapping.detach()
+                        .to(
+                            device="cpu",
+                            dtype=torch.int64,
+                        )
+                        .reshape(-1)
+                    )
                 else:
                     slot_mapping_cpu = torch.as_tensor(
                         slot_mapping,
@@ -2780,32 +3061,41 @@ class LMCacheEngine:
             kv_size * int(csa_group.hidden_dim_size) * int(csa_dtype.itemsize)
         )
         contiguous_prefix = bool(blocks) and kv_size == 1
+        segment_compatible = contiguous_prefix
         expected_start = int(blocks[0][1]) if blocks else 0
         total_rows = 0
+        compressed_block_ends: list[int] = []
+        compressed_block_cursor = 0
         for _key, start, end in blocks:
             if int(start) != expected_start or int(end) < int(start):
                 contiguous_prefix = False
                 break
-            total_rows += (int(end) - int(start)) // compress_ratio
+            chunk_tokens = int(end) - int(start)
+            if chunk_tokens % compress_ratio:
+                segment_compatible = False
+            chunk_rows = chunk_tokens // compress_ratio
+            if chunk_rows % compressed_block_size:
+                segment_compatible = False
+            total_rows += chunk_rows
+            compressed_block_cursor += chunk_rows // compressed_block_size
+            compressed_block_ends.append(compressed_block_cursor)
             expected_start = int(end)
         total_compressed_blocks = total_rows // compressed_block_size
         tokens_per_compressed_block = compress_ratio * compressed_block_size
         object_layer_ids = [int(v) for v in csa_group.layer_indices]
         if (
             contiguous_prefix
+            and segment_compatible
             and slot_mapping_cpu is not None
             and total_rows > 0
             and total_rows % compressed_block_size == 0
             and len(layer_ids_for_group) == len(object_layer_ids)
         ):
-            positions = (
-                torch.arange(total_compressed_blocks, dtype=torch.int64)
-                * tokens_per_compressed_block
-                + int(blocks[0][1])
-            )
-            if (
-                positions.numel() > 0
-                and int(positions[-1]) < int(slot_mapping_cpu.numel())
+            positions = torch.arange(
+                total_compressed_blocks, dtype=torch.int64
+            ) * tokens_per_compressed_block + int(blocks[0][1])
+            if positions.numel() > 0 and int(positions[-1]) < int(
+                slot_mapping_cpu.numel()
             ):
                 slots = slot_mapping_cpu.index_select(0, positions)
                 if bool(torch.all(slots >= 0)):
@@ -2814,76 +3104,158 @@ class LMCacheEngine:
                         tokens_per_compressed_block,
                         rounding_mode="floor",
                     )
-                    prefix_key = blocks[-1][0]
-                    layer_records = disk_backend.get_csa_layer_major_records(
-                        prefix_key,
-                        object_layer_ids,
+                    probe_segments = getattr(
+                        disk_backend,
+                        "get_csa_layer_major_records_for_keys",
+                        None,
                     )
-                    expected_nbytes = total_rows * bytes_per_token
-                    if len(layer_records) == len(layer_ids_for_group) and all(
-                        record is not None
-                        and bool(record.raw_extents)
-                        and int(record.length) == expected_nbytes
-                        for record in layer_records
-                    ):
-                        physical_block_ids = tuple(
-                            int(v) for v in physical_rows.tolist()
+                    if callable(probe_segments):
+                        candidate_keys = [key for key, _start, _end in blocks]
+                        candidate_records = probe_segments(
+                            candidate_keys,
+                            object_layer_ids[0],
                         )
-                        result: dict[int, list[Any]] = {}
-                        for manager_layer_id, record in zip(
-                            layer_ids_for_group,
-                            layer_records,
-                            strict=True,
-                        ):
-                            assert record is not None
-                            disk_meta = DiskCacheMetadata(
-                                path=disk_backend.kv_object_tutti_path(
-                                    record.pool_id
-                                ),
-                                size=int(record.aligned_length),
-                                fmt=MemoryFormat.BINARY_BUFFER,
-                                shape=torch.Size(
-                                    (int(record.aligned_length),)
-                                ),
-                                dtype=torch.uint8,
+                        bytes_per_compressed_block = (
+                            compressed_block_size * bytes_per_token
+                        )
+                        segment_candidates: dict[int, tuple[int, CacheEngineKey]] = {}
+                        for block_index, record in enumerate(candidate_records):
+                            if record is None or not record.raw_extents:
+                                continue
+                            if int(record.length) % bytes_per_compressed_block:
+                                continue
+                            segment_blocks = (
+                                int(record.length) // bytes_per_compressed_block
                             )
-                            result[int(manager_layer_id)] = [
-                                CSAAttentionKVChunkLoc(
-                                    first_compressed_block=0,
-                                    n_compressed_blocks=(
-                                        total_compressed_blocks
-                                    ),
-                                    key=prefix_key,
-                                    disk_meta=disk_meta,
-                                    layer_byte_offset=int(record.offset),
-                                    bytes_per_block=(
-                                        compressed_block_size
-                                        * bytes_per_token
-                                    ),
-                                    raw_extents=tuple(
-                                        (
-                                            int(fo),
-                                            int(slba),
-                                            int(n_sectors),
-                                        )
-                                        for fo, slba, n_sectors in (
-                                            record.raw_extents
-                                        )
-                                    ),
-                                    physical_block_ids=physical_block_ids,
-                                    read_length=expected_nbytes,
-                                    layer_major=True,
+                            segment_end = compressed_block_ends[block_index]
+                            segment_start = segment_end - segment_blocks
+                            if (
+                                segment_start < 0
+                                or segment_end > total_compressed_blocks
+                            ):
+                                continue
+                            current = segment_candidates.get(segment_start)
+                            if current is None or segment_end > current[0]:
+                                segment_candidates[segment_start] = (
+                                    segment_end,
+                                    candidate_keys[block_index],
                                 )
-                            ]
-                        logger.info(
-                            "DSv4 CSA layer-major read plan key=%s "
-                            "layers=%d blocks=%d bytes_per_layer=%d",
-                            prefix_key.to_string(),
-                            len(result),
-                            total_compressed_blocks,
-                            expected_nbytes,
-                        )
-                        return result
+
+                        segments: list[tuple[int, int, CacheEngineKey]] = []
+                        expected_segment_start = 0
+                        while expected_segment_start < total_compressed_blocks:
+                            candidate = segment_candidates.get(expected_segment_start)
+                            if candidate is None:
+                                segments = []
+                                break
+                            segment_end, segment_key = candidate
+                            segments.append(
+                                (
+                                    expected_segment_start,
+                                    segment_end,
+                                    segment_key,
+                                )
+                            )
+                            expected_segment_start = segment_end
+
+                        if not segments:
+                            logger.warning(
+                                "DSv4 CSA layer-major segment coverage failed "
+                                "keys=%d ready=%d candidates=%d covered=%d/%d",
+                                len(candidate_keys),
+                                sum(record is not None for record in candidate_records),
+                                len(segment_candidates),
+                                expected_segment_start,
+                                total_compressed_blocks,
+                            )
+
+                        if (
+                            segments
+                            and expected_segment_start == total_compressed_blocks
+                        ):
+                            result = {
+                                int(layer_id): [] for layer_id in layer_ids_for_group
+                            }
+                            valid_segments = True
+                            for segment_start, segment_end, segment_key in segments:
+                                layer_records = (
+                                    disk_backend.get_csa_layer_major_records(
+                                        segment_key,
+                                        object_layer_ids,
+                                    )
+                                )
+                                expected_nbytes = (
+                                    segment_end - segment_start
+                                ) * bytes_per_compressed_block
+                                if len(layer_records) != len(
+                                    layer_ids_for_group
+                                ) or not all(
+                                    record is not None
+                                    and bool(record.raw_extents)
+                                    and int(record.length) == expected_nbytes
+                                    for record in layer_records
+                                ):
+                                    valid_segments = False
+                                    break
+                                segment_rows = tuple(
+                                    int(v)
+                                    for v in physical_rows[
+                                        segment_start:segment_end
+                                    ].tolist()
+                                )
+                                for manager_layer_id, record in zip(
+                                    layer_ids_for_group,
+                                    layer_records,
+                                    strict=True,
+                                ):
+                                    assert record is not None
+                                    disk_meta = DiskCacheMetadata(
+                                        path=(
+                                            disk_backend.kv_object_tutti_path(
+                                                record.pool_id
+                                            )
+                                        ),
+                                        size=int(record.aligned_length),
+                                        fmt=MemoryFormat.BINARY_BUFFER,
+                                        shape=torch.Size((int(record.aligned_length),)),
+                                        dtype=torch.uint8,
+                                    )
+                                    result[int(manager_layer_id)].append(
+                                        CSAAttentionKVChunkLoc(
+                                            first_compressed_block=(segment_start),
+                                            n_compressed_blocks=(
+                                                segment_end - segment_start
+                                            ),
+                                            key=segment_key,
+                                            disk_meta=disk_meta,
+                                            layer_byte_offset=int(record.offset),
+                                            bytes_per_block=(
+                                                bytes_per_compressed_block
+                                            ),
+                                            raw_extents=tuple(
+                                                (
+                                                    int(fo),
+                                                    int(slba),
+                                                    int(n_sectors),
+                                                )
+                                                for fo, slba, n_sectors in (
+                                                    record.raw_extents
+                                                )
+                                            ),
+                                            physical_block_ids=segment_rows,
+                                            read_length=expected_nbytes,
+                                            layer_major=True,
+                                        )
+                                    )
+                            if valid_segments:
+                                logger.info(
+                                    "DSv4 CSA segmented layer-major read plan "
+                                    "layers=%d segments=%d blocks=%d",
+                                    len(result),
+                                    len(segments),
+                                    total_compressed_blocks,
+                                )
+                                return result
 
         keys = [key for key, _, _ in blocks]
         object_records = disk_backend.get_kv_object_records(keys, roles=None)
@@ -3134,10 +3506,14 @@ class LMCacheEngine:
             return {}
         try:
             if isinstance(slot_mapping, torch.Tensor):
-                slot_mapping_cpu = slot_mapping.detach().to(
-                    device="cpu",
-                    dtype=torch.int64,
-                ).reshape(-1)
+                slot_mapping_cpu = (
+                    slot_mapping.detach()
+                    .to(
+                        device="cpu",
+                        dtype=torch.int64,
+                    )
+                    .reshape(-1)
+                )
             else:
                 slot_mapping_cpu = torch.as_tensor(
                     slot_mapping,
@@ -3190,22 +3566,153 @@ class LMCacheEngine:
             and int(blocks[0][1]) + (total_entries - 1) * compress_ratio
             < int(slot_mapping_cpu.numel())
         ):
-            positions = (
-                torch.arange(total_entries, dtype=torch.int64) * compress_ratio
-                + int(blocks[0][1])
-            )
+            positions = torch.arange(
+                total_entries, dtype=torch.int64
+            ) * compress_ratio + int(blocks[0][1])
             slots = slot_mapping_cpu.index_select(0, positions)
             if bool(torch.all(slots >= 0)):
                 entry_ids = torch.arange(total_entries, dtype=torch.int64)
-                physical_rows = (
-                    torch.div(
-                        slots,
-                        tokens_per_physical_block,
-                        rounding_mode="floor",
-                    )
-                    * hca_block_size
-                    + torch.remainder(entry_ids, hca_block_size)
+                physical_rows = torch.div(
+                    slots,
+                    tokens_per_physical_block,
+                    rounding_mode="floor",
+                ) * hca_block_size + torch.remainder(entry_ids, hca_block_size)
+                probe_segments = getattr(
+                    disk_backend,
+                    "get_hca_layer_major_records_for_keys",
+                    None,
                 )
+                if callable(probe_segments):
+                    candidate_ends: list[int] = []
+                    entry_cursor = 0
+                    for _key, start, end in blocks:
+                        entry_cursor += (int(end) - int(start)) // compress_ratio
+                        candidate_ends.append(entry_cursor)
+                    candidate_records = probe_segments(
+                        keys,
+                        object_layer_ids[0],
+                    )
+                    segment_candidates: dict[int, tuple[int, CacheEngineKey]] = {}
+                    for index, record in enumerate(candidate_records):
+                        if record is None or not record.raw_extents:
+                            continue
+                        if int(record.length) % token_bytes:
+                            continue
+                        segment_entries = int(record.length) // token_bytes
+                        segment_end = candidate_ends[index]
+                        segment_start = segment_end - segment_entries
+                        if segment_start < 0 or segment_end > total_entries:
+                            continue
+                        current = segment_candidates.get(segment_start)
+                        if current is None or segment_end > current[0]:
+                            segment_candidates[segment_start] = (
+                                segment_end,
+                                keys[index],
+                            )
+
+                    segments: list[tuple[int, int, CacheEngineKey]] = []
+                    expected_start = 0
+                    while expected_start < total_entries:
+                        candidate = segment_candidates.get(expected_start)
+                        if candidate is None:
+                            segments = []
+                            break
+                        segment_end, segment_key = candidate
+                        segments.append((expected_start, segment_end, segment_key))
+                        expected_start = segment_end
+
+                    if not segments:
+                        logger.warning(
+                            "DSv4 HCA layer-major segment coverage failed "
+                            "keys=%d ready=%d candidates=%d covered=%d/%d",
+                            len(keys),
+                            sum(record is not None for record in candidate_records),
+                            len(segment_candidates),
+                            expected_start,
+                            total_entries,
+                        )
+
+                    if segments and expected_start == total_entries:
+                        segmented_chunks: dict[int, list[Any]] = {
+                            int(layer_id): [] for layer_id in layer_ids_for_group
+                        }
+                        valid_segments = True
+                        for segment_start, segment_end, segment_key in segments:
+                            layer_records = disk_backend.get_hca_layer_major_records(
+                                segment_key,
+                                object_layer_ids,
+                            )
+                            expected_nbytes = (
+                                segment_end - segment_start
+                            ) * token_bytes
+                            if len(layer_records) != len(
+                                layer_ids_for_group
+                            ) or not all(
+                                record is not None
+                                and bool(record.raw_extents)
+                                and int(record.length) == expected_nbytes
+                                for record in layer_records
+                            ):
+                                valid_segments = False
+                                break
+                            segment_rows = tuple(
+                                int(value)
+                                for value in physical_rows[
+                                    segment_start:segment_end
+                                ].tolist()
+                            )
+                            for manager_layer_id, record in zip(
+                                layer_ids_for_group,
+                                layer_records,
+                                strict=True,
+                            ):
+                                assert record is not None
+                                segmented_chunks[int(manager_layer_id)].append(
+                                    CSAAttentionKVChunkLoc(
+                                        first_compressed_block=segment_start,
+                                        n_compressed_blocks=(
+                                            segment_end - segment_start
+                                        ),
+                                        key=segment_key,
+                                        disk_meta=DiskCacheMetadata(
+                                            path=(
+                                                disk_backend.kv_object_tutti_path(
+                                                    record.pool_id
+                                                )
+                                            ),
+                                            size=int(record.aligned_length),
+                                            fmt=MemoryFormat.BINARY_BUFFER,
+                                            shape=torch.Size(
+                                                (int(record.aligned_length),)
+                                            ),
+                                            dtype=torch.uint8,
+                                        ),
+                                        layer_byte_offset=int(record.offset),
+                                        bytes_per_block=token_bytes,
+                                        raw_extents=tuple(
+                                            (
+                                                int(file_offset),
+                                                int(slba),
+                                                int(n_sectors),
+                                            )
+                                            for file_offset, slba, n_sectors in (
+                                                record.raw_extents
+                                            )
+                                        ),
+                                        physical_block_ids=segment_rows,
+                                        read_length=expected_nbytes,
+                                        layer_major=True,
+                                    )
+                                )
+                        if valid_segments:
+                            logger.info(
+                                "DSv4 HCA segmented layer-major read plan "
+                                "layers=%d segments=%d entries=%d",
+                                len(segmented_chunks),
+                                len(segments),
+                                total_entries,
+                            )
+                            return segmented_chunks
                 prefix_key = blocks[-1][0]
                 layer_records = disk_backend.get_hca_layer_major_records(
                     prefix_key,
@@ -3218,9 +3725,7 @@ class LMCacheEngine:
                     and int(record.length) == expected_nbytes
                     for record in layer_records
                 ):
-                    physical_block_ids = tuple(
-                        int(v) for v in physical_rows.tolist()
-                    )
+                    physical_block_ids = tuple(int(v) for v in physical_rows.tolist())
                     layer_major_chunks: dict[int, list[Any]] = {}
                     for manager_layer_id, record in zip(
                         layer_ids_for_group,
@@ -5108,7 +5613,12 @@ class LMCacheEngine:
         total_tokens = len(tokens)
 
         last_failed_block_start = None
-        for location, blocks in block_mapping.items():
+        for location, mapped_blocks in block_mapping.items():
+            # Storage-manager mappings may be shared with lookup bookkeeping.
+            # Freeze the request view before planners and streaming callbacks
+            # retain it; otherwise a late append changes callback indices after
+            # ``keys`` and shape lists have already been materialised.
+            blocks = list(mapped_blocks)
             keys = [key for key, _, _ in blocks]
 
             # For DSv4-optimised KV layouts, compute per-chunk shape overrides
@@ -5122,16 +5632,6 @@ class LMCacheEngine:
             # prefetcher to load lazily via Tutti during the FFN/MoE overlap
             # window.
             if self.dsv4_optimized_kv:
-                store_shapes_per_key: Optional[List[Optional[List[torch.Size]]]] = [
-                    self._dsv4_retrieve_shapes_for_range(
-                        self.metadata.get_shapes(end - start),
-                        self.metadata.get_dtypes(),
-                        start,
-                        end,
-                        total_tokens,
-                    )
-                    for _, start, end in blocks
-                ]
                 if self._dsv4_csa_attention_kv_prefetch_active():
                     csa_disk_backend = self.storage_manager.storage_backends.get(
                         "LocalDiskBackend"
@@ -5144,8 +5644,24 @@ class LMCacheEngine:
                             kwargs.get("req_id", "unknown"),
                             slot_mapping=kwargs.get("slot_mapping"),
                         )
+                store_shapes_per_key: Optional[List[Optional[List[torch.Size]]]] = [
+                    self._dsv4_retrieve_shapes_for_range(
+                        self.metadata.get_shapes(end - start),
+                        self.metadata.get_dtypes(),
+                        start,
+                        end,
+                        total_tokens,
+                    )
+                    for _, start, end in blocks
+                ]
             else:
                 store_shapes_per_key = None
+
+            # Read-plan construction must be observational. Re-materialise the
+            # key list from the authoritative block map so a planner-side list
+            # transformation can never make the streaming callback one block
+            # shorter than the retrieve mask.
+            keys = [key for key, _, _ in blocks]
 
             shapes_per_key = store_shapes_per_key
             read_ranges_per_key: Optional[
@@ -5219,19 +5735,55 @@ class LMCacheEngine:
                                         for _shapes, read_ranges in retrieve_views
                                     ]
                     stream_tutti_retrieve = (
-                        self.gpu_connector is not None
-                        and not self.save_only_first_rank
+                        self.gpu_connector is not None and not self.save_only_first_rank
                     )
-                    raw_tutti_retrieve = (
-                        stream_tutti_retrieve
-                        and callable(
-                            getattr(
-                                self.gpu_connector,
-                                "batched_raw_to_gpu",
-                                None,
-                            )
+                    raw_tutti_retrieve = stream_tutti_retrieve and callable(
+                        getattr(
+                            self.gpu_connector,
+                            "batched_raw_to_gpu",
+                            None,
                         )
                     )
+                    tutti_blocks = blocks
+                    tutti_keys = [key for key, _, _ in blocks]
+                    tutti_shapes = shapes_per_key
+                    tutti_read_ranges = read_ranges_per_key
+                    tutti_roles = kv_object_roles
+                    if stream_tutti_retrieve and shapes_per_key is not None:
+                        io_indices = [
+                            index
+                            for index, shape_list in enumerate(shapes_per_key)
+                            if shape_list is None
+                            or any(shape.numel() > 0 for shape in shape_list)
+                        ]
+                        io_index_set = set(io_indices)
+                        metadata_only_indices = [
+                            index
+                            for index in range(len(blocks))
+                            if index not in io_index_set
+                        ]
+                        for index in metadata_only_indices:
+                            _key, start, end = blocks[index]
+                            ret_mask[start:end] = True
+                        if metadata_only_indices:
+                            logger.info(
+                                "TUTTI_PROFILE metadata_only_hits blocks=%d/%d",
+                                len(metadata_only_indices),
+                                len(blocks),
+                            )
+                        if not io_indices:
+                            continue
+                        tutti_blocks = [blocks[index] for index in io_indices]
+                        tutti_keys = [tutti_keys[index] for index in io_indices]
+                        tutti_shapes = [shapes_per_key[index] for index in io_indices]
+                        if read_ranges_per_key is not None:
+                            tutti_read_ranges = [
+                                read_ranges_per_key[index] for index in io_indices
+                            ]
+                        if kv_object_roles is not None:
+                            tutti_roles = [
+                                kv_object_roles[index] for index in io_indices
+                            ]
                     streaming_consumed = False
                     streaming_failed = False
                     streamed_blocks = 0
@@ -5239,7 +5791,9 @@ class LMCacheEngine:
                     def _consume_tutti_batch(
                         batch_start: int,
                         batch_results: List[Optional[MemoryObj]],
-                        retrieve_blocks: List[Tuple[CacheEngineKey, int, int]] = blocks,
+                        retrieve_blocks: List[
+                            Tuple[CacheEngineKey, int, int]
+                        ] = tutti_blocks,
                     ) -> None:
                         nonlocal last_failed_block_start
                         nonlocal streaming_consumed, streaming_failed
@@ -5307,7 +5861,9 @@ class LMCacheEngine:
                         staging: torch.Tensor,
                         completed_shapes: List[List[torch.Size]],
                         completed_dtypes: List[List[torch.dtype]],
-                        retrieve_blocks: List[Tuple[CacheEngineKey, int, int]] = blocks,
+                        retrieve_blocks: List[
+                            Tuple[CacheEngineKey, int, int]
+                        ] = tutti_blocks,
                     ) -> None:
                         nonlocal streaming_consumed, streaming_failed
                         nonlocal streamed_blocks, tot_kv_size
@@ -5377,11 +5933,12 @@ class LMCacheEngine:
                             tot_kv_size += size
                             streamed_blocks += 1
 
+                    authoritative_keys = tutti_keys
                     memory_objs = self._tutti_batched_get(
-                        keys,
-                        shapes_per_key=shapes_per_key,
-                        read_ranges_per_key=read_ranges_per_key,
-                        kv_object_roles=kv_object_roles,
+                        authoritative_keys,
+                        shapes_per_key=tutti_shapes,
+                        read_ranges_per_key=tutti_read_ranges,
+                        kv_object_roles=tutti_roles,
                         on_batch_loaded=(
                             _consume_tutti_batch
                             if stream_tutti_retrieve and not raw_tutti_retrieve
@@ -5392,8 +5949,8 @@ class LMCacheEngine:
                         ),
                     )
                     if streaming_consumed:
-                        if not streaming_failed and streamed_blocks < len(blocks):
-                            missing_start = blocks[streamed_blocks][1]
+                        if not streaming_failed and streamed_blocks < len(tutti_blocks):
+                            missing_start = tutti_blocks[streamed_blocks][1]
                             if (
                                 last_failed_block_start is None
                                 or last_failed_block_start > missing_start
@@ -5402,7 +5959,7 @@ class LMCacheEngine:
                         logger.info(
                             "TUTTI_PROFILE streaming_retrieve blocks=%d/%d failed=%s",
                             streamed_blocks,
-                            len(blocks),
+                            len(tutti_blocks),
                             streaming_failed,
                         )
                         continue

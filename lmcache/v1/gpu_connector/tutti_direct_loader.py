@@ -107,9 +107,7 @@ _CUDA_HOST_REGISTER_IO_MEMORY: int = 0x04
 RawBatchLoadedCallback = Callable[
     [int, list[int], list[int], list[int], torch.Tensor], None
 ]
-IndexedBatchLoadedCallback = Callable[
-    [int, torch.Tensor, int, int, torch.Tensor], None
-]
+IndexedBatchLoadedCallback = Callable[[int, torch.Tensor, int, int, torch.Tensor], None]
 _LocalRawBatchLoadedCallback = Callable[
     [list[int], list[int], list[int], torch.Tensor], None
 ]
@@ -1213,10 +1211,14 @@ class TuttiDirectLoader:
         # announcement is never blocked by an in-flight write) and writers
         # re-check between stores, yielding until no reader is waiting.
         self._readers_waiting = 0
-        # Low-priority speculative reads must also yield to an announced
-        # cold-store writer. The writer count is advisory admission state;
-        # ``_io_lock`` remains the sole owner of SQ/CQ and staging memory.
+        # Writers waiting for an idle window are advisory only. They must not
+        # cancel speculative reads during an active request: doing so made a
+        # deferred LMCache seed writer suppress every CSA prediction for as
+        # long as the writer was parked. ``_active_writers`` is set only after
+        # the idle-window policy admits one write; speculative reads yield to
+        # that bounded operation, while parked writers continue to wait.
         self._writers_waiting = 0
+        self._active_writers = 0
         self._reader_gate = threading.Condition(threading.Lock())
         # Slack-only write scheduling (Tutti design: reads own the queue
         # while a request is active; writes go into idle windows).  A write
@@ -1295,9 +1297,7 @@ class TuttiDirectLoader:
         # would be both brittle and wasteful. A range template is independent
         # of its staging destination and can be reused by any subset that
         # touches the same object bytes.
-        self._lba_cache_versions: dict[str, int] = {
-            path: 0 for path in self._lba_cache
-        }
+        self._lba_cache_versions: dict[str, int] = {path: 0 for path in self._lba_cache}
         self._resolved_range_cache: OrderedDict[
             tuple[str, int, int, int, int],
             Optional[tuple[tuple[int, int, int], ...]],
@@ -1595,9 +1595,7 @@ class TuttiDirectLoader:
             if self._lba_cache.get(path) is records:
                 continue
             self._lba_cache[path] = records
-            self._lba_cache_versions[path] = (
-                self._lba_cache_versions.get(path, 0) + 1
-            )
+            self._lba_cache_versions[path] = self._lba_cache_versions.get(path, 0) + 1
             self._build_extent_index(path)
 
     def _build_extent_index(self, file_path: str) -> None:
@@ -1910,22 +1908,22 @@ class TuttiDirectLoader:
 
         is_demand = io_priority == "demand"
         with self._reader_gate:
-            if is_demand:
-                self._readers_waiting += 1
-                self._hp_readers += 1
-                self._reader_gate.notify_all()
-            elif self._hp_readers > 0 or self._writers_waiting > 0:
+            if not is_demand and (self._hp_readers > 0 or self._active_writers > 0):
                 raise RuntimeError(
                     "speculative indexed Tutti read was not admitted because "
-                    "demand I/O or a writer is waiting"
+                    "demand I/O or an active writer owns the queue"
                 )
+            # Every admitted read, including speculative prefetch, prevents a
+            # parked background writer from claiming the shared SQ/CQ ring.
+            self._readers_waiting += 1
+            if is_demand:
+                self._hp_readers += 1
+            self._reader_gate.notify_all()
         try:
             profile_enabled = _tutti_profile_enabled()
             lock_wait_start = time.perf_counter() if profile_enabled else 0.0
             with self._io_lock:
-                lock_wait_ms = (
-                    _elapsed_ms(lock_wait_start) if profile_enabled else 0.0
-                )
+                lock_wait_ms = _elapsed_ms(lock_wait_start) if profile_enabled else 0.0
                 self._load_indexed_chunks_to_hbm_locked(
                     selected_ids,
                     slba_table,
@@ -1937,8 +1935,8 @@ class TuttiDirectLoader:
                 )
         finally:
             with self._reader_gate:
+                self._readers_waiting -= 1
                 if is_demand:
-                    self._readers_waiting -= 1
                     self._hp_readers -= 1
                 self._last_read_end = time.perf_counter()
                 self._reader_gate.notify_all()
@@ -1963,6 +1961,7 @@ class TuttiDirectLoader:
         max_batch_ios: Optional[int] = None,
         should_continue: Optional[Callable[[], bool]] = None,
         deadline_monotonic: Optional[float] = None,
+        throttle_speculative: bool = True,
     ) -> list[Optional[MemoryObj]]:
         """Thread-safe wrapper around the GPU-direct NVMe read path.
 
@@ -1995,18 +1994,24 @@ class TuttiDirectLoader:
                 it to re-register its full-record LBA cache: an interleaved
                 retrieve overwrites the loader's extent table with
                 CSA-filtered ranges between batches, which the walker's byte
-                ranges cannot resolve against.
+                ranges cannot resolve against.  For whole-call locking, the
+                callback runs once immediately after acquiring ``_io_lock``;
+                no other loader operation can replace the table until the
+                call completes.
             io_priority: ``"demand"`` for foreground retrieval or
                 ``"speculative"`` for predicted reads. When omitted,
                 whole-call loads are demand and per-batch loads are
                 speculative. Speculative batches yield before submission if
-                a demand read or store writer is waiting.
+                a demand read or an already-active store writer owns the queue.
             max_batch_bytes: Optional byte cap for one NVMe batch.
             max_batch_ios: Optional command cap for one NVMe batch.
             should_continue: Optional cancellation predicate checked between
                 batches. Returning False leaves unsubmitted results as None.
             deadline_monotonic: Optional absolute ``time.perf_counter()``
                 deadline. Speculative batches are not submitted after it.
+            throttle_speculative: Apply the shared speculative token bucket.
+                Set this to ``False`` for a bounded lookahead read that must
+                finish inside a known compute window.
         """
         if on_batch_loaded is not None and on_raw_batch_loaded is not None:
             raise ValueError(
@@ -2040,15 +2045,19 @@ class TuttiDirectLoader:
         if max_batch_ios is not None and max_batch_ios <= 0:
             raise ValueError("max_batch_ios must be positive")
         with self._reader_gate:
+            # Speculation yields only to an operation that is already active,
+            # not to a writer merely parked until the request becomes idle.
+            if not is_demand and (self._hp_readers > 0 or self._active_writers > 0):
+                return [None] * len(keys)
+            self._readers_waiting += 1
             if is_demand:
-                self._readers_waiting += 1
-                self._reader_gate.notify_all()
                 # Synchronous retrieve = high-priority reader.  Bulk prefetch
                 # batches yield to it (see the per-batch wait below) so the
                 # foreground TTFT path always owns the NVMe queue; the bulk
                 # walker then runs alone during the compute phase, which is
                 # exactly the window it is meant to hide in.
                 self._hp_readers += 1
+            self._reader_gate.notify_all()
         try:
             if lock_per_batch:
                 return self._load_chunks_to_hbm_locked(
@@ -2066,8 +2075,11 @@ class TuttiDirectLoader:
                     max_batch_ios=max_batch_ios,
                     should_continue=should_continue,
                     deadline_monotonic=deadline_monotonic,
+                    throttle_speculative=throttle_speculative,
                 )
             with self._io_lock:
+                if before_batch is not None:
+                    before_batch()
                 return self._load_chunks_to_hbm_locked(
                     keys,
                     disk_metadatas,
@@ -2081,11 +2093,12 @@ class TuttiDirectLoader:
                     max_batch_ios=max_batch_ios,
                     should_continue=should_continue,
                     deadline_monotonic=deadline_monotonic,
+                    throttle_speculative=throttle_speculative,
                 )
         finally:
             with self._reader_gate:
+                self._readers_waiting -= 1
                 if is_demand:
-                    self._readers_waiting -= 1
                     self._hp_readers -= 1
                 self._last_read_end = time.perf_counter()
                 self._reader_gate.notify_all()
@@ -2145,9 +2158,7 @@ class TuttiDirectLoader:
             batch_end = min(total, batch_start + batch_limit)
             batch_ids = selected_ids[batch_start:batch_end]
             n_ios = int(batch_ids.numel())
-            batch_profile_start = (
-                time.perf_counter() if profile_enabled else 0.0
-            )
+            batch_profile_start = time.perf_counter() if profile_enabled else 0.0
             with torch.cuda.device(self._cuda_device):
                 phase_events = (
                     tuple(torch.cuda.Event(enable_timing=True) for _ in range(4))
@@ -2177,9 +2188,7 @@ class TuttiDirectLoader:
                     submit_cpu_ms += _elapsed_ms(submit_start)
                 if phase_events is not None:
                     phase_events[1].record(io_stream)
-                poll_launch_start = (
-                    time.perf_counter() if profile_enabled else 0.0
-                )
+                poll_launch_start = time.perf_counter() if profile_enabled else 0.0
                 _c_ops.tutti_poll_batch(
                     sq_dev_ptr=sq_dev_ptr,
                     cq_dev_ptr=cq_dev_ptr,
@@ -2299,6 +2308,7 @@ class TuttiDirectLoader:
         max_batch_ios: Optional[int] = None,
         should_continue: Optional[Callable[[], bool]] = None,
         deadline_monotonic: Optional[float] = None,
+        throttle_speculative: bool = True,
     ) -> list[Optional[MemoryObj]]:
         """Load KV chunks directly from NVMe into HBM staging.
 
@@ -2377,7 +2387,7 @@ class TuttiDirectLoader:
                 break
             if io_priority == "speculative":
                 with self._reader_gate:
-                    if self._hp_readers > 0 or self._writers_waiting > 0:
+                    if self._hp_readers > 0 or self._active_writers > 0:
                         break
             pack_start = time.perf_counter()
             batch_end = batch_start
@@ -2479,11 +2489,15 @@ class TuttiDirectLoader:
                         return results
                     with self._reader_gate:
                         now = time.perf_counter()
-                        if self._hp_readers > 0 or self._writers_waiting > 0:
+                        if self._hp_readers > 0 or self._active_writers > 0:
                             return results
                         if deadline_monotonic is not None and now >= deadline_monotonic:
                             return results
-                        rate = self._speculative_rate_bytes_per_s
+                        rate = (
+                            self._speculative_rate_bytes_per_s
+                            if throttle_speculative
+                            else 0.0
+                        )
                         if rate <= 0:
                             admitted = True
                             continue
@@ -2591,13 +2605,13 @@ class TuttiDirectLoader:
                             for i, res in enumerate(batch_results):
                                 results[batch_start + i] = res
                 batch_start = batch_end
-                # Fair handoff: a bare threading.Lock has no FIFO ordering
-                # and this loop re-acquires immediately (barging), so a
-                # waiter (the CSA walker's 40 ms layer read) can starve
-                # behind several consecutive mega-batches (measured 1.3-3.5 s
-                # first-gate stalls).  A 1 ms sleep after release lets any
-                # waiter win the lock; costs ~4 ms per multi-batch retrieve.
-                time.sleep(0.001)
+                # A bare threading.Lock has no FIFO ordering. Yield only when
+                # another class has actually announced work; unconditional
+                # 1 ms sleeps made a 30-batch prediction spend ~30 ms asleep.
+                with self._reader_gate:
+                    should_yield = self._hp_readers > 0 or self._active_writers > 0
+                if should_yield:
+                    time.sleep(0.001)
                 continue
             batch_results = self._load_batch(
                 batch_keys,
@@ -2783,6 +2797,7 @@ class TuttiDirectLoader:
         with self._reader_gate:
             self._writers_waiting += 1
             self._reader_gate.notify_all()
+        writer_active = False
         try:
             while True:
                 with self._reader_gate:
@@ -2796,6 +2811,10 @@ class TuttiDirectLoader:
                     ):
                         break
                     self._reader_gate.wait(timeout=self._write_slack_s)
+            with self._reader_gate:
+                self._active_writers += 1
+                writer_active = True
+                self._reader_gate.notify_all()
             with self._io_lock:
                 return self._store_bytes_to_raw_extents_locked(
                     payload_view=payload_view,
@@ -2809,6 +2828,8 @@ class TuttiDirectLoader:
                 )
         finally:
             with self._reader_gate:
+                if writer_active:
+                    self._active_writers -= 1
                 self._writers_waiting -= 1
                 self._reader_gate.notify_all()
 
@@ -2895,10 +2916,7 @@ class TuttiDirectLoader:
             batch_slbas: list[int] = []
             batch_lens: list[int] = []
             batch_paths: list[str] = []
-            while (
-                cursor < len(io_specs)
-                and len(batch_iovas) < usable_queue_depth
-            ):
+            while cursor < len(io_specs) and len(batch_iovas) < usable_queue_depth:
                 staging_offset, slba, io_nbytes = io_specs[cursor]
                 batch_iovas.append(self._staging_iova_at(staging_offset))
                 batch_slbas.append(slba)

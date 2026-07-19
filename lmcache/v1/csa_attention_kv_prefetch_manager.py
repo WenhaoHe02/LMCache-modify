@@ -583,6 +583,8 @@ class CSAAttentionKVPrefetchManager:
         self,
         req_id: str,
         chunks_by_layer: Dict[int, List[CSAAttentionKVChunkLoc]],
+        *,
+        start_profile_capture: bool = True,
     ) -> None:
         """Register LMCache chunk locations for an active request.
 
@@ -602,10 +604,13 @@ class CSAAttentionKVPrefetchManager:
                 one active request at a time in the initial implementation).
             chunks_by_layer: Mapping from CSA layer id to ordered chunk
                 descriptors.  Empty entries clear the layer's chunk list.
+            start_profile_capture: Whether this manager owns the request-level
+                profiler trigger. Auxiliary managers sharing the same Tutti
+                loader must disable it so only one component starts capture.
         """
         is_new_request = str(req_id) != self._active_request_id
         self._active_request_id = str(req_id)
-        if is_new_request:
+        if is_new_request and start_profile_capture:
             self.start_full_nsys_capture_for_request(str(req_id))
         if is_new_request:
             with self._scheduled_layer_futures_lock:
@@ -789,7 +794,11 @@ class CSAAttentionKVPrefetchManager:
         """Compile one-range CSA blocks into persistent GPU lookup tables."""
         state.indexed_slba_table = None
         state.indexed_dst_rows_table = None
-        if state.block_slot_scatter or not state.chunks:
+        if (
+            state.block_slot_scatter
+            or not state.chunks
+            or any(chunk.layer_major for chunk in state.chunks)
+        ):
             return
         io_nbytes = state.compressed_block_size * state.token_bytes
         if io_nbytes <= 0 or io_nbytes % 512:
@@ -955,7 +964,12 @@ class CSAAttentionKVPrefetchManager:
         """
         self._prediction_waiter = waiter
 
-    def fire_deterministic_layer(self, layer_id: int) -> bool:
+    def fire_deterministic_layer(
+        self,
+        layer_id: int,
+        *,
+        label: str = "hca_deterministic",
+    ) -> bool:
         """Submit every covered block for a deterministic HCA layer.
 
         HCA has no sparse indexer: every compressed entry is consumed by its
@@ -964,6 +978,7 @@ class CSAAttentionKVPrefetchManager:
 
         Args:
             layer_id: Registered HCA transformer layer id.
+            label: Profiling label attached to the Tutti submission.
 
         Returns:
             ``True`` when the layer has a registered non-empty chunk map.
@@ -975,7 +990,7 @@ class CSAAttentionKVPrefetchManager:
         self._submit_reads(
             int(layer_id),
             range(covered_end),
-            label="hca_deterministic",
+            label=label,
             raise_on_error=True,
         )
         return True
@@ -1142,6 +1157,28 @@ class CSAAttentionKVPrefetchManager:
             def _patched_forward(*args: Any, **kwargs: Any) -> torch.Tensor:
                 t0 = time.perf_counter() if _timing_enabled() else 0.0
                 wait_ms = 0.0
+                # The native Lightning Indexer reads its own compact K cache
+                # before producing ``true_topk``.  The connector's optional
+                # per-layer callback is not a reliable consumption boundary,
+                # so gate the native-cache stream here.  Besides correctness,
+                # this advances the bounded read window and drains completed
+                # staging buffers for the early CSA layers that have no L2
+                # proxy trigger.
+                from lmcache.v1.indexer_ssd_manager import (
+                    get_indexer_ssd_manager,
+                )
+
+                indexer_manager = get_indexer_ssd_manager()
+                if indexer_manager is not None:
+                    wait_native = getattr(
+                        indexer_manager,
+                        "wait_for_native_indexer_layer",
+                        None,
+                    )
+                    if callable(wait_native) and not wait_native(layer_id):
+                        raise RuntimeError(
+                            f"native indexer cache is unavailable for layer {layer_id}"
+                        )
                 # Never wait for speculative proxy work before the
                 # official Lightning Indexer.  Running true scoring first
                 # overlaps its GPU work with pending I/O and preserves the
@@ -1189,11 +1226,6 @@ class CSAAttentionKVPrefetchManager:
                     # The true Lightning Indexer output is the live source of
                     # truth. Record accuracy only after the asynchronous proxy
                     # has joined, so its block set is complete and stable.
-                    from lmcache.v1.indexer_ssd_manager import (
-                        get_indexer_ssd_manager,
-                    )
-
-                    indexer_manager = get_indexer_ssd_manager()
                     if indexer_manager is not None:
                         indexer_manager.record_csa_prediction_accuracy(
                             layer_id,
@@ -1680,20 +1712,13 @@ class CSAAttentionKVPrefetchManager:
         if not keys:
             return None, []
 
-        # Re-register our full-record LBA extents.  ``_tutti_batched_get``
-        # in the retrieve path overwrites ``_lba_cache`` with extents that
-        # respect ``record.read_ranges``, which excludes csa_attention_kv
-        # when the filter is enabled.  Without this re-registration, Tutti
-        # reports "extents cover 0/N bytes" on every csa byte_range because
-        # the cache only covers the prior groups.
-        if self._pending_raw_lba_cache:
-            try:
-                self._tutti_loader.register_lba_cache(self._pending_raw_lba_cache)
-            except Exception:
-                logger.exception(
-                    "CSAAttentionKVPrefetchManager: re-register LBA cache "
-                    "failed in _issue_reads"
-                )
+        # Restore our full-record extent snapshot only after Tutti owns its
+        # queue lock.  Registering before lock acquisition races the ordinary
+        # retrieve path, which can replace the same synthetic pool path with
+        # a filtered extent table while this request waits for the queue.
+        def _restore_lba_cache() -> None:
+            if self._pending_raw_lba_cache:
+                self._tutti_loader.ensure_lba_cache(self._pending_raw_lba_cache)
 
         # Vectorized streaming scatter: each staging batch is consumed inside
         # Tutti's on_batch_loaded callback with ONE index_copy_ kernel per
@@ -1874,11 +1899,22 @@ class CSAAttentionKVPrefetchManager:
             "file_offsets": file_offsets,
             "read_ranges_per_key": read_ranges_per_key,
             "io_priority": io_priority,
+            "before_batch": _restore_lba_cache,
             # A predicted union can span hundreds of tiny ranges. Release the
             # single Tutti queue between bounded speculative batches so HCA
             # and true-topK demand reads never queue behind the whole walk.
             "lock_per_batch": io_priority == "speculative",
         }
+        if io_priority == "speculative":
+            # A long-prefix prediction can touch ranges in every layer-major
+            # segment. Submit the bounded selected ranges in large batches and
+            # rely on the demand gate for preemption instead of spending the
+            # two-layer compute window in artificial throttling.
+            load_kwargs.update(
+                max_batch_bytes=128 * 1024**2,
+                max_batch_ios=256,
+                throttle_speculative=False,
+            )
         if raw_batch_enabled:
             load_kwargs["on_raw_batch_loaded"] = _scatter_raw_batch
         else:
@@ -1923,8 +1959,9 @@ class CSAAttentionKVPrefetchManager:
         if payload_nbytes <= 0 or read_nbytes < payload_nbytes:
             raise RuntimeError("invalid layer-major read length")
 
-        if self._pending_raw_lba_cache:
-            self._tutti_loader.register_lba_cache(self._pending_raw_lba_cache)
+        def _restore_lba_cache() -> None:
+            if self._pending_raw_lba_cache:
+                self._tutti_loader.ensure_lba_cache(self._pending_raw_lba_cache)
 
         if state.block_slot_scatter:
             k_cache = state.k_cache_tensor.view(torch.uint8)
@@ -2026,6 +2063,7 @@ class CSAAttentionKVPrefetchManager:
                 )
             ],
             "io_priority": io_priority,
+            "before_batch": _restore_lba_cache,
         }
         if _csa_c_ops is not None and hasattr(
             _csa_c_ops, "scatter_rows_from_object_ptrs"

@@ -87,6 +87,88 @@ _OVERLAP_HOOK_ERROR_LOGGED: set[tuple[str, int, str]] = set()
 _SCHEDULER_HMA_INVALID_BLOCK_PATCH_INSTALLED: bool = False
 
 
+class _FullNsysCaptureController:
+    """Drive one request-scoped Nsight capture without a prefetch manager."""
+
+    def __init__(self) -> None:
+        self.active = False
+        self.complete = False
+        self.seen_request_id = ""
+        self.seen_requests = 0
+        self.active_request_id = ""
+
+    def start_for_request(self, request_id: str) -> None:
+        """Start profiling after the configured number of cache-hit requests.
+
+        Args:
+            request_id: Identifier of the cache-hit request entering KV load.
+        """
+        if not self.enabled() or self.active or self.complete:
+            return
+        if request_id != self.seen_request_id:
+            self.seen_request_id = request_id
+            self.seen_requests += 1
+        try:
+            skip = max(
+                0,
+                int(os.getenv("LMCACHE_NSYS_FULL_CAPTURE_SKIP_REQUESTS", "0")),
+            )
+        except ValueError:
+            skip = 0
+        if self.seen_requests <= skip:
+            return
+        try:
+            torch.cuda.profiler.start()
+            self.active = True
+            self.active_request_id = request_id
+            logger.info(
+                "LMCache: NSYS_FULL_CAPTURE start request=%s request_index=%d",
+                request_id,
+                self.seen_requests,
+            )
+        except Exception:
+            self.complete = True
+            logger.exception("LMCache: NSYS_FULL_CAPTURE start failed")
+
+    def finish(self) -> None:
+        """Stop an active capture after the final decoder layer returns."""
+        if not self.active:
+            return
+        try:
+            torch.cuda.profiler.stop()
+            logger.info(
+                "LMCache: NSYS_FULL_CAPTURE stop request=%s",
+                self.active_request_id,
+            )
+        except Exception:
+            logger.exception("LMCache: NSYS_FULL_CAPTURE stop failed")
+        finally:
+            self.active = False
+            self.complete = True
+
+    def reset(self) -> None:
+        """Reset process-local capture state during connector shutdown."""
+        self.active = False
+        self.complete = False
+        self.seen_request_id = ""
+        self.seen_requests = 0
+        self.active_request_id = ""
+
+    @staticmethod
+    def enabled() -> bool:
+        """Return whether generic full capture is enabled for prefetch off."""
+        enabled = os.getenv("LMCACHE_NSYS_FULL_CAPTURE", "0").lower() in {
+            "1",
+            "on",
+            "true",
+            "yes",
+        }
+        return enabled and not _indexer_prefetch_enabled()
+
+
+_FULL_NSYS_CAPTURE_CONTROLLER = _FullNsysCaptureController()
+
+
 def _block_ids_at_index(block_id_groups: tuple[list[int], ...], idx: int) -> set[int]:
     """Return every HMA group block ID present at a logical block index."""
     block_ids: set[int] = set()
@@ -204,8 +286,7 @@ def _install_scheduler_hma_invalid_block_patch() -> None:
                         for group_block_ids in req_block_id_groups:
                             if idx < len(group_block_ids):
                                 blocks_to_evict.update(
-                                    int(block_id)
-                                    for block_id in group_block_ids[idx:]
+                                    int(block_id) for block_id in group_block_ids[idx:]
                                 )
 
             if is_affected:
@@ -377,6 +458,8 @@ def close_vllm_prefetch_managers() -> None:
     manager-module global references before releasing resources.
     """
     global _CSA_ATTENTION_KV_PREFETCH_MANAGER, _INDEXER_PREFETCH_MANAGER
+
+    _FULL_NSYS_CAPTURE_CONTROLLER.reset()
 
     csa_manager = _CSA_ATTENTION_KV_PREFETCH_MANAGER
     _CSA_ATTENTION_KV_PREFETCH_MANAGER = None
@@ -572,7 +655,11 @@ def _decoder_csa_attention(decoder_layer: Any) -> Any:
             continue
         compress_ratio = int(getattr(candidate, "compress_ratio", 1))
         kv_cache = getattr(candidate, "kv_cache", None)
-        if compress_ratio == 4 and isinstance(kv_cache, torch.Tensor) and kv_cache.numel() > 0:
+        if (
+            compress_ratio == 4
+            and isinstance(kv_cache, torch.Tensor)
+            and kv_cache.numel() > 0
+        ):
             return candidate
     return None
 
@@ -596,11 +683,15 @@ def _is_deepseek_decoder_layer_candidate(obj: Any) -> bool:
         layer_id = _infer_decoder_layer_idx(obj)
         if not isinstance(layer_id, int) or layer_id < 0:
             return False
-        has_attention = getattr(obj, "self_attn", None) is not None or getattr(
-            obj,
-            "attn",
-            None,
-        ) is not None
+        has_attention = (
+            getattr(obj, "self_attn", None) is not None
+            or getattr(
+                obj,
+                "attn",
+                None,
+            )
+            is not None
+        )
         if not has_attention:
             return False
         if is_deepseek_decoder_type:
@@ -889,6 +980,23 @@ def _install_decoder_forward_position_hook(decoder_layer: Any) -> bool:
         self._lmcache_python_pre_ffn_overlap_fired = False
         self._lmcache_hc_post_call_index = 0
         try:
+            # ``wait_for_layer_load`` is not invoked once per decoder layer
+            # by every vLLM execution path.  HCA has no indexer forward that
+            # can provide an equivalent consumption gate, so wait here at
+            # the one boundary that is guaranteed to precede the layer's
+            # attention.  This also drains staging buffers and closes the
+            # asynchronous I/O NVTX range at its real completion time.
+            hca_manager = _CSA_ATTENTION_KV_PREFETCH_MANAGER
+            layer_id = getattr(self, "layer_idx", -1)
+            if (
+                hca_manager is not None
+                and isinstance(layer_id, int)
+                and layer_id in hca_manager.hca_layer_ids
+                and not hca_manager.wait_for_layer(layer_id)
+            ):
+                raise RuntimeError(
+                    f"HCA KV is unavailable for decoder layer {layer_id}"
+                )
             return original_forward(*args, **kwargs)
         finally:
             full_nsys_manager = _CSA_ATTENTION_KV_PREFETCH_MANAGER
@@ -896,22 +1004,21 @@ def _install_decoder_forward_position_hook(decoder_layer: Any) -> bool:
                 "LMCACHE_NSYS_FULL_CAPTURE_SCOPE",
                 "decoder",
             ).lower()
-            if (
-                full_nsys_scope == "decoder"
-                and getattr(
-                    self,
-                    "_lmcache_nsys_full_capture_last_layer",
-                    False,
-                )
-                and full_nsys_manager is not None
+            if full_nsys_scope == "decoder" and getattr(
+                self,
+                "_lmcache_nsys_full_capture_last_layer",
+                False,
             ):
-                finish_capture = getattr(
-                    full_nsys_manager,
-                    "finish_full_nsys_capture",
-                    None,
-                )
-                if callable(finish_capture):
-                    finish_capture()
+                if full_nsys_manager is not None:
+                    finish_capture = getattr(
+                        full_nsys_manager,
+                        "finish_full_nsys_capture",
+                        None,
+                    )
+                    if callable(finish_capture):
+                        finish_capture()
+                else:
+                    _FULL_NSYS_CAPTURE_CONTROLLER.finish()
             if previous_source is None:
                 try:
                     delattr(self, "_lmcache_forward_position_source")
@@ -949,6 +1056,34 @@ def _install_decoder_forward_position_hook(decoder_layer: Any) -> bool:
     return True
 
 
+def _attach_full_nsys_capture_stop_hook() -> None:
+    """Attach the generic capture stop hook for the prefetch-off path."""
+    if not _FULL_NSYS_CAPTURE_CONTROLLER.enabled():
+        return
+    decoder_layers = _deepseek_decoder_layers()
+    indexed_decoders = [
+        layer
+        for layer in decoder_layers
+        if isinstance(getattr(layer, "layer_idx", None), int)
+    ]
+    if not indexed_decoders:
+        logger.warning(
+            "LMCache: full nsys capture requested, but no decoder layers "
+            "were registered"
+        )
+        return
+    last_decoder = max(
+        indexed_decoders,
+        key=lambda layer: int(layer.layer_idx),
+    )
+    last_decoder._lmcache_nsys_full_capture_last_layer = True
+    if _install_decoder_forward_position_hook(last_decoder):
+        logger.info(
+            "LMCache: full nsys capture stop hook attached to decoder layer %d",
+            int(last_decoder.layer_idx),
+        )
+
+
 def _log_overlap_hook_error_once(
     kind: str,
     layer_id: int,
@@ -982,9 +1117,7 @@ def _fire_decoder_ffn_overlap(
         None,
     )
     next_csa = getattr(decoder_layer, "_lmcache_next_csa_layer_id", -1)
-    csa_prefetch_level = getattr(
-        decoder_layer, "_lmcache_next_csa_prefetch_level", 1
-    )
+    csa_prefetch_level = getattr(decoder_layer, "_lmcache_next_csa_prefetch_level", 1)
     if indexer_manager is not None and isinstance(next_csa, int) and next_csa >= 0:
         try:
             if positions is not None:
@@ -1256,9 +1389,8 @@ def _configure_decoder_hca_overlap(
         getattr(decoder_layer, "_lmcache_fire_pre_ffn_overlap", None)
     )
     if (
-        (not isinstance(next_hca_layer_id, int) or next_hca_layer_id < 0)
-        and not next_hca_layer_ids
-    ):
+        not isinstance(next_hca_layer_id, int) or next_hca_layer_id < 0
+    ) and not next_hca_layer_ids:
         return native_hook
     return _install_decoder_pre_ffn_overlap_hooks(decoder_layer) or native_hook
 
@@ -1467,9 +1599,7 @@ def _attach_indexer_prefetch(tutti_loader: Optional[Any] = None) -> None:
     if _INDEXER_PREFETCH_MANAGER is not None:
         return
     if _indexer_tutti_backend_enabled() and tutti_loader is None:
-        logger.debug(
-            "IndexerSSDManager waiting for the Tutti loader before attach"
-        )
+        logger.debug("IndexerSSDManager waiting for the Tutti loader before attach")
         return
 
     base_store_dir = os.environ.get("LMCACHE_INDEXER_SSD_DIR", "")
@@ -1558,6 +1688,29 @@ def _attach_indexer_prefetch(tutti_loader: Optional[Any] = None) -> None:
         tutti_storage=tutti_storage,
     )
 
+    if tutti_loader is not None:
+        native_indexer_tensors: dict[int, torch.Tensor] = {}
+        for layer_id, indexer_op in csa_info:
+            kv_cache = getattr(
+                getattr(indexer_op, "k_cache", None),
+                "kv_cache",
+                None,
+            )
+            if isinstance(kv_cache, torch.Tensor) and kv_cache.numel() > 0:
+                native_indexer_tensors[int(layer_id)] = kv_cache
+        try:
+            manager.attach_native_indexer_cache_loader(
+                tutti_loader,
+                native_indexer_tensors,
+            )
+        except Exception:
+            # Safety interlock in the cache engine keeps the ordinary padded
+            # LMCache restore enabled when this attachment is incomplete.
+            logger.exception(
+                "IndexerSSDManager: compact native indexer loader attach "
+                "failed; retaining synchronous indexer restore"
+            )
+
     lookahead_policy = _csa_prefetch_lookahead_policy()
     disabled_csa_layers = (
         lookahead_policy.disabled_targets(csa_layer_ids)
@@ -1588,16 +1741,11 @@ def _attach_indexer_prefetch(tutti_loader: Optional[Any] = None) -> None:
         lookahead_policy,
     )
     manager.configure_prefetch_lookahead(
-        {
-            target: lookahead_policy.lookahead_for(target)
-            for target in csa_layer_ids
-        }
+        {target: lookahead_policy.lookahead_for(target) for target in csa_layer_ids}
     )
     for decoder_layer in decoder_layers:
         decoder_layer_id = getattr(decoder_layer, "layer_idx", -1)
-        next_csa, prefetch_level = source_prefetch.get(
-            int(decoder_layer_id), (-1, 2)
-        )
+        next_csa, prefetch_level = source_prefetch.get(int(decoder_layer_id), (-1, 2))
         attach = getattr(decoder_layer, "attach_indexer_prefetch", None)
         if callable(attach):
             # Native adjacent-L1 prediction was removed. The Python FFN hook
@@ -1695,9 +1843,7 @@ def _attach_csa_attention_kv_prefetch(tutti_loader: Optional[Any] = None) -> Non
     if not _csa_attention_kv_prefetch_enabled():
         return
     if tutti_loader is None:
-        logger.debug(
-            "CSA attention KV prefetch waiting for Tutti loader before attach"
-        )
+        logger.debug("CSA attention KV prefetch waiting for Tutti loader before attach")
         return
     if _CSA_ATTENTION_KV_PREFETCH_MANAGER is not None:
         return
@@ -1759,8 +1905,9 @@ def _attach_csa_attention_kv_prefetch(tutti_loader: Optional[Any] = None) -> Non
         logger.warning(
             "CSA attention KV prefetch: expected [num_blocks, block_size, "
             "token_bytes] K cache tensor; got shape %s; skipping attach",
-            None if not isinstance(probe_kv_cache, torch.Tensor) else
-            tuple(probe_kv_cache.shape),
+            None
+            if not isinstance(probe_kv_cache, torch.Tensor)
+            else tuple(probe_kv_cache.shape),
         )
         return
     compressed_block_size = int(probe_kv_cache.shape[1])
@@ -1840,16 +1987,23 @@ def _attach_csa_attention_kv_prefetch(tutti_loader: Optional[Any] = None) -> Non
                 continue
             try:
                 manager.register_hca_layer(int(layer_id), kv_cache)
+                # HCA layers do not expose the Lightning Indexer forward used
+                # as the CSA consumption gate. Install the decoder boundary
+                # explicitly on every registered HCA layer; otherwise its
+                # staged submission is never drained and the I/O NVTX range
+                # remains open until request teardown.
+                if not _install_decoder_forward_position_hook(decoder_layer):
+                    raise RuntimeError(
+                        f"could not install HCA decoder gate for layer {layer_id}"
+                    )
                 hca_registered += 1
             except Exception:
                 logger.exception(
-                    "Failed to register HCA layer %d with the CSA/HCA "
-                    "prefetch walker",
+                    "Failed to register HCA layer %d with the CSA/HCA prefetch walker",
                     layer_id,
                 )
         logger.info(
-            "CSAAttentionKVPrefetchManager: HCA walker registered %d HCA "
-            "layers",
+            "CSAAttentionKVPrefetchManager: HCA walker registered %d HCA layers",
             hca_registered,
         )
 
@@ -1869,8 +2023,7 @@ def _attach_csa_attention_kv_prefetch(tutti_loader: Optional[Any] = None) -> Non
                     native_attach(None, -1, -1)
                 except Exception:
                     logger.debug(
-                        "Could not detach legacy native HCA prefetch for "
-                        "layer %d",
+                        "Could not detach legacy native HCA prefetch for layer %d",
                         layer_id,
                         exc_info=True,
                     )
@@ -2047,9 +2200,7 @@ class RequestTracker:
     # The block ids that has been allocated so far
     # NOTE: allocated blocks could be more than the number of tokens
     allocated_block_ids: list[int]
-    allocated_block_ids_by_group: tuple[list[int], ...] = field(
-        default_factory=tuple
-    )
+    allocated_block_ids_by_group: tuple[list[int], ...] = field(default_factory=tuple)
 
     # The number of tokens that has been saved
     num_saved_tokens: int = 0
@@ -2695,22 +2846,20 @@ class LMCacheConnectorV1Impl:
         )
         _attach_indexer_prefetch(tutti_loader=engine_tutti_loader)
         _attach_csa_attention_kv_prefetch(tutti_loader=engine_tutti_loader)
+        _attach_full_nsys_capture_stop_hook()
         # The Tutti loader is usually still None here (created lazily after the
         # warmup delay), so the attach above no-ops. Register a callback so the
         # CSA attention-KV manager attaches on the main thread once the loader
         # is created. See _maybe_lazy_attach_csa_prefetch / start_load_kv.
-        if (
-            self.lmcache_engine is not None
-            and (
-                (
-                    _CSA_ATTENTION_KV_PREFETCH_MANAGER is None
-                    and _csa_attention_kv_prefetch_enabled()
-                )
-                or (
-                    _INDEXER_PREFETCH_MANAGER is None
-                    and _indexer_prefetch_enabled()
-                    and _indexer_tutti_backend_enabled()
-                )
+        if self.lmcache_engine is not None and (
+            (
+                _CSA_ATTENTION_KV_PREFETCH_MANAGER is None
+                and _csa_attention_kv_prefetch_enabled()
+            )
+            or (
+                _INDEXER_PREFETCH_MANAGER is None
+                and _indexer_prefetch_enabled()
+                and _indexer_tutti_backend_enabled()
             )
         ):
             register_cb = getattr(
@@ -2756,8 +2905,7 @@ class LMCacheConnectorV1Impl:
                 ]
         if group_layer_names:
             logger.info(
-                "LMCache captured vLLM HMA layout: kv_cache_layers=%d, "
-                "groups=%s",
+                "LMCache captured vLLM HMA layout: kv_cache_layers=%d, groups=%s",
                 len(self._kv_cache_layer_names),
                 [
                     {
@@ -2776,12 +2924,8 @@ class LMCacheConnectorV1Impl:
         return {
             "block_ids_by_group": request.block_ids_by_group,
             "kv_cache_layer_names": self._kv_cache_layer_names,
-            "vllm_kv_cache_group_layer_names": (
-                self._vllm_kv_cache_group_layer_names
-            ),
-            "vllm_kv_cache_group_block_sizes": (
-                self._vllm_kv_cache_group_block_sizes
-            ),
+            "vllm_kv_cache_group_layer_names": (self._vllm_kv_cache_group_layer_names),
+            "vllm_kv_cache_group_block_sizes": (self._vllm_kv_cache_group_block_sizes),
         }
 
     @_lmcache_nvtx_annotate
@@ -2797,15 +2941,14 @@ class LMCacheConnectorV1Impl:
             self._start_load_kv_impl(forward_context, **kwargs)
         except Exception:
             import traceback as _tb
+
             logger.error(
                 "start_load_kv unhandled exception (worker traceback):\n%s",
                 _tb.format_exc(),
             )
             raise
 
-    def _start_load_kv_impl(
-        self, forward_context: "ForwardContext", **kwargs
-    ) -> None:
+    def _start_load_kv_impl(self, forward_context: "ForwardContext", **kwargs) -> None:
         self.current_layer = 0
 
         if len(self.kv_caches) == 0:
@@ -2817,14 +2960,10 @@ class LMCacheConnectorV1Impl:
 
         metadata = self._parent._get_connector_metadata()
         if not isinstance(metadata, LMCacheConnectorMetadata):
-            raise ValueError(
-                f"Expected LMCacheConnectorMetadata, got {type(metadata)}"
-            )
+            raise ValueError(f"Expected LMCacheConnectorMetadata, got {type(metadata)}")
 
         if len(self.kv_caches) == 0:
-            raise ValueError(
-                "start_load_kv: kv_caches still empty after init attempt"
-            )
+            raise ValueError("start_load_kv: kv_caches still empty after init attempt")
         kvcaches = list(self.kv_caches.values())
 
         attn_metadata = forward_context.attn_metadata
@@ -2859,6 +2998,12 @@ class LMCacheConnectorV1Impl:
                     if load_spec is not None and load_spec.can_load:
                         start_capture(str(request.req_id))
                         break
+        else:
+            for request in metadata.requests:
+                load_spec = request.load_spec
+                if load_spec is not None and load_spec.can_load:
+                    _FULL_NSYS_CAPTURE_CONTROLLER.start_for_request(str(request.req_id))
+                    break
 
         self.layerwise_retrievers = []
 
@@ -3056,9 +3201,7 @@ class LMCacheConnectorV1Impl:
         manager = _CSA_ATTENTION_KV_PREFETCH_MANAGER
         if manager is not None and _env_flag("LMCACHE_DSV4_HCA_WALKER"):
             layer_id = _layer_idx_from_prefix(layer_name)
-            if layer_id >= 0 and layer_id in getattr(
-                manager, "hca_layer_ids", ()
-            ):
+            if layer_id >= 0 and layer_id in getattr(manager, "hca_layer_ids", ()):
                 try:
                     if not manager.wait_for_layer(layer_id):
                         raise RuntimeError(
@@ -3073,6 +3216,24 @@ class LMCacheConnectorV1Impl:
                     raise RuntimeError(
                         f"HCA KV is unavailable for {layer_name}"
                     ) from exc
+
+        # The compact native-indexer stream restores the true-scoring cache,
+        # not a proxy pool. Gate each CSA layer immediately before vLLM can
+        # invoke that layer's indexer. Stage0 layers normally pass without a
+        # wait; only a late background layer contributes bubble time here.
+        indexer_manager = _INDEXER_PREFETCH_MANAGER
+        if indexer_manager is not None:
+            layer_id = _layer_idx_from_prefix(layer_name)
+            if layer_id >= 0:
+                wait_native = getattr(
+                    indexer_manager,
+                    "wait_for_native_indexer_layer",
+                    None,
+                )
+                if callable(wait_native) and not wait_native(layer_id):
+                    raise RuntimeError(
+                        f"native indexer cache is unavailable for {layer_name}"
+                    )
 
         if self.layerwise_retrievers:
             logger.debug(f"Waiting for layer {self.current_layer} to be loaded")
@@ -3437,10 +3598,9 @@ class LMCacheConnectorV1Impl:
             == "connector"
         ):
             manager = _CSA_ATTENTION_KV_PREFETCH_MANAGER
-            finish_capture = getattr(manager, "finish_full_nsys_capture", None)
-            if callable(finish_capture) and bool(
-                getattr(manager, "full_nsys_capture_active", False)
-            ):
+            manager_active = bool(getattr(manager, "full_nsys_capture_active", False))
+            generic_active = manager is None and _FULL_NSYS_CAPTURE_CONTROLLER.active
+            if manager_active or generic_active:
                 if (
                     torch.distributed.is_available()
                     and torch.distributed.is_initialized()
@@ -3448,7 +3608,16 @@ class LMCacheConnectorV1Impl:
                     torch.distributed.barrier(
                         device_ids=[torch.cuda.current_device()],
                     )
-                finish_capture()
+                if manager is not None:
+                    finish_capture = getattr(
+                        manager,
+                        "finish_full_nsys_capture",
+                        None,
+                    )
+                    if callable(finish_capture):
+                        finish_capture()
+                else:
+                    _FULL_NSYS_CAPTURE_CONTROLLER.finish()
         return None, None
 
     def get_block_ids_with_load_errors(self) -> set[int]:

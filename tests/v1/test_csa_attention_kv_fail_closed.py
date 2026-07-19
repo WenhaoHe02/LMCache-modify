@@ -101,6 +101,54 @@ def test_late_prediction_falls_back_to_true_topk_without_blocking() -> None:
     assert indexer.forward().tolist() == [1, 2]
 
 
+def test_true_indexer_waits_for_native_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The official indexer must not read a still-streaming native cache."""
+    calls: list[str] = []
+
+    class _NativeManager:
+        def wait_for_native_indexer_layer(self, layer_id: int) -> bool:
+            assert layer_id == 2
+            calls.append("native_gate")
+            return True
+
+        def record_csa_prediction_accuracy(
+            self,
+            layer_id: int,
+            true_topk: torch.Tensor,
+        ) -> None:
+            del layer_id, true_topk
+
+        def finish_nsys_capture_for_layer(self, layer_id: int) -> None:
+            del layer_id
+
+    monkeypatch.setattr(
+        "lmcache.v1.indexer_ssd_manager.get_indexer_ssd_manager",
+        lambda: _NativeManager(),
+    )
+    manager = object.__new__(CSAAttentionKVPrefetchManager)
+    manager._patch_lock = threading.Lock()
+    manager._patched_modules = []
+    manager._active_request_id = "request-a"
+    manager._prediction_waiter = None
+    manager._miss_ids_for_topk = MethodType(
+        lambda _self, _layer_id, _topk: torch.empty(0, dtype=torch.int64),
+        manager,
+    )
+    manager.drain_for_layer = MethodType(lambda _self, _layer_id: None, manager)
+
+    def _true_indexer() -> torch.Tensor:
+        calls.append("true_indexer")
+        return torch.tensor([1, 2])
+
+    indexer = SimpleNamespace(forward=_true_indexer)
+    manager.patch_indexer_forward(indexer, 2)
+
+    assert indexer.forward().tolist() == [1, 2]
+    assert calls == ["native_gate", "true_indexer"]
+
+
 def test_demand_only_layer_reads_true_indexer_misses() -> None:
     """A layer without prediction must demand-read only its true miss set."""
     manager = object.__new__(CSAAttentionKVPrefetchManager)

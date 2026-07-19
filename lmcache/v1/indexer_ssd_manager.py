@@ -975,6 +975,21 @@ class IndexerSSDManager:
         self._proxy_io_executor = ThreadPoolExecutor(
             max_workers=max(2, min(int(io_workers), 4))
         )
+        # Direct LMCache seed persistence is latency-insensitive and may wait
+        # for Tutti's idle-write window. Keep it off the general I/O executor:
+        # HCA submissions and HBM-pool readiness must never queue behind the
+        # 50 ms write-slack waits.
+        self._persistence_executor = ThreadPoolExecutor(max_workers=1)
+        # Native indexer-cache restore is deliberately ordered by transformer
+        # layer. A single worker prevents later layers from consuming NVMe
+        # queue depth before the first two Stage0 layers are ready.
+        self._native_indexer_stream_executor = ThreadPoolExecutor(max_workers=1)
+        self._native_indexer_cache_manager: Optional[Any] = None
+        self._native_indexer_stream_request_id = ""
+        self._native_indexer_stream_active = False
+        self._native_indexer_stage0_layers = 2
+        self._native_indexer_window_layers = 2
+        self._native_indexer_scheduled_layers: Set[int] = set()
         self._closed = False
         self._lock = threading.Lock()
         # pending async read results: layer_id → list of (token_id, Future[bytes])
@@ -1352,21 +1367,48 @@ class IndexerSSDManager:
                     pool.reset()
                     load_ids = list(range(tail_start, total_rows))
                     tail_bytes = torch.cat(chunks, dim=0)[: len(load_ids)]
-                    # Persist the assembled tail once per layer. The old path
-                    # wrote every retrieve chunk independently, turning an 8K
-                    # hit into 32 chunks x 30 layers = 960 tiny Tutti writes.
-                    # The tail buffer already owns every chunk, so one
-                    # contiguous write preserves the exact bytes and reduces
-                    # the write count to 30.
-                    t_write0 = time.perf_counter() if timing else 0.0
-                    self._stores[layer_id].write_tokens_contiguous(
-                        tail_start,
-                        tail_bytes.contiguous().numpy().tobytes(),
-                    )
-                    if timing:
-                        write_ms += (time.perf_counter() - t_write0) * 1000.0
+                    # Publish HBM readiness before persistence. Tutti writes
+                    # intentionally wait for a request-idle window; making the
+                    # true indexer join that write produced one 1.67 s stall
+                    # followed by a 50 ms bubble per layer. The complete tail
+                    # is resident and protected in HBM, so persistence can run
+                    # independently without delaying this request's consumer.
                     pool.load_tokens(load_ids, tail_bytes.contiguous())
                     pool.protect_only(load_ids)
+                    t_write0 = time.perf_counter() if timing else 0.0
+                    payload = tail_bytes.contiguous().numpy().tobytes()
+                    if self._tutti_storage is not None:
+                        store = self._stores[layer_id]
+
+                        def _persist_tail(
+                            target_store: Any = store,
+                            target_layer: int = layer_id,
+                            target_start: int = tail_start,
+                            target_payload: bytes = payload,
+                        ) -> None:
+                            try:
+                                target_store.write_tokens_contiguous(
+                                    target_start,
+                                    target_payload,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "IndexerSSDManager: deferred LMCache tail "
+                                    "persistence failed for layer %d rows=[%d,%d)",
+                                    target_layer,
+                                    target_start,
+                                    target_start
+                                    + len(target_payload) // self._token_bytes,
+                                )
+
+                        self._persistence_executor.submit(_persist_tail)
+                    else:
+                        self._stores[layer_id].write_tokens_contiguous(
+                            tail_start,
+                            payload,
+                        )
+                    if timing:
+                        write_ms += (time.perf_counter() - t_write0) * 1000.0
             if timing:
                 load_ms += (time.perf_counter() - t_load0) * 1000.0
 
@@ -1612,6 +1654,21 @@ class IndexerSSDManager:
             # Decode continues through the official indexer path.
             self._log_residual_proxy_skip(layer_id, "canonical_l2_requires_prefill")
             return
+        # L2 proxy scoring reads the target layer's native indexer K cache two
+        # transformer layers before true scoring. The compact stream therefore
+        # needs its correctness gate here, not only at target consumption.
+        # With the two-layer rolling window this is normally event-only; any
+        # exposed wait is an explicit, measurable prefetch bubble.
+        native_wait_start = time.perf_counter()
+        if not self.wait_for_native_indexer_layer(int(layer_id)):
+            self._log_residual_proxy_skip(layer_id, "native_indexer_stream_late")
+            return
+        native_wait_ms = (time.perf_counter() - native_wait_start) * 1000.0
+        self._log_timing(
+            "native_indexer_proxy_gate",
+            int(layer_id),
+            wait_ms=f"{native_wait_ms:.3f}",
+        )
         if self._decode_cursor.get(layer_id, 0) <= 0:
             self._log_residual_proxy_skip(layer_id, "ssd_uninitialized")
             return
@@ -1679,6 +1736,203 @@ class IndexerSSDManager:
             set_waiter = getattr(manager, "set_prediction_waiter", None)
             if callable(set_waiter):
                 set_waiter(self.wait_for_csa_attention_kv_prediction)
+
+    def attach_native_indexer_cache_loader(
+        self,
+        tutti_loader: Any,
+        layer_tensors: Dict[int, torch.Tensor],
+    ) -> None:
+        """Attach the compact layer-major loader for native indexer caches.
+
+        The native vLLM indexer cache remains the true-scoring source. This
+        loader only changes how its cached prefix is restored: compact
+        per-layer sidecars are streamed directly into the existing tensors
+        instead of retrieving the padded LMCache group as one large object.
+
+        Args:
+            tutti_loader: Active Tutti direct-NVMe loader for this rank.
+            layer_tensors: Native indexer K-cache tensors keyed by transformer
+                layer id. Every configured CSA layer must be present.
+
+        Raises:
+            ValueError: If a configured layer or tensor is missing.
+        """
+        if self._native_indexer_cache_manager is not None:
+            return
+        missing = sorted(set(self._csa_layer_ids) - set(layer_tensors))
+        if missing:
+            raise ValueError(f"native indexer cache tensors missing layers {missing}")
+        from lmcache.v1.csa_attention_kv_prefetch_manager import (
+            CSAAttentionKVPrefetchManager,
+        )
+
+        loader = CSAAttentionKVPrefetchManager(
+            tutti_loader=tutti_loader,
+            csa_layer_ids=self._csa_layer_ids,
+            compressed_block_size=DEEPGEMM_PAGED_BLOCK_SIZE,
+            token_bytes=self._token_bytes,
+        )
+        for layer_id in self._csa_layer_ids:
+            loader.register_layer(int(layer_id), layer_tensors[int(layer_id)])
+        self._native_indexer_cache_manager = loader
+        logger.info(
+            "IndexerSSDManager: compact native indexer loader attached "
+            "layers=%d token_bytes=%d stage0_layers=%d",
+            len(self._csa_layer_ids),
+            self._token_bytes,
+            self._native_indexer_stage0_layers,
+        )
+
+    def register_native_indexer_stream(
+        self,
+        req_id: str,
+        chunks_by_layer: Dict[int, List[Any]],
+    ) -> bool:
+        """Register and start an ordered compact native-indexer restore.
+
+        The first two layers form Stage0 and are completed synchronously.
+        Remaining layers continue on one ordered worker and are gated at the
+        connector immediately before their transformer layer consumes them.
+
+        Args:
+            req_id: Active request identifier.
+            chunks_by_layer: Complete compact layer-major read plan.
+
+        Returns:
+            ``True`` only when every configured CSA layer has a non-empty,
+            safely registered plan and Stage0 completed.
+        """
+        loader = self._native_indexer_cache_manager
+        if loader is None:
+            return False
+        request_id = str(req_id)
+        if (
+            self._native_indexer_stream_active
+            and request_id == self._native_indexer_stream_request_id
+        ):
+            return True
+        missing = [
+            layer_id
+            for layer_id in self._csa_layer_ids
+            if not chunks_by_layer.get(int(layer_id))
+        ]
+        if missing:
+            logger.warning(
+                "IndexerSSDManager: compact native indexer plan incomplete "
+                "request=%s missing_layers=%s; retaining synchronous restore",
+                request_id,
+                missing,
+            )
+            self._native_indexer_stream_active = False
+            with self._lock:
+                for layer_id in self._csa_layer_ids:
+                    self._decode_cursor[int(layer_id)] = 0
+            return False
+        loader.register_request_chunks(
+            request_id,
+            chunks_by_layer,
+            start_profile_capture=False,
+        )
+        self._native_indexer_stream_request_id = request_id
+        self._native_indexer_stream_active = True
+        self._native_indexer_scheduled_layers.clear()
+        covered_rows: Optional[int] = None
+        for layer_id in self._csa_layer_ids:
+            layer_chunks = chunks_by_layer[int(layer_id)]
+            layer_rows = (
+                int(layer_chunks[-1].end_compressed_block) * DEEPGEMM_PAGED_BLOCK_SIZE
+            )
+            if covered_rows is None:
+                covered_rows = layer_rows
+            elif covered_rows != layer_rows:
+                self._native_indexer_stream_active = False
+                with self._lock:
+                    for reset_layer_id in self._csa_layer_ids:
+                        self._decode_cursor[int(reset_layer_id)] = 0
+                raise RuntimeError(
+                    "compact native indexer layers have inconsistent coverage"
+                )
+        assert covered_rows is not None and covered_rows > 0
+        with self._lock:
+            for layer_id in self._csa_layer_ids:
+                self._decode_cursor[int(layer_id)] = covered_rows
+        stage0 = self._csa_layer_ids[: self._native_indexer_stage0_layers]
+        self._schedule_native_indexer_through(len(stage0) - 1)
+        for layer_id in stage0:
+            if not loader.wait_for_layer(int(layer_id), timeout_s=30.0):
+                self._native_indexer_stream_active = False
+                with self._lock:
+                    for reset_layer_id in self._csa_layer_ids:
+                        self._decode_cursor[int(reset_layer_id)] = 0
+                raise RuntimeError(
+                    f"compact native indexer Stage0 failed for layer {layer_id}"
+                )
+        # Keep only a bounded number of post-Stage0 layers queued. Each CSA
+        # consumption gate advances this window by one, leaving Tutti queue
+        # opportunities for the nearer HCA and predicted CSA-KV reads.
+        self._schedule_native_indexer_through(
+            len(stage0) + self._native_indexer_window_layers - 1
+        )
+        logger.info(
+            "IndexerSSDManager: compact native indexer stream started "
+            "request=%s layers=%d stage0=%s window=%d",
+            request_id,
+            len(self._csa_layer_ids),
+            list(stage0),
+            self._native_indexer_window_layers,
+        )
+        return True
+
+    def native_indexer_stream_active(self) -> bool:
+        """Return whether the active request may skip full indexer restore."""
+        return bool(self._native_indexer_stream_active)
+
+    def wait_for_native_indexer_layer(self, layer_id: int) -> bool:
+        """Wait until one streamed native indexer layer is safe to consume.
+
+        Args:
+            layer_id: Transformer layer about to run its true indexer.
+
+        Returns:
+            ``True`` when no compact stream is active or the layer landed;
+            ``False`` if its I/O did not complete within the safety timeout.
+        """
+        if not self._native_indexer_stream_active:
+            return True
+        loader = self._native_indexer_cache_manager
+        if loader is None or int(layer_id) not in self._csa_pos:
+            return True
+        position = self._csa_pos[int(layer_id)]
+        # A missing tracked future means "not scheduled", not "already
+        # complete".  Explicitly queue through the demanded layer before
+        # consulting the loader.  This prevents a late proxy gate (for
+        # example layer 26) from skipping its own restore and then flooding
+        # every intervening layer into the single I/O worker at once.
+        self._schedule_native_indexer_through(position)
+        completed = bool(loader.wait_for_layer(int(layer_id), timeout_s=30.0))
+        if completed:
+            self._schedule_native_indexer_through(
+                position + self._native_indexer_window_layers
+            )
+        return completed
+
+    def _schedule_native_indexer_through(self, position: int) -> None:
+        """Queue unscheduled compact indexer layers through one position."""
+        loader = self._native_indexer_cache_manager
+        if loader is None or not self._native_indexer_stream_active:
+            return
+        stop = min(len(self._csa_layer_ids), max(0, int(position) + 1))
+        for layer_id in self._csa_layer_ids[:stop]:
+            target = int(layer_id)
+            if target in self._native_indexer_scheduled_layers:
+                continue
+            future = self._native_indexer_stream_executor.submit(
+                loader.fire_deterministic_layer,
+                target,
+                label="indexer_native_stream",
+            )
+            self._native_indexer_scheduled_layers.add(target)
+            loader.track_layer_submission(target, future)
 
     def fire_residual_prefetch_for_layer(
         self,
@@ -3596,6 +3850,11 @@ class IndexerSSDManager:
         self._proxy_executor.shutdown(wait=True)
         self._proxy_io_executor.shutdown(wait=True)
         self._executor.shutdown(wait=True)
+        self._persistence_executor.shutdown(wait=True)
+        self._native_indexer_stream_executor.shutdown(wait=True)
+        native_loader = self._native_indexer_cache_manager
+        if native_loader is not None:
+            native_loader.close()
         for store in self._stores.values():
             store.close()
 
