@@ -3035,13 +3035,15 @@ class LMCacheConnectorV1Impl:
                 continue
 
             tokens = request.token_ids
-            # Keep the scheduler-owned CPU mapping available for the DSv4
-            # streaming-only fast path.  Its layer-major plan builders run on
-            # the CPU, so uploading all prefix slots here only to synchronously
-            # copy them back in ``prepare_dsv4_streaming_retrieve`` adds a
-            # request-front H2D/D2H round trip.  Generic retrieval and the
-            # layerwise path still receive the device tensor they require.
-            slot_mapping = request.slot_mapping
+            streaming_retrieve = _env_flag("LMCACHE_INDEXER_ENABLE_PREFETCH")
+            # Preserve the V1 OFF call path exactly: upload slot IDs before
+            # entering the generic retrieve and never probe the streaming
+            # planner.  ON keeps the CPU mapping for its layer-major plan.
+            slot_mapping = (
+                request.slot_mapping
+                if streaming_retrieve
+                else request.slot_mapping.to(self.device)
+            )
             assert len(tokens) == len(slot_mapping)
 
             token_mask = torch.ones(len(tokens), dtype=torch.bool)
@@ -3087,8 +3089,9 @@ class LMCacheConnectorV1Impl:
                     next(layerwise_retriever)
                     self.layerwise_retrievers.append((layerwise_retriever, request))
             else:
-                ret_token_mask = (
-                    self.lmcache_engine.prepare_dsv4_streaming_retrieve(
+                ret_token_mask = None
+                if streaming_retrieve:
+                    ret_token_mask = self.lmcache_engine.prepare_dsv4_streaming_retrieve(
                         tokens[:lmcache_cached_tokens],
                         token_mask[:lmcache_cached_tokens],
                         kvcaches=kvcaches,
@@ -3100,13 +3103,13 @@ class LMCacheConnectorV1Impl:
                         terminal_chunk_hash=request.load_spec.terminal_chunk_hash,
                         **hma_kwargs,
                     )
-                )
                 if ret_token_mask is None:
                     # The generic connector writes through CUDA and therefore
                     # requires device-resident slot IDs.  Delay this upload
                     # until the CPU-only streaming plan has actually declined
                     # the request.
-                    slot_mapping = slot_mapping.to(self.device)
+                    if streaming_retrieve:
+                        slot_mapping = slot_mapping.to(self.device)
                     ret_token_mask = self.lmcache_engine.retrieve(
                         tokens[:lmcache_cached_tokens],
                         token_mask[:lmcache_cached_tokens],

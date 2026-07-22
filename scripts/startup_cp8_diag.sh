@@ -263,7 +263,20 @@ else
   unset LMCACHE_CSA_PREFETCH_BLOCK_BUDGET
   CP_CONFIG="cp_size=off cp_interleave=off cp_oversubscribe=off"
 fi
-export LMCACHE_DSV4_HCA_WALKER=${LMCACHE_DSV4_HCA_WALKER:-0}
+if [ "$CSA_ON" = "1" ]; then
+  export LMCACHE_DSV4_HCA_WALKER=${LMCACHE_DSV4_HCA_WALKER:-1}
+  RETRIEVE_PATH="dsv4_streaming"
+else
+  # OFF is the V1 control path: one generic full-object retrieve at request
+  # start, with no HCA/CSA/indexer layer-major consumer active.
+  export LMCACHE_DSV4_HCA_WALKER=0
+  export LMCACHE_INDEXER_ENABLE_PREFETCH=0
+  export LMCACHE_INDEXER_FULL_OVERLAP=0
+  export LMCACHE_INDEXER_ENABLE_RESIDUAL_PROXY=0
+  export LMCACHE_INDEXER_ENABLE_REUSE_PREFETCH=0
+  export LMCACHE_INDEXER_PROFILE_ACCURACY=0
+  RETRIEVE_PATH="v1_generic_full"
+fi
 export LMCACHE_INDEXER_REUSE_RESIDUAL_TOPK=0
 export LMCACHE_INDEXER_EXPERIMENTAL_RESIDUAL_LOOKAHEAD=0
 export LMCACHE_CSA_PIPELINE_NVTX=${LMCACHE_CSA_PIPELINE_NVTX:-0}
@@ -293,7 +306,7 @@ export PYTHONHASHSEED=${PYTHONHASHSEED:-0}
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 printf '%s\n' \
-  "EXPERIMENT_CONFIG csa_filter=${CSA_FILTER} indexer_prefetch=${INDEXER_ON} ${CP_CONFIG} hca_walker=${LMCACHE_DSV4_HCA_WALKER} accuracy=${LMCACHE_INDEXER_PROFILE_ACCURACY} indexer_timing=${LMCACHE_INDEXER_TIMING} csa_timing=${LMCACHE_CSA_ATTENTION_KV_TIMING} ttft_profile=${LMCACHE_TTFT_STAGE_PROFILE} nvtx=${LMCACHE_CSA_PIPELINE_NVTX}" >&2
+  "EXPERIMENT_CONFIG csa_filter=${CSA_FILTER} indexer_prefetch=${LMCACHE_INDEXER_ENABLE_PREFETCH} retrieve_path=${RETRIEVE_PATH} ${CP_CONFIG} hca_walker=${LMCACHE_DSV4_HCA_WALKER} accuracy=${LMCACHE_INDEXER_PROFILE_ACCURACY} indexer_timing=${LMCACHE_INDEXER_TIMING} csa_timing=${LMCACHE_CSA_ATTENTION_KV_TIMING} ttft_profile=${LMCACHE_TTFT_STAGE_PROFILE} nvtx=${LMCACHE_CSA_PIPELINE_NVTX}" >&2
 
 IFS=',' read -ra _CSA_DIRS <<< "$LMCACHE_INDEXER_SSD_DIR"
 for d in "${_CSA_DIRS[@]}"; do
