@@ -16,6 +16,7 @@ import random
 import tempfile
 import time
 import uuid
+from types import SimpleNamespace
 
 # Third Party
 import pytest
@@ -112,6 +113,31 @@ class TestLMCacheLookupClientServer:
             transport,
         )
 
+    def test_terminal_hash_is_cached_without_rpc_server(
+        self,
+        lmcache_engine_metadata,
+    ) -> None:
+        """The synchronous lookup retains and clears its final hit hash."""
+        config = create_test_config(instance_id="terminal_hash_test")
+        transport = SimpleNamespace(
+            world_size=1,
+            send_and_recv_all=lambda _message: [(512).to_bytes(8, "big")],
+        )
+        client = LMCacheLookupClient(
+            config,
+            lmcache_engine_metadata,
+            transport,
+        )
+        tokens = generate_tokens(512, "cpu", fixed=True).tolist()
+        expected_hash = list(
+            client.token_database.process_tokens(tokens, make_key=False)
+        )[-1][2]
+
+        assert client.lookup(tokens, "request") == 512
+        assert client.lookup_terminal_hash("request") == expected_hash
+        client.clear_lookup_status("request")
+        assert client.lookup_terminal_hash("request") is None
+
     def test_basic_lookup_communication(self, lmcache_engine):
         """Test basic lookup communication between client and server."""
         device = "cpu"
@@ -144,10 +170,18 @@ class TestLMCacheLookupClientServer:
                 # Verify lookup status is cached
                 cached_result = client.lookup_cache(lookup_id)
                 assert cached_result == num_tokens
+                expected_terminal_hash = list(
+                    client.token_database.process_tokens(
+                        tokens.tolist(),
+                        make_key=False,
+                    )
+                )[-1][2]
+                assert client.lookup_terminal_hash(lookup_id) == expected_terminal_hash
 
                 # Test clear lookup status
                 client.clear_lookup_status(lookup_id)
                 assert client.lookup_cache(lookup_id) == -1
+                assert client.lookup_terminal_hash(lookup_id) is None
 
                 # Test supports_producer_reuse
                 assert client.supports_producer_reuse() is True

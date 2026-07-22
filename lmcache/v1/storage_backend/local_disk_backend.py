@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
 import asyncio
+import hashlib
 import logging
 import os
 import threading
@@ -70,10 +72,58 @@ class _TuttiProfileLogFilter(logging.Filter):
 logger.addFilter(_TuttiProfileLogFilter())
 
 _DSV4_HCA_DEFERRED_RETRIEVE_ROLE = "hca_deferred_retrieve"
+_DSV4_CSA_DEFERRED_RETRIEVE_ROLE = "csa_deferred_retrieve"
+_DSV4_CSA_HCA_DEFERRED_RETRIEVE_ROLE = "csa_hca_deferred_retrieve"
 _DSV4_HCA_SLAB_ROLE = "hca_attention_kv_slab"
 _DSV4_HCA_LAYER_MAJOR_ROLE = "hca_attention_kv_layer_major"
 _DSV4_CSA_LAYER_MAJOR_ROLE = "csa_attention_kv_layer_major"
 _DSV4_INDEXER_LAYER_MAJOR_ROLE = "csa_indexer_cache_layer_major"
+_DSV4_CSA_STREAMING_LAYOUT_VERSION = 1
+
+
+@dataclass(frozen=True, slots=True)
+class _CSAStreamingObject:
+    """One immutable object referenced by a CSA layout generation."""
+
+    logical_role: str
+    layer_id: int
+    object_id: KVObjectId
+    length: int
+
+
+@dataclass(frozen=True, slots=True)
+class _CSAStreamingLayout:
+    """Atomically published set of objects for one cached chunk key."""
+
+    generation: str
+    layout_version: int
+    required_entries: frozenset[tuple[str, int]]
+    objects: tuple[_CSAStreamingObject, ...]
+
+    def find_object(
+        self,
+        logical_role: str,
+        layer_id: int,
+    ) -> Optional[_CSAStreamingObject]:
+        """Return one logical layout entry when present."""
+        for entry in self.objects:
+            if entry.logical_role == logical_role and entry.layer_id == layer_id:
+                return entry
+        return None
+
+    def find(self, logical_role: str, layer_id: int) -> Optional[KVObjectId]:
+        """Return the physical object id for one logical layout entry."""
+        entry = self.find_object(logical_role, layer_id)
+        return entry.object_id if entry is not None else None
+
+
+@dataclass(slots=True)
+class _CSAStreamingLayoutBuild:
+    """Invisible generation assembled before the active-layout swap."""
+
+    generation: str
+    required_entries: frozenset[tuple[str, int]]
+    objects: dict[tuple[str, int], _CSAStreamingObject]
 
 KVObjectRawWriter = Callable[
     [KVObjectRecord, memoryview],
@@ -259,6 +309,12 @@ class LocalDiskBackend(StorageBackendInterface):
         self.kv_object_metadata_store: Optional[KVObjectMetadataStore] = None
         self.kv_object_pool_io: Optional[KVObjectPoolIO] = None
         self.kv_object_store_lock = threading.Lock()
+        self._csa_layout_lock = threading.RLock()
+        self._csa_active_layouts: dict[str, _CSAStreamingLayout] = {}
+        self._csa_pending_layouts: dict[str, _CSAStreamingLayoutBuild] = {}
+        self._csa_required_entries_by_mode: dict[
+            tuple[bool, bool], frozenset[tuple[str, int]]
+        ] = {}
         # Separate 1-worker executor for fire-and-forget HCA NVMe writes.
         # HCA slab/deferred writes are large and slow; submitting them here
         # keeps them off the main disk_worker pool so they cannot saturate
@@ -458,6 +514,169 @@ class LocalDiskBackend(StorageBackendInterface):
             block_id=key.chunk_hash_hex,
         )
 
+    @staticmethod
+    def _generation_object_role(logical_role: str, generation: str) -> str:
+        """Return an immutable physical role for one layout generation."""
+        return f"{logical_role}@g{generation}"
+
+    @staticmethod
+    def _streaming_logical_roles() -> frozenset[str]:
+        """Return roles whose physical ids are resolved through a manifest."""
+        return frozenset(
+            {
+                _DSV4_CSA_DEFERRED_RETRIEVE_ROLE,
+                _DSV4_CSA_HCA_DEFERRED_RETRIEVE_ROLE,
+                _DSV4_CSA_LAYER_MAJOR_ROLE,
+                _DSV4_HCA_LAYER_MAJOR_ROLE,
+                _DSV4_INDEXER_LAYER_MAJOR_ROLE,
+            }
+        )
+
+    def _active_csa_layout(self, key: CacheEngineKey) -> Optional[_CSAStreamingLayout]:
+        """Return the atomically published layout for a cache key."""
+        with self._csa_layout_lock:
+            return self._csa_active_layouts.get(key.to_string())
+
+    def _resolve_streaming_object_id(
+        self,
+        key: CacheEngineKey,
+        logical_role: str,
+        layer_id: int,
+    ) -> Optional[KVObjectId]:
+        """Resolve one logical role through the key's active generation."""
+        layout = self._active_csa_layout(key)
+        if layout is None or not self._csa_layout_matches_runtime(layout):
+            return None
+        return layout.find(logical_role, int(layer_id))
+
+    def _required_csa_streaming_entries(self) -> set[tuple[str, int]]:
+        """Return every logical object required by the active ON layout."""
+        required: set[tuple[str, int]] = {
+            (self._csa_streaming_compact_role(), 0)
+        }
+        if self.metadata is None:
+            return required
+        klg_manager = self.metadata.kv_layer_groups_manager
+        if klg_manager is None:
+            return required
+        role_map = {
+            "csa_attention_kv": _DSV4_CSA_LAYER_MAJOR_ROLE,
+            "csa_indexer_cache": _DSV4_INDEXER_LAYER_MAJOR_ROLE,
+        }
+        if _env_flag("LMCACHE_DSV4_HCA_WALKER"):
+            role_map["hca_attention_kv"] = _DSV4_HCA_LAYER_MAJOR_ROLE
+        for group in klg_manager.kv_layer_groups:
+            logical_role = role_map.get(self._kv_group_role(group, group.dtype))
+            if logical_role is None:
+                continue
+            required.update(
+                (logical_role, int(layer_id)) for layer_id in group.layer_indices
+            )
+        return required
+
+    def _csa_streaming_generation(
+        self,
+        keys: Sequence[CacheEngineKey],
+    ) -> str:
+        """Return a deterministic id for one immutable admission generation.
+
+        Deterministic ids let a retry reuse physical objects written by an
+        interrupted admission instead of leaking a fresh set of pool
+        allocations.  The layout version and compact-main role are part of the
+        digest so incompatible ON layouts never share physical object ids.
+
+        Args:
+            keys: Content-addressed chunk keys in admission order.
+
+        Returns:
+            A compact hexadecimal generation identifier.
+        """
+        digest = hashlib.sha256()
+        digest.update(str(_DSV4_CSA_STREAMING_LAYOUT_VERSION).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(self._csa_streaming_compact_role().encode("ascii"))
+        for key in keys:
+            digest.update(b"\0")
+            digest.update(key.to_string().encode("utf-8"))
+        return digest.hexdigest()[:20]
+
+    def _csa_layout_matches_runtime(self, layout: _CSAStreamingLayout) -> bool:
+        """Return whether a manifest matches the currently requested ON mode."""
+        mode = (
+            _env_flag("LMCACHE_INDEXER_ENABLE_PREFETCH"),
+            _env_flag("LMCACHE_DSV4_HCA_WALKER"),
+        )
+        required_entries = self._csa_required_entries_by_mode.get(mode)
+        if required_entries is None:
+            required_entries = frozenset(self._required_csa_streaming_entries())
+            self._csa_required_entries_by_mode[mode] = required_entries
+        return layout.required_entries == required_entries
+
+    def _csa_layout_records_readable(self, layout: _CSAStreamingLayout) -> bool:
+        """Validate all manifest entries and their physical record metadata."""
+        if self.kv_object_metadata_store is None:
+            return False
+        present = {(entry.logical_role, entry.layer_id) for entry in layout.objects}
+        if layout.layout_version != _DSV4_CSA_STREAMING_LAYOUT_VERSION:
+            return False
+        if not layout.required_entries.issubset(present):
+            return False
+        for entry in layout.objects:
+            if entry.length == 0:
+                if entry.logical_role not in {
+                    _DSV4_CSA_DEFERRED_RETRIEVE_ROLE,
+                    _DSV4_CSA_HCA_DEFERRED_RETRIEVE_ROLE,
+                }:
+                    return False
+                continue
+            record = self.kv_object_metadata_store.get(entry.object_id)
+            if (
+                not self._ready_tutti_raw_record(record)
+                or record is None
+                or record.length != entry.length
+            ):
+                return False
+        return True
+
+    def _active_csa_layout_ready(self, key: CacheEngineKey) -> bool:
+        """Return whether one key has a published compatible generation.
+
+        Publication validates every required physical record before installing
+        the immutable layout in ``_csa_active_layouts``. Repeating that full
+        validation for every chunk on every lookup makes long-prefix lookup
+        proportional to ``chunks * streamed_objects``. Active layouts are
+        invalidated when their owning cache key or object pool is removed, so a
+        compatible published layout is the constant-time READY signal here.
+        """
+        layout = self._active_csa_layout(key)
+        return bool(
+            layout is not None
+            and self._csa_layout_matches_runtime(layout)
+        )
+
+    def _publish_csa_layout(
+        self,
+        key: CacheEngineKey,
+        build: _CSAStreamingLayoutBuild,
+    ) -> bool:
+        """Validate a generation and atomically make it active for lookup."""
+        layout = _CSAStreamingLayout(
+            generation=build.generation,
+            layout_version=_DSV4_CSA_STREAMING_LAYOUT_VERSION,
+            required_entries=build.required_entries,
+            objects=tuple(
+                build.objects[entry_key] for entry_key in sorted(build.objects)
+            ),
+        )
+        if not self._csa_layout_matches_runtime(
+            layout
+        ) or not self._csa_layout_records_readable(layout):
+            return False
+        with self._csa_layout_lock:
+            self._csa_active_layouts[key.to_string()] = layout
+            self._csa_pending_layouts.pop(key.to_string(), None)
+        return True
+
     def get_kv_object_records(
         self,
         keys: Sequence[CacheEngineKey],
@@ -483,15 +702,94 @@ class LocalDiskBackend(StorageBackendInterface):
             raise ValueError("layer_ids and keys must have the same length")
         if roles is not None and len(roles) != len(keys):
             raise ValueError("roles and keys must have the same length")
-        object_ids = [
-            self._key_to_object_id(
-                key,
-                layer_id=layer_ids[index] if layer_ids is not None else 0,
-                role=roles[index] if roles is not None else "full",
+        object_ids: list[Optional[KVObjectId]] = []
+        streaming_roles = self._streaming_logical_roles()
+        for index, key in enumerate(keys):
+            layer_id = layer_ids[index] if layer_ids is not None else 0
+            role = roles[index] if roles is not None else "full"
+            if self._csa_streaming_layout_requested() and role in streaming_roles:
+                object_ids.append(
+                    self._resolve_streaming_object_id(key, role, int(layer_id))
+                )
+            else:
+                object_ids.append(
+                    self._key_to_object_id(
+                        key,
+                        layer_id=int(layer_id),
+                        role=role,
+                    )
+                )
+        resolved = [object_id for object_id in object_ids if object_id is not None]
+        records = self.kv_object_metadata_store.get_many(resolved, ready_only=True)
+        result: list[Optional[KVObjectRecord]] = []
+        record_index = 0
+        for object_id in object_ids:
+            if object_id is None:
+                result.append(None)
+                continue
+            result.append(records[record_index])
+            record_index += 1
+        return result
+
+    def get_kv_object_payload_lengths(
+        self,
+        keys: Sequence[CacheEngineKey],
+        *,
+        layer_ids: Optional[Sequence[int]] = None,
+        roles: Optional[Sequence[str]] = None,
+    ) -> list[Optional[int]]:
+        """Return logical READY payload lengths for object-store entries.
+
+        This differs from :meth:`get_kv_object_records` because a published
+        streaming-main entry may intentionally contain zero bytes. Such an
+        entry is a metadata-only hit and is returned as ``0``; ``None`` means
+        the entry is missing or unreadable.
+
+        Args:
+            keys: Cache keys to look up.
+            layer_ids: Optional per-key transformer layer ids.
+            roles: Optional per-key logical object roles.
+
+        Returns:
+            One positive, zero, or ``None`` payload length per key.
+        """
+        if not self.kv_object_store_enabled or self.kv_object_metadata_store is None:
+            return [None] * len(keys)
+        if layer_ids is not None and len(layer_ids) != len(keys):
+            raise ValueError("layer_ids and keys must have the same length")
+        if roles is not None and len(roles) != len(keys):
+            raise ValueError("roles and keys must have the same length")
+
+        lengths: list[Optional[int]] = []
+        streaming_roles = self._streaming_logical_roles()
+        for index, key in enumerate(keys):
+            layer_id = layer_ids[index] if layer_ids is not None else 0
+            role = roles[index] if roles is not None else "full"
+            if self._csa_streaming_layout_requested() and role in streaming_roles:
+                layout = self._active_csa_layout(key)
+                if (
+                    layout is None
+                    or not self._csa_layout_matches_runtime(layout)
+                ):
+                    lengths.append(None)
+                    continue
+                entry = layout.find_object(role, int(layer_id))
+                lengths.append(entry.length if entry is not None else None)
+                continue
+
+            record = self.kv_object_metadata_store.get(
+                self._key_to_object_id(
+                    key,
+                    layer_id=int(layer_id),
+                    role=role,
+                )
             )
-            for index, key in enumerate(keys)
-        ]
-        return self.kv_object_metadata_store.get_many(object_ids, ready_only=True)
+            lengths.append(
+                record.length
+                if record is not None and self._ready_tutti_raw_record(record)
+                else None
+            )
+        return lengths
 
     def get_hca_layer_major_records(
         self,
@@ -665,12 +963,44 @@ class LocalDiskBackend(StorageBackendInterface):
 
         if prefix_keys is not None and len(prefix_keys) != len(memory_objs):
             raise ValueError("prefix_keys and memory_objs must have the same length")
+        streaming_layout = self._csa_streaming_layout_requested()
+        effective_memory_objs = list(memory_objs)
+        effective_prefix_keys = list(prefix_keys) if prefix_keys is not None else None
+        if streaming_layout and effective_prefix_keys is not None:
+            missing_pairs = [
+                (key, memory_obj)
+                for key, memory_obj in zip(
+                    effective_prefix_keys,
+                    effective_memory_objs,
+                    strict=True,
+                )
+                if not self._active_csa_layout_ready(key)
+            ]
+            if not missing_pairs:
+                return max(0, len(self._required_csa_streaming_entries()) - 1)
+            effective_prefix_keys = [key for key, _memory_obj in missing_pairs]
+            effective_memory_objs = [memory_obj for _key, memory_obj in missing_pairs]
+            prefix_key = effective_prefix_keys[-1]
+        generation_keys = (
+            effective_prefix_keys
+            if effective_prefix_keys is not None
+            else [prefix_key]
+        )
+        generation = (
+            self._csa_streaming_generation(generation_keys)
+            if streaming_layout
+            else ""
+        )
+        required_entries = frozenset(self._required_csa_streaming_entries())
+        pending_entries: dict[
+            str,
+            dict[tuple[str, int], _CSAStreamingObject],
+        ] = {}
         layer_segments: dict[tuple[str, int], list[memoryview]] = {}
         layer_chunk_nbytes: dict[tuple[str, int], list[int]] = {}
-        for memory_obj in memory_objs:
+        for memory_obj in effective_memory_objs:
             buffer = memory_obj.byte_array
             group_ranges = self._object_group_ranges_for_offset(memory_obj, 0)
-            compression_ratios = self._object_layer_compression_ratios(memory_obj)
             for layer_id, role, byte_ranges in self._object_layer_view_specs(
                 memory_obj,
                 group_ranges,
@@ -681,10 +1011,6 @@ class LocalDiskBackend(StorageBackendInterface):
                     "csa_indexer_cache",
                 }:
                     continue
-                compression_ratio = compression_ratios.get(
-                    (role, int(layer_id)),
-                    1,
-                )
                 segments = layer_segments.setdefault(
                     (role, int(layer_id)),
                     [],
@@ -692,19 +1018,18 @@ class LocalDiskBackend(StorageBackendInterface):
                 chunk_nbytes = 0
                 for byte_range in byte_ranges:
                     start = int(byte_range.offset)
-                    # DSv4 allocates every compressed cache group with the
-                    # logical chunk row count.  Only the leading
-                    # ``rows / compress_ratio`` rows of each K/V plane hold
-                    # data; the remaining rows are allocation padding.  A
-                    # layer-major sidecar must remove that padding, otherwise
-                    # CSA/HCA objects are inflated by 4x/128x and retrieval's
-                    # compact offsets drift after the first layer/chunk.
-                    compact_length = int(byte_range.length) // compression_ratio
-                    if compact_length <= 0:
+                    # ``MemoryObj.metadata.shapes`` already contains the
+                    # physical row count (logical tokens / compress_ratio;
+                    # see ``LMCacheEngineMetadata.get_shapes``).  Applying
+                    # the ratio again truncates CSA to 1/4 and HCA to 1/128,
+                    # then aliases those bytes as later prefix blocks.  Copy
+                    # the complete per-layer range exactly once.
+                    length = int(byte_range.length)
+                    if length <= 0:
                         continue
-                    end = start + compact_length
+                    end = start + length
                     segments.append(buffer[start:end])
-                    chunk_nbytes += compact_length
+                    chunk_nbytes += length
                 layer_chunk_nbytes.setdefault((role, int(layer_id)), []).append(
                     chunk_nbytes
                 )
@@ -724,84 +1049,96 @@ class LocalDiskBackend(StorageBackendInterface):
                     "hca_attention_kv": _DSV4_HCA_LAYER_MAJOR_ROLE,
                     "csa_indexer_cache": _DSV4_INDEXER_LAYER_MAJOR_ROLE,
                 }[source_role]
+                physical_role = (
+                    self._generation_object_role(object_role, generation)
+                    if streaming_layout
+                    else object_role
+                )
                 object_id = self._key_to_object_id(
                     prefix_key,
                     layer_id=layer_id,
-                    role=object_role,
+                    role=physical_role,
                 )
                 existing = self.kv_object_metadata_store.get(object_id)
+                ready_record: Optional[KVObjectRecord] = None
                 if (
                     existing is not None
                     and existing.state == KVObjectState.READY
                     and existing.length == payload_nbytes
                 ):
-                    ready_count += 1
-                    total_bytes += payload_nbytes
-                    continue
-                if (
-                    raw_writer is not None
-                    and not self.kv_object_payload_fits_tutti_staging(payload_nbytes)
-                ):
-                    logger.warning(
-                        "KV_OBJECT_STORE_PROFILE op=write_attention_layer_major "
-                        "key=%s role=%s layer=%d status=skip "
-                        "reason=staging_capacity "
-                        "bytes=%d staging_bytes=%s",
-                        prefix_key.to_string(),
-                        source_role,
-                        layer_id,
-                        payload_nbytes,
-                        self.kv_object_tutti_raw_staging_bytes,
-                    )
-                    continue
-                if existing is None or existing.length != payload_nbytes:
-                    if raw_writer is not None:
-                        offset, _end_offset, aligned_length = (
-                            self.kv_object_pool_layout.next_allocation_bounds(
-                                payload_nbytes
-                            )
+                    ready_record = existing
+                else:
+                    if (
+                        raw_writer is not None
+                        and not self.kv_object_payload_fits_tutti_staging(
+                            payload_nbytes
                         )
-                        if not self.kv_object_raw_region_covers(
-                            offset,
-                            aligned_length,
-                        ):
-                            logger.warning(
-                                "KV_OBJECT_STORE_PROFILE "
-                                "op=write_attention_layer_major key=%s "
-                                "role=%s layer=%d "
-                                "status=skip reason=raw_region_full bytes=%d",
-                                prefix_key.to_string(),
-                                source_role,
-                                layer_id,
-                                payload_nbytes,
-                            )
-                            continue
-                    record = self.kv_object_pool_layout.allocate(
-                        object_id,
-                        length=payload_nbytes,
-                        shape=(payload_nbytes,),
-                        dtype="torch.uint8",
-                    )
-                else:
-                    record = existing
-
-                # ``bytearray.join`` performs the chunk gather in native code;
-                # no Python byte-by-byte packing occurs on the cold path.
-                payload = bytearray().join(segments)
-                payload_view = memoryview(payload)
-                if raw_writer is not None:
-                    raw_extents, _write_ms = raw_writer(record, payload_view)
-                    ready_record = record.with_raw_extents(raw_extents).mark_ready()
-                else:
-                    if self.kv_object_pool_io is None:
+                    ):
+                        logger.warning(
+                            "KV_OBJECT_STORE_PROFILE "
+                            "op=write_attention_layer_major "
+                            "key=%s role=%s layer=%d status=skip "
+                            "reason=staging_capacity "
+                            "bytes=%d staging_bytes=%s",
+                            prefix_key.to_string(),
+                            source_role,
+                            layer_id,
+                            payload_nbytes,
+                            self.kv_object_tutti_raw_staging_bytes,
+                        )
                         continue
-                    self.kv_object_pool_io.write_object(record, payload_view)
-                    ready_record = record.mark_ready()
-                self.kv_object_metadata_store.put(ready_record)
-                if prefix_keys is not None:
+                    if existing is None or existing.length != payload_nbytes:
+                        if raw_writer is not None:
+                            offset, _end_offset, aligned_length = (
+                                self.kv_object_pool_layout.next_allocation_bounds(
+                                    payload_nbytes
+                                )
+                            )
+                            if not self.kv_object_raw_region_covers(
+                                offset,
+                                aligned_length,
+                            ):
+                                logger.warning(
+                                    "KV_OBJECT_STORE_PROFILE "
+                                    "op=write_attention_layer_major key=%s "
+                                    "role=%s layer=%d "
+                                    "status=skip reason=raw_region_full bytes=%d",
+                                    prefix_key.to_string(),
+                                    source_role,
+                                    layer_id,
+                                    payload_nbytes,
+                                )
+                                continue
+                        record = self.kv_object_pool_layout.allocate(
+                            object_id,
+                            length=payload_nbytes,
+                            shape=(payload_nbytes,),
+                            dtype="torch.uint8",
+                        )
+                    else:
+                        record = existing
+
+                    # ``bytearray.join`` performs the chunk gather in native
+                    # code; no Python byte-by-byte packing occurs on the cold
+                    # path.
+                    payload = bytearray().join(segments)
+                    payload_view = memoryview(payload)
+                    if raw_writer is not None:
+                        raw_extents, _write_ms = raw_writer(record, payload_view)
+                        ready_record = record.with_raw_extents(
+                            raw_extents
+                        ).mark_ready()
+                    else:
+                        if self.kv_object_pool_io is None:
+                            continue
+                        self.kv_object_pool_io.write_object(record, payload_view)
+                        ready_record = record.mark_ready()
+                    self.kv_object_metadata_store.put(ready_record)
+                assert ready_record is not None
+                if effective_prefix_keys is not None:
                     prefix_nbytes = 0
                     for alias_key, chunk_nbytes in zip(
-                        prefix_keys,
+                        effective_prefix_keys,
                         layer_chunk_nbytes[(source_role, layer_id)],
                         strict=True,
                     ):
@@ -809,7 +1146,7 @@ class LocalDiskBackend(StorageBackendInterface):
                         alias_object_id = self._key_to_object_id(
                             alias_key,
                             layer_id=layer_id,
-                            role=object_role,
+                            role=physical_role,
                         )
                         alias_record = KVObjectRecord(
                             object_id=alias_object_id,
@@ -823,8 +1160,37 @@ class LocalDiskBackend(StorageBackendInterface):
                             raw_extents=ready_record.raw_extents,
                         )
                         self.kv_object_metadata_store.put(alias_record)
+                        if streaming_layout:
+                            pending_entries.setdefault(
+                                alias_key.to_string(),
+                                {},
+                            )[(object_role, int(layer_id))] = _CSAStreamingObject(
+                                logical_role=object_role,
+                                layer_id=int(layer_id),
+                                object_id=alias_object_id,
+                                length=prefix_nbytes,
+                            )
+                elif streaming_layout:
+                    pending_entries.setdefault(
+                        prefix_key.to_string(),
+                        {},
+                    )[(object_role, int(layer_id))] = _CSAStreamingObject(
+                        logical_role=object_role,
+                        layer_id=int(layer_id),
+                        object_id=ready_record.object_id,
+                        length=ready_record.length,
+                    )
                 ready_count += 1
                 total_bytes += payload_nbytes
+
+        if streaming_layout:
+            with self._csa_layout_lock:
+                for key_string, objects in pending_entries.items():
+                    self._csa_pending_layouts[key_string] = _CSAStreamingLayoutBuild(
+                        generation=generation,
+                        required_entries=required_entries,
+                        objects=objects,
+                    )
 
         logger.info(
             "KV_OBJECT_STORE_PROFILE op=write_attention_layer_major key=%s "
@@ -863,6 +1229,9 @@ class LocalDiskBackend(StorageBackendInterface):
 
     def reset_kv_object_pool_allocation(self) -> None:
         """Reset logical KV object allocation offsets for future writes."""
+        with self._csa_layout_lock:
+            self._csa_active_layouts.clear()
+            self._csa_pending_layouts.clear()
         if self.kv_object_pool_layout is not None:
             self.kv_object_pool_layout.reset_allocation()
 
@@ -1159,71 +1528,137 @@ class LocalDiskBackend(StorageBackendInterface):
             indexed += 1
         return indexed
 
-    def _write_hca_deferred_retrieve_object(
+    def _write_compact_retrieve_object(
         self,
         key: CacheEngineKey,
         memory_obj: MemoryObj,
         buffer: memoryview,
         raw_writer: Optional[KVObjectRawWriter],
-    ) -> bool:
-        """Materialize the non-HCA DSv4 retrieve payload as a compact object."""
+        *,
+        excluded_roles: frozenset[str],
+        object_role: str,
+        profile_op: str,
+        allow_empty: bool = False,
+    ) -> Optional[int]:
+        """Materialize a DSv4 payload with selected KV roles removed.
+
+        Returns:
+            The logical payload length on success, including zero for an
+            allowed metadata-only payload. ``None`` indicates failure.
+        """
         if self.kv_object_pool_layout is None or self.kv_object_metadata_store is None:
-            return False
+            return None
         group_ranges = self._object_group_ranges_for_offset(memory_obj, 0)
         if not group_ranges:
-            return False
+            return None
         klg_manager = (
             self.metadata.kv_layer_groups_manager if self.metadata is not None else None
         )
         if klg_manager is None or not klg_manager.kv_layer_groups:
-            return False
+            return None
         dtypes = memory_obj.metadata.dtypes or []
 
+        schema_roles = {
+            self._kv_group_role(
+                group,
+                dtypes[group_idx] if group_idx < len(dtypes) else group.dtype,
+            )
+            for group_idx, group in enumerate(klg_manager.kv_layer_groups)
+        }
+        missing_schema_roles = set(excluded_roles) - schema_roles
+        if missing_schema_roles:
+            logger.warning(
+                "KV_OBJECT_STORE_PROFILE op=%s key=%s status=skip "
+                "reason=excluded_role_not_in_schema missing=%s",
+                profile_op,
+                key.to_string(),
+                sorted(missing_schema_roles),
+            )
+            return None
+
         selected_ranges: list[KVObjectByteRange] = []
-        skipped_hca = False
+        skipped_roles: set[str] = set()
         for group_idx, group_range in group_ranges:
             if group_idx >= len(klg_manager.kv_layer_groups):
                 continue
             group = klg_manager.kv_layer_groups[group_idx]
             dtype = dtypes[group_idx] if group_idx < len(dtypes) else group.dtype
             role = self._kv_group_role(group, dtype)
-            if role == "hca_attention_kv":
-                skipped_hca = True
+            if role in excluded_roles:
+                skipped_roles.add(role)
                 continue
             selected_ranges.append(group_range)
-        if not skipped_hca or not selected_ranges:
-            return False
+        if not selected_ranges:
+            if allow_empty and skipped_roles:
+                logger.info(
+                    "KV_OBJECT_STORE_PROFILE op=%s key=%s bytes=0 "
+                    "mode=metadata_only ranges=0 direct=1 "
+                    "excluded_present=%s write_ms=0.000 total_ms=0.000",
+                    profile_op,
+                    key.to_string(),
+                    sorted(skipped_roles),
+                )
+                return 0
+            logger.warning(
+                "KV_OBJECT_STORE_PROFILE op=%s key=%s status=skip "
+                "reason=empty_compact_payload excluded=%s present=%s",
+                profile_op,
+                key.to_string(),
+                sorted(excluded_roles),
+                sorted(skipped_roles),
+            )
+            return None
 
         selected_ranges.sort(key=lambda byte_range: byte_range.target_offset)
         compact_nbytes = sum(byte_range.length for byte_range in selected_ranges)
         if compact_nbytes <= 0:
-            return False
+            return None
         if raw_writer is not None and not self.kv_object_payload_fits_tutti_staging(
             compact_nbytes
         ):
             logger.warning(
-                "KV_OBJECT_STORE_PROFILE op=write_hca_deferred key=%s "
+                "KV_OBJECT_STORE_PROFILE op=%s key=%s "
                 "status=skip reason=staging_capacity bytes=%d "
                 "staging_bytes=%s",
+                profile_op,
                 key.to_string(),
                 compact_nbytes,
                 self.kv_object_tutti_raw_staging_bytes,
             )
-            return False
+            return None
 
-        compact_payload = bytearray(compact_nbytes)
-        target_offset = 0
-        for byte_range in selected_ranges:
-            source_start = byte_range.target_offset
-            source_end = source_start + byte_range.length
-            compact_payload[target_offset : target_offset + byte_range.length] = buffer[
-                source_start:source_end
-            ].tobytes()
-            target_offset += byte_range.length
+        # Non-tail DSv4 MemoryObjs may already zero-shape every excluded
+        # group.  In that case the input buffer is the canonical compact main
+        # payload and must be registered directly; requiring every excluded
+        # role to appear in ``group_ranges`` leaves all non-tail manifests
+        # permanently incomplete.  Repack only when positive-size excluded
+        # ranges still create holes in the source buffer.
+        direct_payload = compact_nbytes == len(buffer)
+        expected_source_offset = 0
+        if direct_payload:
+            for byte_range in selected_ranges:
+                if byte_range.target_offset != expected_source_offset:
+                    direct_payload = False
+                    break
+                expected_source_offset += byte_range.length
+        compact_payload: Optional[bytearray] = None
+        if direct_payload:
+            payload_view = buffer
+        else:
+            compact_payload = bytearray(compact_nbytes)
+            target_offset = 0
+            for byte_range in selected_ranges:
+                source_start = byte_range.target_offset
+                source_end = source_start + byte_range.length
+                compact_payload[
+                    target_offset : target_offset + byte_range.length
+                ] = buffer[source_start:source_end].tobytes()
+                target_offset += byte_range.length
+            payload_view = memoryview(compact_payload)
 
         object_id = self._key_to_object_id(
             key,
-            role=_DSV4_HCA_DEFERRED_RETRIEVE_ROLE,
+            role=object_role,
         )
         start = time.perf_counter()
         existing = self.kv_object_metadata_store.get(object_id)
@@ -1235,7 +1670,7 @@ class LocalDiskBackend(StorageBackendInterface):
             # Content-addressed key already persisted with identical length:
             # skip the redundant NVMe rewrite (fires on every hit otherwise;
             # see the matching guard in the primary object write path).
-            return True
+            return compact_nbytes
         if existing is None:
             if raw_writer is not None:
                 offset, end_offset, aligned_length = (
@@ -1243,15 +1678,16 @@ class LocalDiskBackend(StorageBackendInterface):
                 )
                 if not self.kv_object_raw_region_covers(offset, aligned_length):
                     logger.warning(
-                        "KV_OBJECT_STORE_PROFILE op=write_hca_deferred key=%s "
+                        "KV_OBJECT_STORE_PROFILE op=%s key=%s "
                         "status=skip reason=raw_region_full offset=%d end=%d "
                         "aligned_bytes=%d",
+                        profile_op,
                         key.to_string(),
                         offset,
                         end_offset,
                         aligned_length,
                     )
-                    return False
+                    return None
             record = self.kv_object_pool_layout.allocate(
                 object_id,
                 length=compact_nbytes,
@@ -1269,18 +1705,20 @@ class LocalDiskBackend(StorageBackendInterface):
                     )
                     if not self.kv_object_raw_region_covers(offset, aligned_length):
                         logger.warning(
-                            "KV_OBJECT_STORE_PROFILE op=write_hca_deferred key=%s "
+                            "KV_OBJECT_STORE_PROFILE op=%s key=%s "
                             "status=skip reason=raw_region_full offset=%d end=%d "
                             "aligned_bytes=%d",
+                            profile_op,
                             key.to_string(),
                             offset,
                             end_offset,
                             aligned_length,
                         )
-                        return False
+                        return None
                 logger.info(
-                    "KV_OBJECT_STORE_PROFILE op=write_hca_deferred key=%s "
+                    "KV_OBJECT_STORE_PROFILE op=%s key=%s "
                     "status=reallocate reason=length_changed old=%d new=%d",
+                    profile_op,
                     key.to_string(),
                     record.length,
                     compact_nbytes,
@@ -1292,29 +1730,108 @@ class LocalDiskBackend(StorageBackendInterface):
                     dtype="torch.uint8",
                 )
 
-        payload_view = memoryview(compact_payload)
         if raw_writer is not None:
             raw_extents, write_ms = raw_writer(record, payload_view)
             ready_record = record.with_raw_extents(raw_extents).mark_ready()
             mode = "tutti_raw"
         else:
             if self.kv_object_pool_io is None:
-                return False
+                return None
             write_ms = self.kv_object_pool_io.write_object(record, payload_view)
             ready_record = record.mark_ready()
             mode = "pool_file"
         self.kv_object_metadata_store.put(ready_record)
         logger.info(
-            "KV_OBJECT_STORE_PROFILE op=write_hca_deferred key=%s bytes=%d "
-            "mode=%s ranges=%d write_ms=%.3f total_ms=%.3f",
+            "KV_OBJECT_STORE_PROFILE op=%s key=%s bytes=%d "
+            "mode=%s ranges=%d direct=%d excluded_present=%s "
+            "write_ms=%.3f total_ms=%.3f",
+            profile_op,
             key.to_string(),
             compact_nbytes,
             mode,
             len(selected_ranges),
+            int(direct_payload),
+            sorted(skipped_roles),
             write_ms,
             (time.perf_counter() - start) * 1000.0,
         )
-        return True
+        return compact_nbytes
+
+    def _write_hca_deferred_retrieve_object(
+        self,
+        key: CacheEngineKey,
+        memory_obj: MemoryObj,
+        buffer: memoryview,
+        raw_writer: Optional[KVObjectRawWriter],
+    ) -> bool:
+        """Materialize the non-HCA DSv4 retrieve payload as a compact object."""
+        return (
+            self._write_compact_retrieve_object(
+                key,
+                memory_obj,
+                buffer,
+                raw_writer,
+                excluded_roles=frozenset({"hca_attention_kv"}),
+                object_role=_DSV4_HCA_DEFERRED_RETRIEVE_ROLE,
+                profile_op="write_hca_deferred",
+            )
+            is not None
+        )
+
+    def _write_csa_generation_compact_object(
+        self,
+        key: CacheEngineKey,
+        memory_obj: MemoryObj,
+        buffer: memoryview,
+        raw_writer: Optional[KVObjectRawWriter],
+        build: _CSAStreamingLayoutBuild,
+    ) -> bool:
+        """Write and publish the compact main object for one generation."""
+        logical_role = self._csa_streaming_compact_role()
+        physical_role = self._generation_object_role(
+            logical_role,
+            build.generation,
+        )
+        excluded_roles = {"csa_attention_kv", "csa_indexer_cache"}
+        if _env_flag("LMCACHE_DSV4_HCA_WALKER"):
+            excluded_roles.add("hca_attention_kv")
+        compact_length = self._write_compact_retrieve_object(
+            key,
+            memory_obj,
+            buffer,
+            raw_writer,
+            excluded_roles=frozenset(excluded_roles),
+            object_role=physical_role,
+            profile_op="write_csa_streaming_main",
+            allow_empty=True,
+        )
+        if compact_length is None or self.kv_object_metadata_store is None:
+            return False
+        object_id = self._key_to_object_id(key, role=physical_role)
+        record = self.kv_object_metadata_store.get(object_id)
+        if compact_length > 0:
+            if (
+                not self._ready_tutti_raw_record(record)
+                or record is None
+                or record.length != compact_length
+            ):
+                return False
+        elif record is not None:
+            logger.warning(
+                "KV_OBJECT_STORE_PROFILE op=write_csa_streaming_main key=%s "
+                "status=skip reason=empty_payload_has_physical_record "
+                "record_bytes=%d",
+                key.to_string(),
+                record.length,
+            )
+            return False
+        build.objects[(logical_role, 0)] = _CSAStreamingObject(
+            logical_role=logical_role,
+            layer_id=0,
+            object_id=object_id,
+            length=compact_length,
+        )
+        return self._publish_csa_layout(key, build)
 
     def _write_hca_slab_object(
         self,
@@ -1719,6 +2236,10 @@ class LocalDiskBackend(StorageBackendInterface):
                 self.disk_lock.release()
             return False
 
+        with self._csa_layout_lock:
+            self._csa_active_layouts.pop(key.to_string(), None)
+            self._csa_pending_layouts.pop(key.to_string(), None)
+
         path = meta.path
         size = meta.size
         self.usage -= size
@@ -2097,11 +2618,31 @@ class LocalDiskBackend(StorageBackendInterface):
             return True
         if self.kv_object_metadata_store is None:
             return False
+        if self._csa_streaming_layout_requested():
+            return self._has_readable_csa_streaming_layout_unlocked(key)
         object_id = self._key_to_object_id(key)
         record = self.kv_object_metadata_store.get(object_id)
         if self._ready_tutti_raw_record(record):
             return True
         return self._has_readable_hca_deferred_objects_unlocked(key)
+
+    @staticmethod
+    def _csa_streaming_layout_requested() -> bool:
+        """Return whether cold store must publish the CSA streaming layout."""
+        return _env_flag("LMCACHE_INDEXER_ENABLE_PREFETCH")
+
+    def _csa_streaming_compact_role(self) -> str:
+        """Return the canonical generic-object role for the active pipeline."""
+        if _env_flag("LMCACHE_DSV4_HCA_WALKER"):
+            return _DSV4_CSA_HCA_DEFERRED_RETRIEVE_ROLE
+        return _DSV4_CSA_DEFERRED_RETRIEVE_ROLE
+
+    def _has_readable_csa_streaming_layout_unlocked(
+        self,
+        key: CacheEngineKey,
+    ) -> bool:
+        """Return whether the atomically admitted CSA layout is readable."""
+        return self._active_csa_layout_ready(key)
 
     def _has_readable_hca_deferred_objects_unlocked(
         self,
@@ -2322,6 +2863,33 @@ class LocalDiskBackend(StorageBackendInterface):
                 bytes_len=len(buffer),
             )
             return False
+        if self._csa_streaming_layout_requested():
+            # Idempotent hit-side re-save: the active immutable generation is
+            # already complete, so no object is rewritten or backfilled.
+            if self._active_csa_layout_ready(key):
+                self._log_kv_object_write_skip(
+                    key,
+                    reason="csa_generation_already_ready",
+                    bytes_len=len(buffer),
+                )
+                return True
+            with self._csa_layout_lock:
+                build = self._csa_pending_layouts.get(key.to_string())
+            if build is None:
+                self._log_kv_object_write_skip(
+                    key,
+                    reason="csa_generation_not_prepared",
+                    bytes_len=len(buffer),
+                )
+                return False
+            with self.kv_object_store_lock:
+                return self._write_csa_generation_compact_object(
+                    key,
+                    memory_obj,
+                    buffer,
+                    raw_writer,
+                    build,
+                )
         if raw_writer is not None and not self.kv_object_payload_fits_tutti_staging(
             len(buffer)
         ):
@@ -2366,7 +2934,7 @@ class LocalDiskBackend(StorageBackendInterface):
                         elapsed_ms = (time.perf_counter() - _start) * 1000.0
                         logger.info(
                             "KV_OBJECT_STORE_PROFILE op=write key=%s bytes=%d "
-                            "status=hca_deferred_only compact=%s slab=%s "
+                            "status=deferred_only hca_compact=%s slab=%s "
                             "staging_bytes=%s total_ms=%.3f",
                             _key.to_string(),
                             len(_buffer),
@@ -2503,7 +3071,7 @@ class LocalDiskBackend(StorageBackendInterface):
                     if deferred or slab:
                         logger.info(
                             "KV_OBJECT_STORE_PROFILE op=write key=%s "
-                            "status=hca_supplementary deferred=%s slab=%s",
+                            "status=supplementary hca_deferred=%s slab=%s",
                             _key.to_string(),
                             deferred,
                             slab,

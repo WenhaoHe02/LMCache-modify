@@ -462,15 +462,17 @@ def test_vllm_paged_connector_v3_batched_gpu_restore():
             src_metadata.get_dtypes(),
         )
         assert memory_obj is not None
-        src_connector.from_gpu(
-            memory_obj,
-            start,
-            end,
-            kvcaches=list(src_caches.values()),
-            slot_mapping=slot_mapping,
-            offset=0,
-        )
         memory_objs.append(memory_obj)
+    src_connector.batched_from_gpu(
+        memory_objs,
+        starts,
+        ends,
+        kvcaches=list(src_caches.values()),
+        slot_mapping=slot_mapping,
+        block_ids_by_group=[list(range(num_tokens // block_size))],
+        vllm_kv_cache_group_block_sizes=[block_size],
+        offset=0,
+    )
     src_connector.store_stream.synchronize()
 
     dst_connector.batched_to_gpu(

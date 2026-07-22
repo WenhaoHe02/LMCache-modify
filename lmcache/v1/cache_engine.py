@@ -2,6 +2,7 @@
 # Standard
 from collections import defaultdict
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -103,6 +104,8 @@ class _TuttiProfileLogFilter(logging.Filter):
 logger.addFilter(_TuttiProfileLogFilter())
 
 _DSV4_HCA_DEFERRED_RETRIEVE_ROLE = "hca_deferred_retrieve"
+_DSV4_CSA_DEFERRED_RETRIEVE_ROLE = "csa_deferred_retrieve"
+_DSV4_CSA_HCA_DEFERRED_RETRIEVE_ROLE = "csa_hca_deferred_retrieve"
 
 # Type aliases for processed chunks
 # (cache_key, memory_obj, start_index, end_index)
@@ -426,6 +429,27 @@ class LMCacheEngine:
         self._tutti_store_warmup_keys: dict[str, set[CacheEngineKey]] = {}
         self._tutti_store_warmup_pending: dict[str, set[CacheEngineKey]] = {}
         self._tutti_store_warmup_last_seen: set[str] = set()
+        # Long prefills reach ``store`` in several scheduler batches. Keep an
+        # extra reference to each CPU snapshot until the final batch, then
+        # build one request-wide layer-major generation. Writing one complete
+        # generation per intermediate batch multiplies admission traffic by
+        # O(number_of_batches) and can keep the cache unready for minutes.
+        self._dsv4_snapshot_lock = threading.Lock()
+        self._dsv4_snapshot_req_id: Optional[str] = None
+        self._dsv4_snapshot_keys: list[CacheEngineKey] = []
+        self._dsv4_snapshot_memory_objs: list[MemoryObj] = []
+        self._dsv4_snapshot_tokens = 0
+        # A cache-hit suffix is new admission work, but publishing its next
+        # generation must not delay the current request's first token.  Keep
+        # the exact synchronous cold-admission ordering on one bounded worker:
+        # sidecars first, compact main second, manifest last.
+        self._dsv4_admission_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="lmcache-dsv4-admission",
+        )
+        self._dsv4_admission_lock = threading.Lock()
+        self._dsv4_admission_pending = 0
+        self._dsv4_admission_max_pending = 2
         # Callbacks invoked once the Tutti loader is first created (from the
         # warmup daemon or the first retrieve/store path that succeeds). Used by
         # the vLLM adapter to re-attach the CSA attention-KV prefetch manager,
@@ -1936,6 +1960,18 @@ class LMCacheEngine:
         if request_configs is not None and len(request_configs) != 0:
             assert isinstance(request_configs, dict)
 
+        transfer_spec = kwargs.get("transfer_spec", None)
+        is_last_prefill = bool(
+            kwargs.get(
+                "is_last_prefill",
+                getattr(transfer_spec, "is_last_prefill", False),
+            )
+        )
+        try:
+            lmcache_cached_tokens = int(kwargs.get("lmcache_cached_tokens", 0))
+        except (TypeError, ValueError):
+            lmcache_cached_tokens = 0
+
         with store_stats.profile_process_tokens():
             prev_key = 0
             for start, end, key in self.token_database.process_tokens(
@@ -1956,6 +1992,7 @@ class LMCacheEngine:
                     start,
                     end,
                     len(tokens),
+                    keep_request_tail=is_last_prefill,
                 )
 
                 # TODO (Jiayi): should be batched in the future
@@ -2020,12 +2057,12 @@ class LMCacheEngine:
         with store_stats.profile_from_gpu():
             self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
 
-        # Persist one layer-major sidecar segment for every completed store
-        # batch. Long prefills arrive in several batches; keeping every
-        # segment lets sparse reads coalesce adjacent block ids across the
-        # layer instead of issuing one command per token-major KV object.
-        # Publication remains synchronous so retrieve never sees partial
-        # segment metadata.
+        put_keys = keys
+        put_memory_objs = memory_objs
+
+        # Accumulate CPU snapshots across scheduler store batches and persist
+        # exactly one final layer-major generation. Intermediate batches keep
+        # only ref-counted host objects; they perform no sidecar GPU/NVMe I/O.
         if (
             (
                 _env_flag("LMCACHE_DSV4_HCA_WALKER")
@@ -2034,45 +2071,51 @@ class LMCacheEngine:
             and bool(starts)
             and bool(ends)
         ):
-            disk_backend = self.storage_manager.storage_backends.get("LocalDiskBackend")
-            store_snapshot = getattr(
-                disk_backend,
-                "store_attention_layer_major_snapshot",
-                None,
+            pending_snapshot = self._stage_dsv4_layer_major_snapshot(
+                req_id,
+                keys,
+                memory_objs,
+                tot_token_num,
+                is_last_prefill=is_last_prefill,
             )
-            if callable(store_snapshot):
-                try:
-                    stored_layers = int(
-                        store_snapshot(
-                            keys[-1],
-                            memory_objs,
-                            prefix_keys=keys,
-                        )
-                    )
-                    logger.info(
-                        "DSv4 attention layer-major snapshot key=%s layers=%d "
-                        "chunks=%d tokens=%d",
-                        keys[-1].to_string(),
-                        stored_layers,
-                        len(memory_objs),
-                        num_to_store_tokens,
-                    )
-                except Exception:
-                    logger.exception(
-                        "DSv4 attention layer-major snapshot store failed for %s",
-                        keys[-1].to_string(),
+            # The retained snapshot reference becomes the ownership passed to
+            # ``batched_put`` at final admission. Release this call's original
+            # allocation reference now, for both intermediate and final
+            # batches. Intermediate objects must not be put yet: their compact
+            # main generation is created together with the final sidecars.
+            for memory_obj in memory_objs:
+                memory_obj.ref_count_down()
+            if pending_snapshot is None:
+                put_keys = []
+                put_memory_objs = []
+            else:
+                snapshot_keys, snapshot_memory_objs, snapshot_tokens = pending_snapshot
+                put_keys = snapshot_keys
+                put_memory_objs = snapshot_memory_objs
+                if lmcache_cached_tokens > 0 and self._submit_dsv4_hit_admission(
+                    snapshot_keys,
+                    snapshot_memory_objs,
+                    snapshot_tokens,
+                    req_id=req_id,
+                    is_last_prefill=is_last_prefill,
+                    transfer_spec=transfer_spec,
+                ):
+                    # The bounded admission worker now owns the retained
+                    # MemoryObj references and performs sidecar -> main ->
+                    # manifest publication in that order.
+                    put_keys = []
+                    put_memory_objs = []
+                else:
+                    self._store_dsv4_layer_major_snapshot(
+                        snapshot_keys,
+                        snapshot_memory_objs,
+                        snapshot_tokens,
+                        mode="final",
                     )
 
         with store_stats.profile_put():
-            transfer_spec = kwargs.get("transfer_spec", None)
-            is_last_prefill = bool(
-                kwargs.get(
-                    "is_last_prefill",
-                    getattr(transfer_spec, "is_last_prefill", False),
-                )
-            )
             tutti_warmup_callback = self._make_tutti_store_warmup_callback(
-                list(keys),
+                list(put_keys),
                 req_id,
                 is_last_prefill,
             )
@@ -2099,7 +2142,12 @@ class LMCacheEngine:
                         "into the runtime patch bundle."
                     )
                 put_kwargs["on_complete_callback"] = tutti_warmup_callback
-            self.storage_manager.batched_put(keys, memory_objs, **put_kwargs)
+            if put_memory_objs:
+                self.storage_manager.batched_put(
+                    put_keys,
+                    put_memory_objs,
+                    **put_kwargs,
+                )
 
         self.stats_monitor.on_store_finished(
             store_stats,
@@ -2202,9 +2250,42 @@ class LMCacheEngine:
         )
         disk_keys = block_mapping["LocalDiskBackend"]
         records = disk_backend.get_kv_object_records(disk_keys)
+        logical_lengths: Optional[list[Optional[int]]] = None
+        streaming_compact_role: Optional[str] = None
+        streaming_consumer_inactive = False
         use_hca_deferred_compact = False
         hca_deferred_readable_limit: Optional[int] = None
-        if self._dsv4_hca_defer_requested(total_tokens):
+        streaming_layout_requested = self.dsv4_optimized_kv and _env_flag(
+            "LMCACHE_INDEXER_ENABLE_PREFETCH"
+        )
+        if streaming_layout_requested:
+            streaming_compact_role = (
+                _DSV4_CSA_HCA_DEFERRED_RETRIEVE_ROLE
+                if _env_flag("LMCACHE_DSV4_HCA_WALKER")
+                else _DSV4_CSA_DEFERRED_RETRIEVE_ROLE
+            )
+            if not self._dsv4_streaming_runtime_consumer_ready(streaming_compact_role):
+                # The manifest may be READY, but without its runtime consumer
+                # retrieve cannot safely omit the independently stored groups.
+                streaming_consumer_inactive = True
+            else:
+                get_lengths = getattr(
+                    disk_backend,
+                    "get_kv_object_payload_lengths",
+                    None,
+                )
+                if not callable(get_lengths):
+                    logical_lengths = [None] * len(disk_keys)
+                else:
+                    logical_lengths = get_lengths(
+                        disk_keys,
+                        roles=[streaming_compact_role] * len(disk_keys),
+                    )
+                records = disk_backend.get_kv_object_records(
+                    disk_keys,
+                    roles=[streaming_compact_role] * len(disk_keys),
+                )
+        elif self._dsv4_hca_defer_requested(total_tokens):
             compact_records = disk_backend.get_kv_object_records(
                 disk_keys,
                 roles=[_DSV4_HCA_DEFERRED_RETRIEVE_ROLE] * len(disk_keys),
@@ -2226,7 +2307,16 @@ class LMCacheEngine:
             * 1024
             * int(self._tutti_config["n_slots"])
         )
+        metadata_only = 0
         for index, (key, record) in enumerate(zip(disk_keys, records, strict=True)):
+            if streaming_consumer_inactive:
+                logger.info(
+                    "TUTTI_OBJECT_STORE_PROFILE op=lookup_filter status=miss "
+                    "index=%d key=%s reason=streaming_consumer_inactive",
+                    index,
+                    key.to_string(),
+                )
+                break
             if (
                 hca_deferred_readable_limit is not None
                 and index >= hca_deferred_readable_limit
@@ -2238,6 +2328,47 @@ class LMCacheEngine:
                     key.to_string(),
                 )
                 break
+            if logical_lengths is not None:
+                logical_length = (
+                    logical_lengths[index] if index < len(logical_lengths) else None
+                )
+                if logical_length is None:
+                    logger.info(
+                        "TUTTI_OBJECT_STORE_PROFILE op=lookup_filter "
+                        "status=miss index=%d key=%s "
+                        "reason=no_logical_payload role=%s",
+                        index,
+                        key.to_string(),
+                        streaming_compact_role,
+                    )
+                    break
+                expected_bytes = self._dsv4_streaming_compact_payload_nbytes(
+                    chunk_info_list[preceding_hit_chunks + index],
+                    streaming_compact_role,
+                    total_tokens,
+                )
+                # A chunk that was the tail of the stored request can own a
+                # physical compact-main payload.  When the same prefix is used
+                # by a longer request, that chunk is no longer in the active
+                # tail window and its main payload is intentionally ignored.
+                # Treat it exactly like a metadata-only entry; the streamed
+                # CSA/HCA/indexer objects remain authoritative.
+                if expected_bytes == 0:
+                    readable += 1
+                    metadata_only += 1
+                    continue
+                if logical_length == 0:
+                    logger.info(
+                        "TUTTI_OBJECT_STORE_PROFILE op=lookup_filter "
+                        "status=miss index=%d key=%s "
+                        "reason=metadata_only_shape_mismatch "
+                        "expected_bytes=%d role=%s",
+                        index,
+                        key.to_string(),
+                        expected_bytes,
+                        streaming_compact_role,
+                    )
+                    break
             if record is None:
                 logger.info(
                     "TUTTI_OBJECT_STORE_PROFILE op=lookup_filter status=miss "
@@ -2246,11 +2377,23 @@ class LMCacheEngine:
                     key.to_string(),
                 )
                 break
+            if logical_lengths is not None and record.length != logical_length:
+                logger.info(
+                    "TUTTI_OBJECT_STORE_PROFILE op=lookup_filter status=miss "
+                    "index=%d key=%s reason=length_mismatch "
+                    "logical_bytes=%d record_bytes=%d",
+                    index,
+                    key.to_string(),
+                    logical_length,
+                    record.length,
+                )
+                break
             read_record = self._tutti_lookup_read_record(
                 chunk_info_list[preceding_hit_chunks + index],
                 record,
                 total_tokens,
                 hca_deferred_compact=use_hca_deferred_compact,
+                streaming_compact_role=streaming_compact_role,
             )
             if read_record is None:
                 logger.info(
@@ -2291,6 +2434,16 @@ class LMCacheEngine:
             readable += 1
 
         if readable == len(disk_keys):
+            if metadata_only:
+                logger.info(
+                    "TUTTI_OBJECT_STORE_PROFILE op=lookup_filter "
+                    "status=ready hit_chunks=%d readable=%d "
+                    "metadata_only=%d role=%s",
+                    hit_chunks,
+                    preceding_hit_chunks + readable,
+                    metadata_only,
+                    streaming_compact_role,
+                )
             return hit_chunks
 
         dropped_keys = disk_keys[readable:]
@@ -2315,12 +2468,87 @@ class LMCacheEngine:
         trimmed_hit_chunks = preceding_hit_chunks + readable
         logger.info(
             "TUTTI_OBJECT_STORE_PROFILE op=lookup_filter status=trimmed "
-            "hit_chunks=%d readable=%d dropped=%d",
+            "hit_chunks=%d readable=%d dropped=%d metadata_only=%d",
             hit_chunks,
             trimmed_hit_chunks,
             hit_chunks - trimmed_hit_chunks,
+            metadata_only,
         )
         return trimmed_hit_chunks
+
+    def _dsv4_streaming_runtime_consumer_ready(self, role: str) -> bool:
+        """Return whether split-layout consumers are already attached.
+
+        Lookup runs on a background server thread, so this probe must stay
+        observational: manager construction and model patching belong to the
+        adapter's main-thread lifecycle.
+        """
+        try:
+            from lmcache.v1.csa_attention_kv_prefetch_manager import (
+                get_csa_attention_kv_prefetch_manager,
+            )
+        except ImportError:
+            return False
+        csa_manager = get_csa_attention_kv_prefetch_manager()
+        if csa_manager is None:
+            return False
+        stream_available = getattr(csa_manager, "request_stream_available", None)
+        if not callable(stream_available) or not stream_available():
+            return False
+        try:
+            from lmcache.v1.indexer_ssd_manager import get_indexer_ssd_manager
+        except ImportError:
+            return False
+        indexer_manager = get_indexer_ssd_manager()
+        indexer_available = getattr(
+            indexer_manager,
+            "native_indexer_stream_available",
+            None,
+        )
+        if not callable(indexer_available) or not indexer_available():
+            return False
+        if role == _DSV4_CSA_DEFERRED_RETRIEVE_ROLE:
+            return True
+        if role != _DSV4_CSA_HCA_DEFERRED_RETRIEVE_ROLE or not getattr(
+            csa_manager,
+            "hca_layer_ids",
+            (),
+        ):
+            return False
+        return True
+
+    def _dsv4_streaming_compact_payload_nbytes(
+        self,
+        chunk_info: tuple[int, int, CacheEngineKey],
+        role: Optional[str],
+        total_tokens: int,
+    ) -> int:
+        """Return bytes required by the current request's compact main view."""
+        start, end, _key = chunk_info
+        dtypes = self.metadata.get_dtypes()
+        base_shapes = self.metadata.get_shapes(end - start)
+        if role == _DSV4_CSA_HCA_DEFERRED_RETRIEVE_ROLE:
+            shapes = self._dsv4_csa_hca_compact_retrieve_shapes_for_range(
+                base_shapes,
+                dtypes,
+                start,
+                end,
+                total_tokens,
+            )
+        elif role == _DSV4_CSA_DEFERRED_RETRIEVE_ROLE:
+            shapes = self._dsv4_csa_compact_retrieve_shapes_for_range(
+                base_shapes,
+                dtypes,
+                start,
+                end,
+                total_tokens,
+            )
+        else:
+            return -1
+        return sum(
+            self._shape_nbytes(shape, dtype)
+            for shape, dtype in zip(shapes, dtypes, strict=True)
+        )
 
     def _tutti_lookup_read_record(
         self,
@@ -2329,20 +2557,41 @@ class LMCacheEngine:
         total_tokens: int,
         *,
         hca_deferred_compact: bool = False,
+        streaming_compact_role: Optional[str] = None,
     ) -> Optional[KVObjectRecord]:
         """Return the object record shape-adjusted the same way retrieve will read."""
         start, end, _key = chunk_info
         if not self.dsv4_optimized_kv:
             return record
         dtypes = self.metadata.get_dtypes()
-        shapes, read_ranges = self._dsv4_retrieve_view_for_range(
-            self.metadata.get_shapes(end - start),
-            dtypes,
-            start,
-            end,
-            total_tokens,
-            require_sector_readable=not hca_deferred_compact,
-        )
+        base_shapes = self.metadata.get_shapes(end - start)
+        if streaming_compact_role == _DSV4_CSA_HCA_DEFERRED_RETRIEVE_ROLE:
+            shapes = self._dsv4_csa_hca_compact_retrieve_shapes_for_range(
+                base_shapes,
+                dtypes,
+                start,
+                end,
+                total_tokens,
+            )
+            read_ranges = None
+        elif streaming_compact_role == _DSV4_CSA_DEFERRED_RETRIEVE_ROLE:
+            shapes = self._dsv4_csa_compact_retrieve_shapes_for_range(
+                base_shapes,
+                dtypes,
+                start,
+                end,
+                total_tokens,
+            )
+            read_ranges = None
+        else:
+            shapes, read_ranges = self._dsv4_retrieve_view_for_range(
+                base_shapes,
+                dtypes,
+                start,
+                end,
+                total_tokens,
+                require_sector_readable=not hca_deferred_compact,
+            )
         read_record = record
         if read_ranges is not None and not hca_deferred_compact:
             try:
@@ -2571,6 +2820,79 @@ class LMCacheEngine:
                 filtered.append(shape)
         return filtered
 
+    def _dsv4_csa_compact_retrieve_shapes_for_range(
+        self,
+        shapes: list[torch.Size],
+        dtypes: list[torch.dtype],
+        start: int,
+        end: int,
+        total_tokens: int,
+    ) -> list[torch.Size]:
+        """Return shapes matching the CSA streaming compact main object.
+
+        CSA attention KV and native Indexer K are independently layer-major,
+        so neither is duplicated in the main object. HCA remains here unless
+        the HCA walker is enabled.
+        """
+        stored_shapes = self._dsv4_store_shapes_for_range(
+            shapes,
+            dtypes,
+            start,
+            end,
+            total_tokens,
+        )
+        klg_manager = self.metadata.kv_layer_groups_manager
+        if klg_manager is None or not klg_manager.kv_layer_groups:
+            return stored_shapes
+        return [
+            self._zero_token_shape(shape)
+            if self._dsv4_group_role(group, dtype)
+            in {"csa_attention_kv", "csa_indexer_cache"}
+            else shape
+            for shape, dtype, group in zip(
+                stored_shapes,
+                dtypes,
+                klg_manager.kv_layer_groups,
+                strict=True,
+            )
+        ]
+
+    def _dsv4_csa_hca_compact_retrieve_shapes_for_range(
+        self,
+        shapes: list[torch.Size],
+        dtypes: list[torch.dtype],
+        start: int,
+        end: int,
+        total_tokens: int,
+    ) -> list[torch.Size]:
+        """Return shapes matching the CSA/HCA streaming compact main object."""
+        stored_shapes = self._dsv4_store_shapes_for_range(
+            shapes,
+            dtypes,
+            start,
+            end,
+            total_tokens,
+        )
+        klg_manager = self.metadata.kv_layer_groups_manager
+        if klg_manager is None or not klg_manager.kv_layer_groups:
+            return stored_shapes
+        streamed_roles = {
+            "csa_attention_kv",
+            "hca_attention_kv",
+            "csa_indexer_cache",
+        }
+        return [
+            self._zero_token_shape(shape)
+            if self._dsv4_group_role(group, dtype) in streamed_roles
+            else shape
+            for shape, dtype, group in zip(
+                stored_shapes,
+                dtypes,
+                klg_manager.kv_layer_groups,
+                strict=True,
+            )
+        ]
+
     def _dsv4_log_retrieve_group_table_once(
         self,
         shapes: list[torch.Size],
@@ -2613,6 +2935,91 @@ class LMCacheEngine:
         except Exception:
             logger.exception("DSV4_GROUP_TABLE logging failed")
 
+    @staticmethod
+    def _dsv4_layer_chunk_map_complete(
+        chunks_by_layer: dict[int, list[Any]],
+        layer_ids: Iterable[int],
+        expected_end: Optional[int],
+    ) -> bool:
+        """Return whether every expected layer exactly covers the request."""
+        expected_layers = frozenset(int(layer_id) for layer_id in layer_ids)
+        if (
+            not expected_layers
+            or expected_end is None
+            or expected_end <= 0
+            or set(chunks_by_layer) != expected_layers
+        ):
+            return False
+        common_end: Optional[int] = None
+        for layer_id in expected_layers:
+            chunks = sorted(
+                chunks_by_layer.get(layer_id, ()),
+                key=lambda chunk: int(chunk.first_compressed_block),
+            )
+            cursor = 0
+            for chunk in chunks:
+                start = int(chunk.first_compressed_block)
+                end = int(chunk.end_compressed_block)
+                if start != cursor or end <= start:
+                    return False
+                cursor = end
+            if cursor <= 0:
+                return False
+            if common_end is None:
+                common_end = cursor
+            elif cursor != common_end:
+                return False
+        return common_end == expected_end
+
+    def _dsv4_streaming_expected_layer_coverage(
+        self,
+        blocks: list[tuple[CacheEngineKey, int, int]],
+        group_role: str,
+    ) -> Optional[int]:
+        """Return the descriptor coverage required for one streamed group."""
+        klg_manager = self.metadata.kv_layer_groups_manager
+        if klg_manager is None or not klg_manager.kv_layer_groups:
+            return None
+        dtypes = self.metadata.get_dtypes()
+        compression_ratio: Optional[int] = None
+        for group, dtype in zip(
+            klg_manager.kv_layer_groups,
+            dtypes,
+            strict=True,
+        ):
+            if self._dsv4_group_role(group, dtype) == group_role:
+                compression_ratio = int(group.compress_ratio)
+                break
+        if compression_ratio is None or compression_ratio <= 0:
+            return None
+        descriptor_tokens = compression_ratio * (
+            64 if group_role == "csa_attention_kv" else 1
+        )
+        coverage = 0
+        for _key, start, end in blocks:
+            chunk_tokens = int(end) - int(start)
+            if chunk_tokens <= 0 or chunk_tokens % descriptor_tokens:
+                return None
+            coverage += chunk_tokens // descriptor_tokens
+        return coverage if coverage > 0 else None
+
+    @staticmethod
+    def _dsv4_deactivate_streaming_consumers(
+        csa_manager: Any,
+        indexer_manager: Any,
+    ) -> None:
+        """Ensure no previous split-layout plan can write the next request."""
+        deactivate_indexer = getattr(
+            indexer_manager,
+            "deactivate_native_indexer_stream",
+            None,
+        )
+        if callable(deactivate_indexer) and not deactivate_indexer():
+            raise RuntimeError("native indexer stream did not deactivate")
+        deactivate_csa = getattr(csa_manager, "deactivate_request", None)
+        if callable(deactivate_csa) and not deactivate_csa():
+            raise RuntimeError("CSA/HCA stream did not deactivate")
+
     def _register_csa_attention_kv_chunks(
         self,
         blocks: list[tuple[CacheEngineKey, int, int]],
@@ -2620,26 +3027,43 @@ class LMCacheEngine:
         total_tokens: int,
         req_id: str,
         slot_mapping: Optional[torch.Tensor] = None,
-    ) -> None:
+    ) -> tuple[bool, bool, bool]:
         """Build and register the CSA attention KV chunk map with the manager.
 
-        Best-effort: any failure (missing manager, layout mismatch, FIEMAP
-        error) logs and silently falls back to leaving the manager
-        unregistered, which means the prefetcher will warn-and-skip when
-        later asked to read.
+        All CSA, optional HCA, and native-indexer plans are preflighted before
+        any I/O starts. An incomplete plan leaves every consumer uncommitted.
 
         Args:
             blocks: Ordered ``(key, start_token, end_token)`` triples.
             disk_metas: Per-block ``DiskCacheMetadata``; ``None`` is allowed.
             total_tokens: Total logical tokens in the request.
             req_id: Request identifier for the prefetcher's internal logging.
+            slot_mapping: vLLM physical destination mapping for this request.
+
+        Returns:
+            ``(csa_ready, hca_ready, indexer_ready)`` for the unified
+            layer-major consumers. HCA readiness is false when the HCA walker
+            is disabled.
+
+        Raises:
+            RuntimeError: If the fully preflighted plan cannot be committed to
+                the CSA/HCA manager.
         """
+        register_profile_start = time.perf_counter()
+        indexer_build_ms = 0.0
+        csa_build_ms = 0.0
+        hca_build_ms = 0.0
+        lba_build_ms = 0.0
+        indexer_commit_ms = 0.0
+        manager_commit_ms = 0.0
+        slot_mapping_ms = 0.0
         try:
             from lmcache.v1.csa_attention_kv_prefetch_manager import (
+                build_shared_raw_lba_cache,
                 get_csa_attention_kv_prefetch_manager,
             )
         except ImportError:
-            return
+            return False, False, False
         manager = get_csa_attention_kv_prefetch_manager()
         if manager is None:
             # Tutti loader may have been bootstrapped after post_init; retry
@@ -2650,65 +3074,214 @@ class LMCacheEngine:
                     _ensure_csa_attention_kv_prefetch_attached,
                 )
             except ImportError:
-                return
+                return False, False, False
             manager = _ensure_csa_attention_kv_prefetch_attached(
                 getattr(self, "_tutti_loader", None)
             )
             if manager is None:
-                return
-        # The request-level capture owner is the canonical CSA/HCA manager,
-        # but compact indexer Stage0 runs before its chunk registration. Start
-        # capture here so the trace includes the front-of-pipeline I/O.
-        manager.start_full_nsys_capture_for_request(str(req_id))
-        # Register the compact native-indexer plan first. Shape filtering is
-        # allowed to remove the padded ``csa_indexer_cache`` group only after
-        # this call proves complete sidecar coverage and Stage0 has landed.
+                return False, False, False
+        # Construct all three plans before starting any I/O. Compact-main
+        # selection is an atomic contract: partial consumer activation cannot
+        # safely fall back to restoring the removed groups from a full object.
         try:
             from lmcache.v1.indexer_ssd_manager import get_indexer_ssd_manager
 
             indexer_manager = get_indexer_ssd_manager()
         except ImportError:
             indexer_manager = None
+        indexer_chunks: dict[int, list[Any]] = {}
+        register_indexer: Optional[Callable[..., Any]] = None
+        prepared_slot_mapping = slot_mapping
+        if isinstance(slot_mapping, torch.Tensor):
+            phase_start = time.perf_counter()
+            try:
+                # All three layer-major builders consume the same mapping.
+                # Materialize it once instead of performing three blocking
+                # device-to-host copies before the model forward starts.
+                prepared_slot_mapping = (
+                    slot_mapping.detach()
+                    .to(device="cpu", dtype=torch.int64)
+                    .reshape(-1)
+                )
+            except Exception:
+                logger.warning(
+                    "DSv4 unified layer-major slot mapping materialization "
+                    "failed request=%s",
+                    req_id,
+                )
+                prepared_slot_mapping = None
+            slot_mapping_ms = (time.perf_counter() - phase_start) * 1000.0
         if indexer_manager is not None:
+            phase_start = time.perf_counter()
             indexer_chunks = self._dsv4_build_indexer_cache_chunks(
                 blocks,
                 total_tokens,
-                slot_mapping=slot_mapping,
+                slot_mapping=prepared_slot_mapping,
             )
+            indexer_build_ms = (time.perf_counter() - phase_start) * 1000.0
             register_indexer = getattr(
                 indexer_manager,
                 "register_native_indexer_stream",
                 None,
             )
-            if callable(register_indexer):
-                register_indexer(req_id, indexer_chunks)
 
+        phase_start = time.perf_counter()
         chunks_by_layer = self._dsv4_build_csa_attention_kv_chunks(
             blocks,
             disk_metas,
             total_tokens,
-            slot_mapping=slot_mapping,
+            slot_mapping=prepared_slot_mapping,
         )
-        if _env_flag("LMCACHE_DSV4_HCA_WALKER"):
+        csa_build_ms = (time.perf_counter() - phase_start) * 1000.0
+        csa_expected_end = self._dsv4_streaming_expected_layer_coverage(
+            blocks,
+            "csa_attention_kv",
+        )
+        csa_ready = self._dsv4_layer_chunk_map_complete(
+            chunks_by_layer,
+            getattr(manager, "csa_layer_ids", ()),
+            csa_expected_end,
+        )
+        hca_requested = _env_flag("LMCACHE_DSV4_HCA_WALKER")
+        hca_ready = False
+        if hca_requested:
+            phase_start = time.perf_counter()
             hca_chunks = self._dsv4_build_hca_attention_kv_chunks(
                 blocks,
                 total_tokens,
-                slot_mapping=slot_mapping,
+                slot_mapping=prepared_slot_mapping,
             )
-            for layer_id, chunk_list in hca_chunks.items():
-                if layer_id in chunks_by_layer:
-                    logger.warning(
-                        "DSv4 HCA walker: layer %d already carries CSA "
-                        "chunks; HCA registration for it skipped",
-                        layer_id,
-                    )
-                    continue
-                chunks_by_layer[layer_id] = chunk_list
-        if not chunks_by_layer:
-            return
+            hca_build_ms = (time.perf_counter() - phase_start) * 1000.0
+            overlapping_layers = set(chunks_by_layer) & set(hca_chunks)
+            hca_expected_end = self._dsv4_streaming_expected_layer_coverage(
+                blocks,
+                "hca_attention_kv",
+            )
+            hca_ready = self._dsv4_layer_chunk_map_complete(
+                hca_chunks,
+                getattr(manager, "hca_layer_ids", ()),
+                hca_expected_end,
+            )
+            if overlapping_layers:
+                logger.warning(
+                    "DSv4 unified layer-major layer conflict layers=%s",
+                    sorted(overlapping_layers),
+                )
+                hca_ready = False
+            else:
+                chunks_by_layer.update(hca_chunks)
+        preflight_ready = bool(
+            csa_ready
+            and (not hca_requested or hca_ready)
+            and indexer_chunks
+            and callable(register_indexer)
+        )
+        if not preflight_ready:
+            logger.warning(
+                "DSv4 unified layer-major preflight incomplete "
+                "request=%s csa_ready=%s hca_ready=%s indexer_plan=%s",
+                req_id,
+                csa_ready,
+                hca_ready,
+                bool(indexer_chunks),
+            )
+            self._dsv4_deactivate_streaming_consumers(
+                manager,
+                indexer_manager,
+            )
+            return False, False, False
+
+        # All three plans address objects in the same rank-local raw pool.
+        # Register their union once and pass the exact same list objects to
+        # both managers; otherwise their per-layer reads alternate between
+        # disjoint LBA tables and repeatedly sort the pool extent index.
+        phase_start = time.perf_counter()
+        shared_raw_lba_cache = build_shared_raw_lba_cache(
+            (indexer_chunks, chunks_by_layer)
+        )
+        lba_build_ms = (time.perf_counter() - phase_start) * 1000.0
+        if not shared_raw_lba_cache:
+            logger.warning(
+                "DSv4 unified layer-major extent plan is empty request=%s",
+                req_id,
+            )
+            self._dsv4_deactivate_streaming_consumers(
+                manager,
+                indexer_manager,
+            )
+            return False, False, False
+
+        if str(getattr(manager, "active_request_id", "")) == str(req_id):
+            request_chunks_match = getattr(manager, "request_chunks_match", None)
+            indexer_chunks_match = getattr(
+                indexer_manager,
+                "native_indexer_stream_matches",
+                None,
+            )
+            repeated_plan_matches = bool(
+                callable(request_chunks_match)
+                and request_chunks_match(req_id, chunks_by_layer)
+                and callable(indexer_chunks_match)
+                and indexer_chunks_match(req_id, indexer_chunks)
+            )
+            if not repeated_plan_matches:
+                logger.warning(
+                    "DSv4 unified layer-major repeated request plan changed "
+                    "request=%s; refusing stale registration",
+                    req_id,
+                )
+                self._dsv4_deactivate_streaming_consumers(
+                    manager,
+                    indexer_manager,
+                )
+                return False, False, False
+
+        # The request-level capture owner is the canonical CSA/HCA manager,
+        # but compact indexer Stage0 starts first to maximize its overlap with
+        # request setup and layers 0-1. Destination-row tables are prewarmed at
+        # manager attachment, so this early submission no longer races a
+        # first-hit CUDA allocation/upload in the CSA/HCA registration below.
+        manager.start_full_nsys_capture_for_request(str(req_id))
+        assert callable(register_indexer)
         try:
-            manager.register_request_chunks(req_id, chunks_by_layer)
+            phase_start = time.perf_counter()
+            indexer_ready = bool(
+                register_indexer(
+                    req_id,
+                    indexer_chunks,
+                    shared_raw_lba_cache=shared_raw_lba_cache,
+                )
+            )
+            indexer_commit_ms = (time.perf_counter() - phase_start) * 1000.0
         except Exception as exc:
+            self._dsv4_deactivate_streaming_consumers(
+                manager,
+                indexer_manager,
+            )
+            raise RuntimeError("native indexer read-plan registration failed") from exc
+        if not indexer_ready:
+            logger.warning(
+                "DSv4 unified layer-major indexer commit failed request=%s",
+                req_id,
+            )
+            self._dsv4_deactivate_streaming_consumers(
+                manager,
+                indexer_manager,
+            )
+            return False, False, False
+        try:
+            phase_start = time.perf_counter()
+            manager.register_request_chunks(
+                req_id,
+                chunks_by_layer,
+                shared_raw_lba_cache=shared_raw_lba_cache,
+            )
+            manager_commit_ms = (time.perf_counter() - phase_start) * 1000.0
+        except Exception as exc:
+            self._dsv4_deactivate_streaming_consumers(
+                manager,
+                indexer_manager,
+            )
             logger.exception(
                 "Failed to register CSA attention KV chunks for request %s; "
                 "filtered attention KV cannot be consumed safely",
@@ -2717,6 +3290,24 @@ class LMCacheEngine:
             raise RuntimeError(
                 "CSA attention KV read-plan registration failed"
             ) from exc
+        if _env_flag("LMCACHE_TUTTI_PROFILE"):
+            logger.info(
+                "TUTTI_PROFILE streaming_register request=%s "
+                "slot_mapping_ms=%.3f indexer_build_ms=%.3f "
+                "csa_build_ms=%.3f hca_build_ms=%.3f "
+                "lba_build_ms=%.3f indexer_commit_ms=%.3f "
+                "manager_commit_ms=%.3f total_ms=%.3f",
+                req_id,
+                slot_mapping_ms,
+                indexer_build_ms,
+                csa_build_ms,
+                hca_build_ms,
+                lba_build_ms,
+                indexer_commit_ms,
+                manager_commit_ms,
+                (time.perf_counter() - register_profile_start) * 1000.0,
+            )
+        return csa_ready, hca_ready, indexer_ready
 
     def _dsv4_build_indexer_cache_chunks(
         self,
@@ -2853,44 +3444,53 @@ class LMCacheEngine:
         if not callable(probe) or not callable(get_layers):
             return {}
         candidate_keys = [key for key, _start, _end in blocks]
-        candidate_records = probe(candidate_keys, object_layer_ids[0])
-        segment_candidates: dict[int, tuple[int, CacheEngineKey]] = {}
-        for block_index, record in enumerate(candidate_records):
-            if (
-                record is None
-                or not record.raw_extents
-                or int(record.length) % bytes_per_block
-            ):
-                continue
-            segment_blocks = int(record.length) // bytes_per_block
-            segment_end = block_ends[block_index]
-            segment_start = segment_end - segment_blocks
-            if segment_start < 0 or segment_end > total_blocks:
-                continue
-            current = segment_candidates.get(segment_start)
-            if current is None or segment_end > current[0]:
-                segment_candidates[segment_start] = (
-                    segment_end,
-                    candidate_keys[block_index],
-                )
+        last_records = probe([candidate_keys[-1]], object_layer_ids[0])
+        last_record = last_records[0] if last_records else None
+        if (
+            last_record is not None
+            and last_record.raw_extents
+            and int(last_record.length) == total_blocks * bytes_per_block
+        ):
+            segments = [(0, total_blocks, candidate_keys[-1])]
+        else:
+            candidate_records = probe(candidate_keys, object_layer_ids[0])
+            segment_candidates: dict[int, tuple[int, CacheEngineKey]] = {}
+            for block_index, record in enumerate(candidate_records):
+                if (
+                    record is None
+                    or not record.raw_extents
+                    or int(record.length) % bytes_per_block
+                ):
+                    continue
+                segment_blocks = int(record.length) // bytes_per_block
+                segment_end = block_ends[block_index]
+                segment_start = segment_end - segment_blocks
+                if segment_start < 0 or segment_end > total_blocks:
+                    continue
+                current = segment_candidates.get(segment_start)
+                if current is None or segment_end > current[0]:
+                    segment_candidates[segment_start] = (
+                        segment_end,
+                        candidate_keys[block_index],
+                    )
 
-        segments: list[tuple[int, int, CacheEngineKey]] = []
-        cursor = 0
-        while cursor < total_blocks:
-            candidate = segment_candidates.get(cursor)
-            if candidate is None:
-                logger.warning(
-                    "DSv4 compact indexer coverage failed covered=%d/%d "
-                    "ready=%d keys=%d",
-                    cursor,
-                    total_blocks,
-                    sum(record is not None for record in candidate_records),
-                    len(candidate_keys),
-                )
-                return {}
-            segment_end, segment_key = candidate
-            segments.append((cursor, segment_end, segment_key))
-            cursor = segment_end
+            segments = []
+            cursor = 0
+            while cursor < total_blocks:
+                candidate = segment_candidates.get(cursor)
+                if candidate is None:
+                    logger.warning(
+                        "DSv4 compact indexer coverage failed covered=%d/%d "
+                        "ready=%d keys=%d",
+                        cursor,
+                        total_blocks,
+                        sum(record is not None for record in candidate_records),
+                        len(candidate_keys),
+                    )
+                    return {}
+                segment_end, segment_key = candidate
+                segments.append((cursor, segment_end, segment_key))
+                cursor = segment_end
 
         result: dict[int, list[Any]] = {
             int(layer_id): [] for layer_id in manager_layer_ids
@@ -2939,14 +3539,17 @@ class LMCacheEngine:
                         layer_major=True,
                     )
                 )
-        logger.info(
-            "DSv4 compact native indexer read plan layers=%d segments=%d "
-            "blocks=%d bytes_per_layer=%d",
-            len(result),
-            len(segments),
-            total_blocks,
-            total_blocks * bytes_per_block,
-        )
+        if _env_flag("LMCACHE_TUTTI_PROFILE") or int(
+            getattr(getattr(self, "metadata", None), "worker_id", 0)
+        ) == 0:
+            logger.info(
+                "DSv4 compact native indexer read plan layers=%d segments=%d "
+                "blocks=%d bytes_per_layer=%d",
+                len(result),
+                len(segments),
+                total_blocks,
+                total_blocks * bytes_per_block,
+            )
         return result
 
     def _dsv4_build_csa_attention_kv_chunks(
@@ -3111,63 +3714,86 @@ class LMCacheEngine:
                     )
                     if callable(probe_segments):
                         candidate_keys = [key for key, _start, _end in blocks]
-                        candidate_records = probe_segments(
-                            candidate_keys,
-                            object_layer_ids[0],
-                        )
                         bytes_per_compressed_block = (
                             compressed_block_size * bytes_per_token
                         )
-                        segment_candidates: dict[int, tuple[int, CacheEngineKey]] = {}
-                        for block_index, record in enumerate(candidate_records):
-                            if record is None or not record.raw_extents:
-                                continue
-                            if int(record.length) % bytes_per_compressed_block:
-                                continue
-                            segment_blocks = (
-                                int(record.length) // bytes_per_compressed_block
+                        last_records = probe_segments(
+                            [candidate_keys[-1]],
+                            object_layer_ids[0],
+                        )
+                        last_record = last_records[0] if last_records else None
+                        if (
+                            last_record is not None
+                            and last_record.raw_extents
+                            and int(last_record.length)
+                            == total_compressed_blocks * bytes_per_compressed_block
+                        ):
+                            segments = [
+                                (0, total_compressed_blocks, candidate_keys[-1])
+                            ]
+                            expected_segment_start = total_compressed_blocks
+                        else:
+                            candidate_records = probe_segments(
+                                candidate_keys,
+                                object_layer_ids[0],
                             )
-                            segment_end = compressed_block_ends[block_index]
-                            segment_start = segment_end - segment_blocks
-                            if (
-                                segment_start < 0
-                                or segment_end > total_compressed_blocks
-                            ):
-                                continue
-                            current = segment_candidates.get(segment_start)
-                            if current is None or segment_end > current[0]:
-                                segment_candidates[segment_start] = (
-                                    segment_end,
-                                    candidate_keys[block_index],
+                            segment_candidates: dict[
+                                int, tuple[int, CacheEngineKey]
+                            ] = {}
+                            for block_index, record in enumerate(candidate_records):
+                                if record is None or not record.raw_extents:
+                                    continue
+                                if int(record.length) % bytes_per_compressed_block:
+                                    continue
+                                segment_blocks = (
+                                    int(record.length) // bytes_per_compressed_block
                                 )
+                                segment_end = compressed_block_ends[block_index]
+                                segment_start = segment_end - segment_blocks
+                                if (
+                                    segment_start < 0
+                                    or segment_end > total_compressed_blocks
+                                ):
+                                    continue
+                                current = segment_candidates.get(segment_start)
+                                if current is None or segment_end > current[0]:
+                                    segment_candidates[segment_start] = (
+                                        segment_end,
+                                        candidate_keys[block_index],
+                                    )
 
-                        segments: list[tuple[int, int, CacheEngineKey]] = []
-                        expected_segment_start = 0
-                        while expected_segment_start < total_compressed_blocks:
-                            candidate = segment_candidates.get(expected_segment_start)
-                            if candidate is None:
-                                segments = []
-                                break
-                            segment_end, segment_key = candidate
-                            segments.append(
-                                (
+                            segments = []
+                            expected_segment_start = 0
+                            while expected_segment_start < total_compressed_blocks:
+                                candidate = segment_candidates.get(
+                                    expected_segment_start
+                                )
+                                if candidate is None:
+                                    segments = []
+                                    break
+                                segment_end, segment_key = candidate
+                                segments.append(
+                                    (
+                                        expected_segment_start,
+                                        segment_end,
+                                        segment_key,
+                                    )
+                                )
+                                expected_segment_start = segment_end
+
+                            if not segments:
+                                logger.warning(
+                                    "DSv4 CSA layer-major segment coverage failed "
+                                    "keys=%d ready=%d candidates=%d covered=%d/%d",
+                                    len(candidate_keys),
+                                    sum(
+                                        record is not None
+                                        for record in candidate_records
+                                    ),
+                                    len(segment_candidates),
                                     expected_segment_start,
-                                    segment_end,
-                                    segment_key,
+                                    total_compressed_blocks,
                                 )
-                            )
-                            expected_segment_start = segment_end
-
-                        if not segments:
-                            logger.warning(
-                                "DSv4 CSA layer-major segment coverage failed "
-                                "keys=%d ready=%d candidates=%d covered=%d/%d",
-                                len(candidate_keys),
-                                sum(record is not None for record in candidate_records),
-                                len(segment_candidates),
-                                expected_segment_start,
-                                total_compressed_blocks,
-                            )
 
                         if (
                             segments
@@ -3248,13 +3874,20 @@ class LMCacheEngine:
                                         )
                                     )
                             if valid_segments:
-                                logger.info(
-                                    "DSv4 CSA segmented layer-major read plan "
-                                    "layers=%d segments=%d blocks=%d",
-                                    len(result),
-                                    len(segments),
-                                    total_compressed_blocks,
-                                )
+                                if _env_flag("LMCACHE_TUTTI_PROFILE") or int(
+                                    getattr(
+                                        getattr(self, "metadata", None),
+                                        "worker_id",
+                                        0,
+                                    )
+                                ) == 0:
+                                    logger.info(
+                                        "DSv4 CSA segmented layer-major read plan "
+                                        "layers=%d segments=%d blocks=%d",
+                                        len(result),
+                                        len(segments),
+                                        total_compressed_blocks,
+                                    )
                                 return result
 
         keys = [key for key, _, _ in blocks]
@@ -3524,7 +4157,6 @@ class LMCacheEngine:
             return {}
 
         keys = [key for key, _, _ in blocks]
-        object_records = disk_backend.get_kv_object_records(keys, roles=None)
 
         compress_ratio = int(hca_group.compress_ratio)
         if compress_ratio <= 0:
@@ -3588,49 +4220,62 @@ class LMCacheEngine:
                     for _key, start, end in blocks:
                         entry_cursor += (int(end) - int(start)) // compress_ratio
                         candidate_ends.append(entry_cursor)
-                    candidate_records = probe_segments(
-                        keys,
+                    last_records = probe_segments(
+                        [keys[-1]],
                         object_layer_ids[0],
                     )
-                    segment_candidates: dict[int, tuple[int, CacheEngineKey]] = {}
-                    for index, record in enumerate(candidate_records):
-                        if record is None or not record.raw_extents:
-                            continue
-                        if int(record.length) % token_bytes:
-                            continue
-                        segment_entries = int(record.length) // token_bytes
-                        segment_end = candidate_ends[index]
-                        segment_start = segment_end - segment_entries
-                        if segment_start < 0 or segment_end > total_entries:
-                            continue
-                        current = segment_candidates.get(segment_start)
-                        if current is None or segment_end > current[0]:
-                            segment_candidates[segment_start] = (
-                                segment_end,
-                                keys[index],
-                            )
-
-                    segments: list[tuple[int, int, CacheEngineKey]] = []
-                    expected_start = 0
-                    while expected_start < total_entries:
-                        candidate = segment_candidates.get(expected_start)
-                        if candidate is None:
-                            segments = []
-                            break
-                        segment_end, segment_key = candidate
-                        segments.append((expected_start, segment_end, segment_key))
-                        expected_start = segment_end
-
-                    if not segments:
-                        logger.warning(
-                            "DSv4 HCA layer-major segment coverage failed "
-                            "keys=%d ready=%d candidates=%d covered=%d/%d",
-                            len(keys),
-                            sum(record is not None for record in candidate_records),
-                            len(segment_candidates),
-                            expected_start,
-                            total_entries,
+                    last_record = last_records[0] if last_records else None
+                    if (
+                        last_record is not None
+                        and last_record.raw_extents
+                        and int(last_record.length) == total_entries * token_bytes
+                    ):
+                        segments = [(0, total_entries, keys[-1])]
+                        expected_start = total_entries
+                    else:
+                        candidate_records = probe_segments(
+                            keys,
+                            object_layer_ids[0],
                         )
+                        segment_candidates: dict[int, tuple[int, CacheEngineKey]] = {}
+                        for index, record in enumerate(candidate_records):
+                            if record is None or not record.raw_extents:
+                                continue
+                            if int(record.length) % token_bytes:
+                                continue
+                            segment_entries = int(record.length) // token_bytes
+                            segment_end = candidate_ends[index]
+                            segment_start = segment_end - segment_entries
+                            if segment_start < 0 or segment_end > total_entries:
+                                continue
+                            current = segment_candidates.get(segment_start)
+                            if current is None or segment_end > current[0]:
+                                segment_candidates[segment_start] = (
+                                    segment_end,
+                                    keys[index],
+                                )
+
+                        segments = []
+                        expected_start = 0
+                        while expected_start < total_entries:
+                            candidate = segment_candidates.get(expected_start)
+                            if candidate is None:
+                                segments = []
+                                break
+                            segment_end, segment_key = candidate
+                            segments.append((expected_start, segment_end, segment_key))
+                            expected_start = segment_end
+
+                        if not segments:
+                            logger.warning(
+                                "DSv4 HCA layer-major segment coverage failed "
+                                "keys=%d ready=%d candidates=%d covered=%d/%d",
+                                len(keys),
+                                sum(record is not None for record in candidate_records),
+                                len(segment_candidates),
+                                expected_start,
+                                total_entries,
+                            )
 
                     if segments and expected_start == total_entries:
                         segmented_chunks: dict[int, list[Any]] = {
@@ -3705,13 +4350,20 @@ class LMCacheEngine:
                                     )
                                 )
                         if valid_segments:
-                            logger.info(
-                                "DSv4 HCA segmented layer-major read plan "
-                                "layers=%d segments=%d entries=%d",
-                                len(segmented_chunks),
-                                len(segments),
-                                total_entries,
-                            )
+                            if _env_flag("LMCACHE_TUTTI_PROFILE") or int(
+                                getattr(
+                                    getattr(self, "metadata", None),
+                                    "worker_id",
+                                    0,
+                                )
+                            ) == 0:
+                                logger.info(
+                                    "DSv4 HCA segmented layer-major read plan "
+                                    "layers=%d segments=%d entries=%d",
+                                    len(segmented_chunks),
+                                    len(segments),
+                                    total_entries,
+                                )
                             return segmented_chunks
                 prefix_key = blocks[-1][0]
                 layer_records = disk_backend.get_hca_layer_major_records(
@@ -3773,6 +4425,7 @@ class LMCacheEngine:
                     prefix_key.to_string(),
                 )
 
+        object_records = disk_backend.get_kv_object_records(keys, roles=None)
         chunks_by_layer: dict[int, list[Any]] = {
             int(layer_id): [] for layer_id in layer_ids_for_group
         }
@@ -3891,6 +4544,8 @@ class LMCacheEngine:
         start: int,
         end: int,
         total_tokens: int,
+        *,
+        keep_request_tail: bool = True,
     ) -> list[torch.Size]:
         if not self.dsv4_optimized_kv:
             return shapes
@@ -3898,7 +4553,12 @@ class LMCacheEngine:
         if klg_manager is None or not klg_manager.kv_layer_groups:
             return shapes
         tail_start = max(0, total_tokens - self.dsv4_optimized_tail_tokens)
-        keep_tail_groups = end > tail_start
+        # Chunked prefill presents a growing request prefix on every scheduler
+        # step.  Only the final step contains the real request tail; treating
+        # every intermediate batch boundary as the tail creates one oversized
+        # compact-main object per scheduler batch and breaks chunk shapes on
+        # lookup.
+        keep_tail_groups = keep_request_tail and end > tail_start
         optimized: list[torch.Size] = []
         for shape, dtype, group in zip(
             shapes,
@@ -4113,6 +4773,78 @@ class LMCacheEngine:
                 )
                 return False
         return True
+
+    def _dsv4_streaming_compact_retrieve_available(
+        self,
+        blocks: list[tuple[CacheEngineKey, int, int]],
+        disk_backend: Any,
+        role: str,
+        description: str,
+    ) -> bool:
+        """Return whether physical and metadata-only main entries are ready."""
+        if not blocks:
+            return False
+        keys = [key for key, _start, _end in blocks]
+        get_lengths = getattr(disk_backend, "get_kv_object_payload_lengths", None)
+        if not callable(get_lengths):
+            return False
+        lengths = get_lengths(keys, roles=[role] * len(keys))
+        records = disk_backend.get_kv_object_records(
+            keys,
+            roles=[role] * len(keys),
+        )
+        if len(lengths) != len(keys) or len(records) != len(keys):
+            return False
+        missing = sum(length is None for length in lengths)
+        if missing:
+            logger.info(
+                "%s unavailable blocks=%d missing=%d empty=%d",
+                description,
+                len(blocks),
+                missing,
+                sum(length == 0 for length in lengths),
+            )
+            return False
+        for length, record in zip(lengths, records, strict=True):
+            if length == 0:
+                continue
+            if length is None or not self._dsv4_kv_object_record_readable(
+                disk_backend,
+                record,
+            ):
+                logger.info(
+                    "%s unavailable reason=not_tutti_readable blocks=%d",
+                    description,
+                    len(blocks),
+                )
+                return False
+        return True
+
+    def _dsv4_csa_deferred_retrieve_available(
+        self,
+        blocks: list[tuple[CacheEngineKey, int, int]],
+        disk_backend: Any,
+    ) -> bool:
+        """Return whether compact non-CSA retrieve objects are ready."""
+        return self._dsv4_streaming_compact_retrieve_available(
+            blocks,
+            disk_backend,
+            _DSV4_CSA_DEFERRED_RETRIEVE_ROLE,
+            "CSAAttentionKVPrefetchManager: compact non-CSA retrieve",
+        )
+
+    def _dsv4_csa_hca_deferred_retrieve_available(
+        self,
+        blocks: list[tuple[CacheEngineKey, int, int]],
+        disk_backend: Any,
+    ) -> bool:
+        """Return whether compact non-CSA/non-HCA objects are ready."""
+        return self._dsv4_streaming_compact_retrieve_available(
+            blocks,
+            disk_backend,
+            _DSV4_CSA_HCA_DEFERRED_RETRIEVE_ROLE,
+            "CSA/HCA prefetch: compact non-CSA/non-HCA retrieve",
+        )
 
     def _dsv4_hca_deferred_prefix_len(
         self,
@@ -4646,6 +5378,256 @@ class LMCacheEngine:
 
         self.stats_monitor.on_store_finished(monitor_req_id, tot_token_num)
         yield
+
+    @_lmcache_nvtx_annotate
+    @torch.inference_mode()
+    def prepare_dsv4_streaming_retrieve(
+        self,
+        tokens: Union[torch.Tensor, list[int]],
+        mask: Optional[torch.Tensor] = None,
+        **kwargs: Any,
+    ) -> Optional[torch.Tensor]:
+        """Prepare a metadata-only DSv4 hit without generic KV retrieval.
+
+        This fast path reuses the block map pinned by lookup and registers the
+        CSA, HCA, and indexer layer-major read plans. It is admitted only when
+        the compact-main view for every cached chunk is empty for the current
+        request. Consequently, every byte needed by model execution is owned
+        by a layer-major consumer and calling :meth:`retrieve` would perform
+        only redundant synchronous bookkeeping.
+
+        Args:
+            tokens: Tokens in the externally cached prefix.
+            mask: Tokens that LMCache, rather than vLLM, must restore.
+            **kwargs: Request metadata. ``req_id``, ``request_total_tokens``,
+                ``request_configs``, and ``slot_mapping`` are used here.
+
+        Returns:
+            A CPU boolean mask when the streaming-only plan was committed, or
+            ``None`` when the caller must use normal :meth:`retrieve`.
+        """
+        profile_start = time.perf_counter()
+        if (
+            not self.dsv4_optimized_kv
+            or not _env_flag("LMCACHE_INDEXER_ENABLE_PREFETCH")
+            or self.storage_manager is None
+            or self._tutti_config is None
+            or not self._dsv4_csa_attention_kv_prefetch_active()
+        ):
+            return None
+
+        req_id = str(kwargs.get("req_id", ""))
+        pinned_mapping = self.lookup_pins.get(req_id)
+        request_configs = kwargs.get("request_configs")
+        build_blocks_start = time.perf_counter()
+        terminal_chunk_hash = kwargs.get("terminal_chunk_hash")
+        mask_is_dense = mask is None or bool(torch.all(mask).item())
+        use_terminal_key = bool(
+            isinstance(terminal_chunk_hash, int)
+            and int(kwargs.get("vllm_cached_tokens", 0)) == 0
+            and mask_is_dense
+            and len(tokens) > 0
+            and len(tokens) % int(self.config.chunk_size) == 0
+        )
+        expected_blocks: list[tuple[CacheEngineKey, int, int]] = []
+        if use_terminal_key:
+            terminal_key = CacheEngineKey(
+                model_name=self.metadata.model_name,
+                world_size=int(self.metadata.world_size),
+                worker_id=int(self.metadata.worker_id),
+                chunk_hash=int(terminal_chunk_hash),
+                dtype=self.metadata.kv_dtype,
+                request_configs=request_configs,
+            )
+            expected_blocks.append((terminal_key, 0, len(tokens)))
+        else:
+            for start, end, key in self.token_database.process_tokens(
+                tokens=tokens,
+                mask=mask,
+                request_configs=request_configs,
+            ):
+                assert isinstance(key, CacheEngineKey)
+                expected_blocks.append((key, start, end))
+        if not expected_blocks:
+            return None
+        blocks = expected_blocks
+        build_blocks_ms = (time.perf_counter() - build_blocks_start) * 1000.0
+
+        validate_start = time.perf_counter()
+        disk_backend = self.storage_manager.storage_backends.get("LocalDiskBackend")
+        if disk_backend is None:
+            return None
+        expected_keys = [key for key, _start, _end in blocks]
+        if pinned_mapping is not None:
+            if (
+                set(pinned_mapping) != {"LocalDiskBackend"}
+                or not pinned_mapping["LocalDiskBackend"]
+                or (
+                    use_terminal_key
+                    and pinned_mapping["LocalDiskBackend"][-1] != expected_keys[-1]
+                )
+                or (
+                    not use_terminal_key
+                    and list(pinned_mapping["LocalDiskBackend"]) != expected_keys
+                )
+            ):
+                return None
+        elif any(key not in disk_backend.dict for key in expected_keys):
+            # Only the scheduler-facing rank performs lookup and owns pins.
+            # Other TP ranks may use their atomically admitted rank-local
+            # metadata; plan registration below validates every sidecar before
+            # committing any streaming consumer.
+            return None
+
+        role = (
+            _DSV4_CSA_HCA_DEFERRED_RETRIEVE_ROLE
+            if _env_flag("LMCACHE_DSV4_HCA_WALKER")
+            else _DSV4_CSA_DEFERRED_RETRIEVE_ROLE
+        )
+        request_total_tokens = max(
+            len(tokens),
+            int(kwargs.get("request_total_tokens", len(tokens))),
+        )
+        tail_tokens = getattr(self, "dsv4_optimized_tail_tokens", None)
+        tail_start = (
+            max(0, request_total_tokens - int(tail_tokens))
+            if isinstance(tail_tokens, int) and tail_tokens >= 0
+            else None
+        )
+        # The streaming compact main contains only request-tail groups after
+        # CSA, HCA, and indexer roles have been split into layer-major objects.
+        # Any cached chunk ending at or before the active tail boundary is
+        # therefore zero-byte by construction. Lookup already validated the
+        # immutable generation; expand schemas only for chunks that overlap
+        # the current request tail instead of repeating it for the full prefix.
+        compact_candidates = (
+            ((key, start, end) for key, start, end in blocks if end > tail_start)
+            if tail_start is not None
+            else ((key, start, end) for key, start, end in blocks)
+        )
+        if any(
+            self._dsv4_streaming_compact_payload_nbytes(
+                (start, end, key),
+                role,
+                request_total_tokens,
+            )
+            != 0
+            for key, start, end in compact_candidates
+        ):
+            return None
+        validate_ms = (time.perf_counter() - validate_start) * 1000.0
+
+        ensure_loader_start = time.perf_counter()
+        if not self._ensure_tutti_loader(expected_keys):
+            return None
+        ensure_loader_ms = (time.perf_counter() - ensure_loader_start) * 1000.0
+        register_start = time.perf_counter()
+        csa_ready, hca_ready, indexer_ready = self._register_csa_attention_kv_chunks(
+            blocks,
+            [disk_backend.dict.get(key) for key, _start, _end in blocks],
+            len(tokens),
+            req_id,
+            slot_mapping=kwargs.get("slot_mapping"),
+        )
+        # A terminal sidecar normally snapshots the complete admitted prefix,
+        # which makes the one-key path ideal for the common first hit.  A
+        # deferred hit admission, however, snapshots only its newly computed
+        # suffix under the new terminal key.  When that suffix is extended by
+        # another request, the one-key preflight correctly rejects its short
+        # record.  Rebuild the conventional chunk list here so the layer-major
+        # planners can greedily compose the earlier full-prefix generation and
+        # the suffix generation, instead of falling through to generic main-
+        # object retrieval.
+        if use_terminal_key and not (
+            csa_ready
+            and indexer_ready
+            and (not _env_flag("LMCACHE_DSV4_HCA_WALKER") or hca_ready)
+        ):
+            expanded_blocks: list[tuple[CacheEngineKey, int, int]] = []
+            for start, end, key in self.token_database.process_tokens(
+                tokens=tokens,
+                mask=mask,
+                request_configs=request_configs,
+            ):
+                assert isinstance(key, CacheEngineKey)
+                expanded_blocks.append((key, start, end))
+            if (
+                len(expanded_blocks) > 1
+                and all(
+                    key in disk_backend.dict
+                    for key, _start, _end in expanded_blocks
+                )
+            ):
+                blocks = expanded_blocks
+                csa_ready, hca_ready, indexer_ready = (
+                    self._register_csa_attention_kv_chunks(
+                        blocks,
+                        [
+                            disk_backend.dict.get(key)
+                            for key, _start, _end in blocks
+                        ],
+                        len(tokens),
+                        req_id,
+                        slot_mapping=kwargs.get("slot_mapping"),
+                    )
+                )
+                if (
+                    csa_ready
+                    and indexer_ready
+                    and (
+                        not _env_flag("LMCACHE_DSV4_HCA_WALKER") or hca_ready
+                    )
+                ):
+                    use_terminal_key = False
+                    logger.info(
+                        "DSv4 streaming-only terminal snapshot composed from "
+                        "%d admitted chunks request=%s",
+                        len(blocks),
+                        req_id,
+                    )
+        if not (
+            csa_ready
+            and indexer_ready
+            and (not _env_flag("LMCACHE_DSV4_HCA_WALKER") or hca_ready)
+        ):
+            return None
+        register_ms = (time.perf_counter() - register_start) * 1000.0
+
+        mask_start = time.perf_counter()
+        ret_mask = torch.zeros(len(tokens), dtype=torch.bool, device="cpu")
+        # ``ChunkedTokenDatabase.process_tokens`` yields a dense suffix after
+        # the optional vLLM-cached prefix. The unified sidecar preflight above
+        # has already rejected incomplete coverage, so one slice is exactly
+        # equivalent to 1,875 per-chunk assignments for a 480K hit.
+        ret_mask[blocks[0][1] : blocks[-1][2]] = True
+        if _env_flag("LMCACHE_TUTTI_PROFILE") or int(
+            getattr(getattr(self, "metadata", None), "worker_id", 0)
+        ) == 0:
+            logger.info(
+                "DSv4 streaming-only hit: skipped generic LMCacheEngine.retrieve "
+                "request=%s blocks=%d tokens=%d",
+                req_id,
+                len(blocks),
+                int(blocks[-1][2]) - int(blocks[0][1]),
+            )
+        if _env_flag("LMCACHE_TUTTI_PROFILE"):
+            logger.info(
+                "TUTTI_PROFILE streaming_retrieve request=%s blocks=%d "
+                "terminal_key_fastpath=%d "
+                "build_blocks_ms=%.3f validate_ms=%.3f "
+                "ensure_loader_ms=%.3f register_ms=%.3f mask_ms=%.3f "
+                "total_ms=%.3f",
+                req_id,
+                len(blocks),
+                int(use_terminal_key),
+                build_blocks_ms,
+                validate_ms,
+                ensure_loader_ms,
+                register_ms,
+                (time.perf_counter() - mask_start) * 1000.0,
+                (time.perf_counter() - profile_start) * 1000.0,
+            )
+        return ret_mask
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -5465,6 +6447,11 @@ class LMCacheEngine:
     def close(self) -> None:
         """Close the cache engine and free all the resources"""
         logger.info("Closing LMCacheEngine...")
+        self._discard_dsv4_layer_major_snapshot()
+
+        # Deferred hit admissions access both the object store and the Tutti
+        # writer, so drain them before either backend is closed.
+        self._dsv4_admission_executor.shutdown(wait=True, cancel_futures=False)
 
         try:
             from lmcache.integration.vllm.vllm_v1_adapter import (
@@ -5499,6 +6486,201 @@ class LMCacheEngine:
             self._tutti_loader = None
 
         logger.info("LMCacheEngine closed.")
+
+    def _store_dsv4_layer_major_snapshot(
+        self,
+        keys: list[CacheEngineKey],
+        memory_objs: list[MemoryObj],
+        token_count: int,
+        *,
+        mode: str,
+    ) -> None:
+        """Build sidecars for one complete request snapshot."""
+        disk_backend = self.storage_manager.storage_backends.get("LocalDiskBackend")
+        store_snapshot = getattr(
+            disk_backend,
+            "store_attention_layer_major_snapshot",
+            None,
+        )
+        try:
+            if callable(store_snapshot):
+                stored_layers = int(
+                    store_snapshot(
+                        keys[-1],
+                        memory_objs,
+                        prefix_keys=keys,
+                    )
+                )
+                logger.info(
+                    "DSv4 attention layer-major snapshot key=%s "
+                    "layers=%d chunks=%d tokens=%d mode=%s",
+                    keys[-1].to_string(),
+                    stored_layers,
+                    len(memory_objs),
+                    token_count,
+                    mode,
+                )
+        except Exception:
+            logger.exception(
+                "DSv4 attention layer-major snapshot store failed for %s",
+                keys[-1].to_string(),
+            )
+
+    def _submit_dsv4_hit_admission(
+        self,
+        keys: list[CacheEngineKey],
+        memory_objs: list[MemoryObj],
+        token_count: int,
+        *,
+        req_id: str,
+        is_last_prefill: bool,
+        transfer_spec: Any,
+    ) -> bool:
+        """Queue one cache-hit suffix admission outside first-token latency."""
+        with self._dsv4_admission_lock:
+            if self._dsv4_admission_pending >= self._dsv4_admission_max_pending:
+                return False
+            self._dsv4_admission_pending += 1
+
+        def _run() -> None:
+            try:
+                self._commit_dsv4_hit_admission(
+                    keys,
+                    memory_objs,
+                    token_count,
+                    req_id=req_id,
+                    is_last_prefill=is_last_prefill,
+                    transfer_spec=transfer_spec,
+                )
+            finally:
+                with self._dsv4_admission_lock:
+                    self._dsv4_admission_pending -= 1
+
+        try:
+            self._dsv4_admission_executor.submit(_run)
+        except RuntimeError:
+            with self._dsv4_admission_lock:
+                self._dsv4_admission_pending -= 1
+            return False
+        if int(getattr(self.metadata, "worker_id", 0)) == 0:
+            logger.info(
+                "DSv4 deferred hit admission queued request=%s chunks=%d "
+                "tokens=%d",
+                req_id,
+                len(memory_objs),
+                token_count,
+            )
+        return True
+
+    def _commit_dsv4_hit_admission(
+        self,
+        keys: list[CacheEngineKey],
+        memory_objs: list[MemoryObj],
+        token_count: int,
+        *,
+        req_id: str,
+        is_last_prefill: bool,
+        transfer_spec: Any,
+    ) -> None:
+        """Publish deferred sidecars and compact main as one generation."""
+        put_started = False
+        try:
+            self._store_dsv4_layer_major_snapshot(
+                keys,
+                memory_objs,
+                token_count,
+                mode="deferred_hit",
+            )
+            tutti_warmup_callback = self._make_tutti_store_warmup_callback(
+                list(keys),
+                req_id,
+                is_last_prefill,
+            )
+            put_kwargs: dict[str, Any] = {
+                "transfer_spec": transfer_spec,
+                "location": self.store_location,
+            }
+            if tutti_warmup_callback is not None:
+                put_signature = inspect.signature(self.storage_manager.batched_put)
+                if "on_complete_callback" not in put_signature.parameters:
+                    raise RuntimeError(
+                        "StorageManager.batched_put must support "
+                        "on_complete_callback for deferred Tutti admission"
+                    )
+                put_kwargs["on_complete_callback"] = tutti_warmup_callback
+            put_started = True
+            self.storage_manager.batched_put(keys, memory_objs, **put_kwargs)
+        except Exception:
+            logger.exception(
+                "DSv4 deferred hit admission failed request=%s chunks=%d",
+                req_id,
+                len(memory_objs),
+            )
+            if not put_started:
+                for memory_obj in memory_objs:
+                    memory_obj.ref_count_down()
+
+    def _stage_dsv4_layer_major_snapshot(
+        self,
+        req_id: str,
+        keys: list[CacheEngineKey],
+        memory_objs: list[MemoryObj],
+        token_count: int,
+        *,
+        is_last_prefill: bool,
+    ) -> Optional[tuple[list[CacheEngineKey], list[MemoryObj], int]]:
+        """Retain one store batch and return the complete final snapshot."""
+        stale_memory_objs: list[MemoryObj] = []
+        result: Optional[tuple[list[CacheEngineKey], list[MemoryObj], int]] = None
+        with self._dsv4_snapshot_lock:
+            if (
+                self._dsv4_snapshot_req_id is not None
+                and self._dsv4_snapshot_req_id != req_id
+            ):
+                stale_memory_objs = self._dsv4_snapshot_memory_objs
+                self._dsv4_snapshot_keys = []
+                self._dsv4_snapshot_memory_objs = []
+                self._dsv4_snapshot_tokens = 0
+            self._dsv4_snapshot_req_id = req_id
+
+            retained: list[MemoryObj] = []
+            try:
+                for memory_obj in memory_objs:
+                    memory_obj.ref_count_up()
+                    retained.append(memory_obj)
+            except Exception:
+                for memory_obj in retained:
+                    memory_obj.ref_count_down()
+                raise
+            self._dsv4_snapshot_keys.extend(keys)
+            self._dsv4_snapshot_memory_objs.extend(memory_objs)
+            self._dsv4_snapshot_tokens += int(token_count)
+
+            if is_last_prefill:
+                result = (
+                    self._dsv4_snapshot_keys,
+                    self._dsv4_snapshot_memory_objs,
+                    self._dsv4_snapshot_tokens,
+                )
+                self._dsv4_snapshot_req_id = None
+                self._dsv4_snapshot_keys = []
+                self._dsv4_snapshot_memory_objs = []
+                self._dsv4_snapshot_tokens = 0
+
+        for memory_obj in stale_memory_objs:
+            memory_obj.ref_count_down()
+        return result
+
+    def _discard_dsv4_layer_major_snapshot(self) -> None:
+        """Release retained host snapshots for an incomplete request."""
+        with self._dsv4_snapshot_lock:
+            memory_objs = self._dsv4_snapshot_memory_objs
+            self._dsv4_snapshot_req_id = None
+            self._dsv4_snapshot_keys = []
+            self._dsv4_snapshot_memory_objs = []
+            self._dsv4_snapshot_tokens = 0
+        for memory_obj in memory_objs:
+            memory_obj.ref_count_down()
 
     def _async_process_tokens_internal(
         self,
@@ -5611,6 +6793,14 @@ class LMCacheEngine:
             block_mapping = self.storage_manager.get_block_mapping(chunk_infos)
 
         total_tokens = len(tokens)
+        # vLLM truncates ``tokens`` to the cacheable load prefix and normally
+        # retains at least one block for recomputation.  Tail-only DSv4 groups
+        # must therefore be classified against the full prompt, not against
+        # this shorter retrieve slice.
+        request_total_tokens = max(
+            total_tokens,
+            int(kwargs.get("request_total_tokens", total_tokens)),
+        )
 
         last_failed_block_start = None
         for location, mapped_blocks in block_mapping.items():
@@ -5631,13 +6821,22 @@ class LMCacheEngine:
             # prefetcher is attached, leaving those ~100 MiB for the
             # prefetcher to load lazily via Tutti during the FFN/MoE overlap
             # window.
+            csa_prefetch_active = False
+            csa_stream_ready = False
+            hca_stream_ready = False
+            indexer_stream_ready = False
             if self.dsv4_optimized_kv:
-                if self._dsv4_csa_attention_kv_prefetch_active():
+                csa_prefetch_active = self._dsv4_csa_attention_kv_prefetch_active()
+                if csa_prefetch_active:
                     csa_disk_backend = self.storage_manager.storage_backends.get(
                         "LocalDiskBackend"
                     )
                     if csa_disk_backend is not None:
-                        self._register_csa_attention_kv_chunks(
+                        (
+                            csa_stream_ready,
+                            hca_stream_ready,
+                            indexer_stream_ready,
+                        ) = self._register_csa_attention_kv_chunks(
                             blocks,
                             [csa_disk_backend.dict.get(key) for key, _, _ in blocks],
                             total_tokens,
@@ -5650,7 +6849,7 @@ class LMCacheEngine:
                         self.metadata.get_dtypes(),
                         start,
                         end,
-                        total_tokens,
+                        request_total_tokens,
                     )
                     for _, start, end in blocks
                 ]
@@ -5676,9 +6875,74 @@ class LMCacheEngine:
                         disk_backend = self.storage_manager.storage_backends.get(
                             "LocalDiskBackend"
                         )
-                        if (
-                            manager is not None
+                        use_csa_deferred_compact = bool(
+                            disk_backend is not None
+                            and csa_prefetch_active
+                            and csa_stream_ready
+                            and indexer_stream_ready
+                            and not _env_flag("LMCACHE_DSV4_HCA_WALKER")
+                            and self._dsv4_csa_deferred_retrieve_available(
+                                blocks,
+                                disk_backend,
+                            )
+                        )
+                        if use_csa_deferred_compact:
+                            shapes_per_key = [
+                                self._dsv4_csa_compact_retrieve_shapes_for_range(
+                                    self.metadata.get_shapes(end - start),
+                                    self.metadata.get_dtypes(),
+                                    start,
+                                    end,
+                                    request_total_tokens,
+                                )
+                                for _, start, end in blocks
+                            ]
+                            kv_object_roles = [_DSV4_CSA_DEFERRED_RETRIEVE_ROLE] * len(
+                                blocks
+                            )
+                            read_ranges_per_key = None
+                            logger.info(
+                                "CSAAttentionKVPrefetchManager: using compact "
+                                "non-CSA retrieve objects blocks=%d",
+                                len(blocks),
+                            )
+                        elif (
+                            disk_backend is not None
+                            and csa_prefetch_active
+                            and csa_stream_ready
+                            and hca_stream_ready
+                            and indexer_stream_ready
+                            and _env_flag("LMCACHE_DSV4_HCA_WALKER")
+                            and self._dsv4_csa_hca_deferred_retrieve_available(
+                                blocks,
+                                disk_backend,
+                            )
+                        ):
+                            shapes_per_key = [
+                                self._dsv4_csa_hca_compact_retrieve_shapes_for_range(
+                                    self.metadata.get_shapes(end - start),
+                                    self.metadata.get_dtypes(),
+                                    start,
+                                    end,
+                                    request_total_tokens,
+                                )
+                                for _, start, end in blocks
+                            ]
+                            kv_object_roles = [
+                                _DSV4_CSA_HCA_DEFERRED_RETRIEVE_ROLE
+                            ] * len(blocks)
+                            read_ranges_per_key = None
+                            logger.info(
+                                "CSA/HCA prefetch: using unified layer-major "
+                                "compact non-CSA/non-HCA retrieve objects "
+                                "blocks=%d",
+                                len(blocks),
+                            )
+                        elif (
+                            not _env_flag("LMCACHE_INDEXER_ENABLE_PREFETCH")
+                            and manager is not None
                             and disk_backend is not None
+                            and _env_flag("LMCACHE_DSV4_HCA_WALKER")
                             and self._dsv4_hca_object_source_available(
                                 blocks,
                                 manager,
@@ -5695,28 +6959,60 @@ class LMCacheEngine:
                                 )
                             )
                             if registered_hca_layers > 0:
-                                use_hca_deferred_compact = (
-                                    self._dsv4_hca_deferred_retrieve_available(
+                                use_csa_hca_deferred_compact = bool(
+                                    self._dsv4_csa_attention_kv_prefetch_active()
+                                    and self._dsv4_csa_hca_deferred_retrieve_available(
                                         blocks,
                                         disk_backend,
                                     )
                                 )
-                                retrieve_views = [
-                                    self._dsv4_retrieve_view_for_range(
-                                        self.metadata.get_shapes(end - start),
-                                        self.metadata.get_dtypes(),
-                                        start,
-                                        end,
-                                        total_tokens,
-                                        require_sector_readable=not (
-                                            use_hca_deferred_compact
-                                        ),
+                                use_hca_deferred_compact = (
+                                    not use_csa_hca_deferred_compact
+                                    and self._dsv4_hca_deferred_retrieve_available(
+                                        blocks,
+                                        disk_backend,
                                     )
-                                    for _, start, end in blocks
-                                ]
-                                shapes_per_key = [
-                                    shapes for shapes, _read_ranges in retrieve_views
-                                ]
+                                )
+                                if use_csa_hca_deferred_compact:
+                                    shapes_per_key = [
+                                        self._dsv4_csa_hca_compact_retrieve_shapes_for_range(
+                                            self.metadata.get_shapes(end - start),
+                                            self.metadata.get_dtypes(),
+                                            start,
+                                            end,
+                                            request_total_tokens,
+                                        )
+                                        for _, start, end in blocks
+                                    ]
+                                    kv_object_roles = [
+                                        _DSV4_CSA_HCA_DEFERRED_RETRIEVE_ROLE
+                                    ] * len(blocks)
+                                    read_ranges_per_key = None
+                                    logger.info(
+                                        "CSA/HCA prefetch: using compact "
+                                        "non-CSA/non-HCA retrieve objects "
+                                        "blocks=%d registered_hca_layers=%d",
+                                        len(blocks),
+                                        registered_hca_layers,
+                                    )
+                                else:
+                                    retrieve_views = [
+                                        self._dsv4_retrieve_view_for_range(
+                                            self.metadata.get_shapes(end - start),
+                                            self.metadata.get_dtypes(),
+                                            start,
+                                            end,
+                                            request_total_tokens,
+                                            require_sector_readable=not (
+                                                use_hca_deferred_compact
+                                            ),
+                                        )
+                                        for _, start, end in blocks
+                                    ]
+                                    shapes_per_key = [
+                                        shapes
+                                        for shapes, _read_ranges in retrieve_views
+                                    ]
                                 if use_hca_deferred_compact:
                                     kv_object_roles = [
                                         _DSV4_HCA_DEFERRED_RETRIEVE_ROLE
@@ -5729,11 +7025,36 @@ class LMCacheEngine:
                                         len(blocks),
                                         registered_hca_layers,
                                     )
-                                else:
+                                elif not use_csa_hca_deferred_compact:
                                     read_ranges_per_key = [
                                         read_ranges
                                         for _shapes, read_ranges in retrieve_views
                                     ]
+                        elif csa_prefetch_active:
+                            # A zero-shaped group in the middle of a raw object
+                            # cannot be represented by a shorter prefix read.
+                            # Until the compact non-CSA object is READY, retain
+                            # every stored group so later bytes never shift into
+                            # the wrong tensor. This costs one fallback full CSA
+                            # read but preserves the connector's hit contract.
+                            shapes_per_key = [
+                                self._dsv4_store_shapes_for_range(
+                                    self.metadata.get_shapes(end - start),
+                                    self.metadata.get_dtypes(),
+                                    start,
+                                    end,
+                                    request_total_tokens,
+                                )
+                                for _, start, end in blocks
+                            ]
+                            read_ranges_per_key = None
+                            kv_object_roles = None
+                            logger.warning(
+                                "CSAAttentionKVPrefetchManager: compact non-CSA "
+                                "objects unavailable; retaining generic CSA "
+                                "retrieve for correctness blocks=%d",
+                                len(blocks),
+                            )
                     stream_tutti_retrieve = (
                         self.gpu_connector is not None and not self.save_only_first_rank
                     )

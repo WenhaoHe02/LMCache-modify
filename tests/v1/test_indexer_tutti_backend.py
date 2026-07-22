@@ -2,7 +2,7 @@
 """Tests for the public Tutti indexer-storage interface."""
 
 # Standard
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 import tempfile
 import threading
 from types import SimpleNamespace
@@ -337,6 +337,34 @@ def test_rank_local_proxy_selection_pads_empty_budget_slots() -> None:
     assert 0 in selected.tolist()
 
 
+def test_weighted_predicted_block_hits_preserves_topk_frequency() -> None:
+    """Weighted coverage counts repeated true entries, not only the union."""
+    block = indexer_manager_module.DEEPGEMM_PAGED_BLOCK_SIZE
+    entries = torch.tensor(
+        [
+            2 * block,
+            2 * block + 1,
+            2 * block + 3,
+            5 * block,
+            7 * block,
+            -1,
+            9 * block,
+        ],
+        dtype=torch.int64,
+    )
+    valid = (entries >= 0) & (entries < 8 * block)
+
+    hits, total = indexer_manager_module._weighted_predicted_block_hits(
+        entries,
+        valid,
+        predicted_blocks={2, 5},
+        num_blocks=8,
+    )
+
+    assert hits == 4
+    assert total == 5
+
+
 def test_prediction_readiness_check_expires_pending_work_without_waiting() -> None:
     """The target gate drops an unfinished speculative prediction."""
     manager = object.__new__(IndexerSSDManager)
@@ -347,6 +375,34 @@ def test_prediction_readiness_check_expires_pending_work_without_waiting() -> No
 
     assert not manager.wait_for_csa_attention_kv_prediction(2)
     assert pending.cancelled()
+    assert manager._expired_proxy_layers == {2}
+
+
+def test_prediction_readiness_check_joins_running_work() -> None:
+    """A prediction already writing KV must finish before the target proceeds."""
+    manager = object.__new__(IndexerSSDManager)
+    manager._lock = threading.Lock()
+    manager._prediction_gate_timeout_s = 1.0
+    started = threading.Event()
+    release = threading.Event()
+
+    def _running_prediction() -> None:
+        started.set()
+        assert release.wait(timeout=1.0)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(_running_prediction)
+        assert started.wait(timeout=1.0)
+        manager._proxy_futures = {2: [pending]}
+        manager._expired_proxy_layers = set()
+        timer = threading.Timer(0.01, release.set)
+        timer.start()
+        try:
+            assert manager.wait_for_csa_attention_kv_prediction(2)
+        finally:
+            timer.cancel()
+
+    assert pending.done()
     assert manager._expired_proxy_layers == {2}
 
 
@@ -444,8 +500,9 @@ def test_deterministic_hca_submission_is_exposed_to_target_gate() -> None:
     tracked: dict[int, Any] = {}
     fake_csa_manager = SimpleNamespace(
         active_request_id="request-a",
-        fire_deterministic_layer=lambda layer_id: submitted.append(layer_id),
-        track_layer_submission=lambda layer_id, future: tracked.update(
+        active_request_token=("request-a", 1),
+        fire_deterministic_layer=lambda layer_id, **_kwargs: submitted.append(layer_id),
+        track_layer_submission=lambda layer_id, future, **_kwargs: tracked.update(
             {layer_id: future}
         ),
     )
@@ -475,15 +532,23 @@ def test_native_indexer_stream_orders_and_schedules_demanded_layer() -> None:
     waited: list[int] = []
     tracked: dict[int, Any] = {}
 
-    def fire(layer_id: int, *, label: str) -> bool:
+    def fire(
+        layer_id: int,
+        *,
+        label: str,
+        request_token: tuple[str, int] | None = None,
+    ) -> bool:
+        del request_token
         submitted.append((layer_id, label))
         return True
 
     fake_loader = SimpleNamespace(
         register_layer=MagicMock(),
         register_request_chunks=MagicMock(),
+        deactivate_request=MagicMock(return_value=True),
+        active_request_token=("request-a", 1),
         fire_deterministic_layer=fire,
-        track_layer_submission=lambda layer_id, future: tracked.update(
+        track_layer_submission=lambda layer_id, future, **_kwargs: tracked.update(
             {layer_id: future}
         ),
         wait_for_layer=lambda layer_id, timeout_s: waited.append(layer_id) or True,
@@ -525,12 +590,16 @@ def test_native_indexer_stream_orders_and_schedules_demanded_layer() -> None:
                     12: [SimpleNamespace(end_compressed_block=3)],
                 }
                 assert manager.register_native_indexer_stream("request-a", chunks)
+                # Stage0 is queued, but registration must not wait for I/O;
+                # layer 2's normal consumption gate owns the barrier.
+                assert waited == []
+                assert manager.wait_for_native_indexer_layer(2)
                 for future in tracked.values():
                     future.result(timeout=2.0)
                 assert manager.native_indexer_stream_active()
                 assert manager.has_layer_rows(2, 3 * 64)
-                # The initial Stage0+window covers only 2/4/6/8.  A direct
-                # demand for 12 must queue both 10 and 12 before waiting.
+                # The initial asynchronous Stage0 plus window covers only
+                # 2/4/6. A direct demand for 12 queues 8/10/12 before waiting.
                 assert manager.wait_for_native_indexer_layer(12)
                 for future in tracked.values():
                     future.result(timeout=2.0)
@@ -541,6 +610,7 @@ def test_native_indexer_stream_orders_and_schedules_demanded_layer() -> None:
         "request-a",
         chunks,
         start_profile_capture=False,
+        shared_raw_lba_cache=None,
     )
     assert submitted == [
         (2, "indexer_native_stream"),
@@ -550,7 +620,54 @@ def test_native_indexer_stream_orders_and_schedules_demanded_layer() -> None:
         (10, "indexer_native_stream"),
         (12, "indexer_native_stream"),
     ]
-    assert waited == [2, 4, 12]
+    assert waited == [2, 12]
+
+
+def test_native_indexer_partial_registration_is_rolled_back() -> None:
+    """A loader exception cannot leave a half-registered stream reusable."""
+    deactivations: list[int] = []
+
+    def deactivate_request(*, timeout_s: float) -> bool:
+        del timeout_s
+        deactivations.append(1)
+        return True
+
+    fake_loader = SimpleNamespace(
+        deactivate_request=deactivate_request,
+        register_request_chunks=MagicMock(side_effect=RuntimeError("compile failed")),
+    )
+    manager = object.__new__(IndexerSSDManager)
+    manager._native_indexer_cache_manager = fake_loader
+    manager._native_indexer_stream_active = False
+    manager._native_indexer_stream_request_id = ""
+    manager._native_indexer_stream_cleanup_failed = False
+    manager._native_indexer_scheduled_layers = set()
+    manager._csa_layer_ids = (2,)
+    manager._decode_cursor = {2: 0}
+    manager._lock = threading.RLock()
+
+    with pytest.raises(RuntimeError, match="compile failed"):
+        manager.register_native_indexer_stream(
+            "request-a",
+            {2: [SimpleNamespace(end_compressed_block=1)]},
+        )
+
+    assert len(deactivations) == 1
+    assert not manager._native_indexer_stream_active
+    assert manager._native_indexer_stream_request_id == ""
+    assert not manager._native_indexer_stream_cleanup_failed
+
+
+def test_inactive_native_indexer_stream_is_already_drained() -> None:
+    """First-hit registration does not deactivate a nonexistent old request."""
+    loader = MagicMock()
+    manager = object.__new__(IndexerSSDManager)
+    manager._native_indexer_cache_manager = loader
+    manager._native_indexer_stream_active = False
+    manager._native_indexer_stream_cleanup_failed = False
+
+    assert manager.deactivate_native_indexer_stream()
+    loader.deactivate_request.assert_not_called()
 
 
 def test_deferred_direct_seed_publishes_hbm_before_persistence() -> None:

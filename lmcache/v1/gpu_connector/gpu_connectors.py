@@ -499,6 +499,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         self._layer_name_to_vllm_group: dict[str, int] = {}
         self._vllm_group_block_sizes: tuple[int, ...] = ()
         self._hma_layout_logged = False
+        self._batched_store_logged = False
         self._single_layer_ptr_cache: dict[tuple[int, int], torch.Tensor] = {}
 
         self.store_stream = torch.cuda.Stream()
@@ -1704,9 +1705,6 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                     dst_tensor.copy_(memory_obj_tensor, non_blocking=True)
 
         if not memory_obj.raw_tensor.is_cuda:
-            self.store_stream.synchronize()
-
-        if not memory_obj.raw_tensor.is_cuda:
             # Force a synchronize if the target buffer is NOT CUDA device
             # NOTE: for better performance, we may not want to sync for every
             # memory object
@@ -2128,7 +2126,150 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                     )
         self.load_stream.synchronize()
 
+    def _batched_from_gpu_vectorized(
+        self,
+        memory_objs: List[MemoryObj],
+        starts: List[int],
+        ends: List[int],
+        **kwargs: object,
+    ) -> None:
+        """Gather full chunks from paged KV with one launch per KV group.
+
+        The legacy path synchronizes the store stream once per LMCache chunk.
+        A prefill suffix therefore pays dozens of host round trips even though
+        every full chunk has the same physical layout.  This path mirrors the
+        vectorized restore implementation: it batches destination pointers and
+        block IDs per heterogeneous KV group, launches one transfer per group,
+        and synchronizes once after the whole batch.
+
+        Irregular ranges retain the existing per-object implementation.  This
+        keeps tail shapes and partially aligned chunks on the proven path while
+        making the common full-chunk admission path strictly equivalent.
+        """
+        if "slot_mapping" not in kwargs:
+            raise ValueError("'slot_mapping' should be provided in kwargs")
+        slot_mapping = kwargs["slot_mapping"]
+        if not isinstance(slot_mapping, torch.Tensor):
+            raise ValueError("slot_mapping must be a torch.Tensor")
+
+        self.initialize_kvcaches_ptr(**kwargs)
+        self._initialize_kv_cache_pointers()
+        if (
+            self.group_kv_cache_pointers_on_gpu is None
+            or self.metadata.kv_layer_groups_manager is None
+        ):
+            raise RuntimeError("KV cache pointers unavailable in batched store")
+
+        klg_manager = self.metadata.kv_layer_groups_manager
+        num_groups = klg_manager.num_groups
+        group_ptrs: list[list[int]] = [[] for _ in range(num_groups)]
+        group_ranges: list[list[tuple[int, int]]] = [[] for _ in range(num_groups)]
+        fallback_objects: list[MemoryObj] = []
+        fallback_starts: list[int] = []
+        fallback_ends: list[int] = []
+        self._update_hma_metadata(**kwargs)
+        block_ids_by_group = self._normalize_hma_block_ids(
+            kwargs.get("block_ids_by_group")
+        )
+
+        for memory_obj, start, end in zip(memory_objs, starts, ends, strict=True):
+            if memory_obj.raw_tensor is None:
+                raise ValueError("batched store received an empty memory object")
+            if end - start != self.chunk_size:
+                fallback_objects.append(memory_obj)
+                fallback_starts.append(start)
+                fallback_ends.append(end)
+                continue
+            for group_idx in range(num_groups):
+                destination = memory_obj.get_tensor(group_idx)
+                if destination is None or destination.numel() == 0:
+                    continue
+                group_ptrs[group_idx].append(destination.data_ptr())
+                group_ranges[group_idx].append((start, end))
+
+        with torch.cuda.stream(self.store_stream):
+            for group_idx, pointers in enumerate(group_ptrs):
+                if not pointers:
+                    continue
+                block_ids = self._hma_block_ids_for_ranges(
+                    group_idx,
+                    group_ranges[group_idx],
+                    block_ids_by_group,
+                )
+                if block_ids is None:
+                    block_ids = self._slot_mapping_ranges_to_block_ids(
+                        slot_mapping,
+                        group_ranges[group_idx],
+                    )
+                pointer_tensor = torch.tensor(
+                    pointers,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                group = klg_manager.kv_layer_groups[group_idx]
+                lmc_ops.multi_layer_block_kv_transfer_batched(
+                    self.group_kv_cache_pointers_on_gpu[group_idx],
+                    pointer_tensor,
+                    block_ids,
+                    self.device,
+                    lmc_ops.TransferDirection.D2H,
+                    group.shape_desc,
+                    group.physical_chunk_size,
+                    self.gpu_kv_format,
+                    0,
+                )
+
+        # Host-backed destinations must be complete before storage and
+        # layer-major admission consume them.  One batch-wide barrier replaces
+        # the legacy per-chunk barriers.
+        if any(
+            memory_obj.raw_tensor is not None
+            and not memory_obj.raw_tensor.is_cuda
+            for memory_obj in memory_objs
+        ):
+            self.store_stream.synchronize()
+
+        # Tail or irregular ranges are rare and preserve exact legacy
+        # semantics.  Run them after the vectorized full chunks so a fallback
+        # cannot race a batch-wide host-memory consumer.
+        for memory_obj, start, end in zip(
+            fallback_objects,
+            fallback_starts,
+            fallback_ends,
+            strict=True,
+        ):
+            self.from_gpu(memory_obj, start, end, **kwargs)
+
+        if self.use_mla:
+            for memory_obj in memory_objs:
+                memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
+        if not self._batched_store_logged:
+            logger.info(
+                "VLLMPagedMemGPUConnectorV3 vectorized D2H store active: "
+                "objects=%d groups=%d fallbacks=%d",
+                len(memory_objs),
+                sum(bool(pointers) for pointers in group_ptrs),
+                len(fallback_objects),
+            )
+            self._batched_store_logged = True
+
     def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
+        if not memory_objs:
+            return
+        if hasattr(lmc_ops, "multi_layer_block_kv_transfer_batched"):
+            try:
+                self._batched_from_gpu_vectorized(
+                    list(memory_objs),
+                    list(starts),
+                    list(ends),
+                    **kwargs,
+                )
+                return
+            except Exception:
+                logger.exception(
+                    "Vectorized batched_from_gpu failed; falling back to "
+                    "per-chunk transfers"
+                )
         for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
             self.from_gpu(memory_obj, start, end, **kwargs)
 

@@ -418,6 +418,61 @@ def _make_loader(n_slots: int = 4, slot_mb: int = 32, q_depth: Optional[int] = N
     return loader, ctrl
 
 
+class TestRawStoreStreamIsolation:
+    """Keep background cold-store CUDA work off the model default stream."""
+
+    def test_raw_store_uses_only_dedicated_stream(self) -> None:
+        loader, _ctrl = _make_loader(n_slots=2, q_depth=2)
+        io_stream = MagicMock()
+        io_stream.cuda_stream = 123
+        loader._io_stream = io_stream
+        original_tensor = torch.tensor
+
+        @contextmanager
+        def fake_stream_context(_stream: Any) -> Iterator[None]:
+            yield
+
+        def tensor_on_cpu(*args: Any, **kwargs: Any) -> torch.Tensor:
+            kwargs.pop("device", None)
+            return original_tensor(*args, **kwargs)
+
+        with (
+            patch("torch.cuda.device"),
+            patch("torch.cuda.stream", side_effect=fake_stream_context) as use_stream,
+            patch("torch.cuda.current_stream") as current_stream,
+            patch("torch.cuda.synchronize") as device_synchronize,
+            patch.object(_tdl, "_c_ops") as c_ops,
+            patch.object(
+                loader,
+                "_enqueue_nvme_status_reduction",
+                return_value=False,
+            ),
+            patch.object(loader, "_check_nvme_status"),
+            patch("torch.tensor", side_effect=tensor_on_cpu),
+        ):
+            c_ops.tutti_submit_batch_sgl_write = MagicMock()
+            c_ops.tutti_poll_batch = MagicMock()
+            records = loader._store_bytes_to_raw_extents_locked(
+                payload_view=memoryview(b"x" * 512),
+                payload_nbytes=512,
+                dma_nbytes=512,
+                aligned_nbytes=1 << 16,
+                raw_extents=[
+                    LbaRecord(file_offset=0, slba=0, n_sectors=1),
+                ],
+                base_file_offset=0,
+                profile_start=time.perf_counter(),
+                dev="cuda:0",
+            )
+
+        assert records == [LbaRecord(file_offset=0, slba=0, n_sectors=1)]
+        assert use_stream.call_count == 2
+        current_stream.assert_not_called()
+        device_synchronize.assert_not_called()
+        io_stream.wait_stream.assert_not_called()
+        assert io_stream.synchronize.call_count == 2
+
+
 class _FakeCudaInt64Tensor:
     """Small CUDA-tensor protocol stub for indexed-loader CPU tests."""
 

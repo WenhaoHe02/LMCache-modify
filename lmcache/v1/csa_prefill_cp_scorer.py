@@ -220,6 +220,8 @@ def score_prefill_proxy_rank_local(
     world_size: int,
     interleave_size: int,
     oversubscribe: int = 1,
+    metadata_query_row_start: int | None = None,
+    runtime_info: dict[str, int] | None = None,
 ) -> torch.Tensor:
     """Run the speculative indexer for this rank's query shard over full K.
 
@@ -239,6 +241,12 @@ def score_prefill_proxy_rank_local(
         interleave_size: Consecutive query rows assigned per rank.
         oversubscribe: Reserved compatibility argument. Query sharding always
             uses the official full top-k width.
+        metadata_query_row_start: Optional row offset into the active prefill
+            metadata. When set, ``q_quant``, ``weights``, and ``output`` are a
+            compact slice beginning at this metadata row. This is used only
+            to warm the exact cache-hit proxy shape during cold admission.
+        runtime_info: Optional output mapping populated with resolved scoring
+            dimensions for cold-admission warmup bookkeeping.
 
     Returns:
         ``output`` filled with global token ids for this rank's candidates.
@@ -305,6 +313,8 @@ def score_prefill_proxy_rank_local(
     first_token = int(chunks[0].token_start)
     final_token = first_token
     total_seq_lens = int(chunks[0].total_seq_lens)
+    if runtime_info is not None:
+        runtime_info["total_seq_lens"] = total_seq_lens
     gather_chunk = None
     global_ks_parts = []
     global_ke_parts = []
@@ -340,9 +350,20 @@ def score_prefill_proxy_rank_local(
         gather_chunk.block_table,
         gather_chunk.cu_seq_lens,
     )
+    query_first = first_token
+    query_final = final_token
+    compact_query_base = 0
+    if metadata_query_row_start is not None:
+        if metadata_query_row_start < 0:
+            raise RuntimeError("metadata query row start must be non-negative")
+        query_first = first_token + metadata_query_row_start
+        query_final = query_first + int(hidden_states.shape[0])
+        if query_final > final_token:
+            raise RuntimeError("compact proxy query slice exceeds prefill metadata")
+        compact_query_base = query_first
     local_query_ids = prefill_cp_query_indices(
-        first_token,
-        final_token,
+        query_first,
+        query_final,
         rank,
         world_size,
         interleave_size,
@@ -373,11 +394,12 @@ def score_prefill_proxy_rank_local(
     for query_start in range(0, int(local_query_ids.numel()), max_query_tokens):
         query_ids = local_query_ids[query_start : query_start + max_query_tokens]
         metadata_ids = query_ids - first_token
+        query_row_ids = query_ids - compact_query_base
         local_ks = global_ks.index_select(0, metadata_ids)
         local_ke = global_ke.index_select(0, metadata_ids)
-        q_slice = q_values.index_select(0, query_ids)
+        q_slice = q_values.index_select(0, query_row_ids)
         q_scale_slice = (
-            q_scale.index_select(0, query_ids) if q_scale is not None else None
+            q_scale.index_select(0, query_row_ids) if q_scale is not None else None
         )
         if use_fp4:
             q_cast = q_slice.view(torch.int8)
@@ -386,7 +408,7 @@ def score_prefill_proxy_rank_local(
         logits = fp8_fp4_mqa_logits(
             (q_cast, q_scale_slice),
             (k_cast, scale_cast),
-            weights.index_select(0, query_ids),
+            weights.index_select(0, query_row_ids),
             local_ks,
             local_ke,
             clean_logits=False,
@@ -406,5 +428,5 @@ def score_prefill_proxy_rank_local(
             int(logits.stride(1)),
             topk_tokens,
         )
-        output.index_copy_(0, query_ids, local_output)
+        output.index_copy_(0, query_row_ids, local_output)
     return output

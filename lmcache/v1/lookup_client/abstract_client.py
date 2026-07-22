@@ -75,3 +75,15 @@ class LookupClientInterface(metaclass=abc.ABCMeta):
             lookup_id: The lookup ID whose status needs to be cleared.
         """
         return
+
+    def lookup_terminal_hash(self, lookup_id: str) -> Optional[int]:
+        """Return the terminal chunk hash for a completed prefix lookup.
+
+        Args:
+            lookup_id: Lookup identifier previously passed to :meth:`lookup`.
+
+        Returns:
+            The hash of the final hit chunk, or ``None`` when the lookup client
+            does not expose this optimization metadata.
+        """
+        return None

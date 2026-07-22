@@ -150,6 +150,86 @@ def create_indexer_object_store_metadata() -> LMCacheMetadata:
     return metadata
 
 
+def create_streaming_object_store_metadata() -> LMCacheMetadata:
+    """Create metadata containing generic, CSA, and indexer cache groups."""
+    metadata = create_test_metadata()
+    generic_group = KVLayerGroupInfo(
+        layer_indices=[0],
+        shape_desc=_make_shape_desc(
+            kv_size=2,
+            nl=1,
+            nb=1,
+            bs=8,
+            nh=1,
+            hs=4,
+            dtype=torch.bfloat16,
+        ),
+        dtype=torch.bfloat16,
+        compress_ratio=1,
+        physical_chunk_size=8,
+    )
+    csa_group = KVLayerGroupInfo(
+        layer_indices=[0],
+        shape_desc=_make_shape_desc(
+            kv_size=2,
+            nl=1,
+            nb=1,
+            bs=8,
+            nh=1,
+            hs=584,
+            dtype=torch.uint8,
+        ),
+        dtype=torch.uint8,
+        compress_ratio=4,
+        physical_chunk_size=8,
+    )
+    indexer_group = KVLayerGroupInfo(
+        layer_indices=[0],
+        shape_desc=_make_shape_desc(
+            kv_size=1,
+            nl=1,
+            nb=1,
+            bs=8,
+            nh=1,
+            hs=132,
+            dtype=torch.uint8,
+        ),
+        dtype=torch.uint8,
+        compress_ratio=4,
+        physical_chunk_size=8,
+    )
+    metadata.kv_layer_groups_manager = SimpleNamespace(
+        kv_layer_groups=[generic_group, csa_group, indexer_group],
+        num_groups=3,
+    )
+    return metadata
+
+
+def create_streaming_hca_object_store_metadata() -> LMCacheMetadata:
+    """Create metadata for the canonical generic/CSA/HCA/indexer layout."""
+    metadata = create_streaming_object_store_metadata()
+    hca_group = KVLayerGroupInfo(
+        layer_indices=[0],
+        shape_desc=_make_shape_desc(
+            kv_size=1,
+            nl=1,
+            nb=1,
+            bs=8,
+            nh=1,
+            hs=584,
+            dtype=torch.uint8,
+        ),
+        dtype=torch.uint8,
+        compress_ratio=128,
+        physical_chunk_size=8,
+    )
+    manager = metadata.kv_layer_groups_manager
+    assert manager is not None
+    manager.kv_layer_groups.append(hca_group)
+    manager.num_groups = len(manager.kv_layer_groups)
+    return metadata
+
+
 def create_test_key(key_id: int = 0) -> CacheEngineKey:
     """Create a test CacheEngineKey."""
     return CacheEngineKey(
@@ -315,6 +395,422 @@ class TestKVObjectStoreLocalDiskBackend:
         memory_obj.raw_tensor.fill_(7)
         return memory_obj
 
+    def _create_streaming_object_store_backend(
+        self,
+        temp_disk_path: str,
+        async_loop: asyncio.AbstractEventLoop,
+        local_cpu_backend: LocalCPUBackend,
+    ) -> LocalDiskBackend:
+        """Create a backend configured for canonical CSA streaming objects."""
+        config = create_test_config(temp_disk_path)
+        config.extra_config = {
+            "kv_object_store_enable": True,
+            "kv_object_store_slot_mb": 2,
+            "kv_object_store_capacity": 16,
+        }
+        return LocalDiskBackend(
+            config=config,
+            loop=async_loop,
+            local_cpu_backend=local_cpu_backend,
+            dst_device="cuda:0",
+            metadata=create_streaming_object_store_metadata(),
+        )
+
+    @staticmethod
+    def _allocate_streaming_object_store_memory() -> MemoryObj:
+        """Allocate one generic/CSA/indexer memory object."""
+        allocator = AdHocMemoryAllocator(device="cpu")
+        memory_obj = allocator.allocate(
+            [
+                torch.Size([2, 1, 8, 4]),
+                torch.Size([2, 1, 8, 584]),
+                torch.Size([1, 1, 8, 132]),
+            ],
+            [torch.bfloat16, torch.uint8, torch.uint8],
+            fmt=MemoryFormat.KV_2LTD,
+        )
+        assert memory_obj is not None
+        for group_idx, value in enumerate((1, 2, 3)):
+            tensor = memory_obj.get_tensor(group_idx)
+            assert tensor is not None
+            tensor.fill_(value)
+        return memory_obj
+
+    @staticmethod
+    def _allocate_streaming_hca_object_store_memory() -> MemoryObj:
+        """Allocate one generic/CSA/indexer/HCA memory object."""
+        allocator = AdHocMemoryAllocator(device="cpu")
+        memory_obj = allocator.allocate(
+            [
+                torch.Size([2, 1, 8, 4]),
+                torch.Size([2, 1, 8, 584]),
+                torch.Size([1, 1, 8, 132]),
+                torch.Size([1, 1, 8, 584]),
+            ],
+            [torch.bfloat16, torch.uint8, torch.uint8, torch.uint8],
+            fmt=MemoryFormat.KV_2LTD,
+        )
+        assert memory_obj is not None
+        for group_idx, value in enumerate((1, 2, 3, 4)):
+            tensor = memory_obj.get_tensor(group_idx)
+            assert tensor is not None
+            tensor.fill_(value)
+        return memory_obj
+
+    @staticmethod
+    def _allocate_streaming_hca_memory(
+        allocator: AdHocMemoryAllocator,
+        *,
+        ordinary_rows: int,
+        streamed_rows: int,
+    ) -> MemoryObj:
+        """Allocate a streaming object with explicit group row counts."""
+        memory_obj = allocator.allocate(
+            [
+                torch.Size([2, 1, ordinary_rows, 4]),
+                torch.Size([2, 1, streamed_rows, 584]),
+                torch.Size([1, 1, streamed_rows, 132]),
+                torch.Size([1, 1, streamed_rows, 584]),
+            ],
+            [torch.bfloat16, torch.uint8, torch.uint8, torch.uint8],
+            fmt=MemoryFormat.KV_2LTD,
+        )
+        assert memory_obj is not None
+        for group_idx, value in enumerate((1, 2, 3, 4)):
+            tensor = memory_obj.get_tensor(group_idx)
+            assert tensor is not None
+            tensor.fill_(value)
+        return memory_obj
+
+    def test_csa_streaming_store_publishes_compact_object_last(
+        self,
+        temp_disk_path: str,
+        async_loop: asyncio.AbstractEventLoop,
+        local_cpu_backend: LocalCPUBackend,
+    ) -> None:
+        """CSA admission publishes only after all required objects are ready."""
+        with patch(
+            "os.statvfs",
+            return_value=SimpleNamespace(f_bsize=4096),
+            create=True,
+        ):
+            backend = self._create_streaming_object_store_backend(
+                temp_disk_path,
+                async_loop,
+                local_cpu_backend,
+            )
+        memory_obj = self._allocate_streaming_object_store_memory()
+        key = create_test_key(499)
+
+        with patch.dict(
+            os.environ,
+            {
+                "LMCACHE_INDEXER_ENABLE_PREFETCH": "1",
+                "LMCACHE_DSV4_HCA_WALKER": "0",
+            },
+        ):
+            assert (
+                backend.store_attention_layer_major_snapshot(
+                    key,
+                    [memory_obj],
+                    prefix_keys=[key],
+                )
+                == 2
+            )
+            backend.async_save_bytes_to_disk(key, memory_obj)
+            backend.kv_object_tutti_raw_enabled = True
+            assert backend.contains(key)
+            assert backend.get_kv_object_records([key])[0] is None
+            compact = backend.get_kv_object_records(
+                [key],
+                roles=["csa_deferred_retrieve"],
+            )[0]
+            assert compact is not None
+            assert compact.state == KVObjectState.READY
+            expected_compact_bytes = 2 * 1 * 8 * 4 * 2
+            assert compact.length == expected_compact_bytes
+            assert backend.get_csa_layer_major_records(key, [0])[0] is not None
+            assert backend.get_indexer_layer_major_records(key, [0])[0] is not None
+
+        backend.local_cpu_backend.memory_allocator.close()
+
+    def test_csa_streaming_store_does_not_publish_partial_layout(
+        self,
+        temp_disk_path: str,
+        async_loop: asyncio.AbstractEventLoop,
+        local_cpu_backend: LocalCPUBackend,
+    ) -> None:
+        """A missing layer-major object makes the stored key a raw-cache miss."""
+        with patch(
+            "os.statvfs",
+            return_value=SimpleNamespace(f_bsize=4096),
+            create=True,
+        ):
+            backend = self._create_streaming_object_store_backend(
+                temp_disk_path,
+                async_loop,
+                local_cpu_backend,
+            )
+        memory_obj = self._allocate_streaming_object_store_memory()
+        key = create_test_key(500)
+
+        with patch.dict(
+            os.environ,
+            {
+                "LMCACHE_INDEXER_ENABLE_PREFETCH": "1",
+                "LMCACHE_DSV4_HCA_WALKER": "0",
+            },
+        ):
+            backend.async_save_bytes_to_disk(key, memory_obj)
+            backend.kv_object_tutti_raw_enabled = True
+            assert not backend.contains(key)
+
+            assert (
+                backend.get_kv_object_records(
+                    [key],
+                    roles=["csa_deferred_retrieve"],
+                )[0]
+                is None
+            )
+
+        backend.local_cpu_backend.memory_allocator.close()
+
+    def test_csa_streaming_store_publishes_every_chunk_alias(
+        self,
+        temp_disk_path: str,
+        async_loop: asyncio.AbstractEventLoop,
+        local_cpu_backend: LocalCPUBackend,
+    ) -> None:
+        """One admission batch atomically publishes each chunk-prefix alias."""
+        with patch(
+            "os.statvfs",
+            return_value=SimpleNamespace(f_bsize=4096),
+            create=True,
+        ):
+            backend = self._create_streaming_object_store_backend(
+                temp_disk_path,
+                async_loop,
+                local_cpu_backend,
+            )
+        first = self._allocate_streaming_object_store_memory()
+        second = self._allocate_streaming_object_store_memory()
+        first_key = create_test_key(501)
+        second_key = create_test_key(502)
+
+        with patch.dict(
+            os.environ,
+            {
+                "LMCACHE_INDEXER_ENABLE_PREFETCH": "1",
+                "LMCACHE_DSV4_HCA_WALKER": "0",
+            },
+        ):
+            assert (
+                backend.store_attention_layer_major_snapshot(
+                    second_key,
+                    [first, second],
+                    prefix_keys=[first_key, second_key],
+                )
+                == 2
+            )
+            # Retrying admission before the compact-main write must reuse the
+            # immutable layer objects and reconstruct the pending manifests.
+            assert (
+                backend.store_attention_layer_major_snapshot(
+                    second_key,
+                    [first, second],
+                    prefix_keys=[first_key, second_key],
+                )
+                == 2
+            )
+            backend.async_save_bytes_to_disk(first_key, first)
+            backend.async_save_bytes_to_disk(second_key, second)
+            backend.kv_object_tutti_raw_enabled = True
+
+            assert backend.contains(first_key)
+            assert backend.contains(second_key)
+            first_csa = backend.get_csa_layer_major_records(first_key, [0])[0]
+            second_csa = backend.get_csa_layer_major_records(second_key, [0])[0]
+            assert first_csa is not None
+            assert second_csa is not None
+            assert second_csa.length == 2 * first_csa.length
+            with patch.dict(
+                os.environ,
+                {"LMCACHE_DSV4_HCA_WALKER": "1"},
+            ):
+                assert not backend.contains(first_key)
+                assert not backend.contains(second_key)
+
+        backend.local_cpu_backend.memory_allocator.close()
+
+    def test_csa_hca_streaming_hit_never_rewrites_layout(
+        self,
+        temp_disk_path: str,
+        async_loop: asyncio.AbstractEventLoop,
+        local_cpu_backend: LocalCPUBackend,
+    ) -> None:
+        """A READY CSA/HCA layout makes repeated admission write-free."""
+        config = create_test_config(temp_disk_path)
+        config.extra_config = {
+            "kv_object_store_enable": True,
+            "kv_object_store_slot_mb": 2,
+            "kv_object_store_capacity": 16,
+        }
+        with patch(
+            "os.statvfs",
+            return_value=SimpleNamespace(f_bsize=4096),
+            create=True,
+        ):
+            backend = LocalDiskBackend(
+                config=config,
+                loop=async_loop,
+                local_cpu_backend=local_cpu_backend,
+                dst_device="cuda:0",
+                metadata=create_streaming_hca_object_store_metadata(),
+            )
+        memory_obj = self._allocate_streaming_hca_object_store_memory()
+        key = create_test_key(503)
+
+        with patch.dict(
+            os.environ,
+            {
+                "LMCACHE_INDEXER_ENABLE_PREFETCH": "1",
+                "LMCACHE_DSV4_HCA_WALKER": "1",
+            },
+        ):
+            assert (
+                backend.store_attention_layer_major_snapshot(
+                    key,
+                    [memory_obj],
+                    prefix_keys=[key],
+                )
+                == 3
+            )
+            backend.async_save_bytes_to_disk(key, memory_obj)
+            backend.kv_object_tutti_raw_enabled = True
+            assert backend.contains(key)
+
+            compact = backend.get_kv_object_records(
+                [key],
+                roles=["csa_hca_deferred_retrieve"],
+            )[0]
+            assert compact is not None
+            assert compact.length == 2 * 1 * 8 * 4 * 2
+            assert backend.get_csa_layer_major_records(key, [0])[0] is not None
+            assert backend.get_hca_layer_major_records(key, [0])[0] is not None
+            assert backend.get_indexer_layer_major_records(key, [0])[0] is not None
+
+            retry_memory_obj = self._allocate_streaming_hca_object_store_memory()
+            pool_layout = backend.kv_object_pool_layout
+            pool_io = backend.kv_object_pool_io
+            assert pool_layout is not None
+            assert pool_io is not None
+            next_offset_before = pool_layout.next_allocation_bounds(1)[0]
+            with patch.object(
+                pool_io,
+                "write_object",
+                wraps=pool_io.write_object,
+            ) as write_object:
+                assert (
+                    backend.store_attention_layer_major_snapshot(
+                        key,
+                        [retry_memory_obj],
+                        prefix_keys=[key],
+                    )
+                    == 3
+                )
+                backend.async_save_bytes_to_disk(key, retry_memory_obj)
+                write_object.assert_not_called()
+            assert pool_layout.next_allocation_bounds(1)[0] == next_offset_before
+
+        backend.local_cpu_backend.memory_allocator.close()
+
+    def test_csa_hca_streaming_publishes_empty_non_tail_main_chunks(
+        self,
+        temp_disk_path: str,
+        async_loop: asyncio.AbstractEventLoop,
+        local_cpu_backend: LocalCPUBackend,
+    ) -> None:
+        """Stream-only non-tail chunks publish metadata-only main entries."""
+        config = create_test_config(temp_disk_path)
+        config.extra_config = {
+            "kv_object_store_enable": True,
+            "kv_object_store_slot_mb": 2,
+            "kv_object_store_capacity": 256,
+        }
+        with patch(
+            "os.statvfs",
+            return_value=SimpleNamespace(f_bsize=4096),
+            create=True,
+        ):
+            backend = LocalDiskBackend(
+                config=config,
+                loop=async_loop,
+                local_cpu_backend=local_cpu_backend,
+                dst_device="cuda:0",
+                metadata=create_streaming_hca_object_store_metadata(),
+            )
+
+        allocator = AdHocMemoryAllocator(device="cpu")
+        keys = [create_test_key(600 + index) for index in range(128)]
+        memory_objs = [
+            self._allocate_streaming_hca_memory(
+                allocator,
+                ordinary_rows=0,
+                streamed_rows=8,
+            )
+            for _key in keys[:-1]
+        ]
+        memory_objs.append(
+            self._allocate_streaming_hca_memory(
+                allocator,
+                ordinary_rows=8,
+                streamed_rows=8,
+            )
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "LMCACHE_INDEXER_ENABLE_PREFETCH": "1",
+                "LMCACHE_DSV4_HCA_WALKER": "1",
+            },
+        ):
+            assert (
+                backend.store_attention_layer_major_snapshot(
+                    keys[-1],
+                    memory_objs,
+                    prefix_keys=keys,
+                )
+                == 3
+            )
+            for key, memory_obj in zip(keys, memory_objs, strict=True):
+                backend.async_save_bytes_to_disk(key, memory_obj)
+
+            backend.kv_object_tutti_raw_enabled = True
+            metadata_store = backend.kv_object_metadata_store
+            assert metadata_store is not None
+            with patch.object(
+                metadata_store,
+                "get",
+                wraps=metadata_store.get,
+            ) as metadata_get:
+                assert all(backend.contains(key) for key in keys)
+                assert backend.get_kv_object_payload_lengths(
+                    keys,
+                    roles=["csa_hca_deferred_retrieve"] * len(keys),
+                ) == [0] * 127 + [2 * 1 * 8 * 4 * 2]
+                metadata_get.assert_not_called()
+            compact_records = backend.get_kv_object_records(
+                keys,
+                roles=["csa_hca_deferred_retrieve"] * len(keys),
+            )
+            assert compact_records[:-1] == [None] * 127
+            assert compact_records[-1] is not None
+            assert compact_records[-1].length == 2 * 1 * 8 * 4 * 2
+
+        allocator.close()
+        backend.local_cpu_backend.memory_allocator.close()
+
     def test_write_indexes_layer_role_views(
         self,
         temp_disk_path: str,
@@ -408,10 +904,10 @@ class TestKVObjectStoreLocalDiskBackend:
         assert backend.kv_object_pool_io is not None
         payload0 = backend.kv_object_pool_io.read_object(record0)
         payload1 = backend.kv_object_pool_io.read_object(record1)
-        # compress_ratio=4: only the first two of each plane's eight rows
-        # are active and therefore published in the compact sidecar.
-        assert payload0 == bytes([0] * 8 + [10] * 8 + [40] * 8 + [50] * 8)
-        assert payload1 == bytes([1] * 8 + [11] * 8 + [41] * 8 + [51] * 8)
+        # The supplied shapes already contain physical (compressed) rows.
+        # Sidecar creation must not apply the compression ratio a second time.
+        assert payload0 == bytes([0] * 32 + [10] * 32 + [40] * 32 + [50] * 32)
+        assert payload1 == bytes([1] * 32 + [11] * 32 + [41] * 32 + [51] * 32)
 
         probed = backend.get_csa_layer_major_records_for_keys(
             [first_key, prefix_key],
@@ -424,13 +920,13 @@ class TestKVObjectStoreLocalDiskBackend:
 
         backend.local_cpu_backend.memory_allocator.close()
 
-    def test_indexer_layer_major_snapshot_removes_padding(
+    def test_indexer_layer_major_snapshot_keeps_all_physical_rows(
         self,
         temp_disk_path: str,
         async_loop: asyncio.AbstractEventLoop,
         local_cpu_backend: LocalCPUBackend,
     ) -> None:
-        """Indexer sidecars store only compressed rows for every layer."""
+        """Indexer sidecars keep every already-compressed physical row."""
         config = create_test_config(temp_disk_path)
         config.extra_config = {
             "kv_object_store_enable": True,
@@ -480,14 +976,14 @@ class TestKVObjectStoreLocalDiskBackend:
         )
         assert record0 is not None
         assert record1 is not None
-        assert record0.length == 2 * 2 * 132
-        assert record1.length == 2 * 2 * 132
+        assert record0.length == 2 * 8 * 132
+        assert record1.length == 2 * 8 * 132
         probed = backend.get_indexer_layer_major_records_for_keys(
             [first_key, prefix_key],
             layer_id=0,
         )
         assert probed[0] is not None
-        assert probed[0].length == 2 * 132
+        assert probed[0].length == 8 * 132
         assert probed[1] == record0
 
         backend.local_cpu_backend.memory_allocator.close()

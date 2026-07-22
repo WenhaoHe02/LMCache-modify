@@ -1760,6 +1760,8 @@ def _attach_indexer_prefetch(tutti_loader: Optional[Any] = None) -> None:
         ):
             early_overlap_hooks += 1
 
+    manager.warm_runtime_resources()
+
     if os.getenv("LMCACHE_NSYS_FULL_CAPTURE", "0").lower() in {
         "1",
         "on",
@@ -2046,6 +2048,7 @@ def _attach_csa_attention_kv_prefetch(tutti_loader: Optional[Any] = None) -> Non
                     -1,
                     (),
                 )
+    manager.warm_runtime_resources()
     set_csa_attention_kv_prefetch_manager(manager)
     _CSA_ATTENTION_KV_PREFETCH_MANAGER = manager
     logger.info(
@@ -2148,6 +2151,9 @@ class LoadSpec:
     lmcache_cached_tokens: int
     # Whether the scheduler allow us to load the tokens
     can_load: bool
+    # Hash of the final aligned LMCache hit chunk. This lets worker ranks build
+    # a full-prefix sidecar plan without hashing every token chunk again.
+    terminal_chunk_hash: Optional[int] = None
 
 
 @dataclass
@@ -2370,6 +2376,8 @@ class ReqMeta:
     req_id: str
     # Request tokens
     token_ids: list[int]  # torch.Tensor
+    # Total prompt length before LMCache/vLLM truncate the load prefix.
+    prompt_len: int
     # Slot mapping
     slot_mapping: torch.Tensor
     # vLLM HMA block ids in kv_cache_group order. The legacy slot_mapping above
@@ -2522,6 +2530,7 @@ class ReqMeta:
         return ReqMeta(
             req_id=tracker.req_id,
             token_ids=token_ids,
+            prompt_len=tracker.prompt_len,
             slot_mapping=slot_mapping,
             block_ids_by_group=tracker.allocated_block_ids_by_group,
             is_last_prefill=is_last_prefill,
@@ -3026,8 +3035,13 @@ class LMCacheConnectorV1Impl:
                 continue
 
             tokens = request.token_ids
-            # TODO: have a pre-allocated buffer to hold the slot_mappings
-            slot_mapping = request.slot_mapping.to(self.device)
+            # Keep the scheduler-owned CPU mapping available for the DSv4
+            # streaming-only fast path.  Its layer-major plan builders run on
+            # the CPU, so uploading all prefix slots here only to synchronously
+            # copy them back in ``prepare_dsv4_streaming_retrieve`` adds a
+            # request-front H2D/D2H round trip.  Generic retrieval and the
+            # layerwise path still receive the device tensor they require.
+            slot_mapping = request.slot_mapping
             assert len(tokens) == len(slot_mapping)
 
             token_mask = torch.ones(len(tokens), dtype=torch.bool)
@@ -3041,6 +3055,8 @@ class LMCacheConnectorV1Impl:
             lmcache_cached_tokens = request.load_spec.lmcache_cached_tokens
             hma_kwargs = self._hma_transfer_kwargs(request)
             if self.use_layerwise:
+                # TODO: have a pre-allocated buffer to hold the slot_mappings
+                slot_mapping = slot_mapping.to(self.device)
                 if idx == last_idx:
                     sync = True
                 else:
@@ -3062,6 +3078,7 @@ class LMCacheConnectorV1Impl:
                         kvcaches=kvcaches,
                         slot_mapping=slot_mapping[:lmcache_cached_tokens],
                         vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                        request_total_tokens=request.prompt_len,
                         sync=sync,
                         **hma_kwargs,
                     )
@@ -3070,16 +3087,37 @@ class LMCacheConnectorV1Impl:
                     next(layerwise_retriever)
                     self.layerwise_retrievers.append((layerwise_retriever, request))
             else:
-                ret_token_mask = self.lmcache_engine.retrieve(
-                    tokens[:lmcache_cached_tokens],
-                    token_mask[:lmcache_cached_tokens],
-                    kvcaches=kvcaches,
-                    slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                    vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
-                    request_configs=request.request_configs,
-                    req_id=request.req_id,
-                    **hma_kwargs,
+                ret_token_mask = (
+                    self.lmcache_engine.prepare_dsv4_streaming_retrieve(
+                        tokens[:lmcache_cached_tokens],
+                        token_mask[:lmcache_cached_tokens],
+                        kvcaches=kvcaches,
+                        slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                        request_total_tokens=request.prompt_len,
+                        request_configs=request.request_configs,
+                        req_id=request.req_id,
+                        terminal_chunk_hash=request.load_spec.terminal_chunk_hash,
+                        **hma_kwargs,
+                    )
                 )
+                if ret_token_mask is None:
+                    # The generic connector writes through CUDA and therefore
+                    # requires device-resident slot IDs.  Delay this upload
+                    # until the CPU-only streaming plan has actually declined
+                    # the request.
+                    slot_mapping = slot_mapping.to(self.device)
+                    ret_token_mask = self.lmcache_engine.retrieve(
+                        tokens[:lmcache_cached_tokens],
+                        token_mask[:lmcache_cached_tokens],
+                        kvcaches=kvcaches,
+                        slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                        vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
+                        request_total_tokens=request.prompt_len,
+                        request_configs=request.request_configs,
+                        req_id=request.req_id,
+                        **hma_kwargs,
+                    )
 
                 # Check the result
                 num_retrieved_tokens = ret_token_mask.sum().item()
@@ -3486,6 +3524,11 @@ class LMCacheConnectorV1Impl:
                 request_configs=request.request_configs,
                 req_id=request.req_id,
                 is_last_prefill=is_last_prefill,
+                lmcache_cached_tokens=(
+                    request.load_spec.lmcache_cached_tokens
+                    if request.load_spec is not None and request.load_spec.can_load
+                    else 0
+                ),
                 **self._hma_transfer_kwargs(request),
             )
 
@@ -3766,10 +3809,15 @@ class LMCacheConnectorV1Impl:
                 max(need_to_allocate, 0),
             )
 
+        terminal_chunk_hash = None
+        get_terminal_hash = getattr(self.lookup_client, "lookup_terminal_hash", None)
+        if callable(get_terminal_hash):
+            terminal_chunk_hash = get_terminal_hash(req_id)
         self.load_specs[req_id] = LoadSpec(
             vllm_cached_tokens=num_computed_tokens,
             lmcache_cached_tokens=num_external_hit_tokens,
             can_load=False,
+            terminal_chunk_hash=terminal_chunk_hash,
         )
 
         if below_min_retrieve or need_to_allocate <= 0:

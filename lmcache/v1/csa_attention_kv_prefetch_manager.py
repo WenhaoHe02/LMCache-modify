@@ -50,8 +50,20 @@ from __future__ import annotations
 import os
 import threading
 import time
+from contextlib import nullcontext
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 # Third Party
 import torch
@@ -78,14 +90,81 @@ logger = init_logger(__name__)
 
 _ACTIVE_MANAGER: Optional["CSAAttentionKVPrefetchManager"] = None
 
+_DSV4_CSA_COMPRESS_RATIO = 4
+
 
 _ACTIVE_MANAGER_LOCK = threading.Lock()
+
+# Reuse the exact list objects for immutable generation extent tables across
+# requests.  Tutti's ensure_lba_cache() has an identity fast path; recreating
+# equal lists otherwise forces an unnecessary sort/index rebuild on every hit.
+_SHARED_LBA_TABLE_CACHE: dict[
+    tuple[tuple[str, int, int, int], ...], dict[str, list[Any]]
+] = {}
+_SHARED_LBA_TABLE_CACHE_LOCK = threading.Lock()
+_SHARED_LBA_TABLE_CACHE_LIMIT = 8
 
 
 def _timing_enabled() -> bool:
     """Return True when CSA attention KV prefetch timing logs are enabled."""
     value = os.environ.get("LMCACHE_CSA_ATTENTION_KV_TIMING", "")
     return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _exact_chunk_prefetch_enabled() -> bool:
+    """Return whether exact first-chunk true-topK reads are enabled."""
+    value = os.environ.get("LMCACHE_CSA_EXACT_CHUNK_PREFETCH", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _exact_chunk_prefetch_limit() -> int:
+    """Return the maximum number of true-topK chunks prefetched per layer."""
+    try:
+        return max(
+            0,
+            int(os.environ.get("LMCACHE_CSA_EXACT_CHUNK_PREFETCH_MAX_CHUNKS", "1")),
+        )
+    except ValueError:
+        return 1
+
+
+def _coalesce_physically_contiguous_extents(
+    extents: Sequence[tuple[int, int, int]],
+) -> list[tuple[int, int, int]]:
+    """Merge extent boundaries that are contiguous in file and on NVMe.
+
+    FIEMAP may split a physically contiguous allocation into adjacent records.
+    Treating those records as hard boundaries rejects an otherwise valid
+    one-command indexed block whenever the block straddles the metadata-only
+    split.
+
+    Args:
+        extents: ``(file_offset, slba, n_sectors)`` records.
+
+    Returns:
+        Sorted records with exactly adjacent logical and physical runs merged.
+    """
+    ordered = sorted(
+        (int(offset), int(slba), int(sectors))
+        for offset, slba, sectors in extents
+        if int(sectors) > 0
+    )
+    merged: list[tuple[int, int, int]] = []
+    for offset, slba, sectors in ordered:
+        if merged:
+            prev_offset, prev_slba, prev_sectors = merged[-1]
+            if (
+                prev_offset + prev_sectors * 512 == offset
+                and prev_slba + prev_sectors == slba
+            ):
+                merged[-1] = (
+                    prev_offset,
+                    prev_slba,
+                    prev_sectors + sectors,
+                )
+                continue
+        merged.append((offset, slba, sectors))
+    return merged
 
 
 def get_csa_attention_kv_prefetch_manager() -> Optional[
@@ -202,6 +281,66 @@ class CSAAttentionKVChunkLoc:
         return self.layer_byte_offset + self.payload_skip + local * self.bytes_per_block
 
 
+def build_shared_raw_lba_cache(
+    chunk_maps: Sequence[Mapping[int, Sequence[CSAAttentionKVChunkLoc]]],
+) -> dict[str, list[Any]]:
+    """Build one immutable Tutti extent table shared by stream consumers.
+
+    Args:
+        chunk_maps: CSA, HCA, and native-indexer layer plans whose raw
+            extents must remain simultaneously addressable.
+
+    Returns:
+        A path-keyed, de-duplicated list of Tutti ``LbaRecord`` objects. The
+        returned list objects are intentionally shared by every consumer so
+        ``ensure_lba_cache`` can use identity checks instead of repeatedly
+        sorting the same pool extents on the layer hot path.
+    """
+    seen: set[tuple[str, int, int, int]] = set()
+    for chunks_by_layer in chunk_maps:
+        for chunks in chunks_by_layer.values():
+            for chunk in chunks:
+                path = chunk.disk_meta.path if chunk.disk_meta else None
+                if not path or not chunk.raw_extents:
+                    continue
+                for file_offset, slba, n_sectors in chunk.raw_extents:
+                    seen.add(
+                        (
+                            path,
+                            int(file_offset),
+                            int(slba),
+                            int(n_sectors),
+                        )
+                    )
+    signature = tuple(sorted(seen))
+    if not signature:
+        return {}
+    with _SHARED_LBA_TABLE_CACHE_LOCK:
+        cached = _SHARED_LBA_TABLE_CACHE.get(signature)
+        if cached is not None:
+            return cached
+
+    from lmcache.v1.gpu_connector.tutti_direct_loader import LbaRecord
+
+    raw_lba_cache: dict[str, list[Any]] = {}
+    for path, file_offset, slba, n_sectors in signature:
+        raw_lba_cache.setdefault(path, []).append(
+            LbaRecord(
+                file_offset=file_offset,
+                slba=slba,
+                n_sectors=n_sectors,
+            )
+        )
+    with _SHARED_LBA_TABLE_CACHE_LOCK:
+        cached = _SHARED_LBA_TABLE_CACHE.get(signature)
+        if cached is not None:
+            return cached
+        if len(_SHARED_LBA_TABLE_CACHE) >= _SHARED_LBA_TABLE_CACHE_LIMIT:
+            _SHARED_LBA_TABLE_CACHE.clear()
+        _SHARED_LBA_TABLE_CACHE[signature] = raw_lba_cache
+    return raw_lba_cache
+
+
 @dataclass(slots=True)
 class CSAAttentionKVLayerState:
     """Runtime state for one CSA layer.
@@ -276,6 +415,8 @@ class CSAAttentionKVLayerState:
     indexed_slba_table: Optional[torch.Tensor] = None
     indexed_dst_rows_table: Optional[torch.Tensor] = None
     layer_major_dst_rows_table: Optional[torch.Tensor] = None
+    true_selected_blocks_bitmap: Optional[torch.Tensor] = None
+    true_selected_covers_cached_prefix: bool = False
 
 
 class CSAAttentionKVPrefetchManager:
@@ -366,7 +507,46 @@ class CSAAttentionKVPrefetchManager:
         self._prediction_waiter: Optional[Callable[[int], bool]] = None
         self._scheduled_layer_futures: Dict[int, Any] = {}
         self._scheduled_layer_futures_lock = threading.Lock()
+        self._request_transition_lock = threading.RLock()
+        self._request_state = threading.Condition()
+        self._active_submissions = 0
+        self._request_generation = 0
+        self._request_cleanup_failed = False
+        self._request_lifecycle = "inactive"
         self._closed = False
+        # Physical destination rows are normally identical across requests
+        # when vLLM reuses the same paged-cache layout.  Keep a small,
+        # process-local GPU table cache so the first cache hit after cold
+        # admission pays the upload once and later request registrations only
+        # attach an existing tensor.  The complete row tuple is part of the
+        # key, so a different allocation layout cannot reuse a stale table.
+        self._layer_major_dst_rows_table_cache: dict[
+            tuple[str, tuple[int, ...]], torch.Tensor
+        ] = {}
+        self._layer_major_dst_rows_table_cache_limit = 16
+        # vLLM's single-request block allocator normally returns one
+        # contiguous physical range.  Build the largest identity row table
+        # while KV tensors are registered at server startup, so the first
+        # cache hit can attach a slice without a CUDA allocation or H2D copy.
+        # Non-contiguous layouts are detected exactly and use the tuple cache
+        # above; correctness never depends on the contiguous fast path.
+        self._identity_rows_by_device: dict[str, torch.Tensor] = {}
+        # The vLLM indexer produces an 8192-row prefill in multiple query
+        # chunks.  The first chunk already identifies most of the final block
+        # union, so submit those exact blocks on a background thread while the
+        # remaining chunks are scored.  The normal full-output correction is
+        # retained as the authoritative final gate.
+        self._exact_chunk_prefetch_enabled = _exact_chunk_prefetch_enabled()
+        self._exact_chunk_prefetch_limit = _exact_chunk_prefetch_limit()
+        self._exact_chunk_prefetch_executor: Optional[ThreadPoolExecutor] = None
+        if self._exact_chunk_prefetch_enabled and self._exact_chunk_prefetch_limit:
+            self._exact_chunk_prefetch_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="lmcache-csa-exact-chunk",
+            )
+        self._exact_chunk_futures: Dict[int, List[Future[bool]]] = {}
+        self._exact_chunk_futures_lock = threading.Lock()
+        self._exact_chunk_hook_prefixes: Dict[Any, str] = {}
 
     def _scatter_stream_for(self, device: torch.device) -> torch.cuda.Stream:
         """Return the stream used for K-cache scatter copies.
@@ -405,8 +585,10 @@ class CSAAttentionKVPrefetchManager:
 
     @property
     def csa_layer_ids(self) -> Tuple[int, ...]:
-        """Return registered CSA layer ids in ascending order."""
-        return self._csa_layer_ids
+        """Return successfully registered CSA consumer layers."""
+        return tuple(
+            layer_id for layer_id in self._csa_layer_ids if layer_id in self._layers
+        )
 
     @property
     def active_request_id(self) -> str:
@@ -419,6 +601,204 @@ class CSAAttentionKVPrefetchManager:
         is registered.
         """
         return self._active_request_id or ""
+
+    def warm_runtime_resources(self) -> None:
+        """Create reusable CUDA streams before the first cache hit.
+
+        Layer registration supplies the actual CUDA devices used by the model.
+        Resolving the scatter and indexed-plan streams here moves their one-time
+        construction out of request latency. The method is idempotent and
+        performs no I/O or cache mutation.
+        """
+        devices = {
+            state.k_cache_tensor.device
+            for state in self._layers.values()
+            if state.k_cache_tensor.device.type == "cuda"
+        }
+        for device in devices:
+            with torch.cuda.device(device):
+                self._scatter_stream_for(device)
+                self._prepare_stream_for(device)
+        if devices:
+            logger.info(
+                "CSAAttentionKVPrefetchManager: warmed runtime streams devices=%s",
+                sorted(str(device) for device in devices),
+            )
+
+    @property
+    def active_request_token(self) -> Tuple[str, int]:
+        """Return the active request id and its plan generation."""
+        with self._request_state:
+            if self._active_request_id is None:
+                return "", -1
+            return self._active_request_id, self._request_generation
+
+    def request_stream_available(self) -> bool:
+        """Return whether a prior request cleanup left the consumer usable."""
+        with self._request_state:
+            return not self._request_cleanup_failed and self._request_lifecycle in {
+                "inactive",
+                "active",
+            }
+
+    def request_chunks_match(
+        self,
+        req_id: str,
+        chunks_by_layer: Dict[int, List[CSAAttentionKVChunkLoc]],
+    ) -> bool:
+        """Return whether a repeated request proposes the registered plan.
+
+        Args:
+            req_id: Request identifier whose plan is being checked.
+            chunks_by_layer: Newly constructed per-layer chunk descriptors.
+
+        Returns:
+            ``True`` only when the request id, layer set, byte locations, and
+            destination rows exactly match the currently registered plan.
+        """
+        if str(req_id) != self.active_request_id:
+            return False
+        if set(chunks_by_layer) != set(self._layers):
+            return False
+
+        def signature(chunk: CSAAttentionKVChunkLoc) -> tuple[Any, ...]:
+            disk_path = chunk.disk_meta.path if chunk.disk_meta is not None else None
+            return (
+                int(chunk.first_compressed_block),
+                int(chunk.n_compressed_blocks),
+                chunk.key,
+                disk_path,
+                int(chunk.layer_byte_offset),
+                int(chunk.bytes_per_block),
+                tuple(chunk.raw_extents),
+                tuple(chunk.physical_block_ids),
+                int(chunk.payload_skip),
+                int(chunk.read_length),
+                bool(chunk.layer_major),
+            )
+
+        for layer_id, state in self._layers.items():
+            proposed = sorted(
+                chunks_by_layer.get(int(layer_id), ()),
+                key=lambda chunk: int(chunk.first_compressed_block),
+            )
+            existing = sorted(
+                state.chunks,
+                key=lambda chunk: int(chunk.first_compressed_block),
+            )
+            if tuple(map(signature, proposed)) != tuple(map(signature, existing)):
+                return False
+        return True
+
+    def deactivate_request(self, timeout_s: float = 30.0) -> bool:
+        """Drain and clear the active request plan without unpatching layers.
+
+        Args:
+            timeout_s: Total time allowed for scheduled and in-flight reads.
+
+        Returns:
+            ``True`` when no old-request I/O can still write the registered
+            cache tensors. ``False`` means the caller must abort before model
+            forward starts.
+        """
+        with self._request_transition_lock:
+            return self._deactivate_request_locked(timeout_s)
+
+    def _deactivate_request_locked(self, timeout_s: float = 30.0) -> bool:
+        """Deactivate one request while holding the lifecycle transition lock."""
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        with self._request_state:
+            self._request_cleanup_failed = True
+            self._request_lifecycle = "draining"
+            self._active_request_id = None
+            while self._active_submissions:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.error(
+                        "CSAAttentionKVPrefetchManager: deactivate timed out "
+                        "with active_submissions=%d",
+                        self._active_submissions,
+                    )
+                    return False
+                self._request_state.wait(remaining)
+        with self._scheduled_layer_futures_lock:
+            scheduled = tuple(self._scheduled_layer_futures.items())
+        for _layer_id, future in scheduled:
+            cancel = getattr(future, "cancel", None)
+            if callable(cancel):
+                cancel()
+        for layer_id, future in scheduled:
+            result = getattr(future, "result", None)
+            try:
+                if not callable(result):
+                    raise RuntimeError("tracked submission has no result method")
+                result(timeout=max(0.0, deadline - time.monotonic()))
+            except Exception:
+                cancelled = bool(getattr(future, "cancelled", lambda: False)())
+                done = bool(getattr(future, "done", lambda: False)())
+                if not cancelled and not done:
+                    logger.error(
+                        "CSAAttentionKVPrefetchManager: deactivate timed out "
+                        "waiting for scheduled layer=%d",
+                        layer_id,
+                    )
+                    return False
+                if not cancelled:
+                    logger.exception(
+                        "CSAAttentionKVPrefetchManager: old request "
+                        "submission failed while deactivating"
+                    )
+            with self._scheduled_layer_futures_lock:
+                if self._scheduled_layer_futures.get(layer_id) is future:
+                    self._scheduled_layer_futures.pop(layer_id, None)
+
+        if not self._drain_exact_topk_futures(deadline):
+            logger.error(
+                "CSAAttentionKVPrefetchManager: deactivate timed out waiting "
+                "for exact top-K chunk prefetch"
+            )
+            return False
+
+        for layer_id, state in self._layers.items():
+            with state.pending_reads_lock:
+                while state.pending_read_count:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        logger.error(
+                            "CSAAttentionKVPrefetchManager: deactivate timed "
+                            "out layer=%d pending=%d",
+                            layer_id,
+                            state.pending_read_count,
+                        )
+                        return False
+                    state.pending_reads_lock.wait(remaining)
+            if not self._drain_for_layer_until(int(layer_id), deadline):
+                logger.error(
+                    "CSAAttentionKVPrefetchManager: deactivate timed out "
+                    "waiting for CUDA drain layer=%d",
+                    layer_id,
+                )
+                return False
+
+        self._pending_raw_lba_cache = {}
+        for state in self._layers.values():
+            state.chunks = []
+            state.in_pool_bitmap.zero_()
+            with state.pending_reads_lock:
+                state.pending_reads_bitmap.zero_()
+                state.resident_blocks_bitmap.zero_()
+                state.pending_read_count = 0
+                state.last_drain_event = None
+                state.pending_drains.clear()
+            state.indexed_slba_table = None
+            state.indexed_dst_rows_table = None
+            state.layer_major_dst_rows_table = None
+            state.true_selected_blocks_bitmap = None
+            state.true_selected_covers_cached_prefix = False
+        with self._request_state:
+            self._request_cleanup_failed = False
+            self._request_lifecycle = "inactive"
+        return True
 
     @property
     def full_nsys_capture_active(self) -> bool:
@@ -434,6 +814,75 @@ class CSAAttentionKVPrefetchManager:
     def hca_layer_ids(self) -> Tuple[int, ...]:
         """Transformer layer ids registered via :meth:`register_hca_layer`."""
         return self._hca_layer_ids
+
+    def owns_k_cache(self, k_cache_tensor: torch.Tensor) -> bool:
+        """Return whether ``k_cache_tensor`` belongs to a registered CSA layer.
+
+        The vLLM sparse-prefill patch uses this public probe to enable compact
+        top-K gathering only for caches whose bytes are supplied by this
+        manager.  Comparing storage pointers avoids parsing model-specific
+        layer names and remains valid for strided views of the same cache.
+
+        Args:
+            k_cache_tensor: Candidate vLLM compressed K-cache tensor.
+
+        Returns:
+            ``True`` when the tensor shares storage with a registered CSA
+            layer, otherwise ``False``.
+        """
+        if not isinstance(k_cache_tensor, torch.Tensor):
+            return False
+        candidate_ptr = int(k_cache_tensor.untyped_storage().data_ptr())
+        return any(
+            int(state.k_cache_tensor.untyped_storage().data_ptr()) == candidate_ptr
+            for layer_id, state in self._layers.items()
+            if layer_id in self._csa_layer_ids
+        )
+
+    def true_selected_blocks_for_cache(
+        self,
+        k_cache_tensor: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Return the exact latest true-topK page union for one CSA cache.
+
+        Args:
+            k_cache_tensor: Exact compressed K-cache view used by attention.
+
+        Returns:
+            A CUDA int32 bitmap, or ``None`` when no exact union is available.
+        """
+        if not isinstance(k_cache_tensor, torch.Tensor):
+            return None
+        candidate_ptr = int(k_cache_tensor.data_ptr())
+        for layer_id, state in self._layers.items():
+            if layer_id not in self._csa_layer_ids:
+                continue
+            if int(state.k_cache_tensor.data_ptr()) == candidate_ptr:
+                return state.true_selected_blocks_bitmap
+        return None
+
+    def true_selected_covers_cached_prefix_for_cache(
+        self,
+        k_cache_tensor: torch.Tensor,
+    ) -> bool:
+        """Return whether true top-K selected every cached-prefix page.
+
+        Args:
+            k_cache_tensor: Exact compressed K-cache view used by attention.
+
+        Returns:
+            ``True`` only when the latest correction proved that every page
+            backed by LMCache is selected and resident.
+        """
+        if not isinstance(k_cache_tensor, torch.Tensor):
+            return False
+        candidate_ptr = int(k_cache_tensor.data_ptr())
+        for layer_id, state in self._layers.items():
+            if layer_id not in self._csa_layer_ids:
+                continue
+            if int(state.k_cache_tensor.data_ptr()) == candidate_ptr:
+                return state.true_selected_covers_cached_prefix
+        return False
 
     def register_layer(
         self,
@@ -562,6 +1011,14 @@ class CSAAttentionKVPrefetchManager:
             device="cpu",
         )
         resident_blocks_bitmap = torch.zeros_like(pending_reads_bitmap)
+        device_key = str(k_cache_tensor.device)
+        identity_rows = self._identity_rows_by_device.get(device_key)
+        if identity_rows is None or int(identity_rows.numel()) < num_rows:
+            self._identity_rows_by_device[device_key] = torch.arange(
+                num_rows,
+                dtype=torch.int64,
+                device=k_cache_tensor.device,
+            )
         self._layers[int(layer_id)] = CSAAttentionKVLayerState(
             layer_id=int(layer_id),
             compressed_block_size=compressed_block_size,
@@ -585,6 +1042,7 @@ class CSAAttentionKVPrefetchManager:
         chunks_by_layer: Dict[int, List[CSAAttentionKVChunkLoc]],
         *,
         start_profile_capture: bool = True,
+        shared_raw_lba_cache: Optional[dict[str, list[Any]]] = None,
     ) -> None:
         """Register LMCache chunk locations for an active request.
 
@@ -607,9 +1065,45 @@ class CSAAttentionKVPrefetchManager:
             start_profile_capture: Whether this manager owns the request-level
                 profiler trigger. Auxiliary managers sharing the same Tutti
                 loader must disable it so only one component starts capture.
+            shared_raw_lba_cache: Optional immutable union of the CSA, HCA,
+                and native-indexer extents. All consumers of one Tutti loader
+                must receive the same object so layer reads never replace and
+                re-sort each other's extent table.
         """
-        is_new_request = str(req_id) != self._active_request_id
-        self._active_request_id = str(req_id)
+        with self._request_transition_lock:
+            try:
+                self._register_request_chunks_locked(
+                    req_id,
+                    chunks_by_layer,
+                    start_profile_capture=start_profile_capture,
+                    shared_raw_lba_cache=shared_raw_lba_cache,
+                )
+            except Exception:
+                with self._request_state:
+                    preparing = self._request_lifecycle == "preparing"
+                if preparing and not self._deactivate_request_locked():
+                    logger.error(
+                        "CSAAttentionKVPrefetchManager: failed to roll back "
+                        "partial request plan"
+                    )
+                raise
+
+    def _register_request_chunks_locked(
+        self,
+        req_id: str,
+        chunks_by_layer: Dict[int, List[CSAAttentionKVChunkLoc]],
+        *,
+        start_profile_capture: bool,
+        shared_raw_lba_cache: Optional[dict[str, list[Any]]],
+    ) -> None:
+        """Install one request plan while holding the transition lock."""
+        request_id = str(req_id)
+        is_new_request = request_id != self._active_request_id
+        if is_new_request and not self.deactivate_request():
+            raise RuntimeError("previous CSA/HCA request could not be deactivated")
+        if is_new_request:
+            with self._request_state:
+                self._request_lifecycle = "preparing"
         if is_new_request and start_profile_capture:
             self.start_full_nsys_capture_for_request(str(req_id))
         if is_new_request:
@@ -624,7 +1118,7 @@ class CSAAttentionKVPrefetchManager:
             # registration and only refresh the LBA cache union.
             if self._pending_raw_lba_cache:
                 try:
-                    self._tutti_loader.register_lba_cache(self._pending_raw_lba_cache)
+                    self._tutti_loader.ensure_lba_cache(self._pending_raw_lba_cache)
                 except Exception:
                     logger.exception(
                         "CSAAttentionKVPrefetchManager: LBA cache re-register "
@@ -641,50 +1135,26 @@ class CSAAttentionKVPrefetchManager:
         # every other chunk's coverage — exactly the
         # ``Tutti extents ... cover 0/N bytes`` bug.  Dedup at the
         # (path, file_offset, slba, n_sectors) tuple level instead.
-        try:
-            from lmcache.v1.gpu_connector.tutti_direct_loader import LbaRecord
-        except ImportError:
-            LbaRecord = None  # type: ignore[assignment]
-        if LbaRecord is not None:
-            seen: set[tuple[str, int, int, int]] = set()
-            raw_lba_cache: dict[str, list["LbaRecord"]] = {}
-            for chunks in chunks_by_layer.values():
-                for chunk in chunks:
-                    path = chunk.disk_meta.path if chunk.disk_meta else None
-                    if not path or not chunk.raw_extents:
-                        continue
-                    bucket = raw_lba_cache.setdefault(path, [])
-                    for file_offset, slba, n_sectors in chunk.raw_extents:
-                        key = (
-                            path,
-                            int(file_offset),
-                            int(slba),
-                            int(n_sectors),
-                        )
-                        if key in seen:
-                            continue
-                        seen.add(key)
-                        bucket.append(
-                            LbaRecord(
-                                file_offset=int(file_offset),
-                                slba=int(slba),
-                                n_sectors=int(n_sectors),
-                            )
-                        )
-            if raw_lba_cache:
-                # Stash for re-registration on every read (see comment on
-                # ``_pending_raw_lba_cache``).
-                self._pending_raw_lba_cache = raw_lba_cache
-                try:
-                    self._tutti_loader.register_lba_cache(raw_lba_cache)
-                except Exception:
-                    logger.exception(
-                        "CSAAttentionKVPrefetchManager: failed to register %d "
-                        "LBA cache entries for request %s",
-                        len(raw_lba_cache),
-                        req_id,
-                    )
+        raw_lba_cache = shared_raw_lba_cache
+        if raw_lba_cache is None:
+            raw_lba_cache = build_shared_raw_lba_cache((chunks_by_layer,))
+        if raw_lba_cache:
+            # Keep the exact shared lists. Tutti's identity fast path then
+            # makes every per-layer ensure call O(paths), with no copy/sort.
+            self._pending_raw_lba_cache = raw_lba_cache
+            try:
+                self._tutti_loader.ensure_lba_cache(raw_lba_cache)
+            except Exception:
+                logger.exception(
+                    "CSAAttentionKVPrefetchManager: failed to register %d "
+                    "LBA cache entries for request %s",
+                    len(raw_lba_cache),
+                    req_id,
+                )
 
+        layer_major_table_cache: dict[
+            tuple[str, tuple[int, ...]], torch.Tensor
+        ] = {}
         for layer_id, state in self._layers.items():
             chunks = chunks_by_layer.get(int(layer_id), [])
             ordered = sorted(chunks, key=lambda chunk: chunk.first_compressed_block)
@@ -708,18 +1178,25 @@ class CSAAttentionKVPrefetchManager:
                 expected = chunk.end_compressed_block
             state.chunks = ordered
             self._compile_indexed_layer_tables(state)
-            self._compile_layer_major_table(state)
+            self._compile_layer_major_table(state, layer_major_table_cache)
             # Only reset drain and bitmap state for genuinely new requests.
             # Per-microbatch re-registration (same req_id) must preserve the
             # in_pool_bitmap and last_drain_event so staging slots from reads
             # already in flight are not orphaned (leak → pool exhaustion).
             if is_new_request:
                 state.in_pool_bitmap.zero_()
+                state.true_selected_blocks_bitmap = None
+                state.true_selected_covers_cached_prefix = False
                 with state.pending_reads_lock:
                     state.pending_reads_bitmap.zero_()
                     state.resident_blocks_bitmap.zero_()
                     state.pending_read_count = 0
                     state.last_drain_event = None
+        if is_new_request:
+            with self._request_state:
+                self._request_generation += 1
+                self._active_request_id = request_id
+                self._request_lifecycle = "active"
 
     def start_full_nsys_capture_for_request(self, request_id: str) -> None:
         """Start one full-forward Nsight capture for a selected cache hit.
@@ -797,7 +1274,7 @@ class CSAAttentionKVPrefetchManager:
         if (
             state.block_slot_scatter
             or not state.chunks
-            or any(chunk.layer_major for chunk in state.chunks)
+            or (len(state.chunks) == 1 and state.chunks[0].layer_major)
         ):
             return
         io_nbytes = state.compressed_block_size * state.token_bytes
@@ -816,13 +1293,9 @@ class CSAAttentionKVPrefetchManager:
             # has only ~1.8K blocks. searchsorted performs the monotonic
             # block-to-extent mapping in native parallel code.
             extent_table = torch.as_tensor(
-                chunk.raw_extents,
+                _coalesce_physically_contiguous_extents(chunk.raw_extents),
                 dtype=torch.int64,
             ).reshape(-1, 3)
-            extent_table = extent_table.index_select(
-                0,
-                torch.argsort(extent_table[:, 0]),
-            )
             extent_offsets = extent_table[:, 0]
             extent_slbas = extent_table[:, 1]
             extent_ends = extent_offsets + extent_table[:, 2] * 512
@@ -903,25 +1376,76 @@ class CSAAttentionKVPrefetchManager:
     def _compile_layer_major_table(
         self,
         state: CSAAttentionKVLayerState,
+        shared_tables: dict[tuple[str, tuple[int, ...]], torch.Tensor],
     ) -> None:
-        """Upload the destination rows for a full-prefix layer object."""
+        """Attach one shared destination-row table for layer-major objects."""
         state.layer_major_dst_rows_table = None
-        if len(state.chunks) != 1 or not state.chunks[0].layer_major:
+        if not state.chunks or any(not chunk.layer_major for chunk in state.chunks):
             return
-        chunk = state.chunks[0]
-        if len(chunk.physical_block_ids) != chunk.n_compressed_blocks:
-            return
-        state.layer_major_dst_rows_table = torch.as_tensor(
-            chunk.physical_block_ids,
-            dtype=torch.int64,
-            device=state.k_cache_tensor.device,
+        expected = 0
+        row_parts: list[tuple[int, ...]] = []
+        for chunk in state.chunks:
+            if (
+                chunk.first_compressed_block != expected
+                or len(chunk.physical_block_ids) != chunk.n_compressed_blocks
+            ):
+                return
+            row_parts.append(chunk.physical_block_ids)
+            expected = chunk.end_compressed_block
+        rows = (
+            row_parts[0]
+            if len(row_parts) == 1
+            else tuple(row for part in row_parts for row in part)
         )
+        # Every layer in one sidecar group uses the same immutable physical
+        # row tuple. Upload it once per device instead of issuing 20/21 tiny,
+        # synchronising H2D allocations during every 480K cache hit.
+        cache_key = (
+            str(state.k_cache_tensor.device),
+            tuple(id(part) for part in row_parts),
+        )
+        table = shared_tables.get(cache_key)
+        if table is None:
+            persistent_key = (
+                str(state.k_cache_tensor.device),
+                rows,
+            )
+            first_row = rows[0] if rows else 0
+            identity_rows = self._identity_rows_by_device.get(persistent_key[0])
+            is_contiguous = bool(
+                rows
+                and first_row >= 0
+                and identity_rows is not None
+                and first_row + len(rows) <= int(identity_rows.numel())
+                and all(row == first_row + index for index, row in enumerate(rows))
+            )
+            table = (
+                identity_rows[first_row : first_row + len(rows)]
+                if is_contiguous and identity_rows is not None
+                else self._layer_major_dst_rows_table_cache.get(persistent_key)
+            )
+            if table is None:
+                table = torch.as_tensor(
+                    rows,
+                    dtype=torch.int64,
+                    device=state.k_cache_tensor.device,
+                )
+                if (
+                    len(self._layer_major_dst_rows_table_cache)
+                    >= self._layer_major_dst_rows_table_cache_limit
+                ):
+                    self._layer_major_dst_rows_table_cache.clear()
+                self._layer_major_dst_rows_table_cache[persistent_key] = table
+            shared_tables[cache_key] = table
+        state.layer_major_dst_rows_table = table
 
     def fire_predicted_reads(
         self,
         layer_id: int,
         compressed_block_ids: Sequence[int] | torch.Tensor,
         prefetch_level: int = 2,
+        *,
+        request_token: Optional[Tuple[str, int]] = None,
     ) -> None:
         """Submit Tutti reads for the predicted ``top-K`` of one CSA layer.
 
@@ -933,6 +1457,7 @@ class CSAAttentionKVPrefetchManager:
             layer_id: Transformer-side CSA layer id.
             compressed_block_ids: Predicted compressed block ids.
             prefetch_level: Must be ``2`` for the one early L2 prediction.
+            request_token: Request generation captured when work was queued.
 
         Raises:
             ValueError: If ``prefetch_level`` is not two.
@@ -944,6 +1469,7 @@ class CSAAttentionKVPrefetchManager:
             compressed_block_ids,
             label=f"predicted_l{prefetch_level}",
             io_priority="speculative",
+            request_token=request_token,
         )
 
     def set_prediction_waiter(
@@ -969,6 +1495,7 @@ class CSAAttentionKVPrefetchManager:
         layer_id: int,
         *,
         label: str = "hca_deterministic",
+        request_token: Optional[Tuple[str, int]] = None,
     ) -> bool:
         """Submit every covered block for a deterministic HCA layer.
 
@@ -979,6 +1506,7 @@ class CSAAttentionKVPrefetchManager:
         Args:
             layer_id: Registered HCA transformer layer id.
             label: Profiling label attached to the Tutti submission.
+            request_token: Request generation captured when work was queued.
 
         Returns:
             ``True`` when the layer has a registered non-empty chunk map.
@@ -992,16 +1520,37 @@ class CSAAttentionKVPrefetchManager:
             range(covered_end),
             label=label,
             raise_on_error=True,
+            request_token=request_token,
         )
         return True
 
-    def track_layer_submission(self, layer_id: int, future: Any) -> None:
+    def track_layer_submission(
+        self,
+        layer_id: int,
+        future: Any,
+        *,
+        request_token: Optional[Tuple[str, int]] = None,
+    ) -> None:
         """Track a background submission that must precede a layer gate.
 
         Args:
             layer_id: Target transformer layer id.
             future: Future whose result means Tutti/scatter work was enqueued.
+            request_token: Request generation captured when work was queued.
         """
+        with self._request_state:
+            current_token = (
+                self._active_request_id or "",
+                self._request_generation,
+            )
+            valid = self._request_lifecycle == "active" and (
+                request_token is None or request_token == current_token
+            )
+        if not valid:
+            cancel = getattr(future, "cancel", None)
+            if callable(cancel):
+                cancel()
+            return
         with self._scheduled_layer_futures_lock:
             self._scheduled_layer_futures[int(layer_id)] = future
 
@@ -1015,6 +1564,8 @@ class CSAAttentionKVPrefetchManager:
         self,
         layer_id: int,
         compressed_block_ids: Sequence[int] | torch.Tensor,
+        *,
+        request_token: Optional[Tuple[str, int]] = None,
     ) -> None:
         """Submit Tutti reads for blocks not covered by the prediction.
 
@@ -1025,12 +1576,14 @@ class CSAAttentionKVPrefetchManager:
             layer_id: Transformer-side CSA layer id.
             compressed_block_ids: ``true_topk`` block ids whose K cache
                 slots are not yet populated.
+            request_token: Request generation captured before true-indexer work.
         """
         self._submit_reads(
             layer_id,
             compressed_block_ids,
             label="miss",
             raise_on_error=True,
+            request_token=request_token,
         )
 
     def wait_for_layer(self, layer_id: int, timeout_s: float = 2.0) -> bool:
@@ -1125,6 +1678,40 @@ class CSAAttentionKVPrefetchManager:
                 if callable(ref_count_down):
                     ref_count_down()
 
+    def _drain_for_layer_until(self, layer_id: int, deadline: float) -> bool:
+        """Release one layer's staging buffers without exceeding a deadline."""
+        state = self._layers.get(int(layer_id))
+        if state is None:
+            return True
+        with state.pending_reads_lock:
+            event = state.last_drain_event
+        if event is not None:
+            query = getattr(event, "query", None)
+            if not callable(query):
+                return False
+            while not bool(query()):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                time.sleep(min(0.001, remaining))
+        with state.pending_reads_lock:
+            pending = state.pending_drains[:]
+            state.pending_drains.clear()
+            state.last_drain_event = None
+        for _, memory_objs, io_range, operation_id in pending:
+            csa_pipeline_nvtx.finish_io(
+                io_range,
+                layer_id=int(layer_id),
+                target_layer_id=int(layer_id),
+                operation_id=operation_id,
+                request_id=self.active_request_id,
+            )
+            for memory_obj in memory_objs:
+                ref_count_down = getattr(memory_obj, "ref_count_down", None)
+                if callable(ref_count_down):
+                    ref_count_down()
+        return True
+
     def patch_indexer_forward(
         self,
         indexer_module: Any,
@@ -1154,7 +1741,51 @@ class CSAAttentionKVPrefetchManager:
             orig_forward = indexer_module.forward
             mgr = self
 
+            if getattr(self, "_exact_chunk_prefetch_executor", None) is not None:
+                try:
+                    from vllm.model_executor.layers.sparse_attn_indexer import (
+                        register_lmcache_topk_chunk_callback,
+                    )
+
+                    cache = getattr(indexer_module, "k_cache", None)
+                    hook_prefix = str(cache.prefix)
+
+                    def _observe_topk_chunk(
+                        topk_indices: torch.Tensor,
+                        chunk_index: int,
+                        *,
+                        _layer_id: int = int(layer_id),
+                    ) -> None:
+                        mgr._schedule_exact_topk_chunk(
+                            _layer_id,
+                            topk_indices,
+                            chunk_index,
+                        )
+
+                    register_lmcache_topk_chunk_callback(
+                        hook_prefix,
+                        _observe_topk_chunk,
+                    )
+                    self._exact_chunk_hook_prefixes[indexer_module] = hook_prefix
+                    logger.info(
+                        "CSAAttentionKVPrefetchManager: exact top-K chunk "
+                        "prefetch attached layer=%d prefix=%s max_chunks=%d",
+                        layer_id,
+                        hook_prefix,
+                        self._exact_chunk_prefetch_limit,
+                    )
+                except (AttributeError, ImportError, TypeError):
+                    logger.exception(
+                        "CSAAttentionKVPrefetchManager: failed to attach exact "
+                        "top-K chunk hook for layer %d; final correction "
+                        "remains active",
+                        layer_id,
+                    )
+
             def _patched_forward(*args: Any, **kwargs: Any) -> torch.Tensor:
+                request_token = mgr.active_request_token
+                if not request_token[0]:
+                    return orig_forward(*args, **kwargs)
                 t0 = time.perf_counter() if _timing_enabled() else 0.0
                 wait_ms = 0.0
                 # The native Lightning Indexer reads its own compact K cache
@@ -1188,7 +1819,7 @@ class CSAAttentionKVPrefetchManager:
                 with csa_pipeline_nvtx.range(
                     CsaNvtxEvent.TRUE_INDEXER,
                     layer_id=layer_id,
-                    request_id=mgr.active_request_id,
+                    request_id=request_token[0],
                 ):
                     true_topk = orig_forward(*args, **kwargs)
                 hidden_states = kwargs.get("hidden_states")
@@ -1206,6 +1837,15 @@ class CSAAttentionKVPrefetchManager:
                 )
                 true_indexer_ms = (
                     (time.perf_counter() - true_indexer_start) * 1000.0
+                    if _timing_enabled()
+                    else 0.0
+                )
+                exact_chunk_wait_start = (
+                    time.perf_counter() if _timing_enabled() else 0.0
+                )
+                mgr._wait_for_exact_topk_chunks(layer_id)
+                exact_chunk_wait_ms = (
+                    (time.perf_counter() - exact_chunk_wait_start) * 1000.0
                     if _timing_enabled()
                     else 0.0
                 )
@@ -1233,6 +1873,12 @@ class CSAAttentionKVPrefetchManager:
                         )
                     first_drain_ms = 0.0
                     t_miss0 = time.perf_counter() if _timing_enabled() else 0.0
+                    # The paired vLLM patch compacts the compressed-K gather
+                    # through a top-K-derived block table.  Therefore prefill
+                    # and decode both need only the physical pages referenced
+                    # by the true indexer output; loading a whole layer here
+                    # defeats sparse I/O and makes the 8192-row union approach
+                    # the complete prefix.
                     miss_ids = mgr._miss_ids_for_topk(layer_id, active_topk)
                     miss_ms = (
                         (time.perf_counter() - t_miss0) * 1000.0
@@ -1240,7 +1886,11 @@ class CSAAttentionKVPrefetchManager:
                         else 0.0
                     )
                     if miss_ids.numel():
-                        mgr.submit_miss_reads(layer_id, miss_ids)
+                        mgr.submit_miss_reads(
+                            layer_id,
+                            miss_ids,
+                            request_token=request_token,
+                        )
                     t_drain1 = time.perf_counter() if _timing_enabled() else 0.0
                     mgr.drain_for_layer(layer_id)
                     second_drain_ms = (
@@ -1255,8 +1905,10 @@ class CSAAttentionKVPrefetchManager:
                             "CSAAttentionKVPrefetchManager: correction "
                             "device=%s layer=%d active_query_rows=%d "
                             "raw_selected_entries=%d miss_blocks=%d "
+                            "full_cached_prefix_selected=%d "
                             "reused_residual=%d "
                             "prediction_ready=%d true_indexer_ms=%.3f wait_ms=%.3f "
+                            "exact_chunk_wait_ms=%.3f "
                             "first_drain_ms=%.3f "
                             "miss_filter_ms=%.3f second_drain_ms=%.3f "
                             "total_ms=%.3f",
@@ -1265,10 +1917,16 @@ class CSAAttentionKVPrefetchManager:
                             active_rows,
                             int(active_topk.numel()),
                             len(miss_ids),
+                            int(
+                                mgr._layers[
+                                    int(layer_id)
+                                ].true_selected_covers_cached_prefix
+                            ),
                             int(reused_residual),
                             int(prediction_ready),
                             true_indexer_ms,
                             wait_ms,
+                            exact_chunk_wait_ms,
                             first_drain_ms,
                             miss_ms,
                             second_drain_ms,
@@ -1294,6 +1952,21 @@ class CSAAttentionKVPrefetchManager:
         with self._patch_lock:
             for module, attr, original in self._patched_modules:
                 setattr(module, attr, original)
+                hook_prefixes = getattr(self, "_exact_chunk_hook_prefixes", {})
+                hook_prefix = hook_prefixes.pop(module, None)
+                if hook_prefix is not None:
+                    try:
+                        from vllm.model_executor.layers.sparse_attn_indexer import (
+                            unregister_lmcache_topk_chunk_callback,
+                        )
+
+                        unregister_lmcache_topk_chunk_callback(hook_prefix)
+                    except (ImportError, TypeError):
+                        logger.exception(
+                            "CSAAttentionKVPrefetchManager: failed to remove "
+                            "exact top-K chunk hook prefix=%s",
+                            hook_prefix,
+                        )
                 try:
                     delattr(module, "_lmcache_csa_attention_kv_original_forward")
                 except AttributeError:
@@ -1302,21 +1975,223 @@ class CSAAttentionKVPrefetchManager:
 
     def close(self) -> None:
         """Release resources held by this manager."""
-        if self._closed:
-            return
-        self._closed = True
-        self.unpatch()
-        self._layers.clear()
-        self._active_request_id = None
-        self._prediction_waiter = None
-        with self._scheduled_layer_futures_lock:
-            self._scheduled_layer_futures.clear()
+        with self._request_transition_lock:
+            if self._closed:
+                return
+            if not self._deactivate_request_locked():
+                logger.error(
+                    "CSAAttentionKVPrefetchManager: close left resources "
+                    "attached because request I/O did not drain"
+                )
+                return
+            self._closed = True
+            with self._request_state:
+                self._request_lifecycle = "closed"
+            self.unpatch()
+            if getattr(self, "_exact_chunk_prefetch_executor", None) is not None:
+                self._exact_chunk_prefetch_executor.shutdown(wait=True)
+                self._exact_chunk_prefetch_executor = None
+            self._layers.clear()
+            self._prediction_waiter = None
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _schedule_exact_topk_chunk(
+        self,
+        layer_id: int,
+        topk_indices: torch.Tensor,
+        chunk_index: int,
+    ) -> None:
+        """Queue one exact true-topK chunk without blocking model execution."""
+        executor = self._exact_chunk_prefetch_executor
+        if (
+            executor is None
+            or chunk_index < 0
+            or chunk_index >= self._exact_chunk_prefetch_limit
+            or not isinstance(topk_indices, torch.Tensor)
+            or not topk_indices.is_cuda
+            or topk_indices.numel() == 0
+        ):
+            return
+        request_token = self.active_request_token
+        if not request_token[0]:
+            return
+        ready_event = torch.cuda.Event()
+        ready_event.record(torch.cuda.current_stream(topk_indices.device))
+        future = executor.submit(
+            self._run_exact_topk_chunk,
+            int(layer_id),
+            topk_indices,
+            int(chunk_index),
+            ready_event,
+            request_token,
+        )
+        with self._exact_chunk_futures_lock:
+            self._exact_chunk_futures.setdefault(int(layer_id), []).append(future)
+
+    def _run_exact_topk_chunk(
+        self,
+        layer_id: int,
+        topk_indices: torch.Tensor,
+        chunk_index: int,
+        ready_event: torch.cuda.Event,
+        request_token: Tuple[str, int],
+    ) -> bool:
+        """Select and read exact blocks from one completed indexer chunk."""
+        state = self._layers.get(int(layer_id))
+        if state is None:
+            return False
+        with self._request_state:
+            current_token = (
+                self._active_request_id or "",
+                self._request_generation,
+            )
+            if self._request_lifecycle != "active" or request_token != current_token:
+                return False
+        device = state.in_pool_bitmap.device
+        prepare_stream = self._prepare_stream_for(device)
+        with (
+            torch.cuda.device(device),
+            torch.inference_mode(),
+            torch.cuda.stream(prepare_stream),
+        ):
+            prepare_stream.wait_event(ready_event)
+            missing_ids = self._missing_ids_for_exact_topk_chunk(
+                int(layer_id),
+                topk_indices,
+            )
+        if missing_ids.numel() == 0:
+            return True
+        return self._submit_reads(
+            int(layer_id),
+            missing_ids,
+            label=f"exact_chunk_{chunk_index}",
+            io_priority="demand",
+            raise_on_error=False,
+            request_token=request_token,
+        )
+
+    def _wait_for_exact_topk_chunks(self, layer_id: int) -> None:
+        """Join progressive reads for one layer before final correction."""
+        lock = getattr(self, "_exact_chunk_futures_lock", None)
+        if lock is None:
+            return
+        with lock:
+            futures = self._exact_chunk_futures.pop(int(layer_id), [])
+        for future in futures:
+            try:
+                future.result()
+            except Exception:
+                # Progressive I/O is an optimization only. The authoritative
+                # full-topK correction immediately following this join will
+                # retry every block that did not become resident.
+                logger.exception(
+                    "CSAAttentionKVPrefetchManager: exact top-K chunk "
+                    "prefetch failed for layer %d; using final correction",
+                    layer_id,
+                )
+
+    def _drain_exact_topk_futures(self, deadline: float) -> bool:
+        """Cancel or join every progressive future before request teardown."""
+        lock = getattr(self, "_exact_chunk_futures_lock", None)
+        if lock is None:
+            return True
+        with lock:
+            futures = [
+                future
+                for layer_futures in self._exact_chunk_futures.values()
+                for future in layer_futures
+            ]
+            self._exact_chunk_futures.clear()
+        for future in futures:
+            future.cancel()
+        for future in futures:
+            try:
+                future.result(timeout=max(0.0, deadline - time.monotonic()))
+            except Exception:
+                if not future.done():
+                    return False
+        return True
+
+    def _missing_ids_for_exact_topk_chunk(
+        self,
+        layer_id: int,
+        topk_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return unique cached-prefix blocks selected by one true-topK chunk."""
+        state = self._layers.get(int(layer_id))
+        if state is None or not state.chunks:
+            return torch.empty(0, dtype=torch.int64)
+        entries = topk_indices.reshape(-1)
+        device = state.in_pool_bitmap.device
+        if entries.device != device:
+            entries = entries.to(device)
+        limit = min(
+            int(state.chunks[-1].end_compressed_block),
+            int(state.in_pool_bitmap.shape[0]),
+        )
+        if limit <= 0:
+            return torch.empty(0, dtype=torch.int64)
+        native_select = getattr(_csa_c_ops, "select_missing_csa_blocks", None)
+        if (
+            callable(native_select)
+            and entries.is_cuda
+            and state.in_pool_bitmap.is_cuda
+        ):
+            return native_select(
+                entries.contiguous(),
+                state.in_pool_bitmap,
+                limit,
+                state.compressed_block_size,
+            ).cpu()
+        entries = entries.to(torch.int64)
+        block_ids = entries // state.compressed_block_size
+        valid = (entries >= 0) & (block_ids < limit)
+        seen = torch.zeros(limit, dtype=torch.bool, device=device)
+        seen[block_ids[valid]] = True
+        return (seen & ~state.in_pool_bitmap[:limit]).nonzero().reshape(-1).cpu()
+
     def _submit_reads(
+        self,
+        layer_id: int,
+        compressed_block_ids: Sequence[int] | torch.Tensor,
+        label: str,
+        io_priority: str = "demand",
+        *,
+        raise_on_error: bool = False,
+        request_token: Optional[Tuple[str, int]] = None,
+    ) -> bool:
+        """Run one read submission while pinning the active request state."""
+        with self._request_state:
+            current_token = (
+                self._active_request_id or "",
+                self._request_generation,
+            )
+            if (
+                self._request_lifecycle != "active"
+                or self._active_request_id is None
+                or (request_token is not None and request_token != current_token)
+            ):
+                if raise_on_error:
+                    raise RuntimeError("request read plan is inactive or stale")
+                return False
+            self._active_submissions += 1
+        try:
+            return self._submit_reads_active(
+                layer_id,
+                compressed_block_ids,
+                label,
+                io_priority,
+                raise_on_error=raise_on_error,
+            )
+        finally:
+            with self._request_state:
+                self._active_submissions -= 1
+                self._request_state.notify_all()
+
+    def _submit_reads_active(
         self,
         layer_id: int,
         compressed_block_ids: Sequence[int] | torch.Tensor,
@@ -1456,7 +2331,19 @@ class CSAAttentionKVPrefetchManager:
             # vLLM's model-forward inference_mode context.  The target K cache
             # and resident bitmap may be inference tensors, so all in-place GPU
             # updates must re-enter inference_mode here as well.
-            with torch.inference_mode():
+            # ThreadPoolExecutor workers do not inherit vLLM's per-rank CUDA
+            # current-device state.  Without an explicit device guard, ranks
+            # other than zero enter the correct private stream but restore a
+            # device-0 stream on exit; the error is then reported as an
+            # asynchronous illegal access and invalidates every later layer.
+            k_cache_tensor = getattr(state, "k_cache_tensor", None)
+            device_guard = (
+                torch.cuda.device(k_cache_tensor.device)
+                if isinstance(k_cache_tensor, torch.Tensor)
+                and k_cache_tensor.is_cuda
+                else nullcontext()
+            )
+            with torch.inference_mode(), device_guard:
                 event, issued_memory_objs, completed_ids = self._issue_reads(
                     state,
                     new_ids,
@@ -1554,19 +2441,34 @@ class CSAAttentionKVPrefetchManager:
         """
         if len(sorted_block_ids) == 0:
             return None, [], torch.empty(0, dtype=torch.int64)
+        selected_cpu = torch.as_tensor(
+            sorted_block_ids,
+            dtype=torch.int64,
+            device="cpu",
+        ).reshape(-1)
+        full_layer_major = bool(
+            len(state.chunks) > 1
+            and all(chunk.layer_major for chunk in state.chunks)
+            and state.layer_major_dst_rows_table is not None
+            and selected_cpu.numel()
+            == int(state.chunks[-1].end_compressed_block)
+            and int(selected_cpu[0]) == 0
+            and int(selected_cpu[-1])
+            == int(state.chunks[-1].end_compressed_block) - 1
+        )
+        if full_layer_major:
+            return self._issue_full_multi_layer_major_read(
+                state,
+                io_priority=io_priority,
+            )
         if (
             len(state.chunks) == 1
             and state.chunks[0].layer_major
             and state.layer_major_dst_rows_table is not None
         ):
-            selected = torch.as_tensor(
-                sorted_block_ids,
-                dtype=torch.int64,
-                device="cpu",
-            ).reshape(-1)
             return self._issue_layer_major_read(
                 state,
-                selected,
+                selected_cpu,
                 io_priority=io_priority,
             )
         if (
@@ -1937,6 +2839,193 @@ class CSAAttentionKVPrefetchManager:
         # release and no drain event is needed.
         return None, [], completed_ids
 
+    def _issue_full_multi_layer_major_read(
+        self,
+        state: CSAAttentionKVLayerState,
+        *,
+        io_priority: str,
+    ) -> Tuple[Optional[torch.cuda.Event], List[Any], torch.Tensor]:
+        """Restore a complete layer from several admitted generation objects.
+
+        Native indexer restore consumes every block of a layer. After deferred
+        suffix admission, that layer is represented by two or more contiguous
+        layer-major objects. The general sparse path needlessly walks every
+        block to rediscover two full-object ranges. This path submits one range
+        per generation and performs one fused scatter per returned object.
+
+        Args:
+            state: Registered layer whose chunks densely cover the layer.
+            io_priority: Tutti admission class for this demand read.
+
+        Returns:
+            A completed synchronous read tuple compatible with
+            :meth:`_issue_reads`.
+
+        Raises:
+            RuntimeError: If the layer-major plan or returned payload is
+                incomplete.
+        """
+        chunks = state.chunks
+        dst_rows_table = state.layer_major_dst_rows_table
+        if len(chunks) <= 1 or dst_rows_table is None:
+            raise RuntimeError("multi-generation layer-major plan is unavailable")
+        if any(not chunk.layer_major for chunk in chunks):
+            raise RuntimeError("multi-generation plan contains a non-layer object")
+
+        block_nbytes = int(state.compressed_block_size * state.token_bytes)
+        if block_nbytes <= 0:
+            raise RuntimeError("invalid multi-generation layer-major block size")
+        read_ranges: list[tuple[KVObjectByteRange, ...]] = []
+        payload_skips: list[int] = []
+        expected = 0
+        for chunk in chunks:
+            if chunk.first_compressed_block != expected:
+                raise RuntimeError("multi-generation layer-major plan has a gap")
+            payload_nbytes = int(chunk.n_compressed_blocks) * block_nbytes
+            read_nbytes = int(chunk.read_length) or (
+                int(chunk.payload_skip) + payload_nbytes
+            )
+            if read_nbytes < int(chunk.payload_skip) + payload_nbytes:
+                raise RuntimeError("multi-generation layer-major read is truncated")
+            read_ranges.append(
+                (
+                    KVObjectByteRange(
+                        offset=int(chunk.layer_byte_offset),
+                        length=read_nbytes,
+                        target_offset=0,
+                    ),
+                )
+            )
+            payload_skips.append(int(chunk.payload_skip))
+            expected = chunk.end_compressed_block
+
+        scatter_stream = self._scatter_stream_for(state.k_cache_tensor.device)
+        if state.block_slot_scatter:
+            k_cache = state.k_cache_tensor.view(torch.uint8)
+        else:
+            k_cache = state.k_cache_tensor.view(torch.uint8).reshape(
+                int(state.k_cache_tensor.shape[0]),
+                -1,
+            )
+
+        def _restore_lba_cache() -> None:
+            if self._pending_raw_lba_cache:
+                self._tutti_loader.ensure_lba_cache(self._pending_raw_lba_cache)
+
+        def _scatter_tensor_batch(
+            batch_start: int,
+            batch_results: List[Optional[Any]],
+        ) -> None:
+            with torch.inference_mode(), torch.cuda.stream(scatter_stream):
+                for offset_in_batch, memory_obj in enumerate(batch_results):
+                    if memory_obj is None or memory_obj.raw_tensor is None:
+                        raise RuntimeError(
+                            "multi-generation layer-major read returned no payload"
+                        )
+                    chunk_index = batch_start + offset_in_batch
+                    chunk = chunks[chunk_index]
+                    payload_nbytes = int(chunk.n_compressed_blocks) * block_nbytes
+                    payload_skip = payload_skips[chunk_index]
+                    flat = memory_obj.raw_tensor.view(torch.uint8).reshape(-1)
+                    if int(flat.numel()) < payload_skip + payload_nbytes:
+                        raise RuntimeError(
+                            "multi-generation layer-major tensor is truncated"
+                        )
+                    source = flat[
+                        payload_skip : payload_skip + payload_nbytes
+                    ].view(int(chunk.n_compressed_blocks), block_nbytes)
+                    rows = dst_rows_table[
+                        chunk.first_compressed_block : chunk.end_compressed_block
+                    ]
+                    if state.block_slot_scatter:
+                        slot_size = state.block_slot_size
+                        block_ids = torch.div(rows, slot_size, rounding_mode="floor")
+                        slot_ids = rows - block_ids * slot_size
+                        k_cache.index_put_((block_ids, slot_ids), source)
+                    else:
+                        k_cache.index_copy_(0, rows, source)
+            scatter_stream.synchronize()
+
+        def _scatter_raw_batch(
+            batch_start: int,
+            completed_indices: List[int],
+            completed_offsets: List[int],
+            completed_nbytes: List[int],
+            staging: torch.Tensor,
+        ) -> None:
+            if _csa_c_ops is None:
+                raise RuntimeError("multi-generation raw scatter requires c_ops")
+            scatter = getattr(_csa_c_ops, "scatter_rows_from_object_ptrs", None)
+            if scatter is None:
+                raise RuntimeError("multi-generation fused scatter is unavailable")
+            with torch.inference_mode(), torch.cuda.stream(scatter_stream):
+                for local_index, offset, nbytes in zip(
+                    completed_indices,
+                    completed_offsets,
+                    completed_nbytes,
+                    strict=True,
+                ):
+                    chunk_index = batch_start + local_index
+                    chunk = chunks[chunk_index]
+                    payload_skip = payload_skips[chunk_index]
+                    payload_nbytes = int(chunk.n_compressed_blocks) * block_nbytes
+                    if int(nbytes) < payload_skip + payload_nbytes:
+                        raise RuntimeError(
+                            "multi-generation raw layer-major read is truncated"
+                        )
+                    source_ptr = (
+                        int(staging.data_ptr()) + int(offset) + payload_skip
+                    )
+                    source_ptrs = torch.tensor(
+                        [source_ptr],
+                        dtype=torch.int64,
+                        device=state.k_cache_tensor.device,
+                    )
+                    rows = dst_rows_table[
+                        chunk.first_compressed_block : chunk.end_compressed_block
+                    ]
+                    scatter(
+                        source_ptrs,
+                        k_cache,
+                        rows,
+                        int(chunk.n_compressed_blocks),
+                        block_nbytes,
+                        state.block_slot_size if state.block_slot_scatter else 0,
+                        source_ptr % 8 == 0,
+                    )
+            scatter_stream.synchronize()
+
+        load_kwargs: Dict[str, Any] = {
+            "shapes_per_key": None,
+            "file_offsets": [0] * len(chunks),
+            "read_ranges_per_key": read_ranges,
+            "io_priority": io_priority,
+            "before_batch": _restore_lba_cache,
+            "max_batch_ios": 256,
+            "max_batch_bytes": 128 * 1024**2,
+        }
+        if _csa_c_ops is not None and hasattr(
+            _csa_c_ops,
+            "scatter_rows_from_object_ptrs",
+        ):
+            load_kwargs["on_raw_batch_loaded"] = _scatter_raw_batch
+        else:
+            load_kwargs["on_batch_loaded"] = _scatter_tensor_batch
+        self._tutti_loader.load_chunks_to_hbm(
+            [chunk.key for chunk in chunks],
+            [chunk.disk_meta for chunk in chunks],
+            **load_kwargs,
+        )
+        completed_ids = torch.arange(expected, dtype=torch.int64)
+        with torch.inference_mode(), torch.cuda.stream(scatter_stream):
+            bitmap_ids = completed_ids.to(
+                device=state.in_pool_bitmap.device,
+                non_blocking=True,
+            )
+            state.in_pool_bitmap.index_fill_(0, bitmap_ids, True)
+        scatter_stream.synchronize()
+        return None, [], completed_ids
+
     def _issue_layer_major_read(
         self,
         state: CSAAttentionKVLayerState,
@@ -2299,14 +3388,16 @@ class CSAAttentionKVPrefetchManager:
         state = self._layers.get(int(layer_id))
         if state is None or not state.chunks:
             return torch.empty(0, dtype=torch.int64)
+        # Never let an empty or malformed later call reuse a prior query's
+        # compact-gather coverage proof.
+        state.true_selected_blocks_bitmap = None
+        state.true_selected_covers_cached_prefix = False
         entries = true_topk.reshape(-1)
         if entries.numel() == 0:
             return torch.empty(0, dtype=torch.int64)
         device = state.in_pool_bitmap.device
         if entries.device != device:
             entries = entries.to(device)
-        entries = entries.to(torch.int64)
-        block_ids = entries // state.compressed_block_size
         # Clip to the chunk-map's registered range (sentinel padding past the
         # cached prefix) and to the bitmap capacity (mirrors vLLM's K cache
         # num_blocks) in a single validity mask; sentinel/negative entries
@@ -2316,6 +3407,56 @@ class CSAAttentionKVPrefetchManager:
         limit = min(int(max_block_id), bitmap_len)
         if limit <= 0:
             return torch.empty(0, dtype=torch.int64)
+        native_select = getattr(
+            _csa_c_ops,
+            "select_missing_csa_blocks",
+            None,
+        )
+        native_select_with_seen = getattr(
+            _csa_c_ops,
+            "select_missing_csa_blocks_with_seen",
+            None,
+        )
+        if (
+            (callable(native_select_with_seen) or callable(native_select))
+            and entries.is_cuda
+            and state.in_pool_bitmap.is_cuda
+        ):
+            # Prefill commonly carries 8192 x 512 = 4.19M selected entries.
+            # A single native atomic marker scans them without materialising
+            # the 4M-entry int64 block-id and validity tensors created by the
+            # generic PyTorch path. Only the <=1.9K compact miss ids cross to
+            # the CPU for Tutti submission.
+            if callable(native_select_with_seen):
+                active_rows = int(true_topk.shape[0]) if true_topk.ndim >= 2 else 1
+                suffix_blocks = (
+                    active_rows
+                    + state.compressed_block_size * _DSV4_CSA_COMPRESS_RATIO
+                    - 1
+                ) // (state.compressed_block_size * _DSV4_CSA_COMPRESS_RATIO)
+                selected_limit = min(bitmap_len, limit + suffix_blocks)
+                outputs = native_select_with_seen(
+                    entries.contiguous(),
+                    state.in_pool_bitmap,
+                    limit,
+                    selected_limit,
+                    state.compressed_block_size,
+                )
+                state.true_selected_blocks_bitmap = outputs[1]
+                missing_cpu = outputs[0].cpu()
+                state.true_selected_covers_cached_prefix = bool(
+                    outputs[1][:limit].all().item()
+                )
+                return missing_cpu
+            assert callable(native_select)
+            return native_select(
+                entries.contiguous(),
+                state.in_pool_bitmap,
+                limit,
+                state.compressed_block_size,
+            ).cpu()
+        entries = entries.to(torch.int64)
+        block_ids = entries // state.compressed_block_size
         # Deduplicate via a scatter into a [limit] bool mask instead of
         # torch.unique(): unique() is sort-based (O(N log N)) and costs
         # ~130 ms per call at 33M padded top-K entries (64K-token chunks),

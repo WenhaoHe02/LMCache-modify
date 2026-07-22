@@ -60,6 +60,7 @@ class LMCacheLookupClient(LookupClientInterface):
         # looked up, the following lookups of the same
         # request must have the same result.
         self.reqs_status: dict[str, int] = {}
+        self.reqs_terminal_hash: dict[str, int] = {}
 
         # First Party
         from lmcache.v1.token_database import (
@@ -154,11 +155,33 @@ class LMCacheLookupClient(LookupClientInterface):
         # so we can use the minimum value.
         num_hit_toks = min(results)
         self.reqs_status[lookup_id] = num_hit_toks
+        self.reqs_terminal_hash.pop(lookup_id, None)
+        if not self.enable_blending:
+            hit_chunks = num_hit_toks // self.config.chunk_size
+            if (
+                hit_chunks > 0
+                and num_hit_toks % self.config.chunk_size == 0
+                and hit_chunks <= len(hashes)
+            ):
+                self.reqs_terminal_hash[lookup_id] = int(hashes[hit_chunks - 1])
 
         return num_hit_toks
 
     def clear_lookup_status(self, lookup_id: str) -> None:
         self.reqs_status.pop(lookup_id, None)
+        self.reqs_terminal_hash.pop(lookup_id, None)
+
+    def lookup_terminal_hash(self, lookup_id: str) -> Optional[int]:
+        """Return the final hit chunk hash cached by :meth:`lookup`.
+
+        Args:
+            lookup_id: Lookup identifier previously passed to :meth:`lookup`.
+
+        Returns:
+            The terminal chunk hash for an aligned non-empty hit, otherwise
+            ``None``.
+        """
+        return self.reqs_terminal_hash.get(lookup_id)
 
     def supports_producer_reuse(self) -> bool:
         """Return True as LMCacheLookupClient supports

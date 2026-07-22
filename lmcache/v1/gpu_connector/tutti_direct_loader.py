@@ -1458,21 +1458,23 @@ class TuttiDirectLoader:
                     "reduce n_slots or increase the NVMe queue depth"
                 )
 
-            logger.info(
-                "TUTTI_PROFILE create cuda_device=%d pci=%s slots=%d slot_mb=%.1f "
-                "total_mb=%.1f cuda_malloc_ms=%.3f session_bind_map_ms=%.3f "
-                "aux_alloc_ms=%.3f total_ms=%.3f q_depth=%d",
-                cuda_device,
-                pci_bdf,
-                n_slots,
-                slot_bytes / 1024**2,
-                total_bytes / 1024**2,
-                cuda_malloc_ms,
-                session_ms,
-                aux_alloc_ms,
-                _elapsed_ms(profile_start),
-                q_depth,
-            )
+            if _tutti_profile_enabled():
+                logger.info(
+                    "TUTTI_PROFILE create cuda_device=%d pci=%s slots=%d "
+                    "slot_mb=%.1f total_mb=%.1f cuda_malloc_ms=%.3f "
+                    "session_bind_map_ms=%.3f aux_alloc_ms=%.3f "
+                    "total_ms=%.3f q_depth=%d",
+                    cuda_device,
+                    pci_bdf,
+                    n_slots,
+                    slot_bytes / 1024**2,
+                    total_bytes / 1024**2,
+                    cuda_malloc_ms,
+                    session_ms,
+                    aux_alloc_ms,
+                    _elapsed_ms(profile_start),
+                    q_depth,
+                )
 
             return TuttiDirectLoader(
                 session=session,
@@ -2367,7 +2369,8 @@ class TuttiDirectLoader:
                 "on_batch_loaded and on_raw_batch_loaded are mutually exclusive"
             )
 
-        profile_start = time.perf_counter()
+        profile_enabled = _tutti_profile_enabled()
+        profile_start = time.perf_counter() if profile_enabled else 0.0
         range_cache_hits_start = self._resolved_range_cache_hits
         range_cache_misses_start = self._resolved_range_cache_misses
         results: list[Optional[MemoryObj]] = [None] * n
@@ -2640,19 +2643,20 @@ class TuttiDirectLoader:
                 else sum(1 for res in batch_results if res is not None)
             )
             n_loaded += batch_loaded
-            logger.info(
-                "TUTTI_PROFILE load_batch batch=%d key_start=%d keys=%d "
-                "loaded=%d estimated_ios=%d estimated_mb=%.3f pack_ms=%.3f "
-                "batch_total_ms=%.3f",
-                n_batches,
-                batch_start,
-                len(batch_keys),
-                batch_loaded,
-                batch_ios,
-                batch_bytes / 1024**2,
-                pack_ms,
-                _elapsed_ms(batch_profile_start),
-            )
+            if profile_enabled:
+                logger.info(
+                    "TUTTI_PROFILE load_batch batch=%d key_start=%d keys=%d "
+                    "loaded=%d estimated_ios=%d estimated_mb=%.3f "
+                    "pack_ms=%.3f batch_total_ms=%.3f",
+                    n_batches,
+                    batch_start,
+                    len(batch_keys),
+                    batch_loaded,
+                    batch_ios,
+                    batch_bytes / 1024**2,
+                    pack_ms,
+                    _elapsed_ms(batch_profile_start),
+                )
             if on_raw_batch_loaded is None:
                 if on_batch_loaded is None:
                     for i, res in enumerate(batch_results):
@@ -2661,16 +2665,17 @@ class TuttiDirectLoader:
                     on_batch_loaded(batch_start, batch_results)
             batch_start = batch_end
 
-        logger.info(
-            "TUTTI_PROFILE load_total keys=%d loaded=%d batches=%d "
-            "range_cache_hits=%d range_cache_misses=%d total_ms=%.3f",
-            n,
-            n_loaded,
-            n_batches,
-            self._resolved_range_cache_hits - range_cache_hits_start,
-            self._resolved_range_cache_misses - range_cache_misses_start,
-            _elapsed_ms(profile_start),
-        )
+        if profile_enabled:
+            logger.info(
+                "TUTTI_PROFILE load_total keys=%d loaded=%d batches=%d "
+                "range_cache_hits=%d range_cache_misses=%d total_ms=%.3f",
+                n,
+                n_loaded,
+                n_batches,
+                self._resolved_range_cache_hits - range_cache_hits_start,
+                self._resolved_range_cache_misses - range_cache_misses_start,
+                _elapsed_ms(profile_start),
+            )
         return results
 
     def store_bytes_to_raw_lbas(
@@ -2849,14 +2854,25 @@ class TuttiDirectLoader:
         dev: str,
     ) -> list[LbaRecord]:
         """Body of :meth:`store_bytes_to_raw_extents`; caller holds _io_lock."""
+        profile_enabled = _tutti_profile_enabled()
         _dev = dev
+        io_stream = self._io_stream
         with torch.cuda.device(self._cuda_device):
             copy_start = time.perf_counter()
             staging = self._staging_slice_at(0, aligned_nbytes)
-            staging.zero_()
-            cpu_tensor = torch.frombuffer(payload_view, dtype=torch.uint8)
-            staging[:payload_nbytes].copy_(cpu_tensor, non_blocking=False)
-            torch.cuda.synchronize(device=self._cuda_device)
+            copy_stream = io_stream or torch.cuda.current_stream()
+            # Cold admission runs on a Python worker after the request that
+            # produced ``payload_view`` has finished.  Issuing this H2D copy
+            # on the device default stream makes it wait behind the *next*
+            # request's forward kernels, while the worker holds ``_io_lock``.
+            # Different TP ranks then stop at different points and the model
+            # collective can hang.  Keep the complete write transaction on
+            # the loader's dedicated stream and synchronize only that stream.
+            with torch.cuda.stream(copy_stream):
+                staging.zero_()
+                cpu_tensor = torch.frombuffer(payload_view, dtype=torch.uint8)
+                staging[:payload_nbytes].copy_(cpu_tensor, non_blocking=True)
+            copy_stream.synchronize()
             h2d_ms = _elapsed_ms(copy_start)
 
         max_io = self._session.info.max_data_size
@@ -2928,13 +2944,27 @@ class TuttiDirectLoader:
                 cursor += 1
 
             arg_start = time.perf_counter()
-            staging_iovas_t = torch.tensor(
-                batch_iovas,
-                dtype=torch.int64,
-                device=_dev,
-            )
-            slbas_t = torch.tensor(batch_slbas, dtype=torch.int64, device=_dev)
-            byte_lens_t = torch.tensor(batch_lens, dtype=torch.int32, device=_dev)
+            copy_stream = io_stream or torch.cuda.current_stream()
+            # These tensors are consumed only by the Tutti write kernels.
+            # Creating them on the default stream and then calling
+            # ``io_stream.wait_stream(default)`` accidentally orders every
+            # background write behind unrelated model work.
+            with torch.cuda.stream(copy_stream):
+                staging_iovas_t = torch.tensor(
+                    batch_iovas,
+                    dtype=torch.int64,
+                    device=_dev,
+                )
+                slbas_t = torch.tensor(
+                    batch_slbas,
+                    dtype=torch.int64,
+                    device=_dev,
+                )
+                byte_lens_t = torch.tensor(
+                    batch_lens,
+                    dtype=torch.int32,
+                    device=_dev,
+                )
             arg_ms = _elapsed_ms(arg_start)
 
             q = self._session.queue
@@ -2946,13 +2976,8 @@ class TuttiDirectLoader:
             # Same dedicated-stream rationale as the read path: keep the
             # spinning poll kernel off the shared default stream so raw
             # stores cannot serialise against forward/NCCL kernels.
-            io_stream = self._io_stream
             io_stream_ptr = io_stream.cuda_stream if io_stream is not None else 0
             with torch.cuda.device(self._cuda_device):
-                # Order the io_stream after the argument-tensor H2D copies
-                # issued on the current stream (same race as the read path).
-                if io_stream is not None:
-                    io_stream.wait_stream(torch.cuda.current_stream())
                 submit_start = time.perf_counter()
                 _c_ops.tutti_submit_batch_sgl_write(
                     sq_dev_ptr=sq_dev_ptr,
@@ -3004,27 +3029,30 @@ class TuttiDirectLoader:
             )
             status_ms += _elapsed_ms(status_start)
             n_ios += len(batch_iovas)
-            logger.debug(
-                "TUTTI_PROFILE store_raw_batch ios=%d bytes_mb=%.3f arg_ms=%.3f",
-                len(batch_iovas),
-                sum(batch_lens) / 1024**2,
-                arg_ms,
-            )
+            if profile_enabled:
+                logger.debug(
+                    "TUTTI_PROFILE store_raw_batch ios=%d bytes_mb=%.3f "
+                    "arg_ms=%.3f",
+                    len(batch_iovas),
+                    sum(batch_lens) / 1024**2,
+                    arg_ms,
+                )
 
-        logger.info(
-            "TUTTI_PROFILE store_raw bytes=%d dma_bytes=%d extents=%d ios=%d "
-            "h2d_ms=%.3f submit_launch_ms=%.3f poll_sync_ms=%.3f "
-            "status_ms=%.3f total_ms=%.3f",
-            payload_nbytes,
-            dma_nbytes,
-            len(normalized_extents),
-            n_ios,
-            h2d_ms,
-            submit_ms,
-            poll_sync_ms,
-            status_ms,
-            _elapsed_ms(profile_start),
-        )
+        if profile_enabled:
+            logger.info(
+                "TUTTI_PROFILE store_raw bytes=%d dma_bytes=%d extents=%d ios=%d "
+                "h2d_ms=%.3f submit_launch_ms=%.3f poll_sync_ms=%.3f "
+                "status_ms=%.3f total_ms=%.3f",
+                payload_nbytes,
+                dma_nbytes,
+                len(normalized_extents),
+                n_ios,
+                h2d_ms,
+                submit_ms,
+                poll_sync_ms,
+                status_ms,
+                _elapsed_ms(profile_start),
+            )
         return normalized_extents
 
     def _load_batch(
@@ -3041,6 +3069,7 @@ class TuttiDirectLoader:
     ) -> list[Optional[MemoryObj]]:
         """Load one queue/staging-capacity-bounded batch into HBM staging."""
 
+        profile_enabled = _tutti_profile_enabled()
         profile_start = time.perf_counter()
         # Build per-I/O parameters. A single KV file can occupy multiple
         # filesystem extents, so one logical chunk may expand to multiple NVMe
@@ -3245,13 +3274,10 @@ class TuttiDirectLoader:
         io_stream = self._io_stream
         io_stream_ptr = io_stream.cuda_stream if io_stream is not None else 0
         with torch.cuda.device(self._cuda_device):
-            # The argument tensors above (staging_iovas_t/slbas_t/byte_lens_t)
-            # were H2D-copied on the CURRENT stream; the submit/poll kernels
-            # below run on the private io_stream and dereference those device
-            # pointers.  Without an explicit dependency the io_stream kernel
-            # can race ahead of the copies -> CUDA illegal memory access
-            # (observed at io_stream.synchronize() on warm repeats, where the
-            # launch path is fast enough to expose the window).
+            # Preserve the proven ordering with earlier model-stream work.
+            # Removing this dependency made the first deep prediction miss
+            # its target gate under the full CP8 workload.  Indexed speculative
+            # reads use their narrower ``input_ready_event`` path instead.
             if io_stream is not None:
                 io_stream.wait_stream(torch.cuda.current_stream())
             # Submit all reads in one kernel launch.
@@ -3393,28 +3419,29 @@ class TuttiDirectLoader:
                 self._staging,
             )
             consume_ms = _elapsed_ms(consume_start)
-            logger.info(
-                "TUTTI_PROFILE batch_detail keys=%d completed=%d ios=%d "
-                "bytes_mb=%.3f build_ms=%.3f extents_ms=%.3f arg_ms=%.3f "
-                "submit_launch_ms=%.3f poll_sync_ms=%.3f status_ms=%.3f "
-                "persist_ms=0.000 wrap_ms=0.000 total_ms=%.3f",
-                len(keys),
-                len(completed_indices),
-                n_ios,
-                sum(byte_lens_list) / 1024**2,
-                build_ms,
-                extents_ms,
-                arg_ms,
-                submit_launch_ms,
-                poll_sync_ms,
-                status_ms,
-                _elapsed_ms(profile_start),
-            )
-            logger.info(
-                "TUTTI_PROFILE raw_batch_consume completed=%d consume_ms=%.3f",
-                len(completed_indices),
-                consume_ms,
-            )
+            if profile_enabled:
+                logger.info(
+                    "TUTTI_PROFILE batch_detail keys=%d completed=%d ios=%d "
+                    "bytes_mb=%.3f build_ms=%.3f extents_ms=%.3f arg_ms=%.3f "
+                    "submit_launch_ms=%.3f poll_sync_ms=%.3f status_ms=%.3f "
+                    "persist_ms=0.000 wrap_ms=0.000 total_ms=%.3f",
+                    len(keys),
+                    len(completed_indices),
+                    n_ios,
+                    sum(byte_lens_list) / 1024**2,
+                    build_ms,
+                    extents_ms,
+                    arg_ms,
+                    submit_launch_ms,
+                    poll_sync_ms,
+                    status_ms,
+                    _elapsed_ms(profile_start),
+                )
+                logger.info(
+                    "TUTTI_PROFILE raw_batch_consume completed=%d consume_ms=%.3f",
+                    len(completed_indices),
+                    consume_ms,
+                )
             return [None] * len(keys)
 
         # Build GPU-resident MemoryObj for each completed I/O.
@@ -3480,25 +3507,26 @@ class TuttiDirectLoader:
                     f"Tutti direct load incomplete for key index {i}, path {meta.path}"
                 )
 
-        logger.info(
-            "TUTTI_PROFILE batch_detail keys=%d completed=%d ios=%d bytes_mb=%.3f "
-            "build_ms=%.3f extents_ms=%.3f arg_ms=%.3f submit_launch_ms=%.3f "
-            "poll_sync_ms=%.3f status_ms=%.3f persist_ms=%.3f wrap_ms=%.3f "
-            "total_ms=%.3f",
-            len(keys),
-            len(completed_indices),
-            n_ios,
-            sum(byte_lens_list) / 1024**2,
-            build_ms,
-            extents_ms,
-            arg_ms,
-            submit_launch_ms,
-            poll_sync_ms,
-            status_ms,
-            persist_ms,
-            wrap_ms,
-            _elapsed_ms(profile_start),
-        )
+        if profile_enabled:
+            logger.info(
+                "TUTTI_PROFILE batch_detail keys=%d completed=%d ios=%d "
+                "bytes_mb=%.3f build_ms=%.3f extents_ms=%.3f arg_ms=%.3f "
+                "submit_launch_ms=%.3f poll_sync_ms=%.3f status_ms=%.3f "
+                "persist_ms=%.3f wrap_ms=%.3f total_ms=%.3f",
+                len(keys),
+                len(completed_indices),
+                n_ios,
+                sum(byte_lens_list) / 1024**2,
+                build_ms,
+                extents_ms,
+                arg_ms,
+                submit_launch_ms,
+                poll_sync_ms,
+                status_ms,
+                persist_ms,
+                wrap_ms,
+                _elapsed_ms(profile_start),
+            )
         return results
 
     def close(self) -> None:
