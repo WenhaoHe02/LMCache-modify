@@ -43,7 +43,10 @@ if nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits \
   exit 3
 fi
 
-nsys_prefix="${nsys} profile --trace=cuda,nvtx,osrt --sample=none \
+# OSRT interception perturbs the Python thread-pool/CUDA-stream handoff used by
+# prediction before capture starts.  CUDA+NVTX retains every GPU operation and
+# pipeline range needed for the overlap analysis without that deadlock.
+nsys_prefix="${nsys} profile --trace=cuda,nvtx --sample=none \
 --cpuctxsw=none --capture-range=cudaProfilerApi --capture-range-end=stop \
 --force-overwrite=true --output=${trace_dir}/${trace_name}"
 
@@ -65,6 +68,10 @@ export LMCACHE_CSA_PREFETCH_CP_OVERSUBSCRIBE=1
 export LMCACHE_CSA_PREFETCH_BLOCK_BUDGET=256
 export LMCACHE_DSV4_HCA_WALKER=1
 export LMCACHE_INDEXER_PROFILE_ACCURACY=0
+# Nsight instrumentation can delay the first background CUDA submission even
+# before capture starts.  Keep the production default at 5 s, but do not let a
+# profile-only startup delay turn a correct prefetch into a fail-closed abort.
+export LMCACHE_CSA_PREDICTION_GATE_TIMEOUT_SEC="${LMCACHE_CSA_PREDICTION_GATE_TIMEOUT_SEC:-60}"
 export LMCACHE_CSA_PIPELINE_NVTX=1
 export LMCACHE_CSA_ATTENTION_KV_TIMING=0
 export LMCACHE_TUTTI_PROFILE=0
@@ -74,7 +81,9 @@ export LMCACHE_HCA_TIMING=0
 export LMCACHE_NSYS_CAPTURE=0
 export LMCACHE_NSYS_CAPTURE_SKIP_REQUESTS=0
 export LMCACHE_NSYS_FULL_CAPTURE=1
-export LMCACHE_NSYS_FULL_CAPTURE_SKIP_REQUESTS=1
+# Capture the first cache hit.  Leaving CUPTI injected but inactive across a
+# warmup hit can deadlock this workload's cross-thread CUDA event handoff.
+export LMCACHE_NSYS_FULL_CAPTURE_SKIP_REQUESTS=0
 export LMCACHE_NSYS_FULL_CAPTURE_SCOPE=decoder
 export LMCACHE_EXEC_PREFIX="${nsys_prefix}"
 export CUDA_LAUNCH_BLOCKING=0
@@ -86,10 +95,12 @@ container_pid=$(sudo docker inspect -f '{{.State.Pid}}' "${container}")
 sudo sh -c "tr '\000' '\n' </proc/${container_pid}/environ" \
   > "${result_dir}/process_env.txt"
 grep -qx 'LMCACHE_NSYS_FULL_CAPTURE=1' "${result_dir}/process_env.txt"
-grep -qx 'LMCACHE_NSYS_FULL_CAPTURE_SKIP_REQUESTS=1' "${result_dir}/process_env.txt"
+grep -qx 'LMCACHE_NSYS_FULL_CAPTURE_SKIP_REQUESTS=0' "${result_dir}/process_env.txt"
 grep -qx 'LMCACHE_NSYS_FULL_CAPTURE_SCOPE=decoder' "${result_dir}/process_env.txt"
 grep -qx 'LMCACHE_DSV4_HCA_WALKER=1' "${result_dir}/process_env.txt"
 grep -qx 'LMCACHE_INDEXER_PROFILE_ACCURACY=0' "${result_dir}/process_env.txt"
+grep -qx 'LMCACHE_CSA_PREDICTION_GATE_TIMEOUT_SEC=60' \
+  "${result_dir}/process_env.txt"
 
 {
   date -u '+utc=%FT%TZ'
@@ -166,9 +177,10 @@ summary = {
         if row.get("label") == "cold_store"
     ),
     "warmup_s": float(warmups[0]["elapsed_s"]),
-    "captured_hit_s": float(hits[0]["elapsed_s"]),
+    "captured_hit_s": float(warmups[0]["elapsed_s"]),
+    "post_capture_hit_s": float(hits[0]["elapsed_s"]),
     "accuracy_records": accuracy_records,
-    "capture_scope": "decoder",
+    "capture_scope": "decoder_first_hit",
     "full_retrieval_seen": False,
 }
 (result_dir / "summary.json").write_text(
