@@ -2337,7 +2337,6 @@ class IndexerSSDManager:
             else int(torch.cuda.current_device())
         )
         batches: list[tuple[torch.Tensor, Any, Any, Any, dict[str, Any]]] = []
-        cp_world_size = 1
         selected_rows = 0
         with torch.cuda.device(device_index):
             # Reuse one stream per target layer. This preserves concurrency
@@ -2389,12 +2388,13 @@ class IndexerSSDManager:
                             proxy_done.record(proxy_stream)
                         selected_topk = topk_buf[:num_rows]
                         # Reduce the rank-local query shard to a bounded block
-                        # list, then exchange only those fixed-size IDs. This
-                        # preserves the semantic union of all query shards
-                        # without the prefix-sized uint32 bitmap AllReduce.
-                        # Rank exchange runs later on the CPU proxy worker so
-                        # early ranks never occupy a GPU NCCL kernel while
-                        # waiting for a delayed peer.
+                        # list, then exchange only those fixed-size IDs. Enqueue
+                        # this tiny collective here, while every model rank is
+                        # executing the same decoder hook, rather than from a
+                        # background CPU worker. Background Gloo calls can enter
+                        # in different orders across ranks and deadlock at the
+                        # target gate. The GPU exchange preserves the semantic
+                        # union without the prefix-sized bitmap AllReduce.
                         cursor = self._decode_cursor.get(layer_id, 0)
                         num_blocks = (
                             cursor + DEEPGEMM_PAGED_BLOCK_SIZE - 1
@@ -2405,12 +2405,26 @@ class IndexerSSDManager:
                                 cursor,
                                 num_blocks,
                                 self._proxy_block_budget,
-                            )
+                            ).to(torch.int32)
                             if cp_context is not None:
+                                import torch.distributed as dist
+                                from vllm.distributed import get_tp_group
+
                                 cp_world_size = int(cp_context[1])
-                            # Block IDs fit in int32. Tutti's indexed-read ABI
-                            # is widened only after the bounded CPU exchange.
-                            selected_blocks = selected_blocks.to(torch.int32)
+                                selected_blocks = selected_blocks.contiguous()
+                                exchanged_blocks = torch.empty(
+                                    int(selected_blocks.numel()) * cp_world_size,
+                                    dtype=selected_blocks.dtype,
+                                    device=selected_blocks.device,
+                                )
+                                dist.all_gather_into_tensor(
+                                    exchanged_blocks,
+                                    selected_blocks,
+                                    group=get_tp_group().device_group,
+                                )
+                                selected_blocks = exchanged_blocks
+                            # Tutti's indexed-read ABI is widened only after
+                            # the bounded IDs have reached the CPU worker.
                             selected_cpu = self._acquire_proxy_cpu_selection(
                                 layer_id,
                                 int(selected_blocks.numel()),
@@ -2472,7 +2486,6 @@ class IndexerSSDManager:
             prefetch_level,
             request_id,
             request_token,
-            cp_world_size,
         )
         with self._lock:
             self._proxy_futures[layer_id].append(future)
@@ -2504,7 +2517,6 @@ class IndexerSSDManager:
         prefetch_level: int,
         request_id: str,
         request_token: Tuple[str, int],
-        cp_world_size: int,
     ) -> None:
         """Dispatch the bounded union of all rank-local query predictions."""
         manager = getattr(self, "_csa_attention_kv_manager", None)
@@ -2522,7 +2534,6 @@ class IndexerSSDManager:
         selected_batches: list[torch.Tensor] = []
         event_wait_ms = 0.0
         proxy_gpu_ms = 0.0
-        id_exchange_ms = 0.0
         d2h_gpu_ms = 0.0
         proxy_total_gpu_ms = 0.0
         phase_gpu_ms: dict[str, float] = {
@@ -2571,27 +2582,7 @@ class IndexerSSDManager:
                             )
                 except RuntimeError:
                     pass
-            exchanged_cpu = selected_cpu
-            if cp_world_size > 1:
-                # Gloo blocks only this CPU worker. The dedicated executor
-                # guarantees that every rank enters layer collectives in the
-                # same order even when CUDA side streams finish out of order.
-                import torch.distributed as dist
-                from vllm.distributed import get_tp_group
-
-                exchange_start = time.perf_counter()
-                exchanged_cpu = torch.empty(
-                    int(selected_cpu.numel()) * cp_world_size,
-                    dtype=torch.int32,
-                    device="cpu",
-                )
-                dist.all_gather_into_tensor(
-                    exchanged_cpu,
-                    selected_cpu,
-                    group=get_tp_group().cpu_group,
-                )
-                id_exchange_ms += (time.perf_counter() - exchange_start) * 1000.0
-            selected_batches.append(exchanged_cpu[exchanged_cpu >= 0].to(torch.int64))
+            selected_batches.append(selected_cpu[selected_cpu >= 0].to(torch.int64))
             self._release_proxy_cpu_selection(layer_id, selected_cpu)
         block_ids_tensor = torch.unique(
             torch.cat(selected_batches)
@@ -2660,7 +2651,7 @@ class IndexerSSDManager:
             blocks=dispatched_blocks,
             event_wait_ms=f"{event_wait_ms:.3f}",
             proxy_gpu_ms=f"{proxy_gpu_ms:.3f}",
-            id_exchange_ms=f"{id_exchange_ms:.3f}",
+            id_exchange_ms="0.000",
             d2h_gpu_ms=f"{d2h_gpu_ms:.3f}",
             proxy_total_gpu_ms=f"{proxy_total_gpu_ms:.3f}",
             hc_pre_gpu_ms=f"{phase_gpu_ms['hc_pre']:.3f}",
