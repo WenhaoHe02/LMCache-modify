@@ -1111,6 +1111,9 @@ class IndexerSSDManager:
             1,
             _env_int("LMCACHE_CSA_PREFETCH_BLOCK_BUDGET", 256),
         )
+        self._cp_exchange_proxy_ids = (
+            _env_int("LMCACHE_CSA_PREFETCH_CP_EXCHANGE_IDS", 1) != 0
+        )
         # One reusable proxy stream per target layer. Different target layers
         # still overlap, while repeated requests avoid creating a fresh CUDA
         # stream for every fire. A single per-device stream is intentionally
@@ -2406,7 +2409,7 @@ class IndexerSSDManager:
                                 num_blocks,
                                 self._proxy_block_budget,
                             ).to(torch.int32)
-                            if cp_context is not None:
+                            if cp_context is not None and self._cp_exchange_proxy_ids:
                                 import torch.distributed as dist
                                 from vllm.distributed import get_tp_group
 
@@ -4268,27 +4271,30 @@ class IndexerSSDManager:
             for layer_id in self._csa_layer_ids:
                 self._proxy_stream_for(layer_id)
 
+        selection_sizes = [self._proxy_block_budget]
+        cp_size = _env_int("LMCACHE_CSA_PREFETCH_CP_SIZE", 1)
+        if self._cp_exchange_proxy_ids and cp_size > 1:
+            selection_sizes.append(self._proxy_block_budget * cp_size)
         with self._proxy_buffers_lock:
             for layer_id in self._csa_layer_ids:
                 pool = self._proxy_cpu_selection_pool.setdefault(layer_id, [])
-                if any(
-                    int(buffer.numel()) == self._proxy_block_budget for buffer in pool
-                ):
-                    continue
-                pool.append(
-                    torch.empty(
-                        (self._proxy_block_budget,),
-                        dtype=torch.int32,
-                        device="cpu",
-                        pin_memory=True,
+                for selection_size in selection_sizes:
+                    if any(int(buffer.numel()) == selection_size for buffer in pool):
+                        continue
+                    pool.append(
+                        torch.empty(
+                            (selection_size,),
+                            dtype=torch.int32,
+                            device="cpu",
+                            pin_memory=True,
+                        )
                     )
-                )
 
         logger.info(
             "IndexerSSDManager: warmed proxy resources layers=%d "
-            "selection_size=%d device=%s",
+            "selection_sizes=%s device=%s",
             len(self._csa_layer_ids),
-            self._proxy_block_budget,
+            selection_sizes,
             self._device,
         )
 
@@ -4348,6 +4354,23 @@ class IndexerSSDManager:
                             num_blocks,
                             self._proxy_block_budget,
                         ).to(torch.int32)
+                        if cp_context is not None and self._cp_exchange_proxy_ids:
+                            import torch.distributed as dist
+                            from vllm.distributed import get_tp_group
+
+                            cp_world_size = int(cp_context[1])
+                            selected_blocks = selected_blocks.contiguous()
+                            exchanged_blocks = torch.empty(
+                                int(selected_blocks.numel()) * cp_world_size,
+                                dtype=selected_blocks.dtype,
+                                device=selected_blocks.device,
+                            )
+                            dist.all_gather_into_tensor(
+                                exchanged_blocks,
+                                selected_blocks,
+                                group=get_tp_group().device_group,
+                            )
+                            selected_blocks = exchanged_blocks
                         selected_cpu = self._acquire_proxy_cpu_selection(
                             int(layer_id),
                             int(selected_blocks.numel()),

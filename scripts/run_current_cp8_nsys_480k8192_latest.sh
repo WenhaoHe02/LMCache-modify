@@ -50,8 +50,8 @@ nsys_prefix="${nsys} profile --trace=cuda,nvtx --sample=none \
 --cpuctxsw=none --capture-range=cudaProfilerApi --capture-range-end=stop \
 --force-overwrite=true --output=${trace_dir}/${trace_name}"
 
-export LMCACHE_ABLATION_PATCH_DIR="${LMCACHE_ABLATION_PATCH_DIR:-/home/zbuser02/codex_sync_overlap_fix/patches_native_compact_perf_20260721}"
-export LMCACHE_ABLATION_STARTUP_SCRIPT="${LMCACHE_ABLATION_STARTUP_SCRIPT:-/home/zbuser02/codex_sync_overlap_fix/startup_native_compact_perf_20260721.sh}"
+export LMCACHE_ABLATION_PATCH_DIR="${LMCACHE_ABLATION_PATCH_DIR:-${root}/patches}"
+export LMCACHE_ABLATION_STARTUP_SCRIPT="${LMCACHE_ABLATION_STARTUP_SCRIPT:-${root}/startup_cp8_ab.sh}"
 export LMCACHE_ABLATION_MAX_MODEL_LEN=530000
 export LMCACHE_ABLATION_MAX_BATCHED_TOKENS=65536
 export LMCACHE_ABLATION_GPU_UTIL=0.55
@@ -65,6 +65,7 @@ export LMCACHE_CSA_PREFETCH_LOOKAHEAD_BY_LAYER="${lookahead_policy}"
 export LMCACHE_CSA_PREFETCH_CP_SIZE=8
 export LMCACHE_CSA_PREFETCH_CP_INTERLEAVE=64
 export LMCACHE_CSA_PREFETCH_CP_OVERSUBSCRIBE=1
+export LMCACHE_CSA_PREFETCH_CP_EXCHANGE_IDS="${LMCACHE_CSA_PREFETCH_CP_EXCHANGE_IDS:-1}"
 export LMCACHE_CSA_PREFETCH_BLOCK_BUDGET=256
 export LMCACHE_DSV4_HCA_WALKER=1
 export LMCACHE_INDEXER_PROFILE_ACCURACY=0
@@ -99,6 +100,8 @@ grep -qx 'LMCACHE_NSYS_FULL_CAPTURE_SKIP_REQUESTS=0' "${result_dir}/process_env.
 grep -qx 'LMCACHE_NSYS_FULL_CAPTURE_SCOPE=decoder' "${result_dir}/process_env.txt"
 grep -qx 'LMCACHE_DSV4_HCA_WALKER=1' "${result_dir}/process_env.txt"
 grep -qx 'LMCACHE_INDEXER_PROFILE_ACCURACY=0' "${result_dir}/process_env.txt"
+grep -qx "LMCACHE_CSA_PREFETCH_CP_EXCHANGE_IDS=${LMCACHE_CSA_PREFETCH_CP_EXCHANGE_IDS}" \
+  "${result_dir}/process_env.txt"
 grep -qx 'LMCACHE_CSA_PREDICTION_GATE_TIMEOUT_SEC=60' \
   "${result_dir}/process_env.txt"
 
