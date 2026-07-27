@@ -7,6 +7,7 @@ import re
 
 
 _PROFILE80_SPEC = "default:0,26-42:2"
+_PROFILE80_HYBRID_SPEC = "default:0,26-34:2,36:1,38-40:2,42:1"
 
 
 @dataclass(frozen=True)
@@ -15,12 +16,12 @@ class CSAPrefetchLookaheadPolicy:
 
     The specification is a comma-separated list of ``layer:value``,
     ``start-end:value``, or ``default:value`` entries. Zero disables
-    prediction and preserves true-indexer demand loading; two enables one
-    early L2 prediction. L1 prediction was removed because it repeated the
-    predictor without creating a useful I/O window. Without an explicit
-    default, omitted layers are demand-only.
-    ``profile80`` selects only the profiled high-confidence deep layers via
-    ``default:0,26-42:2``.
+    prediction and preserves true-indexer demand loading; one and two select
+    a single prediction one or two decoder layers before the target. Without
+    an explicit default, omitted layers are demand-only.
+    ``profile80`` selects only the profiled deep layers with two-layer
+    lookahead. ``profile80_hybrid`` moves the two correction-heavy targets,
+    layers 36 and 42, to a closer one-layer source.
 
     Args:
         specification: Per-target-layer lookahead specification.
@@ -43,8 +44,8 @@ class CSAPrefetchLookaheadPolicy:
             target_layer_id: Transformer layer id of the target CSA.
 
         Returns:
-            ``0`` when prediction is disabled or ``2`` for one early L2
-            prediction.
+            ``0`` when prediction is disabled, otherwise the configured
+            source-to-target distance (one or two layers).
         """
         return self._by_layer.get(int(target_layer_id), self._default_lookahead)
 
@@ -61,6 +62,21 @@ class CSAPrefetchLookaheadPolicy:
             int(layer_id)
             for layer_id in target_layer_ids
             if self.lookahead_for(layer_id) == 2
+        }
+
+    def one_layer_targets(self, target_layer_ids: list[int]) -> set[int]:
+        """Return target CSA layers configured for one-layer prefetch.
+
+        Args:
+            target_layer_ids: Available target CSA transformer layer ids.
+
+        Returns:
+            The subset whose configured lookahead is one.
+        """
+        return {
+            int(layer_id)
+            for layer_id in target_layer_ids
+            if self.lookahead_for(layer_id) == 1
         }
 
     def disabled_targets(self, target_layer_ids: list[int]) -> set[int]:
@@ -114,12 +130,14 @@ class CSAPrefetchLookaheadPolicy:
             return 0, {}
         if spec == "profile80":
             spec = _PROFILE80_SPEC
+        elif spec == "profile80_hybrid":
+            spec = _PROFILE80_HYBRID_SPEC
 
         default_lookahead = 0
         default_seen = False
         by_layer: dict[int, int] = {}
-        entry_pattern = re.compile(r"^(\d+)(?:-(\d+))?\s*:\s*([02])$")
-        default_pattern = re.compile(r"^default\s*:\s*([02])$")
+        entry_pattern = re.compile(r"^(\d+)(?:-(\d+))?\s*:\s*([012])$")
+        default_pattern = re.compile(r"^default\s*:\s*([012])$")
         for raw_entry in spec.split(","):
             entry = raw_entry.strip()
             default_match = default_pattern.fullmatch(entry)
@@ -136,7 +154,7 @@ class CSAPrefetchLookaheadPolicy:
             if match is None:
                 raise ValueError(
                     "LMCACHE_CSA_PREFETCH_LOOKAHEAD_BY_LAYER entries must be "
-                    "DEFAULT:0|2, LAYER:0|2, or START-END:0|2; got "
+                    "DEFAULT:0|1|2, LAYER:0|1|2, or START-END:0|1|2; got "
                     + repr(raw_entry)
                 )
             start = int(match.group(1))

@@ -9,6 +9,29 @@ from typing import Any
 import torch
 
 
+def _block_cyclic_indices(
+    length: int,
+    rank: int,
+    world_size: int,
+    interleave_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build one rank's block-cyclic offsets without a dynamic CUDA shape."""
+    cycle = int(world_size) * int(interleave_size)
+    rank_start = int(rank) * int(interleave_size)
+    full_cycles, remainder = divmod(int(length), cycle)
+    tail = max(0, min(int(interleave_size), remainder - rank_start))
+    count = full_cycles * int(interleave_size) + tail
+    if count == 0:
+        return torch.empty(0, dtype=torch.int64, device=device)
+    local = torch.arange(count, dtype=torch.int64, device=device)
+    return (
+        torch.div(local, int(interleave_size), rounding_mode="floor") * cycle
+        + rank_start
+        + torch.remainder(local, int(interleave_size))
+    )
+
+
 def prefill_cp_key_indices(
     total_tokens: int,
     rank: int,
@@ -39,12 +62,13 @@ def prefill_cp_key_indices(
         raise ValueError("rank must be within the prefetch CP group")
     if interleave_size <= 0:
         raise ValueError("interleave_size must be positive")
-    global_ids = torch.arange(total_tokens, dtype=torch.int64, device=device)
-    owners = torch.remainder(
-        torch.div(global_ids, interleave_size, rounding_mode="floor"),
+    return _block_cyclic_indices(
+        total_tokens,
+        rank,
         world_size,
+        interleave_size,
+        device,
     )
-    return global_ids[owners == rank]
 
 
 def prefill_cp_query_indices(
@@ -79,21 +103,13 @@ def prefill_cp_query_indices(
         raise ValueError("rank must be within the prefetch CP group")
     if interleave_size <= 0:
         raise ValueError("interleave_size must be positive")
-    query_ids = torch.arange(
-        token_start,
-        token_end,
-        dtype=torch.int64,
-        device=device,
-    )
-    owners = torch.remainder(
-        torch.div(
-            query_ids - int(token_start),
-            interleave_size,
-            rounding_mode="floor",
-        ),
+    return _block_cyclic_indices(
+        token_end - token_start,
+        rank,
         world_size,
-    )
-    return query_ids[owners == rank]
+        interleave_size,
+        device,
+    ).add_(int(token_start))
 
 
 def globalize_prefill_cp_topk(
@@ -220,6 +236,7 @@ def score_prefill_proxy_rank_local(
     world_size: int,
     interleave_size: int,
     oversubscribe: int = 1,
+    topk_tokens_override: int | None = None,
     metadata_query_row_start: int | None = None,
     runtime_info: dict[str, int] | None = None,
 ) -> torch.Tensor:
@@ -241,6 +258,9 @@ def score_prefill_proxy_rank_local(
         interleave_size: Consecutive query rows assigned per rank.
         oversubscribe: Reserved compatibility argument. Query sharding always
             uses the official full top-k width.
+        topk_tokens_override: Optional wider speculative top-k width. This
+            changes only proxy coverage; the official indexer's output width
+            and sparse-attention semantics remain unchanged.
         metadata_query_row_start: Optional row offset into the active prefill
             metadata. When set, ``q_quant``, ``weights``, and ``output`` are a
             compact slice beginning at this metadata row. This is used only
@@ -291,7 +311,13 @@ def score_prefill_proxy_rank_local(
     output[: hidden_states.shape[0]] = -1
     if oversubscribe <= 0:
         raise RuntimeError("prefill CP oversubscribe must be positive")
-    topk_tokens = int(indexer_op.topk_tokens)
+    topk_tokens = (
+        int(topk_tokens_override)
+        if topk_tokens_override is not None
+        else int(indexer_op.topk_tokens)
+    )
+    if topk_tokens <= 0 or topk_tokens > int(output.shape[1]):
+        raise RuntimeError("proxy top-k width does not fit the output buffer")
     workspace = current_workspace_manager()
     fp8_dtype = current_platform.fp8_dtype()
     head_dim = int(indexer_op.head_dim)

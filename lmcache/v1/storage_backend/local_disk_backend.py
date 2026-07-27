@@ -78,7 +78,7 @@ _DSV4_HCA_SLAB_ROLE = "hca_attention_kv_slab"
 _DSV4_HCA_LAYER_MAJOR_ROLE = "hca_attention_kv_layer_major"
 _DSV4_CSA_LAYER_MAJOR_ROLE = "csa_attention_kv_layer_major"
 _DSV4_INDEXER_LAYER_MAJOR_ROLE = "csa_indexer_cache_layer_major"
-_DSV4_CSA_STREAMING_LAYOUT_VERSION = 1
+_DSV4_CSA_STREAMING_LAYOUT_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +97,7 @@ class _CSAStreamingLayout:
 
     generation: str
     layout_version: int
+    covered_tokens: int
     required_entries: frozenset[tuple[str, int]]
     objects: tuple[_CSAStreamingObject, ...]
 
@@ -122,8 +123,10 @@ class _CSAStreamingLayoutBuild:
     """Invisible generation assembled before the active-layout swap."""
 
     generation: str
+    covered_tokens: int
     required_entries: frozenset[tuple[str, int]]
     objects: dict[tuple[str, int], _CSAStreamingObject]
+
 
 KVObjectRawWriter = Callable[
     [KVObjectRecord, memoryview],
@@ -263,6 +266,7 @@ class LocalDiskBackend(StorageBackendInterface):
         self.dst_device = dst_device
 
         self.local_cpu_backend = local_cpu_backend
+        self._chunk_size = int(config.chunk_size)
 
         self.disk_lock = threading.Lock()
 
@@ -551,9 +555,7 @@ class LocalDiskBackend(StorageBackendInterface):
 
     def _required_csa_streaming_entries(self) -> set[tuple[str, int]]:
         """Return every logical object required by the active ON layout."""
-        required: set[tuple[str, int]] = {
-            (self._csa_streaming_compact_role(), 0)
-        }
+        required: set[tuple[str, int]] = {(self._csa_streaming_compact_role(), 0)}
         if self.metadata is None:
             return required
         klg_manager = self.metadata.kv_layer_groups_manager
@@ -577,6 +579,7 @@ class LocalDiskBackend(StorageBackendInterface):
     def _csa_streaming_generation(
         self,
         keys: Sequence[CacheEngineKey],
+        covered_tokens: int,
     ) -> str:
         """Return a deterministic id for one immutable admission generation.
 
@@ -587,6 +590,7 @@ class LocalDiskBackend(StorageBackendInterface):
 
         Args:
             keys: Content-addressed chunk keys in admission order.
+            covered_tokens: Exact logical-token coverage of this generation.
 
         Returns:
             A compact hexadecimal generation identifier.
@@ -595,6 +599,8 @@ class LocalDiskBackend(StorageBackendInterface):
         digest.update(str(_DSV4_CSA_STREAMING_LAYOUT_VERSION).encode("ascii"))
         digest.update(b"\0")
         digest.update(self._csa_streaming_compact_role().encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(int(covered_tokens)).encode("ascii"))
         for key in keys:
             digest.update(b"\0")
             digest.update(key.to_string().encode("utf-8"))
@@ -649,10 +655,7 @@ class LocalDiskBackend(StorageBackendInterface):
         compatible published layout is the constant-time READY signal here.
         """
         layout = self._active_csa_layout(key)
-        return bool(
-            layout is not None
-            and self._csa_layout_matches_runtime(layout)
-        )
+        return bool(layout is not None and self._csa_layout_matches_runtime(layout))
 
     def _publish_csa_layout(
         self,
@@ -663,6 +666,7 @@ class LocalDiskBackend(StorageBackendInterface):
         layout = _CSAStreamingLayout(
             generation=build.generation,
             layout_version=_DSV4_CSA_STREAMING_LAYOUT_VERSION,
+            covered_tokens=build.covered_tokens,
             required_entries=build.required_entries,
             objects=tuple(
                 build.objects[entry_key] for entry_key in sorted(build.objects)
@@ -767,10 +771,7 @@ class LocalDiskBackend(StorageBackendInterface):
             role = roles[index] if roles is not None else "full"
             if self._csa_streaming_layout_requested() and role in streaming_roles:
                 layout = self._active_csa_layout(key)
-                if (
-                    layout is None
-                    or not self._csa_layout_matches_runtime(layout)
-                ):
+                if layout is None or not self._csa_layout_matches_runtime(layout):
                     lengths.append(None)
                     continue
                 entry = layout.find_object(role, int(layer_id))
@@ -918,6 +919,7 @@ class LocalDiskBackend(StorageBackendInterface):
         prefix_key: CacheEngineKey,
         memory_objs: Sequence[MemoryObj],
         prefix_keys: Optional[Sequence[CacheEngineKey]] = None,
+        prefix_token_count: Optional[int] = None,
     ) -> int:
         """Persist compact layer-major CSA/HCA/indexer sidecar objects.
 
@@ -936,6 +938,8 @@ class LocalDiskBackend(StorageBackendInterface):
                 each key. They all reference the same physical layer-major
                 object and let retrieval stop inside a long store batch without
                 copying data or reading beyond the requested prefix.
+            prefix_token_count: Exact logical-token count represented by all
+                supplied chunks. Omit only when every chunk is full-sized.
 
         Returns:
             Number of layer-major sidecar objects READY after the call.
@@ -963,31 +967,65 @@ class LocalDiskBackend(StorageBackendInterface):
 
         if prefix_keys is not None and len(prefix_keys) != len(memory_objs):
             raise ValueError("prefix_keys and memory_objs must have the same length")
+        original_prefix_keys = list(prefix_keys) if prefix_keys is not None else None
+        chunk_size = self._chunk_size
+        represented_tokens = (
+            len(memory_objs) * chunk_size
+            if prefix_token_count is None
+            else int(prefix_token_count)
+        )
+        minimum_tokens = (len(memory_objs) - 1) * chunk_size + 1
+        maximum_tokens = len(memory_objs) * chunk_size
+        if not minimum_tokens <= represented_tokens <= maximum_tokens:
+            raise ValueError(
+                "prefix_token_count must match the number of supplied chunks"
+            )
+        chunk_token_counts = [chunk_size] * len(memory_objs)
+        chunk_token_counts[-1] = (
+            represented_tokens - (len(memory_objs) - 1) * chunk_size
+        )
         streaming_layout = self._csa_streaming_layout_requested()
         effective_memory_objs = list(memory_objs)
-        effective_prefix_keys = list(prefix_keys) if prefix_keys is not None else None
+        effective_prefix_keys = original_prefix_keys
+        effective_token_counts = chunk_token_counts
         if streaming_layout and effective_prefix_keys is not None:
-            missing_pairs = [
-                (key, memory_obj)
-                for key, memory_obj in zip(
-                    effective_prefix_keys,
-                    effective_memory_objs,
-                    strict=True,
-                )
-                if not self._active_csa_layout_ready(key)
-            ]
-            if not missing_pairs:
+            terminal_layout = self._active_csa_layout(effective_prefix_keys[-1])
+            if (
+                terminal_layout is not None
+                and terminal_layout.covered_tokens == represented_tokens
+                and self._active_csa_layout_ready(effective_prefix_keys[-1])
+            ):
                 return max(0, len(self._required_csa_streaming_entries()) - 1)
-            effective_prefix_keys = [key for key, _memory_obj in missing_pairs]
-            effective_memory_objs = [memory_obj for _key, memory_obj in missing_pairs]
-            prefix_key = effective_prefix_keys[-1]
+
+            # A layer-major generation is a prefix object, not a set of
+            # independently composable chunk objects.  Reusing READY chunks
+            # from an older generation here would omit their bytes from the
+            # new physical sidecars.  It would also reset covered_tokens at
+            # the first missing chunk, so the first request after cold store
+            # could never prove the complete prefix.  Materialize the entire
+            # supplied prefix whenever its terminal generation is not already
+            # an exact READY match.
+        generation_covered_tokens = sum(effective_token_counts)
+        coverage_by_key: dict[str, int] = {}
+        if effective_prefix_keys is not None:
+            cumulative_tokens = 0
+            for key, token_count in zip(
+                effective_prefix_keys,
+                effective_token_counts,
+                strict=True,
+            ):
+                cumulative_tokens += int(token_count)
+                coverage_by_key[key.to_string()] = cumulative_tokens
+        else:
+            coverage_by_key[prefix_key.to_string()] = generation_covered_tokens
         generation_keys = (
-            effective_prefix_keys
-            if effective_prefix_keys is not None
-            else [prefix_key]
+            effective_prefix_keys if effective_prefix_keys is not None else [prefix_key]
         )
         generation = (
-            self._csa_streaming_generation(generation_keys)
+            self._csa_streaming_generation(
+                generation_keys,
+                generation_covered_tokens,
+            )
             if streaming_layout
             else ""
         )
@@ -1125,9 +1163,7 @@ class LocalDiskBackend(StorageBackendInterface):
                     payload_view = memoryview(payload)
                     if raw_writer is not None:
                         raw_extents, _write_ms = raw_writer(record, payload_view)
-                        ready_record = record.with_raw_extents(
-                            raw_extents
-                        ).mark_ready()
+                        ready_record = record.with_raw_extents(raw_extents).mark_ready()
                     else:
                         if self.kv_object_pool_io is None:
                             continue
@@ -1188,6 +1224,7 @@ class LocalDiskBackend(StorageBackendInterface):
                 for key_string, objects in pending_entries.items():
                     self._csa_pending_layouts[key_string] = _CSAStreamingLayoutBuild(
                         generation=generation,
+                        covered_tokens=coverage_by_key[key_string],
                         required_entries=required_entries,
                         objects=objects,
                     )
@@ -1650,9 +1687,9 @@ class LocalDiskBackend(StorageBackendInterface):
             for byte_range in selected_ranges:
                 source_start = byte_range.target_offset
                 source_end = source_start + byte_range.length
-                compact_payload[
-                    target_offset : target_offset + byte_range.length
-                ] = buffer[source_start:source_end].tobytes()
+                compact_payload[target_offset : target_offset + byte_range.length] = (
+                    buffer[source_start:source_end].tobytes()
+                )
                 target_offset += byte_range.length
             payload_view = memoryview(compact_payload)
 
@@ -2188,6 +2225,40 @@ class LocalDiskBackend(StorageBackendInterface):
             if pin:
                 self.dict[key].pin()
                 # vllm lookup sets pin to True
+                self.keys_in_request.append(key)
+            return True
+
+    def contains_streaming_terminal(
+        self,
+        key: CacheEngineKey,
+        token_count: int,
+        pin: bool = False,
+    ) -> bool:
+        """Check and optionally pin one exact terminal streaming generation.
+
+        Args:
+            key: Content-addressed key of the terminal cached chunk.
+            token_count: Exact number of logical tokens required by the lookup.
+            pin: Whether to pin the terminal cache entry on success.
+
+        Returns:
+            ``True`` only if the key exists and its atomically published,
+            runtime-compatible manifest covers exactly ``token_count`` tokens.
+        """
+        if token_count <= 0:
+            return False
+        with self.disk_lock:
+            if key not in self.dict:
+                return False
+            layout = self._active_csa_layout(key)
+            if (
+                layout is None
+                or layout.covered_tokens != int(token_count)
+                or not self._csa_layout_matches_runtime(layout)
+            ):
+                return False
+            if pin:
+                self.dict[key].pin()
                 self.keys_in_request.append(key)
             return True
 

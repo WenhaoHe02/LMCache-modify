@@ -23,6 +23,19 @@ def test_profile80_enables_only_profiled_deep_targets() -> None:
     assert policy.disabled_targets([24, 26, 27, 42, 44]) == {24, 44}
 
 
+def test_profile80_hybrid_moves_only_correction_heavy_targets_to_l1() -> None:
+    """The optimized profile preserves one fire while moving two targets."""
+    policy = CSAPrefetchLookaheadPolicy("profile80_hybrid")
+    targets = list(range(2, 43, 2))
+
+    assert policy.one_layer_targets(targets) == {36, 42}
+    assert policy.two_layer_targets(targets) == {26, 28, 30, 32, 34, 38, 40}
+    assert policy.disabled_targets(targets) == set(range(2, 25, 2))
+    sources = build_residual_prefetch_sources(targets, policy)
+    assert sources[35] == (36, 1)
+    assert sources[41] == (42, 1)
+
+
 def test_explicit_policy_defaults_unlisted_targets_to_demand_only() -> None:
     """Omitted targets never silently re-enable a legacy prediction path."""
     policy = CSAPrefetchLookaheadPolicy("26-42:2")
@@ -65,6 +78,18 @@ def test_source_mapping_uses_exactly_one_l2_for_each_deep_target() -> None:
     }
 
 
+def test_source_mapping_supports_selected_one_layer_targets() -> None:
+    """A target may use one closer source without adding a second fire."""
+    policy = CSAPrefetchLookaheadPolicy("default:0,26:2,28:1")
+
+    assert policy.lookahead_for(26) == 2
+    assert policy.lookahead_for(28) == 1
+    assert build_residual_prefetch_sources([26, 28], policy) == {
+        24: (26, 2),
+        27: (28, 1),
+    }
+
+
 def test_dsv4_flash_21_layer_profile_has_nine_deep_targets_without_conflicts() -> None:
     """V4-Flash has 21 even CSA layers, not the legacy 30-layer geometry."""
     csa_layer_ids = list(range(2, 43, 2))
@@ -86,8 +111,6 @@ def test_dsv4_flash_21_layer_profile_has_nine_deep_targets_without_conflicts() -
         "2:3",
         "default:3",
         "default:0,default:1",
-        "default:1",
-        "2:1",
         "4-2:2",
         "bad",
         "2-4:1,3:2",

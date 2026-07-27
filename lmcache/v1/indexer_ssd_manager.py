@@ -142,6 +142,41 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _proxy_topk_tokens_by_layer(spec: str) -> dict[int, int]:
+    """Parse ``layer:width`` proxy top-k overrides.
+
+    Args:
+        spec: Comma-separated target-layer and width pairs. Supported widths
+            are the persistent-top-k kernel sizes 512, 1024, and 2048.
+
+    Returns:
+        Mapping from target CSA layer id to speculative top-k width.
+
+    Raises:
+        ValueError: If an item is malformed or requests an unsupported width.
+    """
+    result: dict[int, int] = {}
+    for raw_item in spec.split(","):
+        item = raw_item.strip()
+        if not item:
+            continue
+        try:
+            layer_text, width_text = item.split(":", 1)
+            layer_id = int(layer_text)
+            width = int(width_text)
+        except ValueError as exc:
+            raise ValueError(
+                "LMCACHE_CSA_PROXY_TOPK_TOKENS_BY_LAYER must use layer:width"
+            ) from exc
+        if layer_id < 0 or width not in (512, 1024, 2048):
+            raise ValueError(
+                "CSA per-layer proxy top-k requires a non-negative layer and "
+                "a width of 512, 1024, or 2048"
+            )
+        result[layer_id] = width
+    return result
+
+
 def _deepseek_indexer_cache_classes() -> tuple[type[torch.nn.Module], ...]:
     """Return DeepSeek V4 indexer-cache classes available in this vLLM build."""
     class_specs = (
@@ -1111,6 +1146,17 @@ class IndexerSSDManager:
             1,
             _env_int("LMCACHE_CSA_PREFETCH_BLOCK_BUDGET", 256),
         )
+        self._l1_proxy_topk_tokens = _env_int(
+            "LMCACHE_CSA_L1_PROXY_TOPK_TOKENS",
+            2048,
+        )
+        if self._l1_proxy_topk_tokens not in (512, 1024, 2048):
+            raise ValueError(
+                "LMCACHE_CSA_L1_PROXY_TOPK_TOKENS must be 512, 1024, or 2048"
+            )
+        self._proxy_topk_tokens_by_layer = _proxy_topk_tokens_by_layer(
+            os.environ.get("LMCACHE_CSA_PROXY_TOPK_TOKENS_BY_LAYER", "")
+        )
         self._cp_exchange_proxy_ids = (
             _env_int("LMCACHE_CSA_PREFETCH_CP_EXCHANGE_IDS", 1) != 0
         )
@@ -1176,7 +1222,7 @@ class IndexerSSDManager:
         self._nsys_seen_requests = 0
         self._nsys_capture_active = False
         self._nsys_capture_complete = False
-        logger.info("IndexerSSDManager: canonical L2 pipeline enabled")
+        logger.info("IndexerSSDManager: canonical CSA prediction pipeline enabled")
 
     def _log_timing(self, event: str, layer_id: int, **fields: Any) -> None:
         """Emit one lightweight timing line when timing diagnostics are enabled."""
@@ -1206,15 +1252,15 @@ class IndexerSSDManager:
         self._decoder_layers[layer_id] = decoder_layer
 
     def configure_prefetch_lookahead(self, by_target_layer: Dict[int, int]) -> None:
-        """Configure demand-only or two-layer prefetch per target CSA.
+        """Configure demand-only, one-layer, or two-layer prefetch per CSA.
 
         Args:
             by_target_layer: Mapping from target transformer layer id to a
-                lookahead of zero or two layers. Zero disables proxy
+                lookahead of zero, one, or two layers. Zero disables proxy
                 prediction while preserving true-indexer miss correction.
 
         Raises:
-            ValueError: If a target is unknown or lookahead is not zero or two.
+            ValueError: If a target is unknown or lookahead is unsupported.
         """
         configured = dict(self._prefetch_lookahead)
         for layer_id, lookahead in by_target_layer.items():
@@ -1222,8 +1268,8 @@ class IndexerSSDManager:
             level = int(lookahead)
             if target not in self._csa_pos:
                 raise ValueError(f"unknown CSA target layer {target}")
-            if level not in (0, 2):
-                raise ValueError("CSA prefetch lookahead must be 0 or 2")
+            if level not in (0, 1, 2):
+                raise ValueError("CSA prefetch lookahead must be 0, 1, or 2")
             configured[target] = level
         self._prefetch_lookahead = configured
 
@@ -1245,7 +1291,7 @@ class IndexerSSDManager:
         enabled_targets = sorted(
             target
             for target, lookahead in self._prefetch_lookahead.items()
-            if lookahead == 2
+            if lookahead > 0
         )
         if not enabled_targets or int(layer_id) != enabled_targets[0]:
             return
@@ -1283,7 +1329,7 @@ class IndexerSSDManager:
         enabled_targets = sorted(
             target
             for target, lookahead in self._prefetch_lookahead.items()
-            if lookahead == 2
+            if lookahead > 0
         )
         if not enabled_targets or int(layer_id) != enabled_targets[-1]:
             return
@@ -1702,9 +1748,9 @@ class IndexerSSDManager:
         llama_4_scaling: Optional[torch.Tensor] = None,
         prefetch_level: int = 2,
     ) -> None:
-        """Schedule the canonical two-layer CSA prediction.
+        """Schedule one canonical CSA prediction at the configured distance.
 
-        The decoder calls this method once, from the FFN-entry hook exactly two
+        The decoder calls this method once, from the FFN-entry hook one or two
         transformer layers before the target CSA layer. GPU proxy scoring is
         submitted on a side stream and completion/I/O dispatch is handled by
         the proxy executor, so the source layer never waits for SSD I/O.
@@ -1714,15 +1760,15 @@ class IndexerSSDManager:
             residual_f: Source layer post-attention residual.
             positions: Query positions aligned with the residual.
             llama_4_scaling: Optional compatibility input for DSv4 variants.
-            prefetch_level: Must be two. No L1 prediction path exists.
+            prefetch_level: Source-to-target distance, either one or two.
 
         Raises:
-            ValueError: If the caller requests a non-L2 prediction.
+            ValueError: If the caller requests an unsupported distance.
         """
-        if prefetch_level != 2:
-            raise ValueError("prefetch_level must be 2")
+        if prefetch_level not in (1, 2):
+            raise ValueError("prefetch_level must be 1 or 2")
         configured_lookahead = self._prefetch_lookahead.get(int(layer_id), 0)
-        if configured_lookahead != 2:
+        if configured_lookahead != prefetch_level:
             self._log_timing(
                 "prefill_fire_async_skip",
                 layer_id,
@@ -1733,7 +1779,7 @@ class IndexerSSDManager:
 
         manager = getattr(self, "_csa_attention_kv_manager", None)
         if manager is None or residual_f is None or positions is None:
-            self._log_residual_proxy_skip(layer_id, "canonical_l2_inputs_missing")
+            self._log_residual_proxy_skip(layer_id, "canonical_proxy_inputs_missing")
             return
         residual_f, positions, aligned_rows = _flatten_proxy_state_for_positions(
             residual_f,
@@ -1742,7 +1788,7 @@ class IndexerSSDManager:
         if aligned_rows <= 1:
             # The production L2 pipeline is for cache-hit prefill/recompute.
             # Decode continues through the official indexer path.
-            self._log_residual_proxy_skip(layer_id, "canonical_l2_requires_prefill")
+            self._log_residual_proxy_skip(layer_id, "canonical_proxy_requires_prefill")
             return
         if self._decode_cursor.get(layer_id, 0) <= 0:
             self._warm_cold_proxy_kernels(layer_id, residual_f, positions)
@@ -1765,7 +1811,7 @@ class IndexerSSDManager:
         )
         request_id = str(getattr(manager, "active_request_id", ""))
         self.start_nsys_capture_for_layer(layer_id, request_id)
-        fire_key = (int(layer_id), 2)
+        fire_key = (int(layer_id), int(prefetch_level))
         with self._lock:
             if request_id != self._csa_fired_request_id:
                 self._csa_fired_request_id = request_id
@@ -1787,20 +1833,20 @@ class IndexerSSDManager:
             positions,
             llama_4_scaling,
             fire_start=t0,
-            prefetch_level=2,
+            prefetch_level=prefetch_level,
         )
         if not submitted:
             with self._lock:
                 self._csa_fired_levels.discard(fire_key)
-            self._log_residual_proxy_skip(layer_id, "canonical_l2_submit_failed")
+            self._log_residual_proxy_skip(layer_id, "canonical_proxy_submit_failed")
             return
         self._log_timing(
             "prefill_fire_async",
             layer_id,
             total_ms=f"{(time.perf_counter() - t0) * 1000.0:.3f}",
             rows=aligned_rows,
-            mode="canonical_l2_async_submit",
-            prefetch_level=2,
+            mode=f"canonical_l{prefetch_level}_async_submit",
+            prefetch_level=prefetch_level,
         )
 
     def attach_csa_attention_kv_manager(self, manager: Optional[Any]) -> None:
@@ -2114,19 +2160,19 @@ class IndexerSSDManager:
         *,
         lookahead: int,
     ) -> None:
-        """Fire the one canonical L2 residual prediction for a target CSA.
+        """Fire the one configured residual prediction for a target CSA.
 
         Args:
             layer_id: Target CSA transformer layer id.
             residual_f: Source layer's post-attention residual.
             positions: Query positions aligned with ``residual_f``.
-            lookahead: Source-to-target distance. It must be two.
+            lookahead: Source-to-target distance, either one or two.
 
         Raises:
-            ValueError: If ``lookahead`` is not two.
+            ValueError: If ``lookahead`` is unsupported.
         """
-        if lookahead != 2:
-            raise ValueError("lookahead must be 2")
+        if lookahead not in (1, 2):
+            raise ValueError("lookahead must be 1 or 2")
         configured_lookahead = self._prefetch_lookahead.get(int(layer_id), 0)
         if configured_lookahead != lookahead:
             self._log_timing(
@@ -2143,24 +2189,24 @@ class IndexerSSDManager:
             return
         self.wait_for_seed(layer_id)
         self._log_timing(
-            "l2_submit",
+            f"l{lookahead}_submit",
             layer_id,
             rows=_proxy_num_rows(residual_f),
         )
         with csa_pipeline_nvtx.range(
-            CsaNvtxEvent.L2_PROXY,
-            layer_id=layer_id - 2,
+            CsaNvtxEvent.PROXY,
+            layer_id=layer_id - lookahead,
             target_layer_id=layer_id,
             request_id=str(
                 getattr(self._csa_attention_kv_manager, "active_request_id", "")
             ),
-            attributes={"phase": "submit"},
+            attributes={"lookahead": lookahead, "phase": "submit"},
         ):
             self.fire_async_for_layer(
                 layer_id,
                 residual_f=residual_f,
                 positions=positions,
-                prefetch_level=2,
+                prefetch_level=lookahead,
             )
 
     def layer_fired_for_active_request(self, layer_id: int) -> bool:
@@ -2386,6 +2432,14 @@ class IndexerSSDManager:
                             llama_4_scaling,
                             enable_prefill_cp=True,
                             timing_events=phase_events,
+                            proxy_topk_tokens=(
+                                self._proxy_topk_tokens_by_layer.get(
+                                    int(layer_id),
+                                    self._l1_proxy_topk_tokens
+                                    if prefetch_level == 1
+                                    else None,
+                                )
+                            ),
                         )
                         if proxy_done is not None:
                             proxy_done.record(proxy_stream)
@@ -2661,7 +2715,7 @@ class IndexerSSDManager:
             indexer_inputs_gpu_ms=f"{phase_gpu_ms['indexer_inputs']:.3f}",
             q_quant_gpu_ms=f"{phase_gpu_ms['q_quant']:.3f}",
             cp_score_gpu_ms=f"{phase_gpu_ms['cp_score']:.3f}",
-            mode="canonical_l2_async_finish",
+            mode=f"canonical_l{prefetch_level}_async_finish",
             prefetch_level=prefetch_level,
         )
 
@@ -2675,6 +2729,7 @@ class IndexerSSDManager:
         *,
         enable_prefill_cp: bool = False,
         timing_events: Optional[dict[str, Any]] = None,
+        proxy_topk_tokens: Optional[int] = None,
         metadata_query_row_start: Optional[int] = None,
         runtime_info: Optional[dict[str, int]] = None,
     ) -> tuple[torch.Tensor, int, Optional[Tuple[int, int, int, int]]]:
@@ -2706,6 +2761,7 @@ class IndexerSSDManager:
             rotary_emb,
             prefill_cp_context=cp_context,
             timing_events=timing_events,
+            proxy_topk_tokens=proxy_topk_tokens,
             metadata_query_row_start=metadata_query_row_start,
             runtime_info=runtime_info,
         )
@@ -2819,6 +2875,7 @@ class IndexerSSDManager:
         *,
         prefill_cp_context: Optional[Tuple[int, int, int, int]] = None,
         timing_events: Optional[dict[str, Any]] = None,
+        proxy_topk_tokens: Optional[int] = None,
         metadata_query_row_start: Optional[int] = None,
         runtime_info: Optional[dict[str, int]] = None,
     ) -> tuple[torch.Tensor, bool]:
@@ -2870,12 +2927,18 @@ class IndexerSSDManager:
         if timing_events is not None:
             timing_events["q_quant_done"] = torch.cuda.Event(enable_timing=True)
             timing_events["q_quant_done"].record()
+        proxy_width = (
+            int(proxy_topk_tokens)
+            if proxy_topk_tokens is not None
+            else int(reference_topk.shape[1])
+        )
         topk_buf = torch.empty(
-            (int(proxy_hidden.shape[0]), int(reference_topk.shape[1])),
+            (int(proxy_hidden.shape[0]), proxy_width),
             dtype=reference_topk.dtype,
             device=reference_topk.device,
         )
         old_topk = getattr(indexer_op, "topk_indices_buffer", None)
+        old_topk_tokens = getattr(indexer_op, "topk_tokens", None)
         has_skip_insert_attr = hasattr(indexer_op, "skip_k_cache_insert")
         old_skip_insert = (
             indexer_op.skip_k_cache_insert if has_skip_insert_attr else None
@@ -2883,6 +2946,8 @@ class IndexerSSDManager:
         cp_used = False
         try:
             indexer_op.topk_indices_buffer = topk_buf
+            if old_topk_tokens is not None:
+                indexer_op.topk_tokens = proxy_width
             if has_skip_insert_attr:
                 indexer_op.skip_k_cache_insert = True
             if prefill_cp_context is not None:
@@ -2902,6 +2967,7 @@ class IndexerSSDManager:
                         world_size=world_size,
                         interleave_size=interleave_size,
                         oversubscribe=oversubscribe,
+                        topk_tokens_override=proxy_width,
                         metadata_query_row_start=metadata_query_row_start,
                         runtime_info=runtime_info,
                     )
@@ -2921,6 +2987,8 @@ class IndexerSSDManager:
                 )
         finally:
             indexer_op.topk_indices_buffer = old_topk
+            if old_topk_tokens is not None:
+                indexer_op.topk_tokens = old_topk_tokens
             if has_skip_insert_attr:
                 indexer_op.skip_k_cache_insert = old_skip_insert
         return topk_buf, cp_used

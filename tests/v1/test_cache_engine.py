@@ -60,6 +60,34 @@ def get_expected_count(token_len, save_unfull_chunk, chunk_size):
     return (token_len // chunk_size) * chunk_size
 
 
+def test_streaming_terminal_lookup_allows_default_retrieve_locations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``None`` retrieve-location list means all configured backends."""
+    engine = LMCacheEngine.__new__(LMCacheEngine)
+    engine.config = MagicMock(chunk_size=256)
+    engine.is_healthy = MagicMock(return_value=True)
+    engine.dsv4_optimized_kv = True
+    engine.retrieve_locations = None
+    engine.metadata = MagicMock(
+        model_name="model",
+        world_size=1,
+        worker_id=0,
+        kv_dtype=torch.bfloat16,
+    )
+    engine.storage_manager = MagicMock()
+    engine.storage_manager.contains_streaming_terminal.return_value = "LocalDiskBackend"
+    engine.stats_monitor = MagicMock()
+    engine.lookup_pins = {}
+    monkeypatch.setenv("LMCACHE_INDEXER_ENABLE_PREFETCH", "1")
+
+    assert engine.lookup_streaming_terminal(123, 512) == 512
+    engine.storage_manager.contains_streaming_terminal.assert_called_once()
+    assert engine.storage_manager.contains_streaming_terminal.call_args.kwargs[
+        "search_range"
+    ] == ["LocalDiskBackend"]
+
+
 @pytest.mark.parametrize("save_unfull_chunk", [False, True])
 @pytest.mark.skipif(
     not torch.cuda.is_available(),

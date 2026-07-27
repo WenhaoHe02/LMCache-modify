@@ -431,9 +431,7 @@ class StorageManager:
             # is done in the backend
             ks, objs = obj_dict[cname]
             backend_callback = (
-                on_complete_callback
-                if backend_name == "LocalDiskBackend"
-                else None
+                on_complete_callback if backend_name == "LocalDiskBackend" else None
             )
             backend.batched_submit_put_task(
                 ks,
@@ -983,6 +981,33 @@ class StorageManager:
             keys = keys[hit_chunks:]
 
         return total_hit_chunks, block_mapping
+
+    def contains_streaming_terminal(
+        self,
+        key: CacheEngineKey,
+        token_count: int,
+        search_range: Optional[List[str]] = None,
+        pin: bool = False,
+    ) -> Optional[str]:
+        """Find an exact streaming-prefix generation by its terminal key.
+
+        Args:
+            key: Content-addressed key of the terminal cached chunk.
+            token_count: Exact number of prefix tokens the generation must
+                cover.
+            search_range: Optional backend names to search.
+            pin: Whether to pin the terminal key on a hit.
+
+        Returns:
+            Name of the backend containing a compatible complete generation,
+            or ``None`` when no backend can prove exact coverage.
+        """
+        for backend_name, backend in self.get_active_storage_backends(
+            search_range=search_range
+        ):
+            if backend.contains_streaming_terminal(key, token_count, pin):
+                return backend_name
+        return None
 
     def get_block_mapping(
         self, chunk_infos: List[Tuple[CacheEngineKey, int, int]]

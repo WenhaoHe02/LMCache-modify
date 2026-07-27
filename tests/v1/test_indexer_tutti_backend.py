@@ -180,7 +180,7 @@ def test_unaligned_write_preserves_edge_sector_bytes() -> None:
 
 
 def test_two_layer_target_runs_exactly_one_l2_prediction() -> None:
-    """A deep target fires exactly one L2 prediction and rejects stale L1."""
+    """A two-layer target fires once and ignores a non-configured L1 call."""
     fake_csa_manager = SimpleNamespace(
         active_request_id="request-a",
         fire_predicted_reads=MagicMock(),
@@ -201,15 +201,12 @@ def test_two_layer_target_runs_exactly_one_l2_prediction() -> None:
         try:
             residual = torch.zeros((2, 8))
             positions = torch.arange(2)
-            # A stale native L1 hook must also be rejected at the final
-            # async entry point, not merely by the source mapping.
-            with pytest.raises(ValueError, match="prefetch_level must be 2"):
-                manager.fire_async_for_layer(
-                    26,
-                    residual_f=residual,
-                    positions=positions,
-                    prefetch_level=1,
-                )
+            manager.fire_async_for_layer(
+                26,
+                residual_f=residual,
+                positions=positions,
+                prefetch_level=1,
+            )
             fake_csa_manager.fire_predicted_reads.assert_not_called()
             with patch.object(
                 manager,
@@ -224,13 +221,12 @@ def test_two_layer_target_runs_exactly_one_l2_prediction() -> None:
                     positions,
                     lookahead=2,
                 )
-                with pytest.raises(ValueError, match="lookahead must be 2"):
-                    manager.fire_residual_prefetch_for_layer(
-                        26,
-                        residual,
-                        positions,
-                        lookahead=1,
-                    )
+                manager.fire_residual_prefetch_for_layer(
+                    26,
+                    residual,
+                    positions,
+                    lookahead=1,
+                )
         finally:
             manager.close()
 
@@ -265,17 +261,60 @@ def test_disabled_target_has_no_l2_or_l1_prediction() -> None:
                     positions,
                     lookahead=2,
                 )
-                with pytest.raises(ValueError, match="lookahead must be 2"):
-                    manager.fire_residual_prefetch_for_layer(
-                        24,
-                        residual,
-                        positions,
-                        lookahead=1,
-                    )
+                manager.fire_residual_prefetch_for_layer(
+                    24,
+                    residual,
+                    positions,
+                    lookahead=1,
+                )
                 proxy_fire.assert_not_called()
                 wait_for_seed.assert_not_called()
         finally:
             manager.close()
+
+
+def test_one_layer_target_runs_exactly_one_l1_prediction() -> None:
+    """A one-layer target forwards one L1 fire with no L2 duplicate."""
+    fake_csa_manager = SimpleNamespace(active_request_id="request-a")
+    calls: list[int] = []
+    with tempfile.TemporaryDirectory() as store_dir:
+        manager = IndexerSSDManager(
+            csa_layer_ids=[36],
+            store_dir=store_dir,
+            pool_size=8,
+            token_bytes=4,
+            max_seq_len=32,
+            io_workers=1,
+            device=torch.device("cpu"),
+        )
+        manager.attach_csa_attention_kv_manager(fake_csa_manager)
+        manager.configure_prefetch_lookahead({36: 1})
+        try:
+            residual = torch.zeros((2, 8))
+            positions = torch.arange(2)
+            with patch.object(
+                manager,
+                "fire_async_for_layer",
+                side_effect=lambda *_args, **kwargs: calls.append(
+                    int(kwargs["prefetch_level"])
+                ),
+            ):
+                manager.fire_residual_prefetch_for_layer(
+                    36,
+                    residual,
+                    positions,
+                    lookahead=1,
+                )
+                manager.fire_residual_prefetch_for_layer(
+                    36,
+                    residual,
+                    positions,
+                    lookahead=2,
+                )
+        finally:
+            manager.close()
+
+    assert calls == [1]
 
 
 def test_prefill_cp_local_topk_maps_to_global_k_ids() -> None:
@@ -335,6 +374,47 @@ def test_rank_local_proxy_selection_pads_empty_budget_slots() -> None:
     assert selected.numel() == 3
     assert selected.tolist().count(-1) == 2
     assert 0 in selected.tolist()
+
+
+def test_shared_proxy_block_exchange_unions_rank_slots() -> None:
+    """The shared exchange publishes a sorted union without padding IDs."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = f"{tmpdir}/proxy_blocks"
+        rank0 = indexer_manager_module._SharedProxyBlockExchange(
+            rank=0,
+            world_size=2,
+            layer_ids=[2],
+            block_budget=4,
+            path=path,
+        )
+        rank1 = indexer_manager_module._SharedProxyBlockExchange(
+            rank=1,
+            world_size=2,
+            layer_ids=[2],
+            block_budget=4,
+            path=path,
+        )
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                result0 = executor.submit(
+                    rank0.exchange,
+                    2,
+                    5,
+                    torch.tensor([0, 2], dtype=torch.int64),
+                    1.0,
+                )
+                result1 = executor.submit(
+                    rank1.exchange,
+                    2,
+                    5,
+                    torch.tensor([2, 3], dtype=torch.int64),
+                    1.0,
+                )
+                assert result0.result().tolist() == [0, 2, 3]
+                assert result1.result().tolist() == [0, 2, 3]
+        finally:
+            rank0.close()
+            rank1.close()
 
 
 def test_weighted_predicted_block_hits_preserves_topk_frequency() -> None:

@@ -1456,19 +1456,19 @@ class CSAAttentionKVPrefetchManager:
         Args:
             layer_id: Transformer-side CSA layer id.
             compressed_block_ids: Predicted compressed block ids.
-            prefetch_level: Must be ``2`` for the one early L2 prediction.
+            prefetch_level: Source-to-target distance, either one or two.
             request_token: Request generation captured when work was queued.
 
         Raises:
-            ValueError: If ``prefetch_level`` is not two.
+            ValueError: If ``prefetch_level`` is unsupported.
         """
-        if prefetch_level != 2:
-            raise ValueError("prefetch_level must be 2")
+        if prefetch_level not in (1, 2):
+            raise ValueError("prefetch_level must be 1 or 2")
         self._submit_reads(
             layer_id,
             compressed_block_ids,
             label=f"predicted_l{prefetch_level}",
-            io_priority="speculative",
+            io_priority="lookahead",
             request_token=request_token,
         )
 
@@ -2208,7 +2208,8 @@ class CSAAttentionKVPrefetchManager:
                 or exact correction.
             label: Profiling label for the submission.
             io_priority: ``demand`` requires complete execution;
-                ``speculative`` permits a cancelled or partial result.
+                ``lookahead`` is required to reach Tutti but may fall back to
+                exact correction, and ``speculative`` permits cancellation.
             raise_on_error: Re-raise submission and completion failures.
 
         Returns:
@@ -2221,8 +2222,10 @@ class CSAAttentionKVPrefetchManager:
                 layer is unavailable or its I/O fails.
             ValueError: If ``io_priority`` is invalid.
         """
-        if io_priority not in {"demand", "speculative"}:
-            raise ValueError("io_priority must be demand or speculative")
+        if io_priority not in {"demand", "lookahead", "speculative"}:
+            raise ValueError(
+                "io_priority must be demand, lookahead, or speculative"
+            )
         state = self._layers.get(int(layer_id))
         if state is None:
             if raise_on_error:
@@ -2387,6 +2390,24 @@ class CSAAttentionKVPrefetchManager:
             )
             if raise_on_error:
                 raise RuntimeError(f"failed to materialize layer {layer_id}") from exc
+            return False
+        if completed_ids.numel() == 0:
+            csa_pipeline_nvtx.finish_io(
+                io_range,
+                layer_id=int(layer_id),
+                target_layer_id=int(layer_id),
+                operation_id=operation_id,
+                request_id=self.active_request_id,
+                status="not_submitted",
+            )
+            with state.pending_reads_lock:
+                with torch.inference_mode():
+                    state.pending_reads_bitmap[new_ids] = False
+                state.pending_read_count = max(
+                    0,
+                    state.pending_read_count - new_count,
+                )
+                state.pending_reads_lock.notify_all()
             return False
         with state.pending_reads_lock:
             # Publish the CPU resident view before clearing pending state.
@@ -2812,7 +2833,16 @@ class CSAAttentionKVPrefetchManager:
                 max_batch_bytes=128 * 1024**2,
                 max_batch_ios=256,
                 throttle_speculative=False,
+                wait_for_active_io=True,
             )
+        elif io_priority == "lookahead":
+            # A required prediction must not be silently dropped, but the
+            # old speculative per-batch path can expose an incomplete NVMe
+            # batch to the polling kernel. Wait behind already-announced HCA
+            # or indexer demand, then use the same whole-call geometry as the
+            # proven miss-correction path. The predicted union is bounded, so
+            # a newly arriving demand read waits for only this small call.
+            load_kwargs["wait_for_active_io"] = True
         if raw_batch_enabled:
             load_kwargs["on_raw_batch_loaded"] = _scatter_raw_batch
         else:
@@ -3003,6 +3033,7 @@ class CSAAttentionKVPrefetchManager:
             "before_batch": _restore_lba_cache,
             "max_batch_ios": 256,
             "max_batch_bytes": 128 * 1024**2,
+            "wait_for_active_io": io_priority == "lookahead",
         }
         if _csa_c_ops is not None and hasattr(
             _csa_c_ops,
@@ -3233,6 +3264,7 @@ class CSAAttentionKVPrefetchManager:
             "before_batch": _restore_lba_cache,
             "max_batch_ios": 256,
             "max_batch_bytes": 128 * 1024**2,
+            "wait_for_active_io": io_priority == "lookahead",
         }
         if _csa_c_ops is not None and hasattr(
             _csa_c_ops, "scatter_rows_from_object_ptrs"
@@ -3327,6 +3359,7 @@ class CSAAttentionKVPrefetchManager:
             io_priority=io_priority,
             profile_layer_id=state.layer_id,
             input_ready_event=input_ready_event,
+            wait_for_active_io=io_priority == "lookahead",
         )
         # Reuse the already-uploaded ids. This avoids the old second H2D copy
         # and keeps the resident bitmap ordered after every batch scatter.

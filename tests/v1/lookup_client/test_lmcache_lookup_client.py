@@ -14,9 +14,11 @@ Run with: PYTHONHASHSEED=0 pytest tests/v1/lookup_client/test_lmcache_lookup_cli
 import os
 import random
 import tempfile
+import threading
 import time
 import uuid
 from types import SimpleNamespace
+from typing import Optional
 
 # Third Party
 import pytest
@@ -137,6 +139,117 @@ class TestLMCacheLookupClientServer:
         assert client.lookup_terminal_hash("request") == expected_hash
         client.clear_lookup_status("request")
         assert client.lookup_terminal_hash("request") is None
+
+    def test_related_request_sends_verified_streaming_terminal_hint(
+        self,
+        lmcache_engine_metadata,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A cold lookup seeds a content-verified hint for the first hit."""
+        monkeypatch.setenv("LMCACHE_INDEXER_ENABLE_PREFETCH", "1")
+        messages: list[list[object]] = []
+        responses = [0, 512]
+
+        def send_and_recv(message: list[object]) -> list[bytes]:
+            messages.append(message)
+            return [responses.pop(0).to_bytes(4, "big")]
+
+        config = create_test_config(instance_id="streaming_terminal_hint")
+        transport = SimpleNamespace(
+            world_size=1,
+            send_and_recv_all=send_and_recv,
+        )
+        client = LMCacheLookupClient(config, lmcache_engine_metadata, transport)
+        base_tokens = generate_tokens(512, "cpu", fixed=True).tolist()
+        extended_tokens = base_tokens + [100_000 + index for index in range(256)]
+
+        assert client.lookup(base_tokens, "cold") == 0
+        assert client.lookup(extended_tokens, "hit") == 512
+
+        assert len(messages[0]) == 4
+        assert len(messages[1]) == 5
+        hint = messages[1][2]
+        assert isinstance(hint, dict)
+        assert hint["mode"] == "streaming_terminal_prefix"
+        assert hint["tokens"] == 512
+        assert hint["terminal_hash"] == messages[0][0][-1]
+
+    @pytest.mark.parametrize("terminal_hit", [True, False])
+    def test_server_streaming_terminal_fastpath_and_fallback(
+        self,
+        terminal_hit: bool,
+    ) -> None:
+        """The server uses exact manifest lookup and falls back on a miss."""
+
+        class FakeTransport:
+            def __init__(self) -> None:
+                self.requests = [
+                    (
+                        b"identity",
+                        [
+                            [11, 22, 33],
+                            [256, 256, 256],
+                            {
+                                "mode": "streaming_terminal_prefix",
+                                "terminal_hash": 22,
+                                "tokens": 512,
+                            },
+                            "request",
+                            "",
+                        ],
+                    )
+                ]
+                self.response: Optional[bytes] = None
+                self.response_ready = threading.Event()
+
+            def recv_request(self):
+                if self.requests:
+                    return self.requests.pop(0)
+                time.sleep(0.001)
+                return None
+
+            def send_response(self, _identity: bytes, response: bytes) -> None:
+                self.response = response
+                self.response_ready.set()
+
+            def close(self) -> None:
+                return None
+
+        class FakeEngine:
+            def __init__(self) -> None:
+                self.config = SimpleNamespace(enable_blending=False, chunk_size=256)
+                self.calls: list[tuple[list[int], list[int]]] = []
+                self.terminal_calls: list[tuple[int, int, str]] = []
+
+            def lookup_streaming_terminal(
+                self,
+                *,
+                terminal_hash: int,
+                token_count: int,
+                lookup_id: str,
+                **_kwargs,
+            ) -> int:
+                self.terminal_calls.append((terminal_hash, token_count, lookup_id))
+                return token_count if terminal_hit else 0
+
+            def lookup(self, *, hashes, offsets, **_kwargs) -> int:
+                self.calls.append((hashes, offsets))
+                return 512
+
+        transport = FakeTransport()
+        engine = FakeEngine()
+        server = LMCacheLookupServer(engine, SimpleNamespace(), transport)
+        try:
+            assert transport.response_ready.wait(1.0)
+        finally:
+            server.close()
+
+        assert int.from_bytes(transport.response, "big") == 512
+        assert engine.terminal_calls == [(22, 512, "request")]
+        if terminal_hit:
+            assert engine.calls == []
+        else:
+            assert engine.calls == [([11, 22, 33], [256, 256, 256])]
 
     def test_basic_lookup_communication(self, lmcache_engine):
         """Test basic lookup communication between client and server."""

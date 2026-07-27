@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from types import MethodType
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import gc
+import hashlib
 import inspect
 import math
 import os
@@ -359,6 +360,11 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
 
 
+def _ttft_stage_profile_enabled() -> bool:
+    """Return whether request preparation timing diagnostics are enabled."""
+    return _env_flag("LMCACHE_TTFT_STAGE_PROFILE")
+
+
 def _normalize_block_ids_by_group(
     block_ids: Optional[Union[tuple[list[int], ...], list[int], list[list[int]]]],
 ) -> tuple[list[int], ...]:
@@ -496,7 +502,7 @@ def _csa_prefetch_lookahead_policy() -> CSAPrefetchLookaheadPolicy:
     """Return the per-target policy, defaulting to deep-only L2 prefetch."""
     value = os.environ.get(
         "LMCACHE_CSA_PREFETCH_LOOKAHEAD_BY_LAYER",
-        "profile80",
+        "profile80_hybrid",
     )
     return CSAPrefetchLookaheadPolicy(value)
 
@@ -1807,9 +1813,10 @@ def _attach_indexer_prefetch(tutti_loader: Optional[Any] = None) -> None:
         store_dir,
     )
     logger.info(
-        "IndexerSSDManager: canonical L2 policy=%s two_layer_targets=%s "
-        "demand_only_targets=%s",
+        "IndexerSSDManager: canonical policy=%s one_layer_targets=%s "
+        "two_layer_targets=%s demand_only_targets=%s",
         lookahead_policy.specification,
+        sorted(lookahead_policy.one_layer_targets(csa_layer_ids)),
         sorted(lookahead_policy.two_layer_targets(csa_layer_ids)),
         sorted(lookahead_policy.disabled_targets(csa_layer_ids)),
     )
@@ -2420,6 +2427,7 @@ class ReqMeta:
             the request metadata if we need to perform load/save
             operations, None otherwise.
         """
+        profile_start = time.perf_counter()
         input_token_ids = tracker.token_ids
         input_token_len = len(input_token_ids)
 
@@ -2501,6 +2509,7 @@ class ReqMeta:
                 block_size,
             )
 
+        slot_mapping_start = time.perf_counter()
         block_ids = torch.tensor(tracker.allocated_block_ids, dtype=torch.long)
         block_offsets = torch.arange(0, block_size, dtype=torch.long)
         slot_mapping = (
@@ -2510,6 +2519,21 @@ class ReqMeta:
 
         slot_mapping = slot_mapping.flatten()[: len(token_ids)]
         assert slot_mapping.dtype == torch.long  # TODO: this could be removed
+        slot_mapping_ms = (time.perf_counter() - slot_mapping_start) * 1000.0
+
+        if _ttft_stage_profile_enabled() and load_spec is not None:
+            logger.info(
+                "LMCACHE_TTFT_PREP stage=req_meta_built req_id=%s "
+                "tokens=%d slot_bytes=%d group_blocks=%d "
+                "slot_mapping_ms=%.3f total_ms=%.3f wall_ns=%d",
+                tracker.req_id,
+                len(token_ids),
+                int(slot_mapping.numel() * slot_mapping.element_size()),
+                sum(len(group) for group in tracker.allocated_block_ids_by_group),
+                slot_mapping_ms,
+                (time.perf_counter() - profile_start) * 1000.0,
+                time.time_ns(),
+            )
 
         # For load operation: log if the request is scheduled to load
         if load_spec is not None and load_spec.can_load:
@@ -2958,6 +2982,8 @@ class LMCacheConnectorV1Impl:
             raise
 
     def _start_load_kv_impl(self, forward_context: "ForwardContext", **kwargs) -> None:
+        start_load_profile = _ttft_stage_profile_enabled()
+        start_load_begin = time.perf_counter()
         self.current_layer = 0
 
         if len(self.kv_caches) == 0:
@@ -2970,6 +2996,14 @@ class LMCacheConnectorV1Impl:
         metadata = self._parent._get_connector_metadata()
         if not isinstance(metadata, LMCacheConnectorMetadata):
             raise ValueError(f"Expected LMCacheConnectorMetadata, got {type(metadata)}")
+        if start_load_profile:
+            logger.info(
+                "LMCACHE_TTFT_PREP stage=worker_start_load requests=%d "
+                "metadata_get_ms=%.3f wall_ns=%d",
+                len(metadata.requests),
+                (time.perf_counter() - start_load_begin) * 1000.0,
+                time.time_ns(),
+            )
 
         if len(self.kv_caches) == 0:
             raise ValueError("start_load_kv: kv_caches still empty after init attempt")
@@ -3034,6 +3068,7 @@ class LMCacheConnectorV1Impl:
             if request.load_spec is None or not request.load_spec.can_load:
                 continue
 
+            request_profile_start = time.perf_counter()
             tokens = request.token_ids
             streaming_retrieve = _env_flag("LMCACHE_INDEXER_ENABLE_PREFETCH")
             # Preserve the V1 OFF call path exactly: upload slot IDs before
@@ -3120,6 +3155,17 @@ class LMCacheConnectorV1Impl:
                         request_configs=request.request_configs,
                         req_id=request.req_id,
                         **hma_kwargs,
+                    )
+
+                if start_load_profile:
+                    logger.info(
+                        "LMCACHE_TTFT_PREP stage=worker_request_ready req_id=%s "
+                        "tokens=%d slot_bytes=%d elapsed_ms=%.3f wall_ns=%d",
+                        request.req_id,
+                        len(tokens),
+                        int(slot_mapping.numel() * slot_mapping.element_size()),
+                        (time.perf_counter() - request_profile_start) * 1000.0,
+                        time.time_ns(),
                     )
 
                 # Check the result
@@ -3700,6 +3746,7 @@ class LMCacheConnectorV1Impl:
             the number of tokens that can be loaded from the
             external KV cache beyond what is already computed.
         """
+        profile_start = time.perf_counter()
         # Ignore DP attention mock requests
         if request.request_id.startswith("mock_req"):
             return 0
@@ -3757,10 +3804,39 @@ class LMCacheConnectorV1Impl:
             if self.skip_last_n_tokens > 0:
                 token_ids = token_ids[: -self.skip_last_n_tokens]
 
+            if _env_flag("LMCACHE_LOOKUP_TOKEN_DIAGNOSTICS"):
+                prefix_ids = [int(token_id) for token_id in token_ids[:256]]
+                prefix_digest = hashlib.sha256(
+                    ",".join(str(token_id) for token_id in prefix_ids).encode()
+                ).hexdigest()[:16]
+                logger.info(
+                    "LMCache lookup token diagnostic req=%s tokens=%d "
+                    "container=%s token_type=%s prefix256_sha256=%s "
+                    "prefix256_builtin_hash=%s first8=%s request_configs=%s",
+                    req_id,
+                    len(token_ids),
+                    type(token_ids).__name__,
+                    type(token_ids[0]).__name__ if token_ids else "none",
+                    prefix_digest,
+                    hash(tuple(token_ids[:256])),
+                    prefix_ids[:8],
+                    request_configs,
+                )
+
             num_external_hit_tokens = self.lookup_client.lookup(
                 token_ids,
                 lookup_id=req_id,
                 request_configs=request_configs,
+            )
+
+        if _ttft_stage_profile_enabled():
+            logger.info(
+                "LMCACHE_TTFT_PREP stage=lookup_complete req_id=%s hit_tokens=%s "
+                "elapsed_ms=%.3f wall_ns=%d",
+                req_id,
+                num_external_hit_tokens,
+                (time.perf_counter() - profile_start) * 1000.0,
+                time.time_ns(),
             )
 
         if num_external_hit_tokens is None:
@@ -3926,6 +4002,7 @@ class LMCacheConnectorV1Impl:
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
 
+        profile_start = time.perf_counter()
         force_skip_save = self.kv_role == "kv_consumer" or self.force_skip_save
 
         meta = LMCacheConnectorMetadata()
@@ -4150,6 +4227,27 @@ class LMCacheConnectorV1Impl:
             if req_meta is not None:
                 meta.add_request(req_meta)
 
+        if _ttft_stage_profile_enabled():
+            logger.info(
+                "LMCACHE_TTFT_PREP stage=connector_meta_complete requests=%d "
+                "tokens=%d slot_bytes=%d group_blocks=%d elapsed_ms=%.3f "
+                "wall_ns=%d",
+                len(meta.requests),
+                sum(len(request.token_ids) for request in meta.requests),
+                sum(
+                    int(
+                        request.slot_mapping.numel()
+                        * request.slot_mapping.element_size()
+                    )
+                    for request in meta.requests
+                ),
+                sum(
+                    sum(len(group) for group in request.block_ids_by_group)
+                    for request in meta.requests
+                ),
+                (time.perf_counter() - profile_start) * 1000.0,
+                time.time_ns(),
+            )
         return meta
 
     @_lmcache_nvtx_annotate

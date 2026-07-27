@@ -564,6 +564,7 @@ class TestKVObjectStoreLocalDiskBackend:
             backend.async_save_bytes_to_disk(key, memory_obj)
             backend.kv_object_tutti_raw_enabled = True
             assert not backend.contains(key)
+            assert not backend.contains_streaming_terminal(key, 256)
 
             assert (
                 backend.get_kv_object_records(
@@ -609,6 +610,7 @@ class TestKVObjectStoreLocalDiskBackend:
                     second_key,
                     [first, second],
                     prefix_keys=[first_key, second_key],
+                    prefix_token_count=512,
                 )
                 == 2
             )
@@ -619,6 +621,7 @@ class TestKVObjectStoreLocalDiskBackend:
                     second_key,
                     [first, second],
                     prefix_keys=[first_key, second_key],
+                    prefix_token_count=512,
                 )
                 == 2
             )
@@ -628,6 +631,10 @@ class TestKVObjectStoreLocalDiskBackend:
 
             assert backend.contains(first_key)
             assert backend.contains(second_key)
+            assert backend.contains_streaming_terminal(first_key, 256)
+            assert not backend.contains_streaming_terminal(first_key, 512)
+            assert backend.contains_streaming_terminal(second_key, 512, pin=True)
+            assert backend.unpin(second_key)
             first_csa = backend.get_csa_layer_major_records(first_key, [0])[0]
             second_csa = backend.get_csa_layer_major_records(second_key, [0])[0]
             assert first_csa is not None
@@ -639,6 +646,7 @@ class TestKVObjectStoreLocalDiskBackend:
             ):
                 assert not backend.contains(first_key)
                 assert not backend.contains(second_key)
+                assert not backend.contains_streaming_terminal(second_key, 512)
 
         backend.local_cpu_backend.memory_allocator.close()
 

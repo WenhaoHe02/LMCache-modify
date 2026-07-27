@@ -34,6 +34,7 @@ class CsaNvtxEvent(str, Enum):
 
     HCA_LAYER = "hca_layer"
     HCA_ATTENTION = "hca_attention"
+    PROXY = "proxy"
     L2_PROXY = "l2_proxy"
     IO_IN_FLIGHT = "io_in_flight"
     IO_SUBMIT = "io_submit"
@@ -72,6 +73,7 @@ class _PythonNvtxBackend:
 _EVENT_COLORS = {
     CsaNvtxEvent.HCA_LAYER: "blue",
     CsaNvtxEvent.HCA_ATTENTION: "cyan",
+    CsaNvtxEvent.PROXY: "orange",
     CsaNvtxEvent.L2_PROXY: "orange",
     CsaNvtxEvent.IO_IN_FLIGHT: "purple",
     CsaNvtxEvent.IO_SUBMIT: "purple",

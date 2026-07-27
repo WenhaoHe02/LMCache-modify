@@ -3539,9 +3539,10 @@ class LMCacheEngine:
                         layer_major=True,
                     )
                 )
-        if _env_flag("LMCACHE_TUTTI_PROFILE") or int(
-            getattr(getattr(self, "metadata", None), "worker_id", 0)
-        ) == 0:
+        if (
+            _env_flag("LMCACHE_TUTTI_PROFILE")
+            or int(getattr(getattr(self, "metadata", None), "worker_id", 0)) == 0
+        ):
             logger.info(
                 "DSv4 compact native indexer read plan layers=%d segments=%d "
                 "blocks=%d bytes_per_layer=%d",
@@ -3874,13 +3875,17 @@ class LMCacheEngine:
                                         )
                                     )
                             if valid_segments:
-                                if _env_flag("LMCACHE_TUTTI_PROFILE") or int(
-                                    getattr(
-                                        getattr(self, "metadata", None),
-                                        "worker_id",
-                                        0,
+                                if (
+                                    _env_flag("LMCACHE_TUTTI_PROFILE")
+                                    or int(
+                                        getattr(
+                                            getattr(self, "metadata", None),
+                                            "worker_id",
+                                            0,
+                                        )
                                     )
-                                ) == 0:
+                                    == 0
+                                ):
                                     logger.info(
                                         "DSv4 CSA segmented layer-major read plan "
                                         "layers=%d segments=%d blocks=%d",
@@ -4350,13 +4355,17 @@ class LMCacheEngine:
                                     )
                                 )
                         if valid_segments:
-                            if _env_flag("LMCACHE_TUTTI_PROFILE") or int(
-                                getattr(
-                                    getattr(self, "metadata", None),
-                                    "worker_id",
-                                    0,
+                            if (
+                                _env_flag("LMCACHE_TUTTI_PROFILE")
+                                or int(
+                                    getattr(
+                                        getattr(self, "metadata", None),
+                                        "worker_id",
+                                        0,
+                                    )
                                 )
-                            ) == 0:
+                                == 0
+                            ):
                                 logger.info(
                                     "DSv4 HCA segmented layer-major read plan "
                                     "layers=%d segments=%d entries=%d",
@@ -5551,21 +5560,14 @@ class LMCacheEngine:
             ):
                 assert isinstance(key, CacheEngineKey)
                 expanded_blocks.append((key, start, end))
-            if (
-                len(expanded_blocks) > 1
-                and all(
-                    key in disk_backend.dict
-                    for key, _start, _end in expanded_blocks
-                )
+            if len(expanded_blocks) > 1 and all(
+                key in disk_backend.dict for key, _start, _end in expanded_blocks
             ):
                 blocks = expanded_blocks
                 csa_ready, hca_ready, indexer_ready = (
                     self._register_csa_attention_kv_chunks(
                         blocks,
-                        [
-                            disk_backend.dict.get(key)
-                            for key, _start, _end in blocks
-                        ],
+                        [disk_backend.dict.get(key) for key, _start, _end in blocks],
                         len(tokens),
                         req_id,
                         slot_mapping=kwargs.get("slot_mapping"),
@@ -5574,9 +5576,7 @@ class LMCacheEngine:
                 if (
                     csa_ready
                     and indexer_ready
-                    and (
-                        not _env_flag("LMCACHE_DSV4_HCA_WALKER") or hca_ready
-                    )
+                    and (not _env_flag("LMCACHE_DSV4_HCA_WALKER") or hca_ready)
                 ):
                     use_terminal_key = False
                     logger.info(
@@ -5600,9 +5600,10 @@ class LMCacheEngine:
         # has already rejected incomplete coverage, so one slice is exactly
         # equivalent to 1,875 per-chunk assignments for a 480K hit.
         ret_mask[blocks[0][1] : blocks[-1][2]] = True
-        if _env_flag("LMCACHE_TUTTI_PROFILE") or int(
-            getattr(getattr(self, "metadata", None), "worker_id", 0)
-        ) == 0:
+        if (
+            _env_flag("LMCACHE_TUTTI_PROFILE")
+            or int(getattr(getattr(self, "metadata", None), "worker_id", 0)) == 0
+        ):
             logger.info(
                 "DSv4 streaming-only hit: skipped generic LMCacheEngine.retrieve "
                 "request=%s blocks=%d tokens=%d",
@@ -5972,6 +5973,80 @@ class LMCacheEngine:
         yield ret_mask
 
     @_lmcache_nvtx_annotate
+    def lookup_streaming_terminal(
+        self,
+        terminal_hash: int,
+        token_count: int,
+        lookup_id: Optional[str] = None,
+        pin: bool = False,
+        request_configs: Optional[dict] = None,
+    ) -> int:
+        """Look up one exact atomically published streaming generation.
+
+        Args:
+            terminal_hash: Content hash of the final cached chunk.
+            token_count: Exact logical-token coverage required from the
+                generation.
+            lookup_id: Request identifier used to own a successful pin.
+            pin: Whether to pin the terminal key until ``lookup_unpin``.
+            request_configs: Optional request-specific key configuration.
+
+        Returns:
+            ``token_count`` on an exact LocalDiskBackend generation hit, or
+            zero when exact coverage cannot be proven.
+
+        Notes:
+            This method does not reinterpret the terminal key as a synthetic
+            ``[0, token_count)`` ordinary chunk. The manifest itself carries
+            coverage, so short deferred-admission sidecars fail closed.
+        """
+        if (
+            token_count <= 0
+            or token_count % int(self.config.chunk_size) != 0
+            or not self.is_healthy()
+            or not self.dsv4_optimized_kv
+            or not _env_flag("LMCACHE_INDEXER_ENABLE_PREFETCH")
+        ):
+            return 0
+        if pin and lookup_id is None:
+            raise ValueError("lookup_id is required when pin is True")
+        assert self.storage_manager is not None
+        if (
+            self.retrieve_locations is not None
+            and "LocalDiskBackend" not in self.retrieve_locations
+        ):
+            return 0
+
+        lookup_stats = self.stats_monitor.on_lookup_request(token_count)
+        result = 0
+        try:
+            key = CacheEngineKey(
+                model_name=self.metadata.model_name,
+                world_size=int(self.metadata.world_size),
+                worker_id=int(self.metadata.worker_id),
+                chunk_hash=int(terminal_hash),
+                dtype=self.metadata.kv_dtype,
+                request_configs=request_configs,
+            )
+            location = self.storage_manager.contains_streaming_terminal(
+                key,
+                token_count,
+                search_range=["LocalDiskBackend"],
+                pin=pin,
+            )
+            if location is None:
+                return 0
+            if pin:
+                assert lookup_id is not None
+                self.lookup_pins[lookup_id] = {location: [key]}
+            result = token_count
+            return result
+        finally:
+            self.stats_monitor.on_lookup_finished(lookup_stats, result)
+            if pin:
+                self.storage_manager.touch_cache()
+
+    @_lmcache_nvtx_annotate
     def lookup(
         self,
         tokens: Optional[Union[torch.Tensor, List[int]]] = None,
@@ -6073,6 +6148,19 @@ class LMCacheEngine:
                 hit_chunks, block_mapping = self.storage_manager.batched_contains(
                     keys, search_range, pin
                 )
+                if _env_flag("LMCACHE_DISK_CONTAINS_DIAGNOSTICS"):
+                    logger.info(
+                        "LMCache lookup prefix diagnostic stage=before_filter "
+                        "hit_chunks=%d total_chunks=%d first_key=%s miss_key=%s",
+                        hit_chunks,
+                        len(keys),
+                        keys[0].to_string() if keys else "none",
+                        (
+                            keys[hit_chunks].to_string()
+                            if hit_chunks < len(keys)
+                            else "none"
+                        ),
+                    )
                 hit_chunks = self._filter_tutti_raw_lookup_prefix(
                     chunk_info_list,
                     hit_chunks,
@@ -6082,6 +6170,13 @@ class LMCacheEngine:
                     if tokens is not None
                     else sum(offsets or []),
                 )
+                if _env_flag("LMCACHE_DISK_CONTAINS_DIAGNOSTICS"):
+                    logger.info(
+                        "LMCache lookup prefix diagnostic stage=after_filter "
+                        "hit_chunks=%d total_chunks=%d",
+                        hit_chunks,
+                        len(keys),
+                    )
                 if pin and block_mapping:
                     assert lookup_id is not None, (
                         "lookup_id is required when pin is True"
@@ -6509,6 +6604,7 @@ class LMCacheEngine:
                         keys[-1],
                         memory_objs,
                         prefix_keys=keys,
+                        prefix_token_count=token_count,
                     )
                 )
                 logger.info(
@@ -6564,8 +6660,7 @@ class LMCacheEngine:
             return False
         if int(getattr(self.metadata, "worker_id", 0)) == 0:
             logger.info(
-                "DSv4 deferred hit admission queued request=%s chunks=%d "
-                "tokens=%d",
+                "DSv4 deferred hit admission queued request=%s chunks=%d tokens=%d",
                 req_id,
                 len(memory_objs),
                 token_count,

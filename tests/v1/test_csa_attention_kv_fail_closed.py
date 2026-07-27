@@ -9,12 +9,14 @@ import pytest
 import torch
 
 # First Party
+import lmcache.v1.csa_attention_kv_prefetch_manager as csa_manager
 from lmcache.utils import DiskCacheMetadata
 from lmcache.v1.csa_attention_kv_prefetch_manager import (
     CSAAttentionKVChunkLoc,
     CSAAttentionKVPrefetchManager,
     build_shared_raw_lba_cache,
 )
+from lmcache.v1.csa_pipeline_nvtx import csa_pipeline_nvtx
 
 
 def _init_active_request_state(
@@ -286,6 +288,198 @@ def test_multi_generation_layer_major_plan_compiles_indexed_tables() -> None:
     assert state.indexed_dst_rows_table.tolist() == [3, 2, 1, 0]
 
 
+def test_single_layer_major_plan_stays_on_coalesced_path() -> None:
+    """One layer-major object retains the contiguous-range I/O plan."""
+
+    class _Loader:
+        io_stream = None
+
+        def ensure_lba_cache(self, _records: dict[str, list[object]]) -> None:
+            return
+
+    manager = CSAAttentionKVPrefetchManager(
+        tutti_loader=_Loader(),  # type: ignore[arg-type]
+        csa_layer_ids=[2],
+        compressed_block_size=1,
+        token_bytes=1024,
+    )
+    manager.register_layer(2, torch.empty((4, 1, 1024), dtype=torch.uint8))
+    disk_meta = DiskCacheMetadata(path="tutti://rank0-full", size=4096)
+    chunks = {
+        2: [
+            CSAAttentionKVChunkLoc(
+                first_compressed_block=0,
+                n_compressed_blocks=4,
+                key=SimpleNamespace(),  # type: ignore[arg-type]
+                disk_meta=disk_meta,
+                layer_byte_offset=0,
+                bytes_per_block=1024,
+                raw_extents=((0, 100, 8),),
+                physical_block_ids=(3, 2, 1, 0),
+                layer_major=True,
+            )
+        ]
+    }
+
+    manager.register_request_chunks("request-one-layer-object", chunks)
+
+    state = manager._layers[2]
+    assert state.indexed_slba_table is None
+    assert state.indexed_dst_rows_table is None
+    assert state.layer_major_dst_rows_table.tolist() == [3, 2, 1, 0]
+
+
+def test_single_layer_major_plan_tracks_new_destination_rows() -> None:
+    """The coalesced path follows every request's destination allocation."""
+
+    class _Loader:
+        io_stream = None
+
+        def ensure_lba_cache(self, _records: dict[str, list[object]]) -> None:
+            return
+
+    manager = CSAAttentionKVPrefetchManager(
+        tutti_loader=_Loader(),  # type: ignore[arg-type]
+        csa_layer_ids=[2],
+        compressed_block_size=1,
+        token_bytes=1024,
+    )
+    manager.register_layer(2, torch.empty((2, 1, 1024), dtype=torch.uint8))
+    disk_meta = DiskCacheMetadata(path="tutti://rank0-full", size=2048)
+
+    def _chunks(rows: tuple[int, int]) -> dict[int, list[CSAAttentionKVChunkLoc]]:
+        return {
+            2: [
+                CSAAttentionKVChunkLoc(
+                    first_compressed_block=0,
+                    n_compressed_blocks=2,
+                    key=SimpleNamespace(),  # type: ignore[arg-type]
+                    disk_meta=disk_meta,
+                    layer_byte_offset=0,
+                    bytes_per_block=1024,
+                    raw_extents=((0, 100, 4),),
+                    physical_block_ids=rows,
+                    layer_major=True,
+                )
+            ]
+        }
+
+    manager.register_request_chunks("request-plan-first", _chunks((1, 0)))
+    first_slbas = manager._layers[2].indexed_slba_table
+    first_rows = manager._layers[2].indexed_dst_rows_table
+    manager.register_request_chunks("request-plan-second", _chunks((0, 1)))
+
+    assert first_slbas is None
+    assert first_rows is None
+    assert manager._layers[2].indexed_slba_table is None
+    assert manager._layers[2].indexed_dst_rows_table is None
+    assert manager._layers[2].layer_major_dst_rows_table.tolist() == [0, 1]
+
+
+def test_single_layer_major_plan_crossing_extent_uses_general_path() -> None:
+    """A block crossing an extent cannot use the one-command indexed op."""
+
+    class _Loader:
+        io_stream = None
+
+        def ensure_lba_cache(self, _records: dict[str, list[object]]) -> None:
+            return
+
+    manager = CSAAttentionKVPrefetchManager(
+        tutti_loader=_Loader(),  # type: ignore[arg-type]
+        csa_layer_ids=[2],
+        compressed_block_size=1,
+        token_bytes=1024,
+    )
+    manager.register_layer(2, torch.empty((2, 1, 1024), dtype=torch.uint8))
+    disk_meta = DiskCacheMetadata(path="tutti://rank0-full", size=2048)
+    chunks = {
+        2: [
+            CSAAttentionKVChunkLoc(
+                first_compressed_block=0,
+                n_compressed_blocks=2,
+                key=SimpleNamespace(),  # type: ignore[arg-type]
+                disk_meta=disk_meta,
+                layer_byte_offset=0,
+                bytes_per_block=1024,
+                raw_extents=((0, 100, 1), (512, 200, 3)),
+                physical_block_ids=(0, 1),
+                layer_major=True,
+            )
+        ]
+    }
+
+    manager.register_request_chunks("request-crossing-extent", chunks)
+
+    state = manager._layers[2]
+    assert state.indexed_slba_table is None
+    assert state.indexed_dst_rows_table is None
+    assert state.layer_major_dst_rows_table is not None
+
+
+def test_single_layer_major_sparse_read_prefers_coalesced_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single-object plan preserves coalescing for every I/O priority."""
+    manager = object.__new__(CSAAttentionKVPrefetchManager)
+    manager._tutti_loader = SimpleNamespace(load_indexed_chunks_to_hbm=object())
+    state = SimpleNamespace(
+        chunks=[SimpleNamespace(layer_major=True, end_compressed_block=4)],
+        layer_major_dst_rows_table=torch.arange(4, dtype=torch.int64),
+        indexed_slba_table=torch.arange(4, dtype=torch.int64),
+        indexed_dst_rows_table=torch.arange(4, dtype=torch.int64),
+    )
+    selected = torch.tensor([1, 3], dtype=torch.int64)
+    calls: list[str] = []
+
+    def _indexed(
+        _self: CSAAttentionKVPrefetchManager,
+        _state: object,
+        block_ids: object,
+        *,
+        io_priority: str,
+    ) -> tuple[None, list[object], torch.Tensor]:
+        assert block_ids is selected
+        calls.append(f"indexed:{io_priority}")
+        return None, [], selected
+
+    def _layer_major(
+        _self: CSAAttentionKVPrefetchManager,
+        _state: object,
+        _block_ids: object,
+        *,
+        io_priority: str,
+    ) -> tuple[None, list[object], torch.Tensor]:
+        calls.append(f"layer-major:{io_priority}")
+        return None, [], selected
+
+    manager._issue_indexed_reads = MethodType(_indexed, manager)
+    manager._issue_layer_major_read = MethodType(_layer_major, manager)
+    monkeypatch.setattr(
+        csa_manager,
+        "_csa_c_ops",
+        SimpleNamespace(tutti_submit_indexed_sgl_read=object()),
+    )
+
+    _event, _objects, completed = manager._issue_reads(
+        state,
+        selected,
+        io_priority="demand",
+    )
+
+    assert calls == ["layer-major:demand"]
+    assert completed is selected
+
+    _event, _objects, completed = manager._issue_reads(
+        state,
+        selected,
+        io_priority="lookahead",
+    )
+
+    assert calls == ["layer-major:demand", "layer-major:lookahead"]
+    assert completed is selected
+
+
 def test_complete_multi_generation_read_uses_full_object_fastpath() -> None:
     """A dense multi-generation restore bypasses per-block range planning."""
     manager = object.__new__(CSAAttentionKVPrefetchManager)
@@ -391,6 +585,41 @@ def test_speculative_partial_completion_marks_only_completed_blocks() -> None:
     state = manager._layers[2]
     assert state.resident_blocks_bitmap.tolist() == [True, False, False, False]
     assert not bool(torch.any(state.pending_reads_bitmap))
+
+
+def test_rejected_prediction_closes_io_range_immediately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A zero-completion prediction cannot masquerade as in-flight I/O."""
+    manager = _minimal_manager_with_partial_issue()
+
+    def _empty_issue(
+        _self: CSAAttentionKVPrefetchManager,
+        _state: object,
+        _ids: object,
+        *,
+        io_priority: str,
+    ) -> tuple[None, list[object], torch.Tensor]:
+        del io_priority
+        return None, [], torch.empty(0, dtype=torch.int64)
+
+    finished_statuses: list[str] = []
+    manager._issue_reads = MethodType(_empty_issue, manager)
+    monkeypatch.setattr(csa_pipeline_nvtx, "start_io", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        csa_pipeline_nvtx,
+        "finish_io",
+        lambda _range, **kwargs: finished_statuses.append(kwargs["status"]),
+    )
+
+    manager.fire_predicted_reads(2, torch.tensor([0, 1]), prefetch_level=2)
+
+    state = manager._layers[2]
+    assert finished_statuses == ["not_submitted"]
+    assert not bool(torch.any(state.resident_blocks_bitmap))
+    assert not bool(torch.any(state.pending_reads_bitmap))
+    assert state.pending_read_count == 0
+    assert state.pending_drains == []
 
 
 def test_background_prediction_updates_inference_bitmaps() -> None:

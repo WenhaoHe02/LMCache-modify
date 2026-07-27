@@ -1034,6 +1034,60 @@ class TestTuttiDirectLoaderLoadChunksToHbm:
         assert demand_done == [[None]]
         assert results == [None]
 
+    def test_required_speculative_read_waits_for_demand_reader(self) -> None:
+        """A required lookahead read is queued instead of silently dropped."""
+        loader, _ctrl = _make_loader(n_slots=2, q_depth=2)
+        demand_started = threading.Event()
+        release_demand = threading.Event()
+        speculative_submitted = threading.Event()
+        errors: list[BaseException] = []
+
+        def fake_load_locked(*_args: Any, **kwargs: Any) -> list[None]:
+            if kwargs["io_priority"] == "demand":
+                demand_started.set()
+                assert release_demand.wait(timeout=5.0)
+            else:
+                speculative_submitted.set()
+            return [None]
+
+        def run_load(io_priority: str) -> None:
+            try:
+                loader.load_chunks_to_hbm(
+                    [_fake_key(0)],
+                    [_disk_meta_for(512 * 4)],
+                    lock_per_batch=io_priority == "speculative",
+                    on_raw_batch_loaded=lambda *_args: None,
+                    io_priority=io_priority,
+                    wait_for_active_io=io_priority == "speculative",
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        with patch.object(
+            loader,
+            "_load_chunks_to_hbm_locked",
+            side_effect=fake_load_locked,
+        ):
+            demand_thread = threading.Thread(target=run_load, args=("demand",))
+            demand_thread.start()
+            assert demand_started.wait(timeout=5.0)
+
+            speculative_thread = threading.Thread(
+                target=run_load,
+                args=("speculative",),
+            )
+            speculative_thread.start()
+            assert not speculative_submitted.wait(timeout=0.05)
+
+            release_demand.set()
+            demand_thread.join(timeout=5.0)
+            speculative_thread.join(timeout=5.0)
+
+        assert not demand_thread.is_alive()
+        assert not speculative_thread.is_alive()
+        assert speculative_submitted.is_set()
+        assert errors == []
+
     def test_speculative_read_yields_to_store_writer(self, monkeypatch) -> None:
         monkeypatch.setenv("LMCACHE_TUTTI_WRITE_SLACK_SEC", "60")
         monkeypatch.setenv("LMCACHE_TUTTI_WRITE_MAX_DELAY_SEC", "60")

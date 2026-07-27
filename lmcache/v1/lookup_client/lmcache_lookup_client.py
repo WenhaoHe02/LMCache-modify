@@ -2,7 +2,9 @@
 # Standard
 from typing import Optional, Union
 import json
+import os
 import threading
+import time
 
 # Third Party
 import torch
@@ -19,6 +21,11 @@ from lmcache.v1.rpc.transport import (
 )
 
 logger = init_logger(__name__)
+
+
+def _env_flag(name: str) -> bool:
+    """Return whether an environment variable contains a truthy value."""
+    return os.getenv(name, "").lower() in {"1", "true", "yes", "on"}
 
 
 class LMCacheLookupClient(LookupClientInterface):
@@ -61,6 +68,9 @@ class LMCacheLookupClient(LookupClientInterface):
         # request must have the same result.
         self.reqs_status: dict[str, int] = {}
         self.reqs_terminal_hash: dict[str, int] = {}
+        self._recent_prefix_lock = threading.Lock()
+        self._recent_prefix_token_count = 0
+        self._recent_prefix_hashes: list[int] = []
 
         # First Party
         from lmcache.v1.token_database import (
@@ -90,6 +100,7 @@ class LMCacheLookupClient(LookupClientInterface):
         lookup_id: str,
         request_configs: Optional[dict] = None,
     ) -> Optional[int]:
+        lookup_start = time.perf_counter()
         request_configs_str = ""
         if request_configs is not None and len(request_configs) != 0:
             request_configs_str = json.dumps(request_configs)
@@ -114,12 +125,37 @@ class LMCacheLookupClient(LookupClientInterface):
             if not hashes:
                 return 0
 
-            msg_buf = [
+            hash_done = time.perf_counter()
+            terminal_hint = self._streaming_terminal_hint(
+                token_ids,
                 hashes,
                 offsets,
-                lookup_id,
-                request_configs_str,
-            ]
+            )
+
+            if os.getenv("LMCACHE_LOOKUP_TOKEN_DIAGNOSTICS", "0").lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }:
+                first_token = token_ids[0] if len(token_ids) else None
+                logger.info(
+                    "LMCache lookup hash diagnostic req=%s token_container=%s "
+                    "token_type=%s chunk_size=%d first_hash=%s last_hash=%s "
+                    "chunks=%d",
+                    lookup_id,
+                    type(token_ids).__name__,
+                    type(first_token).__name__ if first_token is not None else "none",
+                    self.config.chunk_size,
+                    hashes[0],
+                    hashes[-1],
+                    len(hashes),
+                )
+
+            msg_buf = [hashes, offsets]
+            if terminal_hint is not None:
+                msg_buf.append(terminal_hint)
+            msg_buf.extend([lookup_id, request_configs_str])
         else:
             # Convert token_ids to a plain list for msgpack serialization
             # (vLLM 0.18+ may pass ConstantList which msgspec can't encode)
@@ -135,7 +171,9 @@ class LMCacheLookupClient(LookupClientInterface):
                 request_configs_str,
             ]
 
+        rpc_start = time.perf_counter()
         responses = self.transport.send_and_recv_all(msg_buf)
+        rpc_done = time.perf_counter()
 
         # Transport returns empty list on failure
         if not responses:
@@ -157,6 +195,7 @@ class LMCacheLookupClient(LookupClientInterface):
         self.reqs_status[lookup_id] = num_hit_toks
         self.reqs_terminal_hash.pop(lookup_id, None)
         if not self.enable_blending:
+            self._update_recent_prefix(hashes, offsets, num_hit_toks)
             hit_chunks = num_hit_toks // self.config.chunk_size
             if (
                 hit_chunks > 0
@@ -164,6 +203,22 @@ class LMCacheLookupClient(LookupClientInterface):
                 and hit_chunks <= len(hashes)
             ):
                 self.reqs_terminal_hash[lookup_id] = int(hashes[hit_chunks - 1])
+
+        if _env_flag("LMCACHE_TTFT_STAGE_PROFILE"):
+            logger.info(
+                "LMCACHE_TTFT_LOOKUP req=%s hashes=%d terminal_hint=%d "
+                "hash_ms=%.3f rpc_ms=%.3f total_ms=%.3f",
+                lookup_id,
+                len(hashes) if not self.enable_blending else 0,
+                int(terminal_hint is not None) if not self.enable_blending else 0,
+                (
+                    (hash_done - lookup_start) * 1000.0
+                    if not self.enable_blending
+                    else 0.0
+                ),
+                (rpc_done - rpc_start) * 1000.0,
+                (time.perf_counter() - lookup_start) * 1000.0,
+            )
 
         return num_hit_toks
 
@@ -197,6 +252,62 @@ class LMCacheLookupClient(LookupClientInterface):
 
     def close(self):
         self.transport.close()
+
+    def _streaming_terminal_hint(
+        self,
+        token_ids: Union[torch.Tensor, list[int]],
+        hashes: list[int],
+        offsets: list[int],
+    ) -> Optional[dict[str, int | str]]:
+        """Return a verified recent-prefix hint for ON streaming lookup."""
+        if not _env_flag("LMCACHE_INDEXER_ENABLE_PREFETCH"):
+            return None
+        with self._recent_prefix_lock:
+            candidate_tokens = self._recent_prefix_token_count
+            candidate_chunks = len(self._recent_prefix_hashes)
+            if (
+                candidate_tokens == 0
+                or candidate_tokens % self.config.chunk_size != 0
+                or candidate_chunks != candidate_tokens // self.config.chunk_size
+                or candidate_tokens > len(token_ids)
+                or candidate_chunks > len(hashes)
+                or int(hashes[candidate_chunks - 1])
+                != int(self._recent_prefix_hashes[-1])
+            ):
+                return None
+            current_hashes = [int(value) for value in hashes[:candidate_chunks]]
+            if current_hashes != self._recent_prefix_hashes:
+                return None
+            return {
+                "mode": "streaming_terminal_prefix",
+                "terminal_hash": int(self._recent_prefix_hashes[-1]),
+                "tokens": candidate_tokens,
+            }
+
+    def _update_recent_prefix(
+        self,
+        hashes: list[int],
+        offsets: list[int],
+        num_hit_toks: int,
+    ) -> None:
+        """Cache one aligned prefix for the next related service request."""
+        full_chunks = 0
+        for offset in offsets:
+            if int(offset) != self.config.chunk_size:
+                break
+            full_chunks += 1
+        reusable_tokens = full_chunks * self.config.chunk_size
+        aligned_hit_tokens = (
+            num_hit_toks // self.config.chunk_size * self.config.chunk_size
+        )
+        if aligned_hit_tokens > 0:
+            reusable_tokens = min(reusable_tokens, aligned_hit_tokens)
+            full_chunks = reusable_tokens // self.config.chunk_size
+        if reusable_tokens <= 0 or full_chunks <= 0:
+            return
+        with self._recent_prefix_lock:
+            self._recent_prefix_token_count = reusable_tokens
+            self._recent_prefix_hashes = [int(value) for value in hashes[:full_chunks]]
 
 
 class LMCacheLookupServer:
@@ -263,13 +374,124 @@ class LMCacheLookupServer:
                     if not self.enable_blending:
                         hashes = data_frames[0]
                         offsets = data_frames[1]
-                        lookup_result = self.lmcache_engine.lookup(
-                            hashes=hashes,
-                            offsets=offsets,
-                            lookup_id=lookup_id,
-                            pin=True,
-                            request_configs=request_configs,
+                        terminal_hint = (
+                            data_frames[-3]
+                            if len(data_frames) >= 5
+                            and isinstance(data_frames[-3], dict)
+                            else None
                         )
+                        if os.getenv(
+                            "LMCACHE_LOOKUP_TOKEN_DIAGNOSTICS", "0"
+                        ).lower() in {"1", "true", "yes", "on"}:
+                            logger.info(
+                                "LMCache lookup server hash diagnostic req=%s "
+                                "first_hash=%s last_hash=%s chunks=%d",
+                                lookup_id,
+                                hashes[0] if hashes else None,
+                                hashes[-1] if hashes else None,
+                                len(hashes),
+                            )
+                        fast_start = time.perf_counter()
+                        lookup_result: Optional[int] = None
+                        terminal_fast_hit = False
+                        if (
+                            (lookup_result is None or lookup_result == 0)
+                            and terminal_hint is not None
+                            and terminal_hint.get("mode")
+                            == "streaming_terminal_prefix"
+                        ):
+                            candidate_tokens = int(terminal_hint.get("tokens", 0))
+                            candidate_chunks = (
+                                candidate_tokens
+                                // self.lmcache_engine.config.chunk_size
+                            )
+                            candidate_hash = int(
+                                terminal_hint.get("terminal_hash", 0)
+                            )
+                            hint_valid = bool(
+                                candidate_tokens > 0
+                                and candidate_tokens
+                                % self.lmcache_engine.config.chunk_size
+                                == 0
+                                and candidate_chunks <= len(hashes)
+                                and candidate_chunks <= len(offsets)
+                                and int(offsets[candidate_chunks - 1])
+                                == self.lmcache_engine.config.chunk_size
+                                and int(hashes[candidate_chunks - 1])
+                                == candidate_hash
+                            )
+                            if hint_valid:
+                                candidate_result = (
+                                    self.lmcache_engine.lookup_streaming_terminal(
+                                        terminal_hash=candidate_hash,
+                                        token_count=candidate_tokens,
+                                        lookup_id=lookup_id,
+                                        pin=True,
+                                        request_configs=request_configs,
+                                    )
+                                )
+                                if candidate_result == candidate_tokens:
+                                    lookup_result = candidate_result
+                                    terminal_fast_hit = True
+                        if _env_flag("LMCACHE_INDEXER_ENABLE_PREFETCH"):
+                            # Admission publishes one immutable layer-major
+                            # generation per cached prefix.  The current
+                            # request normally appends a short recompute suffix,
+                            # so probe terminal generations from the end toward
+                            # the beginning before falling back to ordinary
+                            # per-chunk lookup.  This makes the *first* hit after
+                            # cold admission discoverable; relying on a previous
+                            # hit hint creates a 0-hit/short-hit fixed point.
+                            full_chunk_indices: list[int] = []
+                            for index, offset in enumerate(offsets):
+                                if (
+                                    int(offset)
+                                    != self.lmcache_engine.config.chunk_size
+                                ):
+                                    break
+                                full_chunk_indices.append(index)
+                            for candidate_index in (
+                                reversed(full_chunk_indices)
+                                if lookup_result is None or lookup_result == 0
+                                else ()
+                            ):
+                                candidate_tokens = (
+                                    candidate_index + 1
+                                ) * self.lmcache_engine.config.chunk_size
+                                candidate_result = (
+                                    self.lmcache_engine.lookup_streaming_terminal(
+                                        terminal_hash=int(hashes[candidate_index]),
+                                        token_count=candidate_tokens,
+                                        lookup_id=lookup_id,
+                                        pin=True,
+                                        request_configs=request_configs,
+                                    )
+                                )
+                                if candidate_result == candidate_tokens:
+                                    lookup_result = candidate_result
+                                    terminal_fast_hit = True
+                                    break
+                        fast_done = time.perf_counter()
+                        if lookup_result is None:
+                            lookup_result = self.lmcache_engine.lookup(
+                                hashes=hashes,
+                                offsets=offsets,
+                                lookup_id=lookup_id,
+                                pin=True,
+                                request_configs=request_configs,
+                            )
+                        if _env_flag("LMCACHE_TTFT_STAGE_PROFILE"):
+                            logger.info(
+                                "LMCACHE_TTFT_LOOKUP_SERVER req=%s hashes=%d "
+                                "terminal_hint=%d terminal_hit=%d fast_ms=%.3f "
+                                "total_ms=%.3f",
+                                lookup_id,
+                                len(hashes),
+                                int(terminal_hint is not None),
+                                int(terminal_fast_hit),
+                                (fast_done - fast_start) * 1000.0,
+                                (time.perf_counter() - fast_start) * 1000.0,
+                            )
                     else:
                         tokens = data_frames[0]
                         lookup_result = self.lmcache_engine.lookup(

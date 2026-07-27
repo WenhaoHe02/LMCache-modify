@@ -299,6 +299,30 @@ class StorageBackendInterface(metaclass=abc.ABCMeta):
             hit_chunks += 1
         return hit_chunks
 
+    def contains_streaming_terminal(
+        self,
+        key: CacheEngineKey,
+        token_count: int,
+        pin: bool = False,
+    ) -> bool:
+        """Check one terminal key for an exact streaming-prefix generation.
+
+        Args:
+            key: Content-addressed key of the terminal cached chunk.
+            token_count: Exact number of tokens the generation must cover.
+            pin: Whether to pin the terminal key on a hit.
+
+        Returns:
+            ``True`` only when this backend supports terminal-generation lookup
+            and has a complete generation covering exactly ``token_count``.
+
+        Notes:
+            The default is deliberately fail-closed. Backends without an
+            atomically published streaming manifest must use normal prefix
+            lookup instead.
+        """
+        return False
+
     def touch_cache(self) -> None:
         """
         Update cache policy with keys that were accessed during a request.

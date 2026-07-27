@@ -1845,6 +1845,7 @@ class TuttiDirectLoader:
         io_priority: str = "demand",
         profile_layer_id: Optional[int] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
+        wait_for_active_io: bool = False,
     ) -> None:
         """Load fixed-size, arbitrarily selected chunks with GPU planning.
 
@@ -1863,12 +1864,13 @@ class TuttiDirectLoader:
                 stride, logical length, and staging tensor. It must consume
                 the referenced bytes or enqueue their consumption on
                 :attr:`io_stream` before returning.
-            io_priority: ``"demand"`` for L1/miss reads or ``"speculative"``
-                for early CP L2 reads. Speculative indexed reads are rejected
+            io_priority: ``"demand"`` for L1/miss reads, ``"lookahead"``
+                for required CP L2 reads, or ``"speculative"`` for droppable
+                background reads. Lookahead reads wait behind active demand
+                work and then use the same reliable submission geometry as a
+                demand read. Droppable speculative indexed reads are rejected
                 before queue acquisition when demand work or a writer is
-                already waiting; once admitted, their queue ownership is
-                bounded by the indexed request (at most two batches for the
-                1,874-block V28 geometry).
+                already waiting.
             profile_layer_id: Optional transformer layer id included in
                 per-layer profiling logs. CUDA phase events are collected
                 only when ``LMCACHE_CSA_ATTENTION_KV_TIMING=1``.
@@ -1877,6 +1879,11 @@ class TuttiDirectLoader:
                 its I/O stream after the caller's current stream for backward
                 compatibility. The staged CSA path records this event directly
                 on the I/O stream and therefore never waits for model compute.
+            wait_for_active_io: For speculative reads, wait behind an already
+                active demand reader or writer instead of rejecting the read.
+                The waiting reader is announced immediately, so a parked
+                background writer cannot overtake it. Demand reads ignore this
+                option.
 
         Raises:
             ValueError: If tensor layout or transfer geometry is invalid.
@@ -1887,7 +1894,7 @@ class TuttiDirectLoader:
                 "lmcache.c_ops.tutti_submit_indexed_sgl_read not found; "
                 "rebuild lmcache with the indexed Tutti CUDA op"
             )
-        if io_priority not in {"demand", "speculative"}:
+        if io_priority not in {"demand", "lookahead", "speculative"}:
             raise ValueError(f"unsupported Tutti I/O priority: {io_priority}")
         if selected_ids.dtype != torch.int64 or not selected_ids.is_cuda:
             raise ValueError("selected_ids must be a CUDA int64 tensor")
@@ -1912,18 +1919,26 @@ class TuttiDirectLoader:
             return
 
         is_demand = io_priority == "demand"
+        is_speculative = io_priority == "speculative"
         with self._reader_gate:
-            if not is_demand and (self._hp_readers > 0 or self._active_writers > 0):
-                raise RuntimeError(
-                    "speculative indexed Tutti read was not admitted because "
-                    "demand I/O or an active writer owns the queue"
-                )
+            if is_speculative and (
+                self._hp_readers > 0 or self._active_writers > 0
+            ):
+                if not wait_for_active_io:
+                    raise RuntimeError(
+                        "speculative indexed Tutti read was not admitted because "
+                        "demand I/O or an active writer owns the queue"
+                    )
             # Every admitted read, including speculative prefetch, prevents a
             # parked background writer from claiming the shared SQ/CQ ring.
             self._readers_waiting += 1
             if is_demand:
                 self._hp_readers += 1
             self._reader_gate.notify_all()
+            while is_speculative and wait_for_active_io and (
+                self._hp_readers > 0 or self._active_writers > 0
+            ):
+                self._reader_gate.wait()
         try:
             profile_enabled = _tutti_profile_enabled()
             lock_wait_start = time.perf_counter() if profile_enabled else 0.0
@@ -1967,6 +1982,7 @@ class TuttiDirectLoader:
         should_continue: Optional[Callable[[], bool]] = None,
         deadline_monotonic: Optional[float] = None,
         throttle_speculative: bool = True,
+        wait_for_active_io: bool = False,
     ) -> list[Optional[MemoryObj]]:
         """Thread-safe wrapper around the GPU-direct NVMe read path.
 
@@ -2003,11 +2019,13 @@ class TuttiDirectLoader:
                 callback runs once immediately after acquiring ``_io_lock``;
                 no other loader operation can replace the table until the
                 call completes.
-            io_priority: ``"demand"`` for foreground retrieval or
-                ``"speculative"`` for predicted reads. When omitted,
-                whole-call loads are demand and per-batch loads are
-                speculative. Speculative batches yield before submission if
-                a demand read or an already-active store writer owns the queue.
+            io_priority: ``"demand"`` for foreground retrieval,
+                ``"lookahead"`` for required bounded prediction, or
+                ``"speculative"`` for droppable background reads. When
+                omitted, whole-call loads are demand and per-batch loads are
+                speculative. Lookahead waits behind demand and then uses the
+                demand batching path. Speculative batches yield before
+                submission if demand or a writer owns the queue.
             max_batch_bytes: Optional byte cap for one NVMe batch.
             max_batch_ios: Optional command cap for one NVMe batch.
             should_continue: Optional cancellation predicate checked between
@@ -2017,6 +2035,10 @@ class TuttiDirectLoader:
             throttle_speculative: Apply the shared speculative token bucket.
                 Set this to ``False`` for a bounded lookahead read that must
                 finish inside a known compute window.
+            wait_for_active_io: For speculative reads, wait behind an already
+                active demand reader or writer instead of dropping the read.
+                The read remains preemptible between batches by newly arrived
+                demand work. Demand reads ignore this option.
         """
         if on_batch_loaded is not None and on_raw_batch_loaded is not None:
             raise ValueError(
@@ -2024,9 +2046,10 @@ class TuttiDirectLoader:
             )
         if io_priority is None:
             io_priority = "speculative" if lock_per_batch else "demand"
-        if io_priority not in {"demand", "speculative"}:
+        if io_priority not in {"demand", "lookahead", "speculative"}:
             raise ValueError(f"unsupported Tutti I/O priority: {io_priority}")
         is_demand = io_priority == "demand"
+        is_speculative = io_priority == "speculative"
         if io_priority == "speculative":
             if max_batch_bytes is None:
                 max_batch_bytes = (
@@ -2052,8 +2075,11 @@ class TuttiDirectLoader:
         with self._reader_gate:
             # Speculation yields only to an operation that is already active,
             # not to a writer merely parked until the request becomes idle.
-            if not is_demand and (self._hp_readers > 0 or self._active_writers > 0):
-                return [None] * len(keys)
+            if is_speculative and (
+                self._hp_readers > 0 or self._active_writers > 0
+            ):
+                if not wait_for_active_io:
+                    return [None] * len(keys)
             self._readers_waiting += 1
             if is_demand:
                 # Synchronous retrieve = high-priority reader.  Bulk prefetch
@@ -2063,6 +2089,21 @@ class TuttiDirectLoader:
                 # exactly the window it is meant to hide in.
                 self._hp_readers += 1
             self._reader_gate.notify_all()
+            while is_speculative and wait_for_active_io and (
+                self._hp_readers > 0 or self._active_writers > 0
+            ):
+                if should_continue is not None and not should_continue():
+                    self._readers_waiting -= 1
+                    self._reader_gate.notify_all()
+                    return [None] * len(keys)
+                if (
+                    deadline_monotonic is not None
+                    and time.perf_counter() >= deadline_monotonic
+                ):
+                    self._readers_waiting -= 1
+                    self._reader_gate.notify_all()
+                    return [None] * len(keys)
+                self._reader_gate.wait(timeout=0.01)
         try:
             if lock_per_batch:
                 return self._load_chunks_to_hbm_locked(
@@ -2081,8 +2122,17 @@ class TuttiDirectLoader:
                     should_continue=should_continue,
                     deadline_monotonic=deadline_monotonic,
                     throttle_speculative=throttle_speculative,
+                    wait_for_active_io=wait_for_active_io,
                 )
+            profile_enabled = _tutti_profile_enabled()
+            lock_wait_start = time.perf_counter() if profile_enabled else 0.0
             with self._io_lock:
+                if profile_enabled:
+                    logger.info(
+                        "TUTTI_PROFILE io_lock_wait priority=%s wait_ms=%.3f",
+                        io_priority,
+                        _elapsed_ms(lock_wait_start),
+                    )
                 if before_batch is not None:
                     before_batch()
                 return self._load_chunks_to_hbm_locked(
@@ -2099,6 +2149,7 @@ class TuttiDirectLoader:
                     should_continue=should_continue,
                     deadline_monotonic=deadline_monotonic,
                     throttle_speculative=throttle_speculative,
+                    wait_for_active_io=wait_for_active_io,
                 )
         finally:
             with self._reader_gate:
@@ -2314,6 +2365,7 @@ class TuttiDirectLoader:
         should_continue: Optional[Callable[[], bool]] = None,
         deadline_monotonic: Optional[float] = None,
         throttle_speculative: bool = True,
+        wait_for_active_io: bool = False,
     ) -> list[Optional[MemoryObj]]:
         """Load KV chunks directly from NVMe into HBM staging.
 
@@ -2393,8 +2445,17 @@ class TuttiDirectLoader:
                 break
             if io_priority == "speculative":
                 with self._reader_gate:
-                    if self._hp_readers > 0 or self._active_writers > 0:
-                        break
+                    while self._hp_readers > 0 or self._active_writers > 0:
+                        if not wait_for_active_io:
+                            return results
+                        if should_continue is not None and not should_continue():
+                            return results
+                        if (
+                            deadline_monotonic is not None
+                            and time.perf_counter() >= deadline_monotonic
+                        ):
+                            return results
+                        self._reader_gate.wait(timeout=0.01)
             pack_start = time.perf_counter()
             batch_end = batch_start
             batch_ios = 0
@@ -2496,7 +2557,10 @@ class TuttiDirectLoader:
                     with self._reader_gate:
                         now = time.perf_counter()
                         if self._hp_readers > 0 or self._active_writers > 0:
-                            return results
+                            if not wait_for_active_io:
+                                return results
+                            self._reader_gate.wait(timeout=0.01)
+                            continue
                         if deadline_monotonic is not None and now >= deadline_monotonic:
                             return results
                         rate = (
