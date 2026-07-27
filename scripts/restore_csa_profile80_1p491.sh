@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-safe_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+safe_root=${LMCACHE_PROTECTED_ROOT:-/home/zbuser02/protected_lmcache_versions/csa_profile80_hybrid_1p491_20260727}
+if [[ ! -d "$safe_root" && -d "$repo_root/protected_versions/csa_profile80_hybrid_1p491_20260727" ]]; then
+  safe_root="$repo_root/protected_versions/csa_profile80_hybrid_1p491_20260727"
+fi
 protected_image="lmcache/csa-prefetch:protected-1p491-20260727"
 runner_src="$safe_root/scripts/run_container_cp8_ab.sh"
 runner_tmp=$(mktemp /tmp/run_container_1p491.XXXXXX.sh)

@@ -1,6 +1,0 @@
-{"event": "prompt_ready", "target": 16000, "reps": 727, "tokenizer_count": 15995, "chars": 93783, "wait_after_cold": 20.0, "wait_after_flush": 60.0}
-{"label": "cold_store_seed", "status": 200, "elapsed_s": 2.053, "usage": {"prompt_tokens": 15995, "total_tokens": 15996, "completion_tokens": 1, "prompt_tokens_details": null}, "body_head": "{\"id\":\"cmpl-b71f9155dc8b8b0f\",\"object\":\"text_completion\",\"created\":1781844021,\"model\":\"deepseek-v4-pro\",\"choices\":[{\"index\":0,\"text\":\" In\",\"logprobs\":null,\"finish_reason\":\"length\","}
-{"event": "sleep_after_cold", "seconds": 20.0}
-{"label": "flush_small_request", "status": 200, "elapsed_s": 0.11, "usage": {"prompt_tokens": 8, "total_tokens": 9, "completion_tokens": 1, "prompt_tokens_details": null}, "body_head": "{\"id\":\"cmpl-806bc20dc50478cd\",\"object\":\"text_completion\",\"created\":1781844043,\"model\":\"deepseek-v4-pro\",\"choices\":[{\"index\":0,\"text\":\"\\n\",\"logprobs\":null,\"finish_reason\":\"length\",\""}
-{"event": "sleep_after_flush", "seconds": 60.0}
-{"label": "hot_after_flush_wait", "status": 500, "elapsed_s": 300.1, "usage": null, "body_head": "{\"error\":{\"message\":\"EngineCore encountered an issue. See stack trace (above) for the root cause.\",\"type\":\"InternalServerError\",\"param\":null,\"code\":500}}"}

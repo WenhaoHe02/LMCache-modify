@@ -1,1 +1,0 @@
-The text consists of a long, repetitive sequence of the sentence "The quick brown fox jumped over the lazy dog near the river bank" followed by the numbers one through ten, which is a common pattern used for testing or generating filler content.

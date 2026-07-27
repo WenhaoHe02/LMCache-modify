@@ -41,8 +41,11 @@ if nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits \
   exit 3
 fi
 
-nsys_prefix="${nsys} profile --trace=cuda,nvtx,osrt --sample=none \
---cpuctxsw=none --capture-range=cudaProfilerApi --capture-range-end=stop \
+nsys_sample="${LMCACHE_NSYS_SAMPLE:-none}"
+nsys_cpuctxsw="${LMCACHE_NSYS_CPUCTXSW:-${nsys_sample}}"
+nsys_prefix="${nsys} profile --trace=cuda,nvtx,osrt \
+--sample=${nsys_sample} --cpuctxsw=${nsys_cpuctxsw} --cuda-event-trace=true \
+--capture-range=cudaProfilerApi --capture-range-end=stop \
 --force-overwrite=true --output=${trace_dir}/${trace_name}"
 
 export LMCACHE_ABLATION_PATCH_DIR="${root}/patches"
@@ -56,23 +59,23 @@ export LMCACHE_ABLATION_TUTTI_N_SLOTS=4
 export LMCACHE_ABLATION_TUTTI_SLOT_MB=128
 export LMCACHE_ABLATION_TUTTI_STARTUP_DELAY=120
 export LMCACHE_ABLATION_TUTTI_AFTER_STORE_DELAY=10
-export LMCACHE_CSA_PREFETCH_LOOKAHEAD_BY_LAYER=profile80
+export LMCACHE_CSA_PREFETCH_LOOKAHEAD_BY_LAYER="${LMCACHE_CSA_PREFETCH_LOOKAHEAD_BY_LAYER:-profile80_hybrid}"
 export LMCACHE_CSA_PREFETCH_CP_SIZE=8
 export LMCACHE_CSA_PREFETCH_CP_INTERLEAVE=64
 export LMCACHE_CSA_PREFETCH_CP_OVERSUBSCRIBE=1
-export LMCACHE_CSA_PREFETCH_BLOCK_BUDGET=256
+export LMCACHE_CSA_PREFETCH_BLOCK_BUDGET="${LMCACHE_CSA_PREFETCH_BLOCK_BUDGET:-2048}"
 export LMCACHE_DSV4_HCA_WALKER=1
 export LMCACHE_INDEXER_PROFILE_ACCURACY=1
 export LMCACHE_CSA_PIPELINE_NVTX=1
-export LMCACHE_CSA_ATTENTION_KV_TIMING=0
-export LMCACHE_TUTTI_PROFILE=0
-export LMCACHE_INDEXER_TIMING=0
-export LMCACHE_TTFT_STAGE_PROFILE=0
-export LMCACHE_HCA_TIMING=0
+export LMCACHE_CSA_ATTENTION_KV_TIMING="${LMCACHE_CSA_ATTENTION_KV_TIMING:-0}"
+export LMCACHE_TUTTI_PROFILE="${LMCACHE_TUTTI_PROFILE:-0}"
+export LMCACHE_INDEXER_TIMING="${LMCACHE_INDEXER_TIMING:-0}"
+export LMCACHE_TTFT_STAGE_PROFILE="${LMCACHE_TTFT_STAGE_PROFILE:-0}"
+export LMCACHE_HCA_TIMING="${LMCACHE_HCA_TIMING:-0}"
 export LMCACHE_NSYS_CAPTURE=0
 export LMCACHE_NSYS_CAPTURE_SKIP_REQUESTS=0
 export LMCACHE_NSYS_FULL_CAPTURE=1
-export LMCACHE_NSYS_FULL_CAPTURE_SKIP_REQUESTS=1
+export LMCACHE_NSYS_FULL_CAPTURE_SKIP_REQUESTS=0
 export LMCACHE_NSYS_FULL_CAPTURE_SCOPE=decoder
 export LMCACHE_EXEC_PREFIX="${nsys_prefix}"
 export CUDA_LAUNCH_BLOCKING=0
@@ -84,7 +87,7 @@ container_pid=$(sudo docker inspect -f '{{.State.Pid}}' "${container}")
 sudo sh -c "tr '\000' '\n' </proc/${container_pid}/environ" \
   > "${result_dir}/process_env.txt"
 grep -qx 'LMCACHE_NSYS_FULL_CAPTURE=1' "${result_dir}/process_env.txt"
-grep -qx 'LMCACHE_NSYS_FULL_CAPTURE_SKIP_REQUESTS=1' "${result_dir}/process_env.txt"
+grep -qx 'LMCACHE_NSYS_FULL_CAPTURE_SKIP_REQUESTS=0' "${result_dir}/process_env.txt"
 grep -qx 'LMCACHE_NSYS_FULL_CAPTURE_SCOPE=decoder' "${result_dir}/process_env.txt"
 grep -qx 'LMCACHE_DSV4_HCA_WALKER=1' "${result_dir}/process_env.txt"
 grep -qx 'LMCACHE_INDEXER_PROFILE_ACCURACY=1' "${result_dir}/process_env.txt"
@@ -163,8 +166,8 @@ summary = {
         for row in rows
         if row.get("label") == "cold_store"
     ),
-    "warmup_s": float(warmups[0]["elapsed_s"]),
-    "captured_hit_s": float(hits[0]["elapsed_s"]),
+    "captured_first_hit_s": float(warmups[0]["elapsed_s"]),
+    "post_capture_hit_s": float(hits[0]["elapsed_s"]),
     "accuracy_records": accuracy_records,
     "capture_scope": "decoder",
     "full_retrieval_seen": False,

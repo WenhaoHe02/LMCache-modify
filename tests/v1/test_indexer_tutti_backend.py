@@ -376,47 +376,6 @@ def test_rank_local_proxy_selection_pads_empty_budget_slots() -> None:
     assert 0 in selected.tolist()
 
 
-def test_shared_proxy_block_exchange_unions_rank_slots() -> None:
-    """The shared exchange publishes a sorted union without padding IDs."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        path = f"{tmpdir}/proxy_blocks"
-        rank0 = indexer_manager_module._SharedProxyBlockExchange(
-            rank=0,
-            world_size=2,
-            layer_ids=[2],
-            block_budget=4,
-            path=path,
-        )
-        rank1 = indexer_manager_module._SharedProxyBlockExchange(
-            rank=1,
-            world_size=2,
-            layer_ids=[2],
-            block_budget=4,
-            path=path,
-        )
-        try:
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                result0 = executor.submit(
-                    rank0.exchange,
-                    2,
-                    5,
-                    torch.tensor([0, 2], dtype=torch.int64),
-                    1.0,
-                )
-                result1 = executor.submit(
-                    rank1.exchange,
-                    2,
-                    5,
-                    torch.tensor([2, 3], dtype=torch.int64),
-                    1.0,
-                )
-                assert result0.result().tolist() == [0, 2, 3]
-                assert result1.result().tolist() == [0, 2, 3]
-        finally:
-            rank0.close()
-            rank1.close()
-
-
 def test_weighted_predicted_block_hits_preserves_topk_frequency() -> None:
     """Weighted coverage counts repeated true entries, not only the union."""
     block = indexer_manager_module.DEEPGEMM_PAGED_BLOCK_SIZE

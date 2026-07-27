@@ -146,3 +146,8 @@ operator/Dockerfile.cross
 
 # Compiled gettext catalogs (built from .po at HTML build time)
 docs/source/locale/**/*.mo
+# Local CSA experiment archives.  Keep these outside Git; the canonical source
+# and reproduction scripts live in the repository.
+/nsys_results/
+/protected_versions/
+/papers/

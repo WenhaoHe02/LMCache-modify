@@ -201,3 +201,34 @@ For every new candidate, retain only:
 
 Temporary patches, failed traces, raw logs, duplicate exports, and superseded
 handoffs should not be kept in the repository.
+
+## Cleanup state on 2026-07-27
+
+The local workspace retains only two representative traces:
+
+```text
+nsys_results/off_k8_full_nsys_480000p8192_20260718_070437
+nsys_results/csa_profile80_hybrid_l1topk2048_l28topk2048_first_hit_20260726_085114
+```
+
+The first is the OFF comparison; the second is the best representative ON
+profile, with a 1.516956632-second post-capture hit. The 1.491-second reference
+is preserved as a no-Nsys result inside the protected archive.
+
+On GPU002, `/home/zbuser02/csa_cp8_ab_20260717` is reduced to the live mounted
+patch directory plus the small set of canonical runners. Old result trees,
+patch generations, build exports, and June/July diagnostic workspaces were
+removed. Old LMCache cache trees were also removed from all eight experiment
+NVMe devices. The following paths were explicitly retained:
+
+```text
+/mnt/nvme*/models
+/mnt/nvme*/tutti_raw_reserve
+/mnt/nvme*/lmcache_dsv4_cache
+/mnt/nvme*/lmcache_csa
+/home/zbuser02/Tutti
+/home/zbuser02/protected_lmcache_versions/csa_profile80_hybrid_1p491_20260727
+```
+
+The running `dsv4-csa-cp8-on` service and the zero-GPU protection sentinel were
+not stopped or replaced during cleanup.
