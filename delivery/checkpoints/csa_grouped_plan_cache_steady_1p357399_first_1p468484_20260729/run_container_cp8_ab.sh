@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+case_name=${1:?usage: run_container.sh off|on}
+case "$case_name" in
+  off)
+    filter=0
+    hca_walker=0
+    profile_accuracy=0
+    ;;
+  on)
+    filter=1
+    hca_walker="${LMCACHE_DSV4_HCA_WALKER:-1}"
+    profile_accuracy="${LMCACHE_INDEXER_PROFILE_ACCURACY:-1}"
+    ;;
+  *) echo "unknown case: $case_name" >&2; exit 2 ;;
+esac
+
+base=/home/zbuser02/csa_cp8_ab_20260717
+patches_host=${LMCACHE_ABLATION_PATCH_DIR:-$base/patches}
+startup_host=${LMCACHE_ABLATION_STARTUP_SCRIPT:-$base/startup_cp8_ab.sh}
+name="dsv4-csa-cp8-${case_name}"
+image="${LMCACHE_ABLATION_IMAGE:-lmcache/vllm-openai:indexer-ssd-hca-prefetch-decodegate-20260528_0630}"
+model_host=${LMCACHE_ABLATION_MODEL_HOST:-/mnt/dockerdisk/models/DeepSeek-V4-flash}
+model_container=/pro_model
+
+# This legacy recovery service remounts every fstab entry every 20 seconds.
+# It must stay inactive while snvme owns the cache controllers.
+sudo systemctl stop lmcache-remount.service 2>/dev/null || true
+
+sudo mount /mnt/nvme0 >/dev/null 2>&1 || true
+if [ ! -f "$model_host/config.json" ]; then
+  echo "missing model config: $model_host/config.json" >&2
+  exit 2
+fi
+
+# The worker synchronously unmounts each cache filesystem before snvme takes
+# ownership. Propagate those eight unmounts into the host mount namespace;
+# otherwise ext4 remains live while SNVM_DEVICE_BIND detaches its controller.
+# Share only the cache mountpoints: /mnt/dockerdisk contains Docker's data root
+# and must never participate in the Tutti mount handoff.
+cache_mounts=(
+  /mnt/nvme0
+  /mnt/nvme2
+  /mnt/nvme3
+  /mnt/nvme4
+  /mnt/nvme5
+  /mnt/nvme6
+  /mnt/nvme8
+  /mnt/nvme9
+)
+cache_mount_args=()
+for cache_mount in "${cache_mounts[@]}"; do
+  if ! mountpoint -q "$cache_mount"; then
+    echo "cache filesystem is not mounted: $cache_mount" >&2
+    exit 2
+  fi
+  propagation=$(findmnt -n -o PROPAGATION --target "$cache_mount" | head -n 1)
+  if [[ "$propagation" != *shared* ]]; then
+    sudo mount --bind "$cache_mount" "$cache_mount"
+    sudo mount --make-shared "$cache_mount"
+  fi
+  cache_mount_args+=(
+    --mount
+    "type=bind,source=$cache_mount,target=$cache_mount,bind-propagation=rshared"
+  )
+done
+
+sudo docker rm -f "$name" >/dev/null 2>&1 || true
+
+tutti_device_args=()
+if [ -e /dev/snvm_control ]; then
+  tutti_device_args+=(--device /dev/snvm_control:/dev/snvm_control)
+else
+  echo "missing Tutti control device: /dev/snvm_control" >&2
+  echo "Both A/B cases require the real Tutti data path." >&2
+  exit 2
+fi
+
+for dev in /dev/ssnvme*; do
+  [ -e "$dev" ] || continue
+  tutti_device_args+=(--device "$dev:$dev")
+done
+
+csa_prefetch_env_args=()
+tutti_handoff_id=${LMCACHE_TUTTI_HANDOFF_ID:-$(date +%s%N)}
+tutti_handoff_dir="/tmp/lmcache_tutti_mount_handoff_${tutti_handoff_id}"
+rm -rf "$tutti_handoff_dir"
+mkdir -p "$tutti_handoff_dir"
+
+# Mount namespace reassociation from a multi-threaded worker can fail with
+# EINVAL. Keep the host handoff in this single host-side process instead: all
+# eight ranks first release their container mounts and publish rank markers;
+# only then are the host ext4 mounts synchronously released and host.ready is
+# published. The low-level SNVM_DEVICE_BIND path independently requires that
+# final marker.
+(
+  deadline=$((SECONDS + ${LMCACHE_TUTTI_HOST_HANDOFF_TIMEOUT_SEC:-1200}))
+  while true; do
+    rank_ready=$(find "$tutti_handoff_dir" -maxdepth 1 \
+      -name 'mnt_nvme*.ready' -type f 2>/dev/null | wc -l)
+    if [ "$rank_ready" -ge 8 ]; then
+      break
+    fi
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      printf 'timed out waiting for rank mount markers: ready=%s/8\n' \
+        "$rank_ready" > "$tutti_handoff_dir/host.error"
+      exit 1
+    fi
+    sleep 0.05
+  done
+  for cache_mount in "${cache_mounts[@]}"; do
+    if mountpoint -q "$cache_mount"; then
+      # A worker can release its container bind just before the corresponding
+      # host VFS reference becomes quiescent.  Keep the handoff synchronous,
+      # but tolerate that short propagation race instead of failing all ranks
+      # on the first transient EBUSY.
+      umount_deadline=$((SECONDS + 120))
+      while mountpoint -q "$cache_mount"; do
+        if sudo umount "$cache_mount"; then
+          break
+        fi
+        if [ "$SECONDS" -ge "$umount_deadline" ]; then
+          sudo fuser -vm "$cache_mount" >&2 || true
+          break
+        fi
+        sleep 0.1
+      done
+      if mountpoint -q "$cache_mount"; then
+        printf 'synchronous host umount failed: %s\n' "$cache_mount" \
+          > "$tutti_handoff_dir/host.error"
+        exit 1
+      fi
+    fi
+  done
+  for cache_mount in "${cache_mounts[@]}"; do
+    if mountpoint -q "$cache_mount"; then
+      printf 'host mount remains active: %s\n' "$cache_mount" \
+        > "$tutti_handoff_dir/host.error"
+      exit 1
+    fi
+  done
+  touch "$tutti_handoff_dir/host.ready"
+) >"$tutti_handoff_dir/host.log" 2>&1 &
+if [ "$filter" = "1" ]; then
+  csa_prefetch_env_args+=(
+    -e LMCACHE_CSA_PREFETCH_LOOKAHEAD_BY_LAYER="${LMCACHE_CSA_PREFETCH_LOOKAHEAD_BY_LAYER:-profile80_hybrid}"
+    -e LMCACHE_CSA_PREFETCH_CP_SIZE="${LMCACHE_CSA_PREFETCH_CP_SIZE:-8}"
+    -e LMCACHE_CSA_PREFETCH_CP_INTERLEAVE="${LMCACHE_CSA_PREFETCH_CP_INTERLEAVE:-64}"
+    -e LMCACHE_CSA_PREFETCH_CP_OVERSUBSCRIBE="${LMCACHE_CSA_PREFETCH_CP_OVERSUBSCRIBE:-1}"
+    -e LMCACHE_CSA_PREFETCH_CP_EXCHANGE_IDS="${LMCACHE_CSA_PREFETCH_CP_EXCHANGE_IDS:-1}"
+    -e LMCACHE_CSA_PREFETCH_BLOCK_BUDGET="${LMCACHE_CSA_PREFETCH_BLOCK_BUDGET:-2048}"
+    -e LMCACHE_CSA_L1_PROXY_TOPK_TOKENS="${LMCACHE_CSA_L1_PROXY_TOPK_TOKENS:-2048}"
+    -e LMCACHE_CSA_PROXY_TOPK_TOKENS_BY_LAYER="${LMCACHE_CSA_PROXY_TOPK_TOKENS_BY_LAYER:-28:2048}"
+    -e LMCACHE_CSA_EXACT_CHUNK_PREFETCH="${LMCACHE_CSA_EXACT_CHUNK_PREFETCH:-0}"
+    -e LMCACHE_CSA_EXACT_CHUNK_PREFETCH_MAX_CHUNKS="${LMCACHE_CSA_EXACT_CHUNK_PREFETCH_MAX_CHUNKS:-1}"
+    -e LMCACHE_SSD_TP_SHARDED_PREFETCH="${LMCACHE_SSD_TP_SHARDED_PREFETCH:-0}"
+    -e LMCACHE_SSD_TP_SHARD_INDEXER="${LMCACHE_SSD_TP_SHARD_INDEXER:-0}"
+    -e LMCACHE_SSD_TP_SHARD_CSA="${LMCACHE_SSD_TP_SHARD_CSA:-1}"
+    -e LMCACHE_SSD_TP_CSA_REPLICA_VERIFIED="${LMCACHE_SSD_TP_CSA_REPLICA_VERIFIED:-0}"
+    -e LMCACHE_SSD_TP_INDEXER_CP_VERIFIED="${LMCACHE_SSD_TP_INDEXER_CP_VERIFIED:-0}"
+    -e LMCACHE_SSD_TP_CP_SIZE="${LMCACHE_SSD_TP_CP_SIZE:-8}"
+    -e LMCACHE_SSD_TP_CP_INTERLEAVE="${LMCACHE_SSD_TP_CP_INTERLEAVE:-64}"
+    -e LMCACHE_SSD_TP_DENSE_LAYERS="${LMCACHE_SSD_TP_DENSE_LAYERS:-2-24}"
+    -e LMCACHE_SSD_TP_MIN_UNION_BLOCKS="${LMCACHE_SSD_TP_MIN_UNION_BLOCKS:-128}"
+    -e LMCACHE_SSD_TP_STAGING_SLOT_BYTES="${LMCACHE_SSD_TP_STAGING_SLOT_BYTES:-134217728}"
+    -e LMCACHE_SSD_TP_STAGING_SLOTS="${LMCACHE_SSD_TP_STAGING_SLOTS:-2}"
+    -e LMCACHE_SSD_TP_EARLY_LOOKAHEAD="${LMCACHE_SSD_TP_EARLY_LOOKAHEAD:-2}"
+    -e LMCACHE_SSD_TP_DEBUG_VERIFY="${LMCACHE_SSD_TP_DEBUG_VERIFY:-0}"
+  )
+fi
+
+sudo docker run -d \
+  --name "$name" \
+  --gpus all \
+  --network host \
+  --pid host \
+  --ipc host \
+  --cap-add SYS_ADMIN \
+  --cap-add SYS_RAWIO \
+  --privileged \
+  --shm-size 64g \
+  --ulimit memlock=-1 \
+  --ulimit stack=67108864 \
+  "${tutti_device_args[@]}" \
+  "${csa_prefetch_env_args[@]}" \
+  "${cache_mount_args[@]}" \
+  -v /sys:/sys \
+  -v /opt/nvidia/nsight-systems:/opt/nvidia/nsight-systems:ro \
+  -v /tmp:/tmp \
+  -v "$model_host:$model_container:ro" \
+  -v "$patches_host:/patches:ro" \
+  -v "$startup_host:/startup.sh:ro" \
+  -e MODEL_PATH="$model_container" \
+  -e LMCACHE_ABLATION_CSA_ATTENTION_KV_FILTER="$filter" \
+  -e LMCACHE_ABLATION_MAX_MODEL_LEN="${LMCACHE_ABLATION_MAX_MODEL_LEN:-32768}" \
+  -e LMCACHE_ABLATION_MAX_BATCHED_TOKENS="${LMCACHE_ABLATION_MAX_BATCHED_TOKENS:-1024}" \
+  -e LMCACHE_ABLATION_GPU_UTIL="${LMCACHE_ABLATION_GPU_UTIL:-0.75}" \
+  -e LMCACHE_ABLATION_KV_OBJECT_STORE_SLOT_MB="${LMCACHE_ABLATION_KV_OBJECT_STORE_SLOT_MB:-8}" \
+  -e LMCACHE_ABLATION_KV_OBJECT_STORE_CAPACITY="${LMCACHE_ABLATION_KV_OBJECT_STORE_CAPACITY:-48000}" \
+  -e LMCACHE_ABLATION_TUTTI_N_SLOTS="${LMCACHE_ABLATION_TUTTI_N_SLOTS:-4}" \
+  -e LMCACHE_ABLATION_TUTTI_SLOT_MB="${LMCACHE_ABLATION_TUTTI_SLOT_MB:-128}" \
+  -e LMCACHE_ABLATION_TUTTI_STARTUP_DELAY="${LMCACHE_ABLATION_TUTTI_STARTUP_DELAY:-120}" \
+  -e LMCACHE_ABLATION_TUTTI_AFTER_STORE_DELAY="${LMCACHE_ABLATION_TUTTI_AFTER_STORE_DELAY:-10}" \
+  -e LMCACHE_ABLATION_KV_CACHE_MEMORY_BYTES="${LMCACHE_ABLATION_KV_CACHE_MEMORY_BYTES:-}" \
+  -e LMCACHE_DSV4_HCA_WALKER="$hca_walker" \
+  -e LMCACHE_CSA_VALIDATE_AGAINST_GENERIC="${LMCACHE_CSA_VALIDATE_AGAINST_GENERIC:-0}" \
+  -e LMCACHE_CSA_DEBUG_TOPK="${LMCACHE_CSA_DEBUG_TOPK:-0}" \
+  -e LMCACHE_CSA_VALIDATE_BYTES="${LMCACHE_CSA_VALIDATE_BYTES:-0}" \
+  -e LMCACHE_INDEXER_CROSS_LAYER_PREFETCH=0 \
+  -e LMCACHE_INDEXER_REUSE_RESIDUAL_TOPK=0 \
+  -e LMCACHE_INDEXER_EXPERIMENTAL_RESIDUAL_LOOKAHEAD=0 \
+  -e LMCACHE_NATIVE_INDEXER_STAGE0_LAYERS="${LMCACHE_NATIVE_INDEXER_STAGE0_LAYERS:-1}" \
+  -e LMCACHE_NATIVE_INDEXER_WINDOW_LAYERS="${LMCACHE_NATIVE_INDEXER_WINDOW_LAYERS:-1}" \
+  -e LMCACHE_CSA_PIPELINE_NVTX="${LMCACHE_CSA_PIPELINE_NVTX:-0}" \
+  -e LMCACHE_INDEXER_TIMING="${LMCACHE_INDEXER_TIMING:-0}" \
+  -e LMCACHE_INDEXER_PROFILE_ACCURACY="$profile_accuracy" \
+  -e LMCACHE_CSA_PREDICTION_GATE_TIMEOUT_SEC="${LMCACHE_CSA_PREDICTION_GATE_TIMEOUT_SEC:-5}" \
+  -e LMCACHE_NSYS_CAPTURE="${LMCACHE_NSYS_CAPTURE:-0}" \
+  -e LMCACHE_NSYS_CAPTURE_SKIP_REQUESTS="${LMCACHE_NSYS_CAPTURE_SKIP_REQUESTS:-0}" \
+  -e LMCACHE_NSYS_FULL_CAPTURE="${LMCACHE_NSYS_FULL_CAPTURE:-0}" \
+  -e LMCACHE_NSYS_FULL_CAPTURE_SKIP_REQUESTS="${LMCACHE_NSYS_FULL_CAPTURE_SKIP_REQUESTS:-0}" \
+  -e LMCACHE_NSYS_FULL_CAPTURE_SCOPE="${LMCACHE_NSYS_FULL_CAPTURE_SCOPE:-decoder}" \
+  -e LMCACHE_EXEC_PREFIX="${LMCACHE_EXEC_PREFIX:-}" \
+  -e LMCACHE_CSA_ATTENTION_KV_TIMING="${LMCACHE_CSA_ATTENTION_KV_TIMING:-0}" \
+  -e LMCACHE_TUTTI_PROFILE="${LMCACHE_TUTTI_PROFILE:-0}" \
+  -e LMCACHE_DSV4_STREAMING_PLAN_CACHE_CAPACITY="${LMCACHE_DSV4_STREAMING_PLAN_CACHE_CAPACITY:-0}" \
+  -e LMCACHE_DSV4_STATIC_IO_GROUP_MAX="${LMCACHE_DSV4_STATIC_IO_GROUP_MAX:-1}" \
+  -e LMCACHE_DSV4_STATIC_IO_GROUP_TARGET_MIB="${LMCACHE_DSV4_STATIC_IO_GROUP_TARGET_MIB:-32}" \
+  -e LMCACHE_TTFT_STAGE_PROFILE="${LMCACHE_TTFT_STAGE_PROFILE:-0}" \
+  -e LMCACHE_LOOKUP_TOKEN_DIAGNOSTICS="${LMCACHE_LOOKUP_TOKEN_DIAGNOSTICS:-0}" \
+  -e LMCACHE_PY_ENABLE_GC="${LMCACHE_PY_ENABLE_GC:-true}" \
+  -e LMCACHE_HCA_TIMING="${LMCACHE_HCA_TIMING:-0}" \
+  -e LMCACHE_HCA_PREFETCH_LOOKAHEAD_LAYERS="${LMCACHE_HCA_PREFETCH_LOOKAHEAD_LAYERS:-1}" \
+  -e LMCACHE_D2H_TIMING="${LMCACHE_D2H_TIMING:-0}" \
+  -e LMCACHE_TUTTI_HOST_MOUNT_HANDOFF=0 \
+  -e LMCACHE_TUTTI_HANDOFF_ID="$tutti_handoff_id" \
+  -e LMCACHE_TUTTI_HANDOFF_RANKS=8 \
+  -e LMCACHE_TUTTI_HANDOFF_TIMEOUT_SEC="${LMCACHE_TUTTI_HANDOFF_TIMEOUT_SEC:-180}" \
+  -e LMCACHE_HCA_ENABLE_DECODE_HOOK=0 \
+  -e CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-0}" \
+  -e PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}" \
+  --entrypoint /bin/bash \
+  "$image" /startup.sh
+
+for i in $(seq 1 360); do
+  writer_ready=$(sudo docker logs "$name" 2>&1 \
+    | grep -c 'KV object Tutti raw cold-store writer installed' || true)
+  if [ "$writer_ready" -ge 8 ] \
+    && curl -sf http://127.0.0.1:8000/v1/models >/dev/null 2>&1; then
+    echo "ready_after_seconds=$((i * 2))"
+    echo "tutti_raw_writers_ready=${writer_ready}/8"
+    curl -sf http://127.0.0.1:8000/v1/models
+    exit 0
+  fi
+  sleep 2
+done
+
+echo "not ready" >&2
+sudo docker logs --tail 240 "$name" >&2 || true
+exit 1
