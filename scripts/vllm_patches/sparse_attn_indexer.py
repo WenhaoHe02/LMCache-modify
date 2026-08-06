@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """vLLM sparse-attention indexer with an optional LMCache chunk hook."""
 
+import os
 from collections.abc import Callable
+from typing import Any
 
 import torch
 
@@ -48,6 +50,99 @@ MXFP4_BLOCK_SIZE = 32
 _LMCACHE_TOPK_CHUNK_CALLBACKS: dict[
     str, Callable[[torch.Tensor, int], None]
 ] = {}
+
+# Experimental exact context-parallel execution for the *official* prefill
+# indexer.  DeepSeek V4 replicates both the Indexer K cache and Indexer weights
+# on every TP rank, so query rows can be divided without sharding K.  The
+# feature is opt-in while it is being qualified on the production topology.
+_LMCACHE_TRUE_INDEXER_CP_WORKSPACES: dict[
+    tuple[str, int | None, torch.dtype, int, int],
+    tuple[int, torch.Tensor],
+] = {}
+
+
+def _lmcache_true_indexer_cp_context(
+    num_rows: int,
+) -> tuple[int, int, object] | None:
+    """Return the TP rank, size, and process group for exact Indexer CP."""
+    enabled = os.getenv("LMCACHE_TRUE_INDEXER_CP", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not enabled:
+        return None
+    try:
+        minimum_rows = max(
+            1,
+            int(os.getenv("LMCACHE_TRUE_INDEXER_CP_MIN_ROWS", "1024")),
+        )
+        expected_size = max(
+            2,
+            int(os.getenv("LMCACHE_TRUE_INDEXER_CP_SIZE", "8")),
+        )
+    except ValueError as exc:
+        raise RuntimeError("invalid LMCache true-Indexer CP configuration") from exc
+    if int(num_rows) < minimum_rows:
+        return None
+
+    import torch.distributed as dist
+    from vllm.distributed import get_tp_group
+
+    if not dist.is_available() or not dist.is_initialized():
+        raise RuntimeError(
+            "LMCACHE_TRUE_INDEXER_CP requires initialized torch.distributed"
+        )
+    tp_group = get_tp_group()
+    world_size = int(tp_group.world_size)
+    rank = int(tp_group.rank_in_group)
+    if world_size != expected_size:
+        raise RuntimeError(
+            "LMCACHE_TRUE_INDEXER_CP_SIZE does not match the TP group: "
+            f"configured={expected_size} runtime={world_size}"
+        )
+    return rank, world_size, tp_group.device_group
+
+
+def _lmcache_balanced_row_bounds(
+    num_rows: int,
+    rank: int,
+    world_size: int,
+) -> tuple[int, int]:
+    """Return one contiguous, balanced query-row interval."""
+    return (
+        int(num_rows) * int(rank) // int(world_size),
+        int(num_rows) * (int(rank) + 1) // int(world_size),
+    )
+
+
+def _lmcache_true_indexer_cp_workspace(
+    reference: torch.Tensor,
+    padded_rows: int,
+    topk_tokens: int,
+    world_size: int,
+) -> torch.Tensor:
+    """Return a reusable rank-local send buffer for exact Indexer CP."""
+    key = (
+        reference.device.type,
+        reference.device.index,
+        reference.dtype,
+        int(topk_tokens),
+        int(world_size),
+    )
+    cached = _LMCACHE_TRUE_INDEXER_CP_WORKSPACES.get(key)
+    if cached is None or cached[0] < int(padded_rows):
+        capacity = int(padded_rows)
+        send = torch.empty(
+            (capacity, int(topk_tokens)),
+            dtype=reference.dtype,
+            device=reference.device,
+        )
+        cached = (capacity, send)
+        _LMCACHE_TRUE_INDEXER_CP_WORKSPACES[key] = cached
+    _capacity, send = cached
+    return send[: int(padded_rows)]
 
 
 def register_lmcache_topk_chunk_callback(
@@ -207,7 +302,6 @@ def sparse_attn_indexer(
             scale_fmt,
         )
 
-    topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
@@ -225,7 +319,16 @@ def sparse_attn_indexer(
             scales_spec,
         )
         chunk_callback = _LMCACHE_TOPK_CHUNK_CALLBACKS.get(str(k_cache_prefix))
-        for chunk_index, chunk in enumerate(prefill_metadata.chunks):
+
+        def _score_prefill_rows(
+            chunk: Any,
+            row_start: int,
+            row_end: int,
+            output: torch.Tensor,
+        ) -> None:
+            """Score a contiguous subset of one native prefill chunk."""
+            if int(row_start) >= int(row_end):
+                return
             k_quant = k_quant_full[: chunk.total_seq_lens]
             k_scale = k_scale_full[: chunk.total_seq_lens]
 
@@ -238,9 +341,9 @@ def sparse_attn_indexer(
                     chunk.cu_seq_lens,
                 )
 
-            q_slice = q_quant[chunk.token_start : chunk.token_end]
+            q_slice = q_quant[int(row_start) : int(row_end)]
             q_scale_slice = (
-                q_scale[chunk.token_start : chunk.token_end]
+                q_scale[int(row_start) : int(row_end)]
                 if q_scale is not None
                 else None
             )
@@ -257,22 +360,31 @@ def sparse_attn_indexer(
             logits = fp8_fp4_mqa_logits(
                 (q_slice_cast, q_scale_slice),
                 (k_quant_cast, k_scale_cast),
-                weights[chunk.token_start : chunk.token_end],
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
+                weights[int(row_start) : int(row_end)],
+                chunk.cu_seqlen_ks[
+                    int(row_start) - int(chunk.token_start) : int(row_end)
+                    - int(chunk.token_start)
+                ],
+                chunk.cu_seqlen_ke[
+                    int(row_start) - int(chunk.token_start) : int(row_end)
+                    - int(chunk.token_start)
+                ],
                 clean_logits=False,
             )
             num_rows = logits.shape[0]
-
-            topk_indices = topk_indices_buffer[
-                chunk.token_start : chunk.token_end, :topk_tokens
-            ]
+            topk_indices = output[:num_rows, :topk_tokens]
 
             if current_platform.is_xpu():
                 xpu_ops.top_k_per_row_prefill(  # type: ignore[attr-defined]
                     logits,
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
+                    chunk.cu_seqlen_ks[
+                        int(row_start) - int(chunk.token_start) : int(row_end)
+                        - int(chunk.token_start)
+                    ],
+                    chunk.cu_seqlen_ke[
+                        int(row_start) - int(chunk.token_start) : int(row_end)
+                        - int(chunk.token_start)
+                    ],
                     topk_indices,
                     num_rows,
                     logits.stride(0),
@@ -282,18 +394,150 @@ def sparse_attn_indexer(
             else:
                 torch.ops._C.top_k_per_row_prefill(
                     logits,
-                    chunk.cu_seqlen_ks,
-                    chunk.cu_seqlen_ke,
+                    chunk.cu_seqlen_ks[
+                        int(row_start) - int(chunk.token_start) : int(row_end)
+                        - int(chunk.token_start)
+                    ],
+                    chunk.cu_seqlen_ke[
+                        int(row_start) - int(chunk.token_start) : int(row_end)
+                        - int(chunk.token_start)
+                    ],
                     topk_indices,
                     num_rows,
                     logits.stride(0),
                     logits.stride(1),
                     topk_tokens,
                 )
+
+        chunks = tuple(prefill_metadata.chunks)
+        prefill_start = int(chunks[0].token_start) if chunks else 0
+        prefill_end = int(chunks[-1].token_end) if chunks else prefill_start
+        for previous, current in zip(chunks, chunks[1:], strict=False):
+            if int(previous.token_end) != int(current.token_start):
+                raise RuntimeError(
+                    "LMCache true-Indexer CP requires contiguous prefill chunks"
+                )
+        prefill_rows = prefill_end - prefill_start
+        cp_context = _lmcache_true_indexer_cp_context(prefill_rows)
+        # The exact CP path below overwrites every pure-prefill output row with
+        # the all-gather result.  Clearing the complete [Q, topk] buffer first
+        # therefore launches a redundant 16 MiB fill at Q=8192 on every layer
+        # and rank.  Preserve the official initialization for local execution
+        # and mixed prefill/decode batches, where unused rows may remain.
+        complete_prefill_output = (
+            prefill_start == 0 and prefill_end == int(hidden_states.shape[0])
+        )
+        if cp_context is None or has_decode or not complete_prefill_output:
+            topk_indices_buffer[: hidden_states.shape[0]] = -1
+        if cp_context is None:
+            for chunk_index, chunk in enumerate(chunks):
+                chunk_topk = topk_indices_buffer[
+                    int(chunk.token_start) : int(chunk.token_end), :topk_tokens
+                ]
+                _score_prefill_rows(
+                    chunk,
+                    int(chunk.token_start),
+                    int(chunk.token_end),
+                    chunk_topk,
+                )
+                if chunk_callback is not None:
+                    chunk_callback(chunk_topk, chunk_index)
+        else:
+            import torch.distributed as dist
+
+            cp_rank, cp_world_size, cp_group = cp_context
+            logger.info_once(
+                "LMCache true-indexer query CP is active: world_size=%d "
+                "prefill_rows=%d topk=%d",
+                cp_world_size,
+                prefill_rows,
+                topk_tokens,
+            )
+            relative_start, relative_end = _lmcache_balanced_row_bounds(
+                prefill_rows,
+                cp_rank,
+                cp_world_size,
+            )
+            local_start = prefill_start + relative_start
+            local_end = prefill_start + relative_end
+            padded_rows = (prefill_rows + cp_world_size - 1) // cp_world_size
+            local_topk = _lmcache_true_indexer_cp_workspace(
+                topk_indices_buffer,
+                padded_rows,
+                topk_tokens,
+                cp_world_size,
+            )
+            direct_output = topk_indices_buffer[
+                prefill_start:prefill_end,
+                :topk_tokens,
+            ]
+            direct_gather = (
+                prefill_rows % cp_world_size == 0
+                and direct_output.is_contiguous()
+            )
+            if direct_gather:
+                gathered_topk = direct_output
+            else:
+                gathered_topk = torch.empty(
+                    (padded_rows * cp_world_size, topk_tokens),
+                    dtype=topk_indices_buffer.dtype,
+                    device=topk_indices_buffer.device,
+                )
+            local_rows = local_end - local_start
+            # Balanced partitions need padding only when Q is not divisible by
+            # the CP world size.  Scoring overwrites all real local rows.
+            if local_rows < padded_rows:
+                local_topk[local_rows:].fill_(-1)
+            for chunk in chunks:
+                overlap_start = max(local_start, int(chunk.token_start))
+                overlap_end = min(local_end, int(chunk.token_end))
+                if overlap_start >= overlap_end:
+                    continue
+                output_start = overlap_start - local_start
+                output_end = overlap_end - local_start
+                _score_prefill_rows(
+                    chunk,
+                    overlap_start,
+                    overlap_end,
+                    local_topk[output_start:output_end],
+                )
+
+            with torch.cuda.nvtx.range(
+                "lmcache.true_indexer_cp.all_gather_topk"
+            ):
+                dist.all_gather_into_tensor(
+                    gathered_topk,
+                    local_topk,
+                    group=cp_group,
+                )
+            if not direct_gather:
+                for owner in range(cp_world_size):
+                    owner_start, owner_end = _lmcache_balanced_row_bounds(
+                        prefill_rows,
+                        owner,
+                        cp_world_size,
+                    )
+                    owner_rows = owner_end - owner_start
+                    source_start = owner * padded_rows
+                    topk_indices_buffer[
+                        prefill_start + owner_start : prefill_start + owner_end,
+                        :topk_tokens,
+                    ].copy_(
+                        gathered_topk[source_start : source_start + owner_rows]
+                    )
             if chunk_callback is not None:
-                chunk_callback(topk_indices, chunk_index)
+                for chunk_index, chunk in enumerate(chunks):
+                    chunk_callback(
+                        topk_indices_buffer[
+                            int(chunk.token_start) : int(chunk.token_end),
+                            :topk_tokens,
+                        ],
+                        chunk_index,
+                    )
 
     if has_decode:
+        if not has_prefill:
+            topk_indices_buffer[: hidden_states.shape[0]] = -1
         decode_metadata = attn_metadata_narrowed.decode
         assert decode_metadata is not None
         kv_cache = kv_cache_as_quant_view(kv_cache, head_dim, use_fp4_cache)

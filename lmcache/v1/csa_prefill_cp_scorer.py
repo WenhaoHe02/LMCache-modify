@@ -78,6 +78,7 @@ def prefill_cp_query_indices(
     world_size: int,
     interleave_size: int,
     device: torch.device,
+    sample_stride: int = 1,
 ) -> torch.Tensor:
     """Return query rows owned by one speculative prefill rank.
 
@@ -88,6 +89,8 @@ def prefill_cp_query_indices(
         world_size: Number of ranks sharing proxy scoring.
         interleave_size: Consecutive query rows assigned to one rank.
         device: Device on which to construct the indices.
+        sample_stride: Fractional query sampling stride. A value of two scores
+            one half of the rows while keeping the work balanced across ranks.
 
     Returns:
         Sorted query-row indices assigned in block-cyclic order.
@@ -103,10 +106,12 @@ def prefill_cp_query_indices(
         raise ValueError("rank must be within the prefetch CP group")
     if interleave_size <= 0:
         raise ValueError("interleave_size must be positive")
+    if sample_stride <= 0:
+        raise ValueError("sample_stride must be positive")
     return _block_cyclic_indices(
         token_end - token_start,
-        rank,
-        world_size,
+        rank * sample_stride,
+        world_size * sample_stride,
         interleave_size,
         device,
     ).add_(int(token_start))
@@ -238,6 +243,8 @@ def score_prefill_proxy_rank_local(
     oversubscribe: int = 1,
     topk_tokens_override: int | None = None,
     metadata_query_row_start: int | None = None,
+    preselected_query_rows: torch.Tensor | None = None,
+    preselected_query_span: int | None = None,
     runtime_info: dict[str, int] | None = None,
 ) -> torch.Tensor:
     """Run the speculative indexer for this rank's query shard over full K.
@@ -265,6 +272,10 @@ def score_prefill_proxy_rank_local(
             metadata. When set, ``q_quant``, ``weights``, and ``output`` are a
             compact slice beginning at this metadata row. This is used only
             to warm the exact cache-hit proxy shape during cold admission.
+        preselected_query_rows: Optional original row indices represented by
+            compact proxy inputs. When supplied, expensive HC/Q preparation
+            has already been restricted to this rank's sampled query rows.
+        preselected_query_span: Original row count before compact sampling.
         runtime_info: Optional output mapping populated with resolved scoring
             dimensions for cold-admission warmup bookkeeping.
 
@@ -383,18 +394,60 @@ def score_prefill_proxy_rank_local(
         if metadata_query_row_start < 0:
             raise RuntimeError("metadata query row start must be non-negative")
         query_first = first_token + metadata_query_row_start
-        query_final = query_first + int(hidden_states.shape[0])
+        query_final = query_first + int(
+            preselected_query_span
+            if preselected_query_span is not None
+            else hidden_states.shape[0]
+        )
         if query_final > final_token:
             raise RuntimeError("compact proxy query slice exceeds prefill metadata")
         compact_query_base = query_first
-    local_query_ids = prefill_cp_query_indices(
-        query_first,
-        query_final,
-        rank,
-        world_size,
-        interleave_size,
-        k_quant.device,
-    )
+    try:
+        query_sample_stride = int(
+            os.getenv("LMCACHE_CSA_PREFETCH_CP_QUERY_SAMPLE_STRIDE", "1")
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            "LMCACHE_CSA_PREFETCH_CP_QUERY_SAMPLE_STRIDE must be an integer"
+        ) from exc
+    if query_sample_stride <= 0:
+        raise RuntimeError(
+            "LMCACHE_CSA_PREFETCH_CP_QUERY_SAMPLE_STRIDE must be positive"
+        )
+    if preselected_query_rows is None:
+        local_query_ids = prefill_cp_query_indices(
+            query_first,
+            query_final,
+            rank,
+            world_size,
+            interleave_size,
+            k_quant.device,
+            sample_stride=query_sample_stride,
+        )
+        input_query_rows = local_query_ids - compact_query_base
+    else:
+        if preselected_query_rows.ndim != 1:
+            raise RuntimeError("preselected proxy query rows must be one-dimensional")
+        if preselected_query_rows.device != k_quant.device:
+            raise RuntimeError("preselected proxy query rows must use the proxy device")
+        if preselected_query_rows.numel() != hidden_states.shape[0]:
+            raise RuntimeError(
+                "preselected proxy query rows do not match compact inputs"
+            )
+        if preselected_query_rows.numel() > 0:
+            first_row = int(preselected_query_rows[0].item())
+            final_row = int(preselected_query_rows[-1].item())
+            if first_row < 0 or final_row >= query_final - query_first:
+                raise RuntimeError("preselected proxy query row is outside metadata")
+        local_query_ids = preselected_query_rows.to(torch.int64) + query_first
+        input_query_rows = torch.arange(
+            int(preselected_query_rows.numel()),
+            dtype=torch.int64,
+            device=k_quant.device,
+        )
+    if runtime_info is not None:
+        runtime_info["query_sample_stride"] = query_sample_stride
+        runtime_info["local_query_rows"] = int(local_query_ids.numel())
     if local_query_ids.numel() == 0:
         return output
 
@@ -420,7 +473,9 @@ def score_prefill_proxy_rank_local(
     for query_start in range(0, int(local_query_ids.numel()), max_query_tokens):
         query_ids = local_query_ids[query_start : query_start + max_query_tokens]
         metadata_ids = query_ids - first_token
-        query_row_ids = query_ids - compact_query_base
+        query_row_ids = input_query_rows[
+            query_start : query_start + max_query_tokens
+        ]
         local_ks = global_ks.index_select(0, metadata_ids)
         local_ke = global_ke.index_select(0, metadata_ids)
         q_slice = q_values.index_select(0, query_row_ids)

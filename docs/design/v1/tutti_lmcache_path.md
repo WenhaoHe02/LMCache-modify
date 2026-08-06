@@ -4,6 +4,10 @@
 本地 SSD 命中，进入 Tutti GPU-direct NVMe 读取，再作为 GPU resident
 `MemoryObj` 回填给 vLLM。CSA/HCA 预取是另一路功能，不在本文展开。
 
+SNVMe 内核模块的 `.o/.ko` 构建、模块加载、文件系统 handoff、controller bind
+和 GPU queue 初始化见
+[`SNVMe 从编译产物到设备绑定`](gpu_connector/snvme-build-and-bind.md)。
+
 ## 目标
 
 Tutti 路径解决的是 LMCache full-hit 时的本地 SSD KV 读取方式。

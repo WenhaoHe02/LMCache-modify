@@ -1577,7 +1577,47 @@ def _make_mock_engine(
     engine.storage_manager.get_block_mapping.return_value = block_mapping
     engine.storage_manager.batched_get.side_effect = batched_get_side_effect
     engine.lookup_pins = {}
+    engine.dsv4_optimized_kv = False
     return engine
+
+
+def test_process_tokens_worker_uses_exact_streaming_terminal() -> None:
+    """A non-scheduler TP rank validates the terminal manifest, not chunks."""
+    k0, k1 = _make_key(0), _make_key(1)
+    mem0 = _make_mock_memory_obj()
+    mem1 = _make_mock_memory_obj()
+    engine = _make_mock_engine(
+        process_tokens_results=[(0, 10, k0), (10, 20, k1)],
+        block_mapping={},
+        batched_get_side_effect=[[mem0, mem1]],
+    )
+    engine.dsv4_optimized_kv = True
+    engine._tutti_config = None
+    engine._dsv4_csa_attention_kv_prefetch_active.return_value = False
+    engine.storage_manager.contains_streaming_terminal.return_value = (
+        "LocalDiskBackend"
+    )
+    engine._dsv4_retrieve_shapes_for_range.return_value = []
+
+    ret_mask = torch.zeros(20, dtype=torch.bool)
+    chunks, total_size = LMCacheEngine._process_tokens_internal(
+        engine,
+        torch.zeros(20, dtype=torch.long),
+        None,
+        ret_mask,
+        req_id="worker-rank-request",
+    )
+
+    assert [chunk[0] for chunk in chunks] == [k0, k1]
+    assert total_size == 2048
+    assert ret_mask.all()
+    engine.storage_manager.contains_streaming_terminal.assert_called_once_with(
+        k1,
+        20,
+        search_range=["LocalDiskBackend"],
+        pin=False,
+    )
+    engine.storage_manager.get_block_mapping.assert_not_called()
 
 
 def test_process_tokens_single_location_boundary_failure():

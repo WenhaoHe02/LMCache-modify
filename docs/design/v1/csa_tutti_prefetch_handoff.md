@@ -46,6 +46,82 @@ The archive contains the exact deployed sources, scripts, result, environment,
 logs, image inspect data, and an offline `docker save` image. The binary archive
 is deliberately not stored in Git.
 
+## CPU RAM baseline
+
+A same-image LocalCPUBackend baseline was validated on GPU002 on 2026-07-28.
+It uses the same DeepSeek-V4 model, vLLM 0.20.2, LMCache 0.4.4, TP8, FP8 KV,
+530,000-token model limit, and 65,536-token chunked-prefill limit as the Tutti
+run. CSA, HCA, native-indexer prefetch, and the Tutti object store are disabled.
+
+The production-like CPU configuration keeps one CPU shard per TP rank:
+
+```yaml
+chunk_size: 256
+local_cpu: true
+max_local_cpu_size: 160
+reserve_local_cpu_size: 128
+use_gpu_connector_v3: true
+use_layerwise: false
+numa_mode: null
+store_location: LocalCPUBackend
+retrieve_locations: [LocalCPUBackend]
+extra_config:
+  save_only_first_rank: false
+  dsv4_optimized_kv: false
+```
+
+The launcher is `scripts/run_cpu_baseline.sh`. It deliberately does not invoke
+the Tutti host handoff, unmount the native NVMe model filesystem, or pass
+`/dev/snvm*` devices into the container. On GPU002, launch it with:
+
+```bash
+LMCACHE_ABLATION_MAX_MODEL_LEN=530000 \
+LMCACHE_ABLATION_MAX_BATCHED_TOKENS=65536 \
+LMCACHE_ABLATION_GPU_UTIL=0.50 \
+LMCACHE_CPU_SAVE_ONLY_FIRST_RANK=false \
+LMCACHE_CPU_PER_RANK_GB=160 \
+./scripts/run_cpu_baseline.sh
+```
+
+The 480K object is 145.6986 GB per rank, so the baseline reserves 1.28 TB of
+pinned host memory across TP8. All eight ranks reported exact 480,000-token
+hits. Results without Nsys were:
+
+| Workload | Warmup | Timed hits | Stable result |
+|---|---:|---|---:|
+| 480K + 8K recompute | 6.886 s | 6.895 / 6.909 / 6.898 s | 6.898 s median |
+| 480K + 2K recompute | 5.986 s | 11.696 / 6.615 / 6.413 s | 6.413-6.615 s |
+
+The first 2K timed request is excluded from the stable range. Its warmup suffix
+was already a full cache hit left by the preceding 8K run, so it did not warm
+the 2K recompute shape; the 11.696-second sample paid that one-time kernel/JIT
+cost. Stable CPU retrieval of the 480K prefix took about 5.4-5.7 seconds at
+roughly 26-27 GB/s per rank. In comparison, the frozen Tutti ON reference is
+1.491 seconds for 480K + 8K, about 4.6 times faster end to end.
+
+Two configurations that appear attractive are invalid on this deployment:
+
+- `numa_mode: auto` fails inside the non-privileged container with
+  `mbind failed: Operation not permitted`. Keep it null unless the container is
+  explicitly granted and tested with the required memory-policy capability.
+- `save_only_first_rank: true` stores only rank 0's CPU copy, then broadcasts
+  each retrieved object through a temporary GPU tensor. The 480K request needs
+  an 80 MiB staging allocation after cold-prefill activations have fragmented
+  GPU memory, and passive ranks fail with CUDA OOM. Lowering the vLLM KV-cache
+  percentage does not reliably remove post-prefill fragmentation; per-rank CPU
+  shards avoid the broadcast completely.
+
+These choices also follow the upstream constraints: DeepSeek sparse attention
+needs heterogeneous KV-layer-group support and was initially limited to
+LocalCPUBackend ([LMCache issue 1989](https://github.com/LMCache/LMCache/issues/1989));
+`max_local_cpu_size: 0` is invalid rather than a way to disable the pool
+([issue 1889](https://github.com/LMCache/LMCache/issues/1889)); and an undersized
+pool causes CPU-memory-pressure eviction
+([issue 1878](https://github.com/LMCache/LMCache/issues/1878)).
+
+Raw client results are stored in
+`matrix_results_20260727/cpu_baseline_20260728/`.
+
 ## Pipeline
 
 Cold admission executes the complete model and materializes the online layout

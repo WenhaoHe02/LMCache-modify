@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from types import MethodType
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
@@ -50,7 +50,6 @@ from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.compute.blend import LMCBlenderBuilder
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.config_base import validate_and_set_config_value
-from lmcache.v1.csa_pipeline_nvtx import CsaNvtxEvent, csa_pipeline_nvtx
 from lmcache.v1.csa_prefetch_policy import (
     CSAPrefetchLookaheadPolicy,
     build_residual_prefetch_sources,
@@ -238,6 +237,7 @@ def _install_scheduler_hma_invalid_block_patch() -> None:
                 for idx, block_id in zip(
                     range(req_num_computed_blocks),
                     req_block_ids,
+                    strict=False,
                 ):
                     if block_id not in invalid_block_ids:
                         continue
@@ -348,7 +348,7 @@ def _infer_decoder_layer_idx(decoder_layer: Any) -> int:
         inferred = _layer_idx_from_prefix(prefix)
         if inferred >= 0:
             try:
-                setattr(decoder_layer, "layer_idx", inferred)
+                decoder_layer.layer_idx = inferred
             except Exception:
                 pass
             return inferred
@@ -564,7 +564,7 @@ def _install_deepseek_decoder_registry_hook() -> None:
     if module_registry is None:
         module_registry = weakref.WeakSet()
         try:
-            setattr(module, "_DEEPSEEK_V4_DECODER_LAYER_REGISTRY", module_registry)
+            module._DEEPSEEK_V4_DECODER_LAYER_REGISTRY = module_registry
         except Exception:
             module_registry = None
     layer_cls = getattr(module, "DeepseekV4DecoderLayer", None)
@@ -585,7 +585,7 @@ def _install_deepseek_decoder_registry_hook() -> None:
         layer_idx = _layer_idx_from_prefix(prefix)
         if layer_idx >= 0:
             try:
-                setattr(self, "layer_idx", layer_idx)
+                self.layer_idx = layer_idx
             except Exception:
                 pass
         try:
@@ -1169,6 +1169,35 @@ def _fire_decoder_ffn_overlap(
         except Exception as exc:
             _log_overlap_hook_error_once("CSA", int(layer_id), exc)
 
+    dense_manager = getattr(
+        decoder_layer,
+        "_lmcache_dense_csa_prefetch_manager",
+        None,
+    )
+    dense_targets = getattr(
+        decoder_layer,
+        "_lmcache_next_dense_csa_layer_ids",
+        (),
+    )
+    if dense_manager is not None and dense_targets:
+        try:
+            already_fired = getattr(
+                dense_manager,
+                "dense_layer_fired_for_active_request",
+                None,
+            )
+            fire_dense = getattr(dense_manager, "fire_dense_csa_layers", None)
+            pending_dense = tuple(
+                target
+                for target in dense_targets
+                if not (callable(already_fired) and already_fired(target))
+            )
+            if pending_dense and callable(fire_dense):
+                fire_dense(pending_dense)
+            fired = True
+        except Exception as exc:
+            _log_overlap_hook_error_once("CSA_DENSE", int(layer_id), exc)
+
     hca_manager = getattr(decoder_layer, "_lmcache_hca_prefetch_manager", None)
     hca_targets = getattr(decoder_layer, "_lmcache_next_hca_layer_ids", ())
     if hca_manager is not None and isinstance(hca_targets, tuple) and hca_targets:
@@ -1397,6 +1426,22 @@ def _configure_decoder_hca_overlap(
     if (
         not isinstance(next_hca_layer_id, int) or next_hca_layer_id < 0
     ) and not next_hca_layer_ids:
+        return native_hook
+    return _install_decoder_pre_ffn_overlap_hooks(decoder_layer) or native_hook
+
+
+def _configure_decoder_dense_csa_overlap(
+    decoder_layer: Any,
+    manager: Any,
+    target_layer_ids: tuple[int, ...],
+) -> bool:
+    """Attach deterministic early-CSA work to one decoder FFN boundary."""
+    decoder_layer._lmcache_dense_csa_prefetch_manager = manager
+    decoder_layer._lmcache_next_dense_csa_layer_ids = target_layer_ids
+    native_hook = callable(
+        getattr(decoder_layer, "_lmcache_fire_pre_ffn_overlap", None)
+    )
+    if not target_layer_ids:
         return native_hook
     return _install_decoder_pre_ffn_overlap_hooks(decoder_layer) or native_hook
 
@@ -1695,6 +1740,13 @@ def _attach_indexer_prefetch(tutti_loader: Optional[Any] = None) -> None:
     )
 
     if tutti_loader is not None:
+        from lmcache.v1.ssd_tp_sharded_prefetch import (
+            SSDTPShardedPrefetchConfig,
+        )
+
+        shard_config = SSDTPShardedPrefetchConfig.from_engine_config(
+            lmcache_get_or_create_config()
+        )
         native_indexer_tensors: dict[int, torch.Tensor] = {}
         for layer_id, indexer_op in csa_info:
             kv_cache = getattr(
@@ -1708,6 +1760,7 @@ def _attach_indexer_prefetch(tutti_loader: Optional[Any] = None) -> None:
             manager.attach_native_indexer_cache_loader(
                 tutti_loader,
                 native_indexer_tensors,
+                shard_config=shard_config,
             )
         except Exception:
             # Safety interlock in the cache engine keeps the ordinary padded
@@ -1922,11 +1975,53 @@ def _attach_csa_attention_kv_prefetch(tutti_loader: Optional[Any] = None) -> Non
     compressed_block_size = int(probe_kv_cache.shape[1])
     token_bytes = int(probe_kv_cache.shape[2])
 
+    from lmcache.v1.ssd_tp_sharded_prefetch import (
+        SSDTPShardedPrefetchConfig,
+        TorchDistributedShardGather,
+    )
+
+    shard_config = SSDTPShardedPrefetchConfig.from_engine_config(
+        lmcache_get_or_create_config()
+    )
+    shard_transport = None
+    if (
+        shard_config.enabled
+        and shard_config.csa_enabled
+        and shard_config.csa_replica_verified
+    ):
+        try:
+            from vllm.distributed import get_tp_group
+
+            tp_group = get_tp_group()
+            if int(tp_group.world_size) != shard_config.cp_size:
+                raise RuntimeError(
+                    f"configured CP size {shard_config.cp_size} does not match "
+                    f"runtime TP size {int(tp_group.world_size)}"
+                )
+            shard_transport = TorchDistributedShardGather.from_model_group(
+                tp_group.device_group,
+                shard_config,
+            )
+        except Exception:
+            # Capability failure occurs before request I/O. The manager keeps
+            # the complete local path and all correctness gates unchanged.
+            logger.exception(
+                "CSA shard-gather communicator initialization failed; "
+                "retaining LOCAL_DIRECT"
+            )
+    elif shard_config.enabled and shard_config.csa_enabled:
+        logger.warning(
+            "CSA shard-gather requested without "
+            "LMCACHE_SSD_TP_CSA_REPLICA_VERIFIED=1; retaining LOCAL_DIRECT"
+        )
+
     manager = CSAAttentionKVPrefetchManager(
         tutti_loader=tutti_loader,
         csa_layer_ids=csa_layer_ids,
         compressed_block_size=compressed_block_size,
         token_bytes=token_bytes,
+        shard_config=shard_config,
+        shard_transport=shard_transport,
     )
 
     patched_layers = 0
@@ -2019,6 +2114,10 @@ def _attach_csa_attention_kv_prefetch(tutti_loader: Optional[Any] = None) -> Non
     indexer_manager.attach_csa_attention_kv_manager(manager)
     if hca_registered:
         hca_set = set(manager.hca_layer_ids)
+        hca_lookahead = max(
+            1,
+            _env_int("LMCACHE_HCA_PREFETCH_LOOKAHEAD_LAYERS", 1),
+        )
         for decoder_layer in decoder_layers:
             layer_id = getattr(decoder_layer, "layer_idx", -1)
             if not isinstance(layer_id, int):
@@ -2036,8 +2135,18 @@ def _attach_csa_attention_kv_prefetch(tutti_loader: Optional[Any] = None) -> Non
                         layer_id,
                         exc_info=True,
                     )
-            next_hca = layer_id + 1
-            if next_hca in hca_set:
+            next_hca = next(
+                (
+                    target_layer_id
+                    for target_layer_id in range(
+                        layer_id + 1,
+                        layer_id + hca_lookahead + 1,
+                    )
+                    if target_layer_id in hca_set
+                ),
+                -1,
+            )
+            if next_hca >= 0:
                 _configure_decoder_hca_overlap(
                     decoder_layer,
                     indexer_manager,
@@ -2046,15 +2155,32 @@ def _attach_csa_attention_kv_prefetch(tutti_loader: Optional[Any] = None) -> Non
                 )
             else:
                 # Disable the legacy "next HCA anywhere ahead" mapping. In
-                # staged mode HCA is deterministic and is submitted only from
-                # its immediately preceding CSA FFN, so it cannot steal I/O
-                # from a nearer target CSA prediction deadline.
+                # staged mode HCA is deterministic and only the nearest target
+                # inside the configured lookahead window is submitted.
                 _configure_decoder_hca_overlap(
                     decoder_layer,
                     None,
                     -1,
                     (),
                 )
+
+    # Early CSA layers have no reliable proxy source. Attach deterministic
+    # dense work to the configured one/two-layer FFN boundary; the manager's
+    # cost table and all-rank preflight still decide whether the data path is
+    # shard-gather or the preserved local read.
+    dense_by_source: dict[int, list[int]] = {}
+    for target_layer_id in manager.dense_shard_layer_ids:
+        source_layer_id = int(target_layer_id) - shard_config.early_lookahead
+        if source_layer_id >= 0:
+            dense_by_source.setdefault(source_layer_id, []).append(int(target_layer_id))
+    for decoder_layer in decoder_layers:
+        decoder_layer_id = getattr(decoder_layer, "layer_idx", -1)
+        targets = tuple(sorted(dense_by_source.get(int(decoder_layer_id), ())))
+        _configure_decoder_dense_csa_overlap(
+            decoder_layer,
+            indexer_manager if targets else None,
+            targets,
+        )
     manager.warm_runtime_resources()
     set_csa_attention_kv_prefetch_manager(manager)
     _CSA_ATTENTION_KV_PREFETCH_MANAGER = manager
@@ -2703,6 +2829,8 @@ class LMCacheConnectorV1Impl:
             vllm_config.parallel_config
         )
         self.current_layer = 0
+        self._tutti_compute_slack_requests: set[str] = set()
+        self._tutti_read_sensitive_requests: set[str] = set()
 
         self.force_skip_save = bool(os.environ.get("LMCACHE_FORCE_SKIP_SAVE", False))
         self._requests_priority: dict[str, int] = {}
@@ -2970,11 +3098,13 @@ class LMCacheConnectorV1Impl:
             forward_context (ForwardContext): the forward context.
             **kwargs: additional arguments for the load operation
         """
+        self._clear_tutti_write_request_state()
         try:
             self._start_load_kv_impl(forward_context, **kwargs)
         except Exception:
             import traceback as _tb
 
+            self._clear_tutti_write_request_state()
             logger.error(
                 "start_load_kv unhandled exception (worker traceback):\n%s",
                 _tb.format_exc(),
@@ -3016,9 +3146,12 @@ class LMCacheConnectorV1Impl:
 
         if self.lmcache_engine is None:
             logger.warning(
-                "start_load_kv: lmcache_engine is None (degraded mode), skipping KV load"
+                "start_load_kv: lmcache_engine is None (degraded mode), "
+                "skipping KV load"
             )
             return
+
+        self._open_tutti_write_request_state(metadata)
 
         # Attach the CSA attention-KV prefetch manager if the Tutti loader
         # became ready after register_kv_caches. Runs on the main thread before
@@ -3126,17 +3259,23 @@ class LMCacheConnectorV1Impl:
             else:
                 ret_token_mask = None
                 if streaming_retrieve:
-                    ret_token_mask = self.lmcache_engine.prepare_dsv4_streaming_retrieve(
-                        tokens[:lmcache_cached_tokens],
-                        token_mask[:lmcache_cached_tokens],
-                        kvcaches=kvcaches,
-                        slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                        vllm_cached_tokens=request.load_spec.vllm_cached_tokens,
-                        request_total_tokens=request.prompt_len,
-                        request_configs=request.request_configs,
-                        req_id=request.req_id,
-                        terminal_chunk_hash=request.load_spec.terminal_chunk_hash,
-                        **hma_kwargs,
+                    ret_token_mask = (
+                        self.lmcache_engine.prepare_dsv4_streaming_retrieve(
+                            tokens[:lmcache_cached_tokens],
+                            token_mask[:lmcache_cached_tokens],
+                            kvcaches=kvcaches,
+                            slot_mapping=slot_mapping[:lmcache_cached_tokens],
+                            vllm_cached_tokens=(
+                                request.load_spec.vllm_cached_tokens
+                            ),
+                            request_total_tokens=request.prompt_len,
+                            request_configs=request.request_configs,
+                            req_id=request.req_id,
+                            terminal_chunk_hash=(
+                                request.load_spec.terminal_chunk_hash
+                            ),
+                            **hma_kwargs,
+                        )
                     )
                 if ret_token_mask is None:
                     # The generic connector writes through CUDA and therefore
@@ -3453,6 +3592,10 @@ class LMCacheConnectorV1Impl:
     def wait_for_save(self):
         """Blocking until the KV cache is saved to the connector buffer."""
 
+        # Forward compute has ended. Close the no-external-KV slack before any
+        # save-side gather or metadata work can overlap the next demand read.
+        self._clear_tutti_write_request_state()
+
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
 
@@ -3577,6 +3720,11 @@ class LMCacheConnectorV1Impl:
                     request.load_spec.lmcache_cached_tokens
                     if request.load_spec is not None and request.load_spec.can_load
                     else 0
+                ),
+                lmcache_terminal_chunk_hash=(
+                    request.load_spec.terminal_chunk_hash
+                    if request.load_spec is not None and request.load_spec.can_load
+                    else None
                 ),
                 **self._hma_transfer_kwargs(request),
             )
@@ -4311,3 +4459,65 @@ class LMCacheConnectorV1Impl:
         if self.lmcache_engine is not None:
             return self.lmcache_engine.get_kv_events()
         return []
+
+    def _open_tutti_write_request_state(
+        self,
+        metadata: LMCacheConnectorMetadata,
+    ) -> None:
+        """Mark the forward as write slack or external-KV read-sensitive."""
+        engine = self.lmcache_engine
+        if engine is None or not metadata.requests:
+            return
+        requires_external_kv = any(
+            request.load_spec is not None
+            and request.load_spec.can_load
+            and request.load_spec.lmcache_cached_tokens
+            > request.load_spec.vllm_cached_tokens
+            for request in metadata.requests
+        )
+        if requires_external_kv:
+            read_sensitive_requests = getattr(
+                self,
+                "_tutti_read_sensitive_requests",
+                None,
+            )
+            if read_sensitive_requests is None:
+                read_sensitive_requests = set()
+                self._tutti_read_sensitive_requests = read_sensitive_requests
+            for request in metadata.requests:
+                request_id = str(request.req_id)
+                engine.set_tutti_read_sensitive_write_state(request_id, True)
+                read_sensitive_requests.add(request_id)
+            return
+        for request in metadata.requests:
+            request_id = str(request.req_id)
+            engine.set_tutti_compute_write_slack(request_id, True)
+            active_requests = getattr(
+                self,
+                "_tutti_compute_slack_requests",
+                None,
+            )
+            if active_requests is None:
+                active_requests = set()
+                self._tutti_compute_slack_requests = active_requests
+            active_requests.add(request_id)
+
+    def _clear_tutti_write_request_state(self) -> None:
+        """Close all write-planning request state owned by this connector."""
+        active_requests = getattr(self, "_tutti_compute_slack_requests", None)
+        read_sensitive_requests = getattr(
+            self,
+            "_tutti_read_sensitive_requests",
+            None,
+        )
+        engine = self.lmcache_engine
+        if engine is not None and active_requests:
+            for request_id in active_requests:
+                engine.set_tutti_compute_write_slack(request_id, False)
+        if engine is not None and read_sensitive_requests:
+            for request_id in read_sensitive_requests:
+                engine.set_tutti_read_sensitive_write_state(request_id, False)
+        if active_requests:
+            active_requests.clear()
+        if read_sensitive_requests:
+            read_sensitive_requests.clear()

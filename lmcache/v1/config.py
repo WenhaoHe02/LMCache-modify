@@ -104,6 +104,109 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
+    # TP-sharded SSD prefetch. These fields are intentionally centralized so
+    # Indexer and CSA managers cannot drift onto different collective modes.
+    "ssd_tp_sharded_prefetch": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
+    "ssd_tp_shard_indexer": {
+        "type": bool,
+        "default": True,
+        "env_converter": _to_bool,
+    },
+    "ssd_tp_shard_csa": {
+        "type": bool,
+        "default": True,
+        "env_converter": _to_bool,
+    },
+    "ssd_tp_dense_layers": {
+        "type": str,
+        "default": "2-24",
+        "env_converter": str,
+    },
+    "ssd_tp_disabled_layers": {
+        "type": str,
+        "default": "",
+        "env_converter": str,
+    },
+    "ssd_tp_debug_verify": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
+    "ssd_tp_csa_replica_verified": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
+    "ssd_tp_indexer_cp_verified": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
+    "ssd_tp_cp_size": {"type": int, "default": 8, "env_converter": int},
+    "ssd_tp_cp_interleave": {
+        "type": int,
+        "default": 64,
+        "env_converter": int,
+    },
+    "ssd_tp_min_union_blocks": {
+        "type": int,
+        "default": 128,
+        "env_converter": int,
+    },
+    "ssd_tp_staging_slot_bytes": {
+        "type": int,
+        "default": 128 * 1024**2,
+        "env_converter": int,
+    },
+    "ssd_tp_staging_slots": {
+        "type": int,
+        "default": 2,
+        "env_converter": int,
+    },
+    "ssd_tp_early_lookahead": {
+        "type": int,
+        "default": 2,
+        "env_converter": int,
+    },
+    "ssd_tp_margin_ratio": {
+        "type": float,
+        "default": 0.10,
+        "env_converter": float,
+    },
+    "ssd_tp_hysteresis_ms": {
+        "type": float,
+        "default": 0.25,
+        "env_converter": float,
+    },
+    "ssd_tp_ssd_fixed_ms": {
+        "type": float,
+        "default": 0.5,
+        "env_converter": float,
+    },
+    "ssd_tp_ssd_block_us": {
+        "type": float,
+        "default": 3.2,
+        "env_converter": float,
+    },
+    "ssd_tp_gather_fixed_ms": {
+        "type": float,
+        "default": 0.3,
+        "env_converter": float,
+    },
+    "ssd_tp_nvlink_gbps": {
+        "type": float,
+        "default": 300.0,
+        "env_converter": float,
+    },
+    "ssd_tp_interference_ms": {
+        "type": float,
+        "default": 0.0,
+        "env_converter": float,
+    },
     "pre_caching_hash_algorithm": {
         "type": str,
         "default": "builtin",
@@ -598,6 +701,15 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
 # Specialized methods that are unique to LMCacheEngineConfig
 def _validate_config(self):
     """Validate configuration"""
+
+    # Import lazily only for opted-in deployments; the planning module imports
+    # torch, which should not become a configuration-startup cost by default.
+    if self.ssd_tp_sharded_prefetch:
+        from lmcache.v1.ssd_tp_sharded_prefetch import (
+            SSDTPShardedPrefetchConfig,
+        )
+
+        SSDTPShardedPrefetchConfig.from_engine_config(self)
 
     # needed for the old async serializer implementation
     # # auto-adjust save_unfull_chunk for async loading to prevent CPU fragmentation

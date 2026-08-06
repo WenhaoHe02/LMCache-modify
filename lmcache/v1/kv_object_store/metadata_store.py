@@ -22,7 +22,11 @@ class KVObjectMetadataStore:
 
     def __init__(self) -> None:
         """Create an empty metadata store."""
-        self._records: dict[str, KVObjectRecord] = {}
+        # KVObjectId is an immutable, hashable value object. Indexing by it
+        # directly avoids JSON-serialising every id on each put/get. A 480K
+        # streaming generation performs O(chunks * layers) metadata accesses,
+        # so that conversion otherwise dominates admission CPU time.
+        self._records: dict[KVObjectId, KVObjectRecord] = {}
         self._lock = threading.RLock()
 
     def put(self, record: KVObjectRecord) -> None:
@@ -32,7 +36,7 @@ class KVObjectMetadataStore:
             record: Metadata record to store.
         """
         with self._lock:
-            self._records[record.object_id.to_key()] = record
+            self._records[record.object_id] = record
 
     def get(self, object_id: KVObjectId) -> KVObjectRecord | None:
         """Return one record if present.
@@ -44,7 +48,7 @@ class KVObjectMetadataStore:
             The matching record, or ``None`` when absent.
         """
         with self._lock:
-            return self._records.get(object_id.to_key())
+            return self._records.get(object_id)
 
     def get_many(
         self,
@@ -63,9 +67,7 @@ class KVObjectMetadataStore:
             One result per input object id; absent entries are ``None``.
         """
         with self._lock:
-            records = [
-                self._records.get(object_id.to_key()) for object_id in object_ids
-            ]
+            records = [self._records.get(object_id) for object_id in object_ids]
         if not ready_only:
             return records
         return [
@@ -85,7 +87,23 @@ class KVObjectMetadataStore:
             The removed record, or ``None`` when absent.
         """
         with self._lock:
-            return self._records.pop(object_id.to_key(), None)
+            return self._records.pop(object_id, None)
+
+    def clear(self) -> int:
+        """Remove every metadata record.
+
+        Returns:
+            Number of records removed.
+
+        Notes:
+            This only invalidates control-plane metadata. The owning storage
+            backend remains responsible for resetting or reclaiming physical
+            object-pool space.
+        """
+        with self._lock:
+            removed = len(self._records)
+            self._records.clear()
+        return removed
 
     def records(self) -> list[KVObjectRecord]:
         """Return a snapshot of all records."""
@@ -144,4 +162,4 @@ class KVObjectMetadataStore:
         """
         with self._lock:
             for record in records:
-                self._records[record.object_id.to_key()] = record
+                self._records[record.object_id] = record

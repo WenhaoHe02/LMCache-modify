@@ -7,6 +7,8 @@ import asyncio
 import os
 import shutil
 import tempfile
+import threading
+import time
 
 # Third Party
 import pytest
@@ -25,7 +27,162 @@ from lmcache.v1.memory_management import (
 )
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
-from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
+from lmcache.v1.storage_backend.local_disk_backend import (
+    LocalDiskBackend,
+    _LayerMajorSidecar,
+    _pack_layer_major_wave_on_gpu,
+    _pack_layer_major_wave_with_fallback,
+    _write_wave_limit_bytes,
+)
+
+
+def test_write_quantum_defaults_to_legacy_wave_setting() -> None:
+    with patch.dict(
+        os.environ,
+        {"LMCACHE_DSV4_RAW_WRITE_WAVE_MB": "64"},
+        clear=False,
+    ):
+        os.environ.pop("LMCACHE_DSV4_WRITE_QUANTUM_MB", None)
+        assert _write_wave_limit_bytes(256 * 1024**2) == 64 * 1024**2
+
+
+def test_write_quantum_overrides_legacy_wave_without_changing_staging() -> None:
+    with patch.dict(
+        os.environ,
+        {
+            "LMCACHE_DSV4_RAW_WRITE_WAVE_MB": "256",
+            "LMCACHE_DSV4_WRITE_QUANTUM_MB": "32",
+        },
+    ):
+        assert _write_wave_limit_bytes(256 * 1024**2) == 32 * 1024**2
+
+
+def _gpu_pack_test_wave() -> tuple[list[_LayerMajorSidecar], dict[int, bytes]]:
+    first_source = bytes(range(32))
+    second_source = bytes(range(64, 96))
+    object_id = KVObjectId(
+        model_id="model",
+        parallel_config_id="tp1",
+        rank=0,
+        layer_id=0,
+        role="csa",
+        block_id="first",
+    )
+    first_record = KVObjectRecord(
+        object_id=object_id,
+        pool_id="pool",
+        offset=0,
+        length=8,
+        aligned_length=16,
+        shape=(8,),
+        dtype="torch.uint8",
+    )
+    second_record = KVObjectRecord(
+        object_id=KVObjectId(
+            model_id="model",
+            parallel_config_id="tp1",
+            rank=0,
+            layer_id=1,
+            role="csa",
+            block_id="second",
+        ),
+        pool_id="pool",
+        offset=16,
+        length=8,
+        aligned_length=16,
+        shape=(8,),
+        dtype="torch.uint8",
+    )
+    return (
+        [
+            _LayerMajorSidecar(
+                source_role="csa_attention_kv",
+                layer_id=0,
+                object_role="csa",
+                physical_role="csa-generation",
+                payload_nbytes=8,
+                segments=[
+                    memoryview(first_source)[2:5],
+                    memoryview(first_source)[8:13],
+                ],
+                segment_sources=[(100, 2), (100, 8)],
+                record=first_record,
+            ),
+            _LayerMajorSidecar(
+                source_role="csa_attention_kv",
+                layer_id=1,
+                object_role="csa",
+                physical_role="csa-generation",
+                payload_nbytes=8,
+                segments=[
+                    memoryview(second_source)[1:6],
+                    memoryview(second_source)[10:13],
+                ],
+                segment_sources=[(200, 1), (200, 10)],
+                record=second_record,
+            ),
+        ],
+        {100: first_source, 200: second_source},
+    )
+
+
+def test_gpu_layer_major_pack_preserves_order_and_padding() -> None:
+    wave, sources = _gpu_pack_test_wave()
+    destination = torch.full((32,), 255, dtype=torch.uint8)
+
+    def packer(
+        source_host_ptrs: list[int],
+        source_indices: list[int],
+        source_offsets: list[int],
+        destination_offsets: list[int],
+        lengths: list[int],
+        target: torch.Tensor,
+    ) -> float:
+        target.zero_()
+        target_view = memoryview(target.numpy())
+        for source_idx, source_offset, target_offset, length in zip(
+            source_indices,
+            source_offsets,
+            destination_offsets,
+            lengths,
+            strict=True,
+        ):
+            source = sources[source_host_ptrs[source_idx]]
+            target_view[target_offset : target_offset + length] = source[
+                source_offset : source_offset + length
+            ]
+        return 0.1
+
+    record, payload, _elapsed = _pack_layer_major_wave_on_gpu(
+        wave,
+        destination,
+        packer,
+    )
+    assert record.offset == 0
+    assert record.aligned_length == 32
+    assert bytes(payload[:8]) == sources[100][2:5] + sources[100][8:13]
+    assert bytes(payload[8:16]) == bytes(8)
+    assert bytes(payload[16:24]) == sources[200][1:6] + sources[200][10:13]
+    assert bytes(payload[24:32]) == bytes(8)
+
+
+def test_gpu_layer_major_pack_failure_falls_back_to_cpu() -> None:
+    wave, sources = _gpu_pack_test_wave()
+    destination = torch.empty(32, dtype=torch.uint8)
+
+    def failing_packer(*_args: object) -> float:
+        raise RuntimeError("synthetic CUDA failure")
+
+    _record, payload, _elapsed = _pack_layer_major_wave_with_fallback(
+        wave,
+        bytearray(32),
+        destination,
+        failing_packer,
+    )
+    assert bytes(payload[:8]) == sources[100][2:5] + sources[100][8:13]
+    assert bytes(payload[8:16]) == bytes(8)
+    assert bytes(payload[16:24]) == sources[200][1:6] + sources[200][10:13]
+    assert bytes(payload[24:32]) == bytes(8)
 
 
 class MockLookupServer:
@@ -395,6 +552,56 @@ class TestKVObjectStoreLocalDiskBackend:
         memory_obj.raw_tensor.fill_(7)
         return memory_obj
 
+    def test_raw_pool_reset_invalidates_recovered_lookup_metadata(
+        self,
+        temp_disk_path: str,
+        async_loop: asyncio.AbstractEventLoop,
+        local_cpu_backend: LocalCPUBackend,
+    ) -> None:
+        """Rewinding raw LBAs must make old cache and object records unreachable."""
+        with patch(
+            "os.statvfs",
+            return_value=SimpleNamespace(f_bsize=4096),
+            create=True,
+        ):
+            backend = self._create_object_store_backend(
+                temp_disk_path,
+                async_loop,
+                local_cpu_backend,
+            )
+        key = create_test_key(91)
+        backend.insert_key(
+            key,
+            size=4096,
+            shape=torch.Size([4096]),
+            dtype=torch.uint8,
+            fmt=MemoryFormat.KV_2LTD,
+        )
+        assert backend.kv_object_pool_layout is not None
+        assert backend.kv_object_metadata_store is not None
+        object_id = KVObjectId(
+            model_id="test_model",
+            parallel_config_id="world1",
+            rank=0,
+            layer_id=0,
+            role="full",
+            block_id="recovered",
+        )
+        record = backend.kv_object_pool_layout.allocate(
+            object_id,
+            length=4096,
+            shape=(4096,),
+            dtype="torch.uint8",
+        ).mark_ready()
+        backend.kv_object_metadata_store.put(record)
+
+        backend.reset_kv_object_pool_allocation()
+
+        assert not backend.contains(key)
+        assert backend.kv_object_metadata_store.get(object_id) is None
+        assert backend.kv_object_pool_layout.next_allocation_bounds(4096)[0] == 0
+        backend.local_cpu_backend.memory_allocator.close()
+
     def _create_streaming_object_store_backend(
         self,
         temp_disk_path: str,
@@ -534,6 +741,69 @@ class TestKVObjectStoreLocalDiskBackend:
 
         backend.local_cpu_backend.memory_allocator.close()
 
+    def test_csa_streaming_store_waits_for_raw_writer_ready(
+        self,
+        temp_disk_path: str,
+        async_loop: asyncio.AbstractEventLoop,
+        local_cpu_backend: LocalCPUBackend,
+    ) -> None:
+        """Cold admission waits for a concurrently initialising raw writer."""
+        with patch(
+            "os.statvfs",
+            return_value=SimpleNamespace(f_bsize=4096),
+            create=True,
+        ):
+            backend = self._create_streaming_object_store_backend(
+                temp_disk_path,
+                async_loop,
+                local_cpu_backend,
+            )
+        backend.kv_object_tutti_raw_cold_store_enabled = True
+        backend.set_kv_object_tutti_raw_region_extents([(0, 1000, 32768)])
+        memory_obj = self._allocate_streaming_object_store_memory()
+        key = create_test_key(498)
+
+        def install_writer() -> None:
+            backend.set_kv_object_tutti_raw_writer(
+                lambda record, _buffer: (
+                    [
+                        (
+                            record.offset,
+                            1000 + record.offset // 512,
+                            record.aligned_length // 512,
+                        )
+                    ],
+                    0.0,
+                )
+            )
+
+        timer = threading.Timer(0.05, install_writer)
+        with patch.dict(
+            os.environ,
+            {
+                "LMCACHE_INDEXER_ENABLE_PREFETCH": "1",
+                "LMCACHE_DSV4_HCA_WALKER": "0",
+                "LMCACHE_KV_OBJECT_STORE_RAW_WRITER_READY_TIMEOUT_SEC": "1",
+            },
+        ):
+            start = time.perf_counter()
+            timer.start()
+            try:
+                assert (
+                    backend.store_attention_layer_major_snapshot(
+                        key,
+                        [memory_obj],
+                        prefix_keys=[key],
+                    )
+                    == 2
+                )
+            finally:
+                timer.join()
+            assert time.perf_counter() - start >= 0.04
+
+        assert backend.wait_for_kv_object_tutti_raw_writer(0.0)
+        backend.local_cpu_backend.memory_allocator.close()
+
     def test_csa_streaming_store_does_not_publish_partial_layout(
         self,
         temp_disk_path: str,
@@ -625,6 +895,8 @@ class TestKVObjectStoreLocalDiskBackend:
                 )
                 == 2
             )
+            assert backend.kv_object_metadata_store is not None
+            assert len(backend.kv_object_metadata_store.ready_records()) == 2
             backend.async_save_bytes_to_disk(first_key, first)
             backend.async_save_bytes_to_disk(second_key, second)
             backend.kv_object_tutti_raw_enabled = True
@@ -647,6 +919,85 @@ class TestKVObjectStoreLocalDiskBackend:
                 assert not backend.contains(first_key)
                 assert not backend.contains(second_key)
                 assert not backend.contains_streaming_terminal(second_key, 512)
+
+        backend.local_cpu_backend.memory_allocator.close()
+
+    def test_csa_streaming_partial_hit_extends_ready_generation(
+        self,
+        temp_disk_path: str,
+        async_loop: asyncio.AbstractEventLoop,
+        local_cpu_backend: LocalCPUBackend,
+    ) -> None:
+        """A partial-hit suffix composes with its READY prefix generation."""
+        with patch(
+            "os.statvfs",
+            return_value=SimpleNamespace(f_bsize=4096),
+            create=True,
+        ):
+            backend = self._create_streaming_object_store_backend(
+                temp_disk_path,
+                async_loop,
+                local_cpu_backend,
+            )
+        base = self._allocate_streaming_object_store_memory()
+        suffix = self._allocate_streaming_object_store_memory()
+        suffix_csa = suffix.get_tensor(1)
+        suffix_indexer = suffix.get_tensor(2)
+        assert suffix_csa is not None
+        assert suffix_indexer is not None
+        suffix_csa.fill_(12)
+        suffix_indexer.fill_(13)
+        base_key = create_test_key(511)
+        suffix_key = create_test_key(512)
+
+        with patch.dict(
+            os.environ,
+            {
+                "LMCACHE_INDEXER_ENABLE_PREFETCH": "1",
+                "LMCACHE_DSV4_HCA_WALKER": "0",
+            },
+        ):
+            assert (
+                backend.store_attention_layer_major_snapshot(
+                    base_key,
+                    [base],
+                    prefix_keys=[base_key],
+                    prefix_token_count=256,
+                )
+                == 2
+            )
+            backend.async_save_bytes_to_disk(base_key, base)
+            assert backend.contains_streaming_terminal(base_key, 256)
+
+            assert (
+                backend.store_attention_layer_major_snapshot(
+                    suffix_key,
+                    [suffix],
+                    prefix_keys=[suffix_key],
+                    prefix_token_count=256,
+                    base_prefix_key=base_key,
+                    base_prefix_token_count=256,
+                )
+                == 2
+            )
+            backend.async_save_bytes_to_disk(suffix_key, suffix)
+
+            assert backend.contains_streaming_terminal(suffix_key, 512)
+            csa = backend.get_csa_layer_major_records(suffix_key, [0])[0]
+            indexer = backend.get_indexer_layer_major_records(suffix_key, [0])[0]
+            assert csa is not None
+            assert indexer is not None
+            assert len(csa.read_ranges) == 2
+            assert len(indexer.read_ranges) == 2
+            assert csa.aligned_length % 512 == 0
+            assert indexer.aligned_length % 512 == 0
+            assert backend.kv_object_pool_io is not None
+            assert backend.kv_object_pool_io.read_object(csa) == bytes(
+                [2] * (2 * 8 * 584) + [12] * (2 * 8 * 584)
+            )
+            assert backend.kv_object_pool_io.read_object(indexer) == bytes(
+                [3] * (8 * 132) + [13] * (8 * 132)
+            )
 
         backend.local_cpu_backend.memory_allocator.close()
 
@@ -926,6 +1277,90 @@ class TestKVObjectStoreLocalDiskBackend:
         assert probed[0].length == record0.length // 2
         assert probed[1] == record0
 
+        backend.local_cpu_backend.memory_allocator.close()
+
+    def test_attention_layer_major_raw_store_batches_contiguous_layers(
+        self,
+        temp_disk_path: str,
+        async_loop: asyncio.AbstractEventLoop,
+        local_cpu_backend: LocalCPUBackend,
+    ) -> None:
+        """Contiguous layer sidecars share one bounded raw-write wave."""
+        with patch(
+            "os.statvfs",
+            return_value=SimpleNamespace(f_bsize=4096),
+            create=True,
+        ):
+            backend = self._create_object_store_backend(
+                temp_disk_path,
+                async_loop,
+                local_cpu_backend,
+            )
+        backend.kv_object_tutti_raw_cold_store_enabled = True
+        backend.kv_object_tutti_raw_staging_bytes = 1024**2
+        backend.set_kv_object_tutti_raw_region_extents([(0, 1000, 2048)])
+        writes: list[tuple[KVObjectRecord, bytes]] = []
+
+        def raw_writer(
+            record: KVObjectRecord,
+            payload: memoryview,
+        ) -> tuple[list[tuple[int, int, int]], float]:
+            writes.append((record, bytes(payload)))
+            return [
+                (
+                    record.offset,
+                    1000 + record.offset // 512,
+                    record.aligned_length // 512,
+                )
+            ], 0.0
+
+        backend.set_kv_object_tutti_raw_writer(raw_writer)
+        allocator = AdHocMemoryAllocator(device="cpu")
+        memory_objs: list[MemoryObj] = []
+        for chunk_id in range(2):
+            memory_obj = allocator.allocate(
+                [torch.Size([2, 2, 8, 4])],
+                [torch.uint8],
+                fmt=MemoryFormat.KV_2LTD,
+            )
+            assert memory_obj is not None
+            tensor = memory_obj.get_tensor(0)
+            assert tensor is not None
+            for kv_id in range(2):
+                for layer_id in range(2):
+                    tensor[kv_id, layer_id].fill_(chunk_id * 40 + kv_id * 10 + layer_id)
+            memory_objs.append(memory_obj)
+
+        first_key = create_test_key(296)
+        prefix_key = create_test_key(297)
+        with patch.dict(os.environ, {"LMCACHE_DSV4_RAW_WRITE_WAVE_MB": "1"}):
+            assert (
+                backend.store_attention_layer_major_snapshot(
+                    prefix_key,
+                    memory_objs,
+                    prefix_keys=[first_key, prefix_key],
+                )
+                == 2
+            )
+
+        assert len(writes) == 1
+        wave_record, wave_payload = writes[0]
+        assert wave_record.offset == 0
+        assert wave_record.aligned_length == 8192
+        assert len(wave_payload) == 8192
+        assert wave_payload[:128] == bytes([0] * 32 + [10] * 32 + [40] * 32 + [50] * 32)
+        assert wave_payload[128:4096] == bytes(4096 - 128)
+        assert wave_payload[4096:4224] == bytes(
+            [1] * 32 + [11] * 32 + [41] * 32 + [51] * 32
+        )
+
+        record0, record1 = backend.get_csa_layer_major_records(prefix_key, [0, 1])
+        assert record0 is not None
+        assert record1 is not None
+        assert record0.raw_extents == ((0, 1000, 8),)
+        assert record1.raw_extents == ((4096, 1008, 8),)
+        assert backend.kv_object_record_raw_readable(record0)
+        assert backend.kv_object_record_raw_readable(record1)
         backend.local_cpu_backend.memory_allocator.close()
 
     def test_indexer_layer_major_snapshot_keeps_all_physical_rows(

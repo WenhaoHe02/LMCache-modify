@@ -43,9 +43,12 @@ Usage
 
 import bisect
 import ctypes
+import glob
 import hashlib
 import mmap
 import os
+import re
+import stat
 import struct as _struct
 import sys
 import threading
@@ -70,11 +73,65 @@ from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey, DiskCacheMetadata
 from lmcache.v1.kv_object_store import KVObjectByteRange
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj, MemoryObjMetadata
+from lmcache.v1.write_planner import TuttiWritePlanManager, WritePlanSnapshot
 
 # TensorMemoryObj lives here; import carefully to avoid circular deps
 from lmcache.v1.memory_management import TensorMemoryObj
 
 logger = init_logger(__name__)
+
+
+def _kernel_device_numbers(block_name: str) -> Optional[tuple[int, int]]:
+    """Return kernel major/minor numbers for one snvme namespace."""
+    try:
+        with open(
+            f"/sys/class/block/{block_name}/dev",
+            encoding="utf-8",
+        ) as dev_file:
+            value = dev_file.read().strip()
+    except FileNotFoundError:
+        value = ""
+        with open("/proc/partitions", encoding="utf-8") as partitions:
+            for line in partitions:
+                fields = line.split()
+                if len(fields) == 4 and fields[3] == block_name:
+                    value = f"{fields[0]}:{fields[1]}"
+                    break
+    if not value:
+        return None
+    major, minor = (int(part) for part in value.split(":"))
+    return major, minor
+
+
+def _wait_for_mount_handoff_before_bind() -> None:
+    """Refuse SNVM_DEVICE_BIND until rank and host handoffs are complete."""
+    handoff_id = os.getenv("LMCACHE_TUTTI_HANDOFF_ID", "").strip()
+    if not handoff_id:
+        return
+    expected = int(os.getenv("LMCACHE_TUTTI_HANDOFF_RANKS", "8"))
+    timeout_s = float(os.getenv("LMCACHE_TUTTI_HANDOFF_TIMEOUT_SEC", "30"))
+    barrier_dir = f"/tmp/lmcache_tutti_mount_handoff_{handoff_id}"
+    deadline = time.monotonic() + timeout_s
+    ready = 0
+    names: list[str] = []
+    while time.monotonic() < deadline:
+        try:
+            names = os.listdir(barrier_dir)
+            ready = sum(
+                name.startswith("mnt_nvme") and name.endswith(".ready")
+                for name in names
+            )
+        except FileNotFoundError:
+            names = []
+            ready = 0
+        if ready >= expected and "host.ready" in names:
+            return
+        time.sleep(0.05)
+    raise RuntimeError(
+        "SNVM_DEVICE_BIND blocked because mount handoff is incomplete: "
+        f"id={handoff_id} rank_ready={ready}/{expected} "
+        f"host_ready={int('host.ready' in names)}"
+    )
 
 # ── conditional import of CUDA ops ──────────────────────────────────────────
 try:
@@ -82,10 +139,12 @@ try:
 
     _HAS_C_OPS: bool = hasattr(_c_ops, "tutti_submit_batch_sgl_read")
     _HAS_WRITE_C_OPS: bool = hasattr(_c_ops, "tutti_submit_batch_sgl_write")
+    _HAS_HOST_PACK_C_OPS: bool = hasattr(_c_ops, "pack_pinned_host_segments")
 except ImportError:
     _c_ops = None  # type: ignore[assignment]
     _HAS_C_OPS = False
     _HAS_WRITE_C_OPS = False
+    _HAS_HOST_PACK_C_OPS = False
 
 # ── constants ────────────────────────────────────────────────────────────────
 
@@ -119,9 +178,14 @@ def _raw_write_window_ready(
     waited_s: float,
     write_slack_s: float,
     write_max_delay_s: float,
+    demand_readers_waiting: Optional[int] = None,
 ) -> bool:
     """Return whether a background raw write may acquire the I/O queue."""
-    if readers_waiting > 0:
+    if demand_readers_waiting is None:
+        demand_readers_waiting = readers_waiting
+    if demand_readers_waiting > 0:
+        return False
+    if readers_waiting > 0 and waited_s < write_max_delay_s:
         return False
     return idle_for_s >= write_slack_s or waited_s >= write_max_delay_s
 
@@ -323,6 +387,28 @@ def _cuda_free(ptr: int) -> None:
     if ptr == 0:
         return
     _get_cudart().cudaFree(ctypes.c_void_p(ptr))
+
+
+def _cuda_memcpy_async_h2d(
+    dest_ptr: int,
+    src_ptr: int,
+    nbytes: int,
+    stream_ptr: int,
+) -> None:
+    """Enqueue a pinned-host-to-device copy on an explicit CUDA stream."""
+    # cudaMemcpyHostToDevice = 1.  Calling libcudart directly avoids entering
+    # PyTorch's current-stream context, whose allocator bookkeeping may wait
+    # behind unrelated model work before it enqueues a tiny descriptor copy.
+    ret = _get_cudart().cudaMemcpyAsync(
+        ctypes.c_void_p(dest_ptr),
+        ctypes.c_void_p(src_ptr),
+        ctypes.c_size_t(nbytes),
+        ctypes.c_int(1),
+        ctypes.c_void_p(stream_ptr),
+    )
+    if ret != 0:
+        _get_cudart().cudaGetLastError()
+        raise RuntimeError(f"cudaMemcpyAsync H2D failed (error {ret})")
 
 
 def _cuda_malloc_device(size: int, device_id: int) -> int:
@@ -908,6 +994,7 @@ class SnvmeSession:
         self._fd_dev = os.open(self._device_path, os.O_RDWR)
         cap_buf = _struct.pack("I", kernel_ioq_cap)
         fcntl.ioctl(self._fd_dev, _NVM_SET_KERNEL_IOQ_CAP, cap_buf)
+        _wait_for_mount_handoff_before_bind()
         _clear_driver_override(pci_bdf)
         _ioctl(self._fd_ctrl, _SNVM_DEVICE_BIND, bdf)
 
@@ -1178,6 +1265,7 @@ class TuttiDirectLoader:
         cuda_device: int = 0,
         initial_lba_cache: Optional[dict[str, list[LbaRecord]]] = None,
         debug_expected_checksums: Optional[dict[str, tuple[int, str]]] = None,
+        pci_bdf: str = "",
     ) -> None:
         self._session = session
         self._staging = staging_tensor
@@ -1186,6 +1274,7 @@ class TuttiDirectLoader:
         self._slot_gpu_pages = slot_gpu_pages
         self._slot_bytes = slot_gpu_pages * _GPU_PAGE_SIZE
         self._cuda_device = cuda_device
+        self._pci_bdf = pci_bdf
         # Serialises every NVMe submit/poll cycle (loads AND raw stores).
         # The SQ/CQ ring, doorbells, staging pool, and status buffer are all
         # single-instance per loader; the CSA prefetch path calls
@@ -1237,6 +1326,16 @@ class TuttiDirectLoader:
         self._write_max_delay_s = float(
             os.environ.get("LMCACHE_TUTTI_WRITE_MAX_DELAY_SEC", "2.0")
         )
+        self._write_plan_manager = TuttiWritePlanManager(
+            write_slack_s=self._write_slack_s,
+            write_max_delay_s=self._write_max_delay_s,
+            initial_bandwidth_mib_s=float(
+                os.environ.get("LMCACHE_TUTTI_WRITE_INITIAL_MIBPS", "4096")
+            ),
+            deadline_guard_s=float(
+                os.environ.get("LMCACHE_TUTTI_WRITE_DEADLINE_GUARD_SEC", "0.01")
+            ),
+        )
         speculative_rate_mbps = float(
             os.environ.get("LMCACHE_TUTTI_SPECULATIVE_RATE_MBPS", "256")
         )
@@ -1257,8 +1356,10 @@ class TuttiDirectLoader:
         # completion turns the spin into a global freeze: forward and NCCL
         # kernels queue behind it on every rank that fired a read.
         self._io_stream: Optional[torch.cuda.Stream] = None
+        self._host_pack_stream: Optional[torch.cuda.Stream] = None
         if torch.cuda.is_available():
             self._io_stream = torch.cuda.Stream(device=cuda_device)
+            self._host_pack_stream = torch.cuda.Stream(device=cuda_device)
 
         # Managed-memory control scalars (writable from both CPU and GPU).
         self._sq_tail_ptr = sq_tail_ptr
@@ -1268,6 +1369,77 @@ class TuttiDirectLoader:
 
         # Reusable GPU tensor for per-CQE status codes.
         self._status_buf = status_buf
+
+        # Raw writes used to construct three tiny CUDA tensors from Python
+        # lists for every submission batch. The first allocation on the
+        # deferred-admission thread can enter cudaMalloc and synchronize the
+        # device after a long prefill (measured at 11.8-12.1 seconds on seven
+        # TP ranks for a 480K cold store). Keep fixed queue-depth descriptor
+        # buffers instead. The single shared SQ/CQ lock also serializes access
+        # to these buffers, so one set per loader is sufficient.
+        write_descriptor_capacity = max(1, int(session.info.q_depth) - 1)
+        self._write_staging_iovas_cpu = torch.empty(
+            write_descriptor_capacity,
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=torch.cuda.is_available(),
+        )
+        self._write_slbas_cpu = torch.empty(
+            write_descriptor_capacity,
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=torch.cuda.is_available(),
+        )
+        self._write_byte_lens_cpu = torch.empty(
+            write_descriptor_capacity,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=torch.cuda.is_available(),
+        )
+        # CPU mirrors keep the mocked, CUDA-free unit path executable. A real
+        # Tutti loader always replaces them with device buffers below.
+        self._write_staging_iovas_gpu = torch.empty(
+            write_descriptor_capacity,
+            dtype=torch.int64,
+        )
+        self._write_slbas_gpu = torch.empty(
+            write_descriptor_capacity,
+            dtype=torch.int64,
+        )
+        self._write_byte_lens_gpu = torch.empty(
+            write_descriptor_capacity,
+            dtype=torch.int32,
+        )
+        if torch.cuda.is_available():
+            assert self._io_stream is not None
+            with (
+                torch.cuda.device(cuda_device),
+                torch.cuda.stream(self._io_stream),
+            ):
+                descriptor_device = torch.device("cuda", cuda_device)
+                self._write_staging_iovas_gpu = torch.empty(
+                    write_descriptor_capacity,
+                    dtype=torch.int64,
+                    device=descriptor_device,
+                )
+                self._write_slbas_gpu = torch.empty(
+                    write_descriptor_capacity,
+                    dtype=torch.int64,
+                    device=descriptor_device,
+                )
+                self._write_byte_lens_gpu = torch.empty(
+                    write_descriptor_capacity,
+                    dtype=torch.int32,
+                    device=descriptor_device,
+                )
+                # Establish the descriptor buffers on the same private stream
+                # that submits every raw write. If they are first touched on
+                # the model default stream, their first cross-stream H2D copy
+                # can inherit the complete long-prefill tail.
+                self._write_staging_iovas_gpu.zero_()
+                self._write_slbas_gpu.zero_()
+                self._write_byte_lens_gpu.zero_()
+            self._io_stream.synchronize()
 
         # Persistent lookup used by the indexed CSA submit kernel. snvme
         # exposes one IOVA per 64-KiB GPU page; keeping the table on-device
@@ -1490,6 +1662,7 @@ class TuttiDirectLoader:
                 cuda_device=cuda_device,
                 initial_lba_cache=initial_lba_cache,
                 debug_expected_checksums=debug_expected_checksums,
+                pci_bdf=pci_bdf,
             )
         except Exception:
             if session is not None:
@@ -2799,6 +2972,268 @@ class TuttiDirectLoader:
             logical_nbytes=logical_nbytes,
         )
 
+    def begin_write_slack(
+        self,
+        source: str,
+        expected_duration_s: Optional[float] = None,
+    ) -> int:
+        """Open a known write-slack window.
+
+        Args:
+            source: Human-readable source, for example ``"tool_call"``.
+            expected_duration_s: Optional expected remaining slack duration.
+
+        Returns:
+            Opaque token to pass to :meth:`end_write_slack`.
+        """
+        with self._reader_gate:
+            token = self._write_plan_manager.begin_slack(
+                source,
+                expected_duration_s,
+            )
+            self._reader_gate.notify_all()
+            return token
+
+    def end_write_slack(self, token: int) -> bool:
+        """Close a known write-slack window and restore the idle guard.
+
+        Args:
+            token: Token returned by :meth:`begin_write_slack`.
+
+        Returns:
+            Whether an active window was closed.
+        """
+        with self._reader_gate:
+            removed = self._write_plan_manager.end_slack(token)
+            if removed:
+                self._last_read_end = time.perf_counter()
+                self._reader_gate.notify_all()
+            return removed
+
+    def set_compute_write_slack(self, request_id: str, active: bool) -> None:
+        """Mark compute that performs no external KV read as write slack.
+
+        Args:
+            request_id: Serving request identifier.
+            active: Whether the compute window is active.
+        """
+        with self._reader_gate:
+            changed = self._write_plan_manager.set_compute_slack(request_id, active)
+            if changed and not active:
+                self._last_read_end = time.perf_counter()
+            if changed:
+                self._reader_gate.notify_all()
+
+    def set_read_sensitive_write_state(self, request_id: str, active: bool) -> None:
+        """Block writes while a forward may issue more external KV reads.
+
+        Args:
+            request_id: Serving request identifier.
+            active: Whether the read-sensitive forward is active.
+        """
+        with self._reader_gate:
+            changed = self._write_plan_manager.set_read_sensitive(request_id, active)
+            if changed and not active:
+                self._last_read_end = time.perf_counter()
+            if changed:
+                self._reader_gate.notify_all()
+
+    def get_write_plan_snapshot(self) -> WritePlanSnapshot:
+        """Return current write-planner state for observability.
+
+        Returns:
+            Current slack, wave queue, completion, and bandwidth state.
+        """
+        return self._write_plan_manager.snapshot()
+
+    def kernel_block_device_path(self) -> str:
+        """Return the snvme kernel block device paired with this loader.
+
+        The snvme namespace is created after the container starts, so its
+        device node is not necessarily mirrored into the container ``/dev``.
+        Resolve the namespace by PCI BDF through sysfs and materialize a
+        rank-local block node under ``/tmp`` when needed.
+
+        Returns:
+            Absolute kernel block-device path.
+
+        Raises:
+            RuntimeError: If the driver reports an unexpected name or the
+                derived block device is unavailable.
+        """
+        if not self._pci_bdf:
+            raise RuntimeError("Tutti loader has no PCI BDF for kernel I/O")
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            for sys_path in glob.glob("/sys/class/block/snvme*n1"):
+                if self._pci_bdf not in os.path.realpath(sys_path):
+                    continue
+                sys_name = os.path.basename(sys_path)
+                block_name = re.sub(r"c\d+n", "n", sys_name)
+                dev_numbers = _kernel_device_numbers(block_name)
+                if dev_numbers is None:
+                    continue
+                major, minor = dev_numbers
+                expected_device = os.makedev(major, minor)
+                device_path = f"/tmp/lmcache-{block_name}"
+                try:
+                    current = os.stat(device_path)
+                except FileNotFoundError:
+                    current = None
+                if current is not None and (
+                    not stat.S_ISBLK(current.st_mode)
+                    or current.st_rdev != expected_device
+                ):
+                    os.unlink(device_path)
+                    current = None
+                if current is None:
+                    os.mknod(
+                        device_path,
+                        stat.S_IFBLK | 0o600,
+                        expected_device,
+                    )
+                return device_path
+            time.sleep(0.05)
+        discovered = {
+            path: os.path.realpath(path)
+            for path in glob.glob("/sys/class/block/snvme*n1")
+        }
+        raise RuntimeError(
+            "no snvme kernel block device for "
+            f"{self._pci_bdf}; discovered={discovered}"
+        )
+
+    def queue_background_write(self, nbytes: int) -> None:
+        """Record one CPU raw-write wave entering the admission queue.
+
+        Args:
+            nbytes: Total physical bytes in the wave.
+        """
+        self._write_plan_manager.wave_queued(nbytes)
+
+    def wait_for_background_write_slot(
+        self,
+        nbytes: int,
+        writer_wait_started_s: float,
+    ) -> None:
+        """Wait until one bounded CPU write block may be submitted.
+
+        The check is repeated before every block. Demand readers and
+        read-sensitive forwards always win; a write already inside the kernel
+        is bounded by the configured CPU raw-write block size.
+
+        Args:
+            nbytes: Size of the proposed kernel write.
+            writer_wait_started_s: Monotonic timestamp when its containing wave
+                first entered the queue.
+        """
+        while True:
+            with self._reader_gate:
+                decision = self._write_plan_manager.decide(
+                    now_s=time.perf_counter(),
+                    readers_waiting=self._readers_waiting,
+                    demand_readers_waiting=self._hp_readers,
+                    last_read_end_s=self._last_read_end,
+                    writer_wait_started_s=writer_wait_started_s,
+                    wave_nbytes=nbytes,
+                )
+                if decision.admitted:
+                    return
+                self._reader_gate.wait(
+                    timeout=max(0.001, min(0.05, decision.retry_after_s))
+                )
+
+    def start_background_write(self) -> None:
+        """Record one admitted CPU raw-write wave becoming active."""
+        self._write_plan_manager.wave_started()
+
+    def finish_background_write(
+        self,
+        nbytes: int,
+        duration_s: float,
+        success: bool,
+    ) -> None:
+        """Record CPU raw-write completion and update planner bandwidth.
+
+        Args:
+            nbytes: Total physical bytes in the wave.
+            duration_s: End-to-end active-wave duration.
+            success: Whether every physical write completed.
+        """
+        self._write_plan_manager.wave_finished(nbytes, duration_s, success)
+        with self._reader_gate:
+            self._reader_gate.notify_all()
+
+    def pack_pinned_host_segments(
+        self,
+        source_host_ptrs: Sequence[int],
+        source_indices: Sequence[int],
+        source_offsets: Sequence[int],
+        destination_offsets: Sequence[int],
+        lengths: Sequence[int],
+        destination: torch.Tensor,
+    ) -> float:
+        """Pack pinned CPU segments with a CUDA kernel.
+
+        The source snapshot remains CPU-owned, so vLLM may release its paged
+        GPU KV blocks before this method runs. The kernel accesses registered
+        host buffers through CUDA-mapped aliases and emits the final
+        layer-major layout into ``destination`` on a private stream.
+
+        Args:
+            source_host_ptrs: Base CPU address of every unique source buffer.
+            source_indices: Source-buffer index for each segment.
+            source_offsets: Byte offset within the selected source buffer.
+            destination_offsets: Byte offset within ``destination``.
+            lengths: Number of bytes copied for each segment.
+            destination: Contiguous pinned CPU uint8 tensor.
+
+        Returns:
+            Kernel submission and completion time in milliseconds.
+
+        Raises:
+            RuntimeError: If the extension lacks the pack kernel or CUDA is
+                unavailable.
+            ValueError: If descriptor lengths disagree or the destination is
+                not a contiguous pinned CPU uint8 tensor.
+        """
+        descriptor_lengths = {
+            len(source_indices),
+            len(source_offsets),
+            len(destination_offsets),
+            len(lengths),
+        }
+        if len(descriptor_lengths) != 1:
+            raise ValueError("host-pack descriptor lengths must match")
+        if not source_indices:
+            raise ValueError("host-pack descriptors must not be empty")
+        if destination.device.type != "cpu" or destination.dtype != torch.uint8:
+            raise ValueError("destination must be a CPU uint8 tensor")
+        if not destination.is_contiguous() or not destination.is_pinned():
+            raise ValueError("destination must be contiguous pinned CPU memory")
+        if not _HAS_HOST_PACK_C_OPS or _c_ops is None:
+            raise RuntimeError(
+                "lmcache.c_ops.pack_pinned_host_segments is unavailable; "
+                "rebuild the CUDA extension"
+            )
+        pack_stream = self._host_pack_stream
+        if pack_stream is None:
+            raise RuntimeError("CUDA host-pack stream is unavailable")
+
+        started = time.perf_counter()
+        with torch.cuda.device(self._cuda_device), torch.cuda.stream(pack_stream):
+            _c_ops.pack_pinned_host_segments(
+                list(source_host_ptrs),
+                list(source_indices),
+                list(source_offsets),
+                list(destination_offsets),
+                list(lengths),
+                destination,
+                torch.device("cuda", self._cuda_device),
+            )
+        pack_stream.synchronize()
+        return _elapsed_ms(started)
+
     def store_bytes_to_raw_extents(
         self,
         payload: bytes | bytearray | memoryview,
@@ -2853,8 +3288,9 @@ class TuttiDirectLoader:
                 f"but only {self._staging_capacity_bytes()} bytes are available"
             )
 
+        self._write_plan_manager.wave_queued(dma_nbytes)
+
         profile_start = time.perf_counter()
-        _dev = f"cuda:{self._cuda_device}"
         # Same single SQ/CQ ring and staging pool as the read path: a raw
         # store racing a concurrent load corrupts both. Serialise on _io_lock
         # from the staging copy through the last poll/status batch.
@@ -2870,25 +3306,34 @@ class TuttiDirectLoader:
             self._writers_waiting += 1
             self._reader_gate.notify_all()
         writer_active = False
+        device_start = 0.0
+        write_succeeded = False
         try:
             while True:
                 with self._reader_gate:
                     now = time.perf_counter()
-                    if _raw_write_window_ready(
+                    decision = self._write_plan_manager.decide(
+                        now_s=now,
                         readers_waiting=self._readers_waiting,
-                        idle_for_s=now - self._last_read_end,
-                        waited_s=now - park_start,
-                        write_slack_s=self._write_slack_s,
-                        write_max_delay_s=self._write_max_delay_s,
-                    ):
+                        demand_readers_waiting=self._hp_readers,
+                        last_read_end_s=self._last_read_end,
+                        writer_wait_started_s=park_start,
+                        wave_nbytes=dma_nbytes,
+                    )
+                    if decision.admitted:
                         break
-                    self._reader_gate.wait(timeout=self._write_slack_s)
+                    self._reader_gate.wait(timeout=decision.retry_after_s)
             with self._reader_gate:
                 self._active_writers += 1
                 writer_active = True
                 self._reader_gate.notify_all()
+            self._write_plan_manager.wave_started()
+            gate_wait_ms = _elapsed_ms(park_start)
+            lock_wait_start = time.perf_counter()
             with self._io_lock:
-                return self._store_bytes_to_raw_extents_locked(
+                lock_wait_ms = _elapsed_ms(lock_wait_start)
+                device_start = time.perf_counter()
+                result = self._store_bytes_to_raw_extents_locked(
                     payload_view=payload_view,
                     payload_nbytes=payload_nbytes,
                     dma_nbytes=dma_nbytes,
@@ -2896,9 +3341,20 @@ class TuttiDirectLoader:
                     raw_extents=raw_extents,
                     base_file_offset=base_file_offset,
                     profile_start=profile_start,
-                    dev=_dev,
+                    gate_wait_ms=gate_wait_ms,
+                    lock_wait_ms=lock_wait_ms,
                 )
+                write_succeeded = True
+                return result
         finally:
+            duration_s = (
+                time.perf_counter() - device_start if device_start > 0 else 0.0
+            )
+            self._write_plan_manager.wave_finished(
+                dma_nbytes,
+                duration_s,
+                write_succeeded,
+            )
             with self._reader_gate:
                 if writer_active:
                     self._active_writers -= 1
@@ -2915,11 +3371,11 @@ class TuttiDirectLoader:
         raw_extents: list[LbaRecord],
         base_file_offset: int,
         profile_start: float,
-        dev: str,
+        gate_wait_ms: float = 0.0,
+        lock_wait_ms: float = 0.0,
     ) -> list[LbaRecord]:
         """Body of :meth:`store_bytes_to_raw_extents`; caller holds _io_lock."""
         profile_enabled = _tutti_profile_enabled()
-        _dev = dev
         io_stream = self._io_stream
         with torch.cuda.device(self._cuda_device):
             copy_start = time.perf_counter()
@@ -2933,7 +3389,12 @@ class TuttiDirectLoader:
             # collective can hang.  Keep the complete write transaction on
             # the loader's dedicated stream and synchronize only that stream.
             with torch.cuda.stream(copy_stream):
-                staging.zero_()
+                # The source overwrites every payload byte. Only the sector
+                # padding that NVMe will actually write needs initialization;
+                # zeroing the whole GPU-page-aligned wave adds a redundant HBM
+                # pass and another kernel to every background transaction.
+                if payload_nbytes < dma_nbytes:
+                    staging[payload_nbytes:dma_nbytes].zero_()
                 cpu_tensor = torch.frombuffer(payload_view, dtype=torch.uint8)
                 staging[:payload_nbytes].copy_(cpu_tensor, non_blocking=True)
             copy_stream.synchronize()
@@ -2994,6 +3455,9 @@ class TuttiDirectLoader:
         submit_ms = 0.0
         poll_sync_ms = 0.0
         status_ms = 0.0
+        arg_ms = 0.0
+        arg_cpu_ms = 0.0
+        arg_h2d_ms = 0.0
         while cursor < len(io_specs):
             batch_iovas: list[int] = []
             batch_slbas: list[int] = []
@@ -3007,29 +3471,53 @@ class TuttiDirectLoader:
                 batch_paths.append(f"raw://slba/{slba}")
                 cursor += 1
 
+            batch_n_ios = len(batch_iovas)
+            if batch_n_ios > self._write_staging_iovas_cpu.numel():
+                raise RuntimeError("Tutti raw write exceeds descriptor capacity")
             arg_start = time.perf_counter()
+            cpu_arg_start = time.perf_counter()
+            self._write_staging_iovas_cpu[:batch_n_ios].copy_(
+                torch.tensor(batch_iovas, dtype=torch.int64),
+            )
+            self._write_slbas_cpu[:batch_n_ios].copy_(
+                torch.tensor(batch_slbas, dtype=torch.int64),
+            )
+            self._write_byte_lens_cpu[:batch_n_ios].copy_(
+                torch.tensor(batch_lens, dtype=torch.int32),
+            )
+            arg_cpu_ms += _elapsed_ms(cpu_arg_start)
             copy_stream = io_stream or torch.cuda.current_stream()
-            # These tensors are consumed only by the Tutti write kernels.
-            # Creating them on the default stream and then calling
-            # ``io_stream.wait_stream(default)`` accidentally orders every
-            # background write behind unrelated model work.
-            with torch.cuda.stream(copy_stream):
-                staging_iovas_t = torch.tensor(
-                    batch_iovas,
-                    dtype=torch.int64,
-                    device=_dev,
-                )
-                slbas_t = torch.tensor(
-                    batch_slbas,
-                    dtype=torch.int64,
-                    device=_dev,
-                )
-                byte_lens_t = torch.tensor(
-                    batch_lens,
-                    dtype=torch.int32,
-                    device=_dev,
-                )
-            arg_ms = _elapsed_ms(arg_start)
+            arg_h2d_start = time.perf_counter()
+            staging_iovas_t = self._write_staging_iovas_gpu[:batch_n_ios]
+            slbas_t = self._write_slbas_gpu[:batch_n_ios]
+            byte_lens_t = self._write_byte_lens_gpu[:batch_n_ios]
+            descriptor_pairs = (
+                (staging_iovas_t, self._write_staging_iovas_cpu),
+                (slbas_t, self._write_slbas_cpu),
+                (byte_lens_t, self._write_byte_lens_cpu),
+            )
+            if io_stream is not None:
+                # The tensors are persistent, so direct runtime copies are
+                # safe without allocator lifetime tracking.  Supplying the
+                # stream pointer also avoids changing PyTorch's current-stream
+                # state on this background thread.
+                for gpu_descriptors, cpu_descriptors in descriptor_pairs:
+                    _cuda_memcpy_async_h2d(
+                        gpu_descriptors.data_ptr(),
+                        cpu_descriptors.data_ptr(),
+                        gpu_descriptors.nbytes,
+                        io_stream.cuda_stream,
+                    )
+            else:
+                with torch.cuda.stream(copy_stream):
+                    for gpu_descriptors, cpu_descriptors in descriptor_pairs:
+                        gpu_descriptors.copy_(
+                            cpu_descriptors[:batch_n_ios],
+                            non_blocking=True,
+                        )
+            arg_h2d_ms += _elapsed_ms(arg_h2d_start)
+            batch_arg_ms = _elapsed_ms(arg_start)
+            arg_ms += batch_arg_ms
 
             q = self._session.queue
             sq_dev_ptr = q.sq_tensor.data_ptr()
@@ -3099,19 +3587,26 @@ class TuttiDirectLoader:
                     "arg_ms=%.3f",
                     len(batch_iovas),
                     sum(batch_lens) / 1024**2,
-                    arg_ms,
+                    batch_arg_ms,
                 )
 
         if profile_enabled:
             logger.info(
                 "TUTTI_PROFILE store_raw bytes=%d dma_bytes=%d extents=%d ios=%d "
-                "h2d_ms=%.3f submit_launch_ms=%.3f poll_sync_ms=%.3f "
+                "gate_wait_ms=%.3f lock_wait_ms=%.3f h2d_ms=%.3f "
+                "arg_ms=%.3f arg_cpu_ms=%.3f arg_h2d_ms=%.3f "
+                "submit_launch_ms=%.3f poll_sync_ms=%.3f "
                 "status_ms=%.3f total_ms=%.3f",
                 payload_nbytes,
                 dma_nbytes,
                 len(normalized_extents),
                 n_ios,
+                gate_wait_ms,
+                lock_wait_ms,
                 h2d_ms,
+                arg_ms,
+                arg_cpu_ms,
+                arg_h2d_ms,
                 submit_ms,
                 poll_sync_ms,
                 status_ms,
@@ -3142,9 +3637,11 @@ class TuttiDirectLoader:
         completed_offsets: list[int] = []
         completed_nbytes: list[int] = []
         io_to_key_index: list[int] = []
+        io_wave_indices: list[int] = []
         staging_iovas_list: list[int] = []
         slbas_list: list[int] = []
         byte_lens_list: list[int] = []
+        wave_io_counts: dict[int, int] = {}
         next_staging_offset = 0
         extents_ms = 0.0
 
@@ -3176,8 +3673,23 @@ class TuttiDirectLoader:
                 read_ranges=read_ranges,
             )
             nbytes = sum(byte_range.length for byte_range in logical_read_ranges)
-            dma_nbytes = _align_up(nbytes, _NVME_LBS)
-            aligned_nbytes = _align_up(dma_nbytes, _GPU_PAGE_SIZE)
+            range_dma_nbytes = [
+                _align_up(byte_range.length, _NVME_LBS)
+                for byte_range in logical_read_ranges
+            ]
+            dma_nbytes = sum(range_dma_nbytes)
+            staging_nbytes = max(
+                (
+                    byte_range.target_offset + dma_length
+                    for byte_range, dma_length in zip(
+                        logical_read_ranges,
+                        range_dma_nbytes,
+                        strict=True,
+                    )
+                ),
+                default=0,
+            )
+            aligned_nbytes = _align_up(staging_nbytes, _GPU_PAGE_SIZE)
             if next_staging_offset + aligned_nbytes > self._staging_capacity_bytes():
                 logger.warning(
                     "Tutti batch staging capacity exceeded for %s: need %d bytes, "
@@ -3191,9 +3703,18 @@ class TuttiDirectLoader:
             io_start = len(io_to_key_index)
             file_ios = 0
             skip_file = False
-            for byte_range in logical_read_ranges:
-                range_dma_nbytes = _align_up(byte_range.length, _NVME_LBS)
-                is_tail_range = byte_range.target_offset + byte_range.length == nbytes
+            ordered_ranges = any(
+                dma_length != byte_range.length
+                and byte_range.target_offset + byte_range.length != nbytes
+                for byte_range, dma_length in zip(
+                    logical_read_ranges,
+                    range_dma_nbytes,
+                    strict=True,
+                )
+            )
+            for range_index, (byte_range, range_dma_length) in enumerate(
+                zip(logical_read_ranges, range_dma_nbytes, strict=True)
+            ):
                 if byte_range.offset % _NVME_LBS != 0:
                     logger.warning(
                         "Chunk %s read offset %d is not 512B aligned; skipping",
@@ -3202,31 +3723,26 @@ class TuttiDirectLoader:
                     )
                     skip_file = True
                     break
-                if range_dma_nbytes != byte_range.length and not is_tail_range:
-                    logger.warning(
-                        "Chunk %s non-tail read length %d is not 512B aligned; "
-                        "skipping",
-                        key,
-                        byte_range.length,
-                    )
-                    skip_file = True
-                    break
                 resolved = self._resolve_range_ios(
                     meta.path,
                     byte_range.offset,
-                    range_dma_nbytes,
+                    range_dma_length,
                 )
                 if resolved is None:
                     logger.warning(
                         "Tutti extents for %s cover range %d/%d bytes; skipping",
                         meta.path,
                         0,
-                        range_dma_nbytes,
+                        range_dma_length,
                     )
                     skip_file = True
                     break
                 usable_queue_depth = self._q_depth() - 1
-                if len(io_to_key_index) + len(resolved) > usable_queue_depth:
+                wave_index = range_index if ordered_ranges else 0
+                if (
+                    wave_io_counts.get(wave_index, 0) + len(resolved)
+                    > usable_queue_depth
+                ):
                     logger.warning(
                         "Tutti batch for %s would exceed usable queue depth %d; "
                         "skipping",
@@ -3243,6 +3759,10 @@ class TuttiDirectLoader:
                     slbas_list.append(lba_slba)
                     byte_lens_list.append(chunk_nbytes)
                     io_to_key_index.append(i)
+                    io_wave_indices.append(wave_index)
+                    wave_io_counts[wave_index] = (
+                        wave_io_counts.get(wave_index, 0) + 1
+                    )
                     file_ios += 1
                     logger.debug(
                         "Tutti extent read: key=%s staging_offset=%d "
@@ -3260,6 +3780,10 @@ class TuttiDirectLoader:
                 del slbas_list[io_start:]
                 del byte_lens_list[io_start:]
                 del io_to_key_index[io_start:]
+                removed_waves = io_wave_indices[io_start:]
+                del io_wave_indices[io_start:]
+                for wave_index in removed_waves:
+                    wave_io_counts[wave_index] -= 1
                 logger.warning(
                     "Tutti extents for %s cover %d/%d bytes; skipping",
                     meta.path,
@@ -3279,42 +3803,15 @@ class TuttiDirectLoader:
                 raise RuntimeError("Tutti direct load found no readable KV extents")
             return [None] * len(keys)
 
-        # Build GPU tensors for kernel arguments (same device as staging).
-        # Upload ON the io_stream itself: these pointers are dereferenced by
-        # the submit kernel on io_stream, and uploading on the calling
-        # thread's current stream + wait_stream() only builds the dependency
-        # for THAT thread's stream. With concurrent retrieve and speculative
-        # reader threads, the H2D copies and consuming kernel can end up on
-        # unrelated streams -> submit kernel read half-written argument
-        # tensors -> DMA to garbage IOVAs -> illegal memory access family.
-        arg_start = time.perf_counter()
+        # Upload and submit one dependency wave at a time. Most requests have
+        # only wave zero and retain the original single-submit fast path. A
+        # composed object whose non-tail range is not sector sized uses later
+        # waves for subsequent ranges: the rounded DMA tail of an earlier
+        # range may overlap the next range's logical destination, so that next
+        # range must complete last. This preserves dense staging without an
+        # extra gather kernel or rewriting the immutable base generation.
         _dev = f"cuda:{self._cuda_device}"
         _arg_stream = self._io_stream
-        with torch.cuda.device(self._cuda_device):
-            if _arg_stream is not None:
-                with torch.cuda.stream(_arg_stream):
-                    staging_iovas_t = torch.tensor(
-                        staging_iovas_list,
-                        dtype=torch.int64,
-                    ).to(_dev, non_blocking=True)
-                    slbas_t = torch.tensor(slbas_list, dtype=torch.int64).to(
-                        _dev, non_blocking=True
-                    )
-                    byte_lens_t = torch.tensor(byte_lens_list, dtype=torch.int32).to(
-                        _dev, non_blocking=True
-                    )
-            else:
-                staging_iovas_t = torch.tensor(
-                    staging_iovas_list,
-                    dtype=torch.int64,
-                    device=_dev,
-                )
-                slbas_t = torch.tensor(slbas_list, dtype=torch.int64, device=_dev)
-                byte_lens_t = torch.tensor(
-                    byte_lens_list, dtype=torch.int32, device=_dev
-                )
-        arg_ms = _elapsed_ms(arg_start)
-
         q = self._session.queue
         sq_dev_ptr = q.sq_tensor.data_ptr()
         cq_dev_ptr = q.cq_tensor.data_ptr()
@@ -3337,6 +3834,10 @@ class TuttiDirectLoader:
         # only this host thread blocks on it.
         io_stream = self._io_stream
         io_stream_ptr = io_stream.cuda_stream if io_stream is not None else 0
+        arg_ms = 0.0
+        submit_launch_ms = 0.0
+        poll_sync_ms = 0.0
+        status_ms = 0.0
         with torch.cuda.device(self._cuda_device):
             # Preserve the proven ordering with earlier model-stream work.
             # Removing this dependency made the first deep prediction miss
@@ -3344,103 +3845,142 @@ class TuttiDirectLoader:
             # reads use their narrower ``input_ready_event`` path instead.
             if io_stream is not None:
                 io_stream.wait_stream(torch.cuda.current_stream())
-            # Submit all reads in one kernel launch.
-            submit_start = time.perf_counter()
-            _c_ops.tutti_submit_batch_sgl_read(
-                sq_dev_ptr=sq_dev_ptr,
-                cq_dev_ptr=cq_dev_ptr,
-                sq_db_ptr=sq_db_ptr,
-                cq_db_ptr=cq_db_ptr,
-                sq_tail_ptr=self._sq_tail_ptr,
-                q_depth=self._q_depth(),
-                qid=q.qid,
-                nsid=self._session.nsid,
-                staging_iovas=staging_iovas_t,
-                slbas=slbas_t,
-                byte_lens=byte_lens_t,
-                stream_ptr=io_stream_ptr,
-            )
-            submit_launch_ms = _elapsed_ms(submit_start)
+            for wave_index in sorted(set(io_wave_indices)):
+                wave_ios = [
+                    index
+                    for index, value in enumerate(io_wave_indices)
+                    if value == wave_index
+                ]
+                wave_n_ios = len(wave_ios)
+                arg_start = time.perf_counter()
+                wave_iovas = [staging_iovas_list[index] for index in wave_ios]
+                wave_slbas = [slbas_list[index] for index in wave_ios]
+                wave_lengths = [byte_lens_list[index] for index in wave_ios]
+                if _arg_stream is not None:
+                    with torch.cuda.stream(_arg_stream):
+                        staging_iovas_t = torch.tensor(
+                            wave_iovas,
+                            dtype=torch.int64,
+                        ).to(_dev, non_blocking=True)
+                        slbas_t = torch.tensor(wave_slbas, dtype=torch.int64).to(
+                            _dev, non_blocking=True
+                        )
+                        byte_lens_t = torch.tensor(
+                            wave_lengths,
+                            dtype=torch.int32,
+                        ).to(_dev, non_blocking=True)
+                else:
+                    staging_iovas_t = torch.tensor(
+                        wave_iovas,
+                        dtype=torch.int64,
+                        device=_dev,
+                    )
+                    slbas_t = torch.tensor(
+                        wave_slbas,
+                        dtype=torch.int64,
+                        device=_dev,
+                    )
+                    byte_lens_t = torch.tensor(
+                        wave_lengths,
+                        dtype=torch.int32,
+                        device=_dev,
+                    )
+                arg_ms += _elapsed_ms(arg_start)
 
-            # Poll completions on the same dedicated stream (submit
-            # happens-before poll within the stream without an explicit sync).
-            poll_start = time.perf_counter()
-            _c_ops.tutti_poll_batch(
-                sq_dev_ptr=sq_dev_ptr,
-                cq_dev_ptr=cq_dev_ptr,
-                sq_db_ptr=sq_db_ptr,
-                cq_db_ptr=cq_db_ptr,
-                cq_head_ptr=self._cq_head_ptr,
-                cq_phase_ptr=self._cq_phase_ptr,
-                q_depth=self._q_depth(),
-                n_ios=n_ios,
-                status_out=self._status_buf,
-                timed_out_ptr=self._timed_out_ptr,
-                max_iters=self.POLL_MAX_ITERS,
-                stream_ptr=io_stream_ptr,
-            )
-            status_has_error = self._enqueue_nvme_status_reduction(
-                n_ios,
-                io_stream,
-            )
+                submit_start = time.perf_counter()
+                _c_ops.tutti_submit_batch_sgl_read(
+                    sq_dev_ptr=sq_dev_ptr,
+                    cq_dev_ptr=cq_dev_ptr,
+                    sq_db_ptr=sq_db_ptr,
+                    cq_db_ptr=cq_db_ptr,
+                    sq_tail_ptr=self._sq_tail_ptr,
+                    q_depth=self._q_depth(),
+                    qid=q.qid,
+                    nsid=self._session.nsid,
+                    staging_iovas=staging_iovas_t,
+                    slbas=slbas_t,
+                    byte_lens=byte_lens_t,
+                    stream_ptr=io_stream_ptr,
+                )
+                submit_launch_ms += _elapsed_ms(submit_start)
 
-            # Sync the I/O stream before reading back status / building
-            # MemoryObjs.  NVMe DMA writes are visible to all streams once the
-            # poll kernel has confirmed the CQEs, so a host-side sync of just
-            # this stream orders the staging reads that follow.
-            if io_stream is not None:
-                io_stream.synchronize()
-            else:
-                torch.cuda.synchronize(device=self._cuda_device)
-            poll_sync_ms = _elapsed_ms(poll_start)
+                poll_start = time.perf_counter()
+                _c_ops.tutti_poll_batch(
+                    sq_dev_ptr=sq_dev_ptr,
+                    cq_dev_ptr=cq_dev_ptr,
+                    sq_db_ptr=sq_db_ptr,
+                    cq_db_ptr=cq_db_ptr,
+                    cq_head_ptr=self._cq_head_ptr,
+                    cq_phase_ptr=self._cq_phase_ptr,
+                    q_depth=self._q_depth(),
+                    n_ios=wave_n_ios,
+                    status_out=self._status_buf,
+                    timed_out_ptr=self._timed_out_ptr,
+                    max_iters=self.POLL_MAX_ITERS,
+                    stream_ptr=io_stream_ptr,
+                )
+                status_has_error = self._enqueue_nvme_status_reduction(
+                    wave_n_ios,
+                    io_stream,
+                )
+                if io_stream is not None:
+                    io_stream.synchronize()
+                else:
+                    torch.cuda.synchronize(device=self._cuda_device)
+                poll_sync_ms += _elapsed_ms(poll_start)
 
-        if ctypes.c_int32.from_address(self._timed_out_ptr).value != 0:
-            cq_head = ctypes.c_uint16.from_address(self._cq_head_ptr).value
-            cq_phase = ctypes.c_uint8.from_address(self._cq_phase_ptr).value
-            raw_statuses = self._status_buf[:n_ios].cpu().tolist()
-            missing_cq_slots: list[int] = []
-            for i, raw_status in enumerate(raw_statuses):
-                wrapped = int(cq_head + i >= self._q_depth())
-                if (int(raw_status) & 0x1) != (cq_phase ^ wrapped):
-                    missing_cq_slots.append(i)
-            logger.error(
-                "TUTTI_PROFILE poll_timeout keys=%d completed=%d ios=%d "
-                "bytes_mb=%.3f build_ms=%.3f extents_ms=%.3f arg_ms=%.3f "
-                "submit_launch_ms=%.3f poll_sync_ms=%.3f cq_head=%d "
-                "cq_phase=%d missing_cqes=%d first_missing=%s",
-                len(keys),
-                len(completed_indices),
-                n_ios,
-                sum(byte_lens_list) / 1024**2,
-                build_ms,
-                extents_ms,
-                arg_ms,
-                submit_launch_ms,
-                poll_sync_ms,
-                cq_head,
-                cq_phase,
-                len(missing_cq_slots),
-                missing_cq_slots[:8],
-            )
-            raise RuntimeError(
-                "Tutti NVMe poll timed out; "
-                "check snvme module and NVMe controller health"
-            )
+                if ctypes.c_int32.from_address(self._timed_out_ptr).value != 0:
+                    cq_head = ctypes.c_uint16.from_address(self._cq_head_ptr).value
+                    cq_phase = ctypes.c_uint8.from_address(self._cq_phase_ptr).value
+                    raw_statuses = self._status_buf[:wave_n_ios].cpu().tolist()
+                    missing_cq_slots: list[int] = []
+                    for status_index, raw_status in enumerate(raw_statuses):
+                        wrapped = int(status_index + cq_head >= self._q_depth())
+                        if (int(raw_status) & 0x1) != (cq_phase ^ wrapped):
+                            missing_cq_slots.append(status_index)
+                    logger.error(
+                        "TUTTI_PROFILE poll_timeout keys=%d completed=%d "
+                        "ios=%d wave=%d bytes_mb=%.3f build_ms=%.3f "
+                        "extents_ms=%.3f arg_ms=%.3f submit_launch_ms=%.3f "
+                        "poll_sync_ms=%.3f cq_head=%d cq_phase=%d "
+                        "missing_cqes=%d first_missing=%s",
+                        len(keys),
+                        len(completed_indices),
+                        wave_n_ios,
+                        wave_index,
+                        sum(wave_lengths) / 1024**2,
+                        build_ms,
+                        extents_ms,
+                        arg_ms,
+                        submit_launch_ms,
+                        poll_sync_ms,
+                        cq_head,
+                        cq_phase,
+                        len(missing_cq_slots),
+                        missing_cq_slots[:8],
+                    )
+                    raise RuntimeError(
+                        "Tutti NVMe poll timed out; "
+                        "check snvme module and NVMe controller health"
+                    )
 
-        # Check per-CQE status.
-        status_start = time.perf_counter()
+                status_start = time.perf_counter()
 
-        def _read_path_for_io(io_index: int) -> str:
-            meta = metas[io_to_key_index[io_index]]
-            return meta.path if meta is not None else "<unknown>"
+                def _read_path_for_wave_io(
+                    local_index: int,
+                    wave_io_indices: tuple[int, ...] = (*wave_ios,),
+                ) -> str:
+                    global_index = wave_io_indices[local_index]
+                    meta = metas[io_to_key_index[global_index]]
+                    return meta.path if meta is not None else "<unknown>"
 
-        self._check_nvme_status(
-            op_name="READ",
-            n_ios=n_ios,
-            path_for_io=_read_path_for_io,
-            gpu_has_error=status_has_error,
-        )
-        status_ms = _elapsed_ms(status_start)
+                self._check_nvme_status(
+                    op_name="READ",
+                    n_ios=wave_n_ios,
+                    path_for_io=_read_path_for_wave_io,
+                    gpu_has_error=status_has_error,
+                )
+                status_ms += _elapsed_ms(status_start)
 
         if on_raw_batch_loaded is not None:
             expected_completed = sum(meta is not None for meta in metas)
@@ -3605,6 +4145,12 @@ class TuttiDirectLoader:
         _cuda_free(self._timed_out_ptr)
         self._timed_out_ptr = 0
         self._status_buf = torch.empty(0, dtype=torch.int32)
+        self._write_staging_iovas_cpu = torch.empty(0, dtype=torch.int64)
+        self._write_slbas_cpu = torch.empty(0, dtype=torch.int64)
+        self._write_byte_lens_cpu = torch.empty(0, dtype=torch.int32)
+        self._write_staging_iovas_gpu = torch.empty(0, dtype=torch.int64)
+        self._write_slbas_gpu = torch.empty(0, dtype=torch.int64)
+        self._write_byte_lens_gpu = torch.empty(0, dtype=torch.int32)
         self._staging = torch.empty(0, dtype=torch.uint8)
         _cuda_free(self._staging_raw_ptr)
         self._staging_raw_ptr = 0

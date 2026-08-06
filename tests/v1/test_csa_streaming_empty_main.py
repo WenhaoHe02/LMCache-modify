@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 # Third Party
+import pytest
 import torch
 
 # First Party
@@ -100,8 +101,9 @@ def test_new_request_releases_incomplete_snapshot() -> None:
     assert next_obj.refs == 1
 
 
-def test_deferred_hit_admission_preserves_publish_order() -> None:
-    """Hit admission publishes sidecars before handing main-object ownership off."""
+@pytest.mark.parametrize("admission_mode", ["deferred_cold", "deferred_hit"])
+def test_deferred_admission_preserves_publish_order(admission_mode: str) -> None:
+    """Deferred admission publishes sidecars before handing main ownership off."""
 
     class _ImmediateExecutor:
         def submit(self, callback: object) -> None:
@@ -143,10 +145,11 @@ def test_deferred_hit_admission_preserves_publish_order() -> None:
     )
     engine._make_tutti_store_warmup_callback = Mock(return_value=object())
 
-    assert engine._submit_dsv4_hit_admission(
+    assert engine._submit_dsv4_admission(
         [key],
         [memory_obj],  # type: ignore[list-item]
         8192,
+        admission_mode=admission_mode,
         req_id="hit",
         is_last_prefill=True,
         transfer_spec=None,

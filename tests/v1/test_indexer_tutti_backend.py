@@ -483,6 +483,28 @@ def test_prefill_cp_query_partitions_cover_each_row_once() -> None:
     assert torch.equal(merged, torch.arange(13, 113))
 
 
+def test_prefill_cp_query_sampling_is_balanced_and_disjoint() -> None:
+    """Sampled query shards cover a balanced subset without duplication."""
+    partitions = [
+        prefill_cp_query_indices(
+            0,
+            1024,
+            rank=rank,
+            world_size=8,
+            interleave_size=16,
+            device=torch.device("cpu"),
+            sample_stride=2,
+        )
+        for rank in range(8)
+    ]
+
+    merged = torch.cat(partitions).sort().values
+
+    assert merged.numel() == 512
+    assert torch.unique(merged).numel() == merged.numel()
+    assert {partition.numel() for partition in partitions} == {64}
+
+
 def test_prefill_cp_query_ranges_use_rank_local_logits_budget() -> None:
     """A one-eighth K shard coalesces sixteen official chunks into two."""
     official_chunk_tokens = 1082

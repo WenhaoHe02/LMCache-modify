@@ -82,6 +82,17 @@ from lmcache.v1.csa_pipeline_nvtx import (
     csa_pipeline_nvtx,
 )
 from lmcache.v1.kv_object_store import KVObjectByteRange
+from lmcache.v1.ssd_tp_sharded_prefetch import (
+    CollectiveDescriptor,
+    SSDReadMode,
+    SSDTPShardedPrefetchConfig,
+    ShardCollectiveError,
+    ShardGatherTransport,
+    ShardPrefetchDecisionTable,
+    bucket_prefetch_key,
+    compile_cp_read_plan,
+    partition_block_union,
+)
 
 if TYPE_CHECKING:
     from lmcache.v1.gpu_connector.tutti_direct_loader import TuttiDirectLoader
@@ -449,6 +460,12 @@ class CSAAttentionKVPrefetchManager:
         csa_layer_ids: Sequence[int],
         compressed_block_size: int = 64,
         token_bytes: int = 584,
+        *,
+        data_group: str = "csa",
+        shard_config: Optional[SSDTPShardedPrefetchConfig] = None,
+        shard_transport: Optional[ShardGatherTransport] = None,
+        cp_rank: int = 0,
+        cp_world_size: int = 1,
     ) -> None:
         """Initialise the manager.
 
@@ -460,6 +477,12 @@ class CSAAttentionKVPrefetchManager:
                 Defaults to 64 (vLLM IndexerCache packed layout).
             token_bytes: Bytes per compressed entry.  Defaults to 584
                 (DSv4 fp8_ds_mla format).
+            data_group: ``"csa"`` for attention KV or ``"indexer"`` for the
+                compact native Indexer-K restore helper.
+            shard_config: Centralized feature gates and cost parameters.
+            shard_transport: Optional independent collective transport.
+            cp_rank: Rank in the native Indexer context-parallel group.
+            cp_world_size: Native Indexer context-parallel group size.
         """
         if tutti_loader is None:
             raise ValueError("tutti_loader is required for CSA attention KV prefetch")
@@ -469,11 +492,23 @@ class CSAAttentionKVPrefetchManager:
             raise ValueError("compressed_block_size must be positive")
         if token_bytes <= 0:
             raise ValueError("token_bytes must be positive")
+        if data_group not in {"csa", "indexer"}:
+            raise ValueError("data_group must be csa or indexer")
+        if cp_world_size <= 0 or cp_rank < 0 or cp_rank >= cp_world_size:
+            raise ValueError("invalid CP rank or world size")
 
         self._tutti_loader = tutti_loader
         self._compressed_block_size = int(compressed_block_size)
         self._token_bytes = int(token_bytes)
         self._bytes_per_block = self._compressed_block_size * self._token_bytes
+        self._data_group = data_group
+        self._shard_config = shard_config or SSDTPShardedPrefetchConfig.from_env()
+        self._shard_transport = shard_transport
+        self._shard_decisions = ShardPrefetchDecisionTable(self._shard_config)
+        self._shard_collective_lock = threading.Lock()
+        self._cp_rank = int(cp_rank)
+        self._cp_world_size = int(cp_world_size)
+        self._cp_fallback_reasons: set[tuple[int, str]] = set()
         # Per-request LBA cache snapshot.  Other paths (e.g.,
         # ``_tutti_batched_get``) overwrite ``self._tutti_loader._lba_cache``
         # with the FILTERED ``read_ranges`` extents, which exclude
@@ -607,8 +642,9 @@ class CSAAttentionKVPrefetchManager:
 
         Layer registration supplies the actual CUDA devices used by the model.
         Resolving the scatter and indexed-plan streams here moves their one-time
-        construction out of request latency. The method is idempotent and
-        performs no I/O or cache mutation.
+        construction out of request latency. When CSA sharding is enabled, the
+        same startup hook allocates and prewarms the bounded gather ring. The
+        method is idempotent and performs no SSD I/O or cache mutation.
         """
         devices = {
             state.k_cache_tensor.device
@@ -619,6 +655,41 @@ class CSAAttentionKVPrefetchManager:
             with torch.cuda.device(device):
                 self._scatter_stream_for(device)
                 self._prepare_stream_for(device)
+        transport = self._shard_transport
+        if (
+            self._data_group == "csa"
+            and self._shard_config.enabled
+            and self._shard_config.csa_enabled
+            and transport is not None
+        ):
+            registered_blocks = max(
+                (int(state.in_pool_bitmap.numel()) for state in self._layers.values()),
+                default=0,
+            )
+            # The registered bitmap spans the complete model KV pool (and can
+            # therefore be several GiB per layer).  The gather ring only needs
+            # to cover one bounded union.  Cap its warm allocation to the
+            # largest world-size-aligned union that fits in a staging slot;
+            # larger request unions are rejected by preflight and use the
+            # LOCAL_DIRECT fallback.
+            blocks_per_rank = self._shard_config.staging_slot_bytes // (
+                transport.world_size * self._bytes_per_block
+            )
+            staging_blocks = blocks_per_rank * transport.world_size
+            max_blocks = min(registered_blocks, staging_blocks)
+            if max_blocks > 0 and devices:
+                # A TP rank's registered CSA tensors all live on one device.
+                # Multiple devices would require one communicator per device,
+                # which is deliberately outside the first implementation.
+                if len(devices) != 1:
+                    raise RuntimeError(
+                        "shard-gather manager requires exactly one CUDA device"
+                    )
+                transport.warm(
+                    max_union_blocks=max_blocks,
+                    block_bytes=self._bytes_per_block,
+                    device=next(iter(devices)),
+                )
         if devices:
             logger.info(
                 "CSAAttentionKVPrefetchManager: warmed runtime streams devices=%s",
@@ -814,6 +885,22 @@ class CSAAttentionKVPrefetchManager:
     def hca_layer_ids(self) -> Tuple[int, ...]:
         """Transformer layer ids registered via :meth:`register_hca_layer`."""
         return self._hca_layer_ids
+
+    @property
+    def dense_shard_layer_ids(self) -> Tuple[int, ...]:
+        """Return registered CSA layers eligible for dense shard-gather."""
+        if (
+            not self._shard_config.enabled
+            or not self._shard_config.csa_enabled
+            or self._shard_transport is None
+        ):
+            return ()
+        return tuple(
+            layer_id
+            for layer_id in self.csa_layer_ids
+            if layer_id in self._shard_config.dense_layers
+            and layer_id not in self._shard_config.disabled_layers
+        )
 
     def owns_k_cache(self, k_cache_tensor: torch.Tensor) -> bool:
         """Return whether ``k_cache_tensor`` belongs to a registered CSA layer.
@@ -1515,10 +1602,48 @@ class CSAAttentionKVPrefetchManager:
         if state is None or not state.chunks:
             return False
         covered_end = int(state.chunks[-1].end_compressed_block)
+        selected_blocks: Sequence[int] = range(covered_end)
+        if self._data_group == "indexer":
+            selected_blocks = self._indexer_cp_owned_blocks(
+                int(layer_id),
+                covered_end,
+            )
+        self._submit_reads(
+            int(layer_id),
+            selected_blocks,
+            label=label,
+            raise_on_error=True,
+            request_token=request_token,
+        )
+        return True
+
+    def fire_dense_layer(
+        self,
+        layer_id: int,
+        *,
+        request_token: Optional[Tuple[str, int]] = None,
+    ) -> bool:
+        """Submit a complete CSA layer through dense shard-gather planning.
+
+        Args:
+            layer_id: Registered CSA transformer layer id.
+            request_token: Request generation captured by the source hook.
+
+        Returns:
+            ``True`` when a non-empty layer plan was submitted. Capability or
+            cost rejection transparently uses the complete local path.
+        """
+        if self._data_group != "csa":
+            return False
+        state = self._layers.get(int(layer_id))
+        if state is None or not state.chunks:
+            return False
+        covered_end = int(state.chunks[-1].end_compressed_block)
         self._submit_reads(
             int(layer_id),
             range(covered_end),
-            label=label,
+            label="dense",
+            io_priority="lookahead",
             raise_on_error=True,
             request_token=request_token,
         )
@@ -1559,6 +1684,35 @@ class CSAAttentionKVPrefetchManager:
         with self._scheduled_layer_futures_lock:
             future = self._scheduled_layer_futures.get(int(layer_id))
         return future is None or bool(future.done())
+
+    def wait_for_tracked_submission(
+        self,
+        layer_id: int,
+        timeout_s: float = 30.0,
+    ) -> bool:
+        """Join a tracked producer before miss filtering inspects bitmaps.
+
+        Args:
+            layer_id: Target transformer layer id.
+            timeout_s: Maximum seconds to wait for the producer.
+
+        Returns:
+            ``True`` when no producer is tracked or it completed successfully.
+        """
+        with self._scheduled_layer_futures_lock:
+            future = self._scheduled_layer_futures.pop(int(layer_id), None)
+        if future is None:
+            return True
+        try:
+            future.result(timeout=max(0.0, timeout_s))
+            return True
+        except Exception:
+            logger.exception(
+                "CSAAttentionKVPrefetchManager: tracked layer %d submission "
+                "failed or timed out",
+                layer_id,
+            )
+            return False
 
     def submit_miss_reads(
         self,
@@ -1850,6 +2004,15 @@ class CSAAttentionKVPrefetchManager:
                     else 0.0
                 )
                 try:
+                    # Dense early-layer work is queued on a background
+                    # producer. Join that producer after true-indexer compute
+                    # but before miss filtering reads the resident bitmap.
+                    if hasattr(mgr, "_scheduled_layer_futures_lock") and not (
+                        mgr.wait_for_tracked_submission(layer_id)
+                    ):
+                        raise RuntimeError(
+                            f"tracked shard submission failed for layer {layer_id}"
+                        )
                     # Prediction remains asynchronous through the complete
                     # official indexer. Join only now, immediately before
                     # miss filtering needs a stable pending/resident view.
@@ -1991,6 +2154,10 @@ class CSAAttentionKVPrefetchManager:
             if getattr(self, "_exact_chunk_prefetch_executor", None) is not None:
                 self._exact_chunk_prefetch_executor.shutdown(wait=True)
                 self._exact_chunk_prefetch_executor = None
+            shard_transport = getattr(self, "_shard_transport", None)
+            if shard_transport is not None:
+                shard_transport.close()
+                self._shard_transport = None
             self._layers.clear()
             self._prediction_waiter = None
 
@@ -2236,7 +2403,19 @@ class CSAAttentionKVPrefetchManager:
             dtype=torch.int64,
             device="cpu",
         ).reshape(-1)
-        if candidate_ids.numel() == 0:
+        active_sharding = bool(
+            getattr(self, "_shard_transport", None) is not None
+            and getattr(self, "_shard_config", None) is not None
+            and self._shard_config.enabled
+            and self._shard_config.csa_enabled
+            and (label == "dense" or label.startswith("predicted_"))
+        )
+        # Sharded participants must not return independently after the local
+        # loaded/pending filter: one rank may already own every requested row
+        # while another still needs data. All ranks retain the canonical
+        # request union for metadata consensus; ``new_ids`` below is used only
+        # by the LOCAL_DIRECT fallback and pending-state accounting.
+        if candidate_ids.numel() == 0 and not active_sharding:
             return True
         candidate_count = int(candidate_ids.numel())
         if _timing_enabled():
@@ -2297,7 +2476,7 @@ class CSAAttentionKVPrefetchManager:
                 ~state.resident_blocks_bitmap[candidate_ids]
                 & ~state.pending_reads_bitmap[candidate_ids]
             ]
-            if new_ids.numel() == 0:
+            if new_ids.numel() == 0 and not active_sharding:
                 if _timing_enabled():
                     logger.info(
                         "CSAAttentionKVPrefetchManager: _submit_reads "
@@ -2347,11 +2526,31 @@ class CSAAttentionKVPrefetchManager:
                 else nullcontext()
             )
             with torch.inference_mode(), device_guard:
-                event, issued_memory_objs, completed_ids = self._issue_reads(
-                    state,
-                    new_ids,
-                    io_priority=io_priority,
-                )
+                preferred_mode = None
+                issue_ids = new_ids
+                if active_sharding:
+                    preferred_mode = (
+                        SSDReadMode.SHARD_GATHER_DENSE
+                        if label == "dense"
+                        else SSDReadMode.SHARD_GATHER_PREDICTED
+                    )
+                    issue_ids = candidate_ids
+                if active_sharding:
+                    event, issued_memory_objs, completed_ids = self._issue_reads(
+                        state,
+                        issue_ids,
+                        io_priority=io_priority,
+                        local_fallback_ids=new_ids,
+                        preferred_mode=preferred_mode,
+                    )
+                else:
+                    # Preserve the original call contract for local reads and
+                    # integrations that replace the issue hook in tests.
+                    event, issued_memory_objs, completed_ids = self._issue_reads(
+                        state,
+                        issue_ids,
+                        io_priority=io_priority,
+                    )
                 completed_ids = torch.unique(
                     completed_ids.to(device="cpu", dtype=torch.int64),
                     sorted=True,
@@ -2388,6 +2587,10 @@ class CSAAttentionKVPrefetchManager:
                 layer_id,
                 new_count,
             )
+            if isinstance(exc, ShardCollectiveError) and exc.data_submitted:
+                raise RuntimeError(
+                    f"submitted shard-gather failed for layer {layer_id}"
+                ) from exc
             if raise_on_error:
                 raise RuntimeError(f"failed to materialize layer {layer_id}") from exc
             return False
@@ -2433,6 +2636,50 @@ class CSAAttentionKVPrefetchManager:
         return True
 
     def _issue_reads(
+        self,
+        state: CSAAttentionKVLayerState,
+        sorted_block_ids: Sequence[int] | torch.Tensor,
+        *,
+        io_priority: str = "demand",
+        local_fallback_ids: Optional[Sequence[int] | torch.Tensor] = None,
+        preferred_mode: Optional[SSDReadMode] = None,
+    ) -> Tuple[Optional[torch.cuda.Event], List[Any], torch.Tensor]:
+        """Choose shard-gather or the preserved rank-local read path."""
+        if (
+            getattr(self, "_shard_transport", None) is None
+            or not getattr(self, "_shard_config", None)
+            or preferred_mode is None
+        ):
+            return self._issue_local_reads(
+                state,
+                local_fallback_ids
+                if local_fallback_ids is not None
+                else sorted_block_ids,
+                io_priority=io_priority,
+            )
+        local_capability = self._shard_capability_for(
+            state,
+            sorted_block_ids,
+            mode=preferred_mode,
+        )
+        # A process group requires one total collective order per rank. Proxy
+        # I/O uses multiple workers, so serialize metadata and data collectives
+        # while retaining overlap between SSD reads and model compute.
+        with self._shard_collective_lock:
+            return self._issue_shard_gather(
+                state,
+                sorted_block_ids,
+                mode=preferred_mode,
+                io_priority=io_priority,
+                local_fallback_ids=(
+                    local_fallback_ids
+                    if local_fallback_ids is not None
+                    else sorted_block_ids
+                ),
+                local_capability=local_capability,
+            )
+
+    def _issue_local_reads(
         self,
         state: CSAAttentionKVLayerState,
         sorted_block_ids: Sequence[int] | torch.Tensor,
@@ -3501,3 +3748,296 @@ class CSAAttentionKVPrefetchManager:
         seen[block_ids[valid]] = True
         miss_mask = seen & ~state.in_pool_bitmap[:limit]
         return miss_mask.nonzero(as_tuple=False).reshape(-1).cpu()
+
+    def _shard_capability_for(
+        self,
+        state: CSAAttentionKVLayerState,
+        block_ids: Sequence[int] | torch.Tensor,
+        *,
+        mode: SSDReadMode,
+    ) -> bool:
+        """Return this rank's capability/cost vote for a proposed mode."""
+        transport = self._shard_transport
+        if (
+            self._data_group != "csa"
+            or transport is None
+            or not self._shard_config.enabled
+            or not self._shard_config.csa_enabled
+        ):
+            return False
+        selected = torch.as_tensor(
+            block_ids,
+            dtype=torch.int64,
+            device="cpu",
+        ).reshape(-1)
+        selected = torch.unique(selected, sorted=True)
+        if selected.numel() == 0:
+            return False
+        covered_end = int(state.chunks[-1].end_compressed_block) if state.chunks else 0
+        complete_layer = bool(
+            int(selected.numel()) == covered_end
+            and int(selected[0]) == 0
+            and int(selected[-1]) == covered_end - 1
+        )
+        mode_matches_request = bool(
+            mode == SSDReadMode.SHARD_GATHER_PREDICTED
+            or (
+                mode == SSDReadMode.SHARD_GATHER_DENSE
+                and complete_layer
+                and state.layer_id in self._shard_config.dense_layers
+            )
+        )
+        logical_rows = self._logical_destination_rows(state)
+        capability_ok = bool(
+            mode_matches_request
+            and self._shard_config.csa_replica_verified
+            and transport.healthy
+            and transport.world_size == self._shard_config.cp_size
+            and logical_rows is not None
+            and not state.block_slot_scatter
+            and int(selected[-1]) < int(state.in_pool_bitmap.numel())
+            and int(selected[-1]) < int(logical_rows.numel())
+        )
+        context_tokens = (
+            covered_end * state.compressed_block_size * _DSV4_CSA_COMPRESS_RATIO
+        )
+        key = bucket_prefetch_key(
+            group="csa",
+            layer_id=state.layer_id,
+            context_tokens=context_tokens,
+            query_tokens=0,
+            union_blocks=int(selected.numel()),
+        )
+        return bool(
+            self._shard_decisions.choose(
+                key,
+                union_blocks=int(selected.numel()),
+                block_bytes=self._bytes_per_block,
+                world_size=transport.world_size,
+                shard_mode=mode,
+                capability_ok=capability_ok,
+            )
+            == mode
+        )
+
+    def _issue_shard_gather(
+        self,
+        state: CSAAttentionKVLayerState,
+        block_ids: Sequence[int] | torch.Tensor,
+        *,
+        mode: SSDReadMode,
+        io_priority: str,
+        local_fallback_ids: Sequence[int] | torch.Tensor,
+        local_capability: bool,
+    ) -> Tuple[Optional[torch.cuda.Event], List[Any], torch.Tensor]:
+        """Read this rank's owner slice and gather the complete union."""
+        transport = self._shard_transport
+        logical_rows = self._logical_destination_rows(state)
+        if transport is None:
+            return self._issue_local_reads(
+                state,
+                local_fallback_ids,
+                io_priority=io_priority,
+            )
+        selected = torch.as_tensor(
+            block_ids,
+            dtype=torch.int64,
+            device="cpu",
+        ).reshape(-1)
+        selected = torch.unique(selected, sorted=True)
+        partition = partition_block_union(selected.tolist(), transport.world_size)
+        phase = 2 if mode == SSDReadMode.SHARD_GATHER_DENSE else 1
+        descriptor = CollectiveDescriptor(
+            request_generation=int(self._request_generation),
+            layer_id=state.layer_id,
+            phase=phase,
+            mode=mode,
+            partition=partition,
+        )
+        device = state.k_cache_tensor.device
+        try:
+            agreed = transport.preflight(
+                descriptor,
+                local_capability=local_capability,
+                device=device,
+            )
+        except ShardCollectiveError:
+            logger.exception(
+                "CSAAttentionKVPrefetchManager: preflight failed layer=%d; "
+                "using LOCAL_DIRECT",
+                state.layer_id,
+            )
+            return self._issue_local_reads(
+                state,
+                local_fallback_ids,
+                io_priority=io_priority,
+            )
+        if not agreed:
+            logger.warning(
+                "CSAAttentionKVPrefetchManager: shard consensus rejected "
+                "layer=%d mode=%s union_blocks=%d; using LOCAL_DIRECT",
+                state.layer_id,
+                mode.value,
+                int(selected.numel()),
+            )
+            return self._issue_local_reads(
+                state,
+                local_fallback_ids,
+                io_priority=io_priority,
+            )
+        if logical_rows is None:
+            raise RuntimeError(
+                "shard-gather consensus accepted without a destination-row table"
+            )
+
+        owned = torch.as_tensor(
+            partition.blocks_for_rank(transport.rank),
+            dtype=torch.int64,
+            device="cpu",
+        )
+        local_event: Optional[torch.cuda.Event] = None
+        local_objects: List[Any] = []
+        local_completed = torch.empty(0, dtype=torch.int64)
+        local_error: Optional[Exception] = None
+        try:
+            local_event, local_objects, local_completed = self._issue_local_reads(
+                state,
+                owned,
+                io_priority=io_priority,
+            )
+        except Exception as exc:
+            local_error = exc
+        local_complete = bool(
+            local_error is None
+            and torch.equal(
+                torch.unique(local_completed.cpu(), sorted=True),
+                owned,
+            )
+        )
+        ready_descriptor = CollectiveDescriptor(
+            request_generation=descriptor.request_generation,
+            layer_id=descriptor.layer_id,
+            phase=descriptor.phase + 128,
+            mode=descriptor.mode,
+            partition=descriptor.partition,
+        )
+        try:
+            all_reads_ready = transport.preflight(
+                ready_descriptor,
+                local_capability=local_complete,
+                device=device,
+            )
+        except ShardCollectiveError:
+            all_reads_ready = False
+        if not all_reads_ready:
+            logger.warning(
+                "CSAAttentionKVPrefetchManager: owner read readiness rejected "
+                "layer=%d owned=%d; using LOCAL_DIRECT",
+                state.layer_id,
+                int(owned.numel()),
+            )
+            fallback_event, fallback_objects, completed = self._issue_local_reads(
+                state,
+                local_fallback_ids,
+                io_priority=io_priority,
+            )
+            return (
+                fallback_event or local_event,
+                [*local_objects, *fallback_objects],
+                completed,
+            )
+
+        if state.block_slot_scatter:
+            raise RuntimeError("CSA shard-gather does not support block-slot scatter")
+        k_cache_rows = state.k_cache_tensor.view(torch.uint8).reshape(
+            int(state.k_cache_tensor.shape[0]),
+            -1,
+        )
+        gather_event = transport.gather_into(
+            descriptor,
+            source_rows=k_cache_rows,
+            logical_destination_rows=logical_rows,
+            destination_rows=k_cache_rows,
+            local_ready_event=local_event,
+            resident_bitmap=state.in_pool_bitmap,
+        )
+        logger.info(
+            "CSA_SHARD_GATHER layer=%d mode=%s union_blocks=%d "
+            "owned_blocks=%d ssd_bytes=%d gather_send_bytes=%d "
+            "gather_total_bytes=%d union_hash=%d sequence=%d",
+            state.layer_id,
+            mode.value,
+            len(partition.union),
+            len(partition.blocks_for_rank(transport.rank)),
+            len(partition.blocks_for_rank(transport.rank)) * self._bytes_per_block,
+            partition.padded_blocks * self._bytes_per_block,
+            partition.padded_blocks * partition.world_size * self._bytes_per_block,
+            partition.union_hash,
+            descriptor.sequence_number,
+        )
+        return gather_event, local_objects, selected
+
+    @staticmethod
+    def _logical_destination_rows(
+        state: CSAAttentionKVLayerState,
+    ) -> Optional[torch.Tensor]:
+        """Return the logical-block to physical-row table for a layer."""
+        if state.layer_major_dst_rows_table is not None:
+            return state.layer_major_dst_rows_table
+        return state.indexed_dst_rows_table
+
+    def _indexer_cp_owned_blocks(
+        self,
+        layer_id: int,
+        covered_blocks: int,
+    ) -> Sequence[int]:
+        """Compile native Indexer-K CP ownership or return the full fallback."""
+        config = self._shard_config
+        if (
+            not config.enabled
+            or not config.indexer_enabled
+            or not config.indexer_cp_verified
+            or layer_id in config.disabled_layers
+        ):
+            return range(covered_blocks)
+        try:
+            if self._cp_world_size != config.cp_size:
+                raise ValueError(
+                    f"configured_cp={config.cp_size},runtime_cp={self._cp_world_size}"
+                )
+            plan = compile_cp_read_plan(
+                total_rows=covered_blocks * self._compressed_block_size,
+                rank=self._cp_rank,
+                world_size=self._cp_world_size,
+                interleave_rows=config.cp_interleave,
+                block_rows=self._compressed_block_size,
+                row_bytes=self._token_bytes,
+            )
+        except ValueError as exc:
+            reason = str(exc)
+            key = (int(layer_id), reason)
+            if key not in self._cp_fallback_reasons:
+                self._cp_fallback_reasons.add(key)
+                logger.warning(
+                    "INDEXER_CP_LOCAL_FALLBACK layer=%d reason=%s planned_mode=%s",
+                    layer_id,
+                    reason,
+                    SSDReadMode.LOCAL_DIRECT.value,
+                )
+            return range(covered_blocks)
+        logger.info(
+            "INDEXER_CP_LOCAL_READ layer=%d rank=%d world_size=%d "
+            "planned_rows=%d row_ranges=%d owned_blocks=%d ssd_bytes=%d "
+            "kernel_row_min=%d kernel_row_max=%d mode=%s",
+            layer_id,
+            plan.rank,
+            plan.world_size,
+            plan.planned_rows,
+            len(plan.row_ranges),
+            len(plan.block_ids),
+            plan.ssd_bytes,
+            plan.row_ranges[0].start if plan.row_ranges else -1,
+            plan.row_ranges[-1].end if plan.row_ranges else -1,
+            SSDReadMode.CP_LOCAL_INDEXER.value,
+        )
+        return plan.block_ids

@@ -49,12 +49,25 @@ import time
 from collections import OrderedDict
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 import torch
 
 from lmcache.logging import init_logger
 from lmcache.v1.csa_pipeline_nvtx import CsaNvtxEvent, csa_pipeline_nvtx
+
+if TYPE_CHECKING:
+    from lmcache.v1.ssd_tp_sharded_prefetch import SSDTPShardedPrefetchConfig
 
 logger = init_logger(__name__)
 DEEPGEMM_PAGED_BLOCK_SIZE = 64
@@ -1074,6 +1087,9 @@ class IndexerSSDManager:
         # HCA submissions and HBM-pool readiness must never queue behind the
         # 50 ms write-slack waits.
         self._persistence_executor = ThreadPoolExecutor(max_workers=1)
+        # Dense CSA work contains collectives. Preserve one submission order
+        # across ranks even though ordinary Indexer/HCA I/O uses a wider pool.
+        self._dense_shard_executor = ThreadPoolExecutor(max_workers=1)
         # Native indexer-cache restore is deliberately ordered by transformer
         # layer. The first layer is submitted as Stage0 before model forward;
         # its existing consumption gate waits only if layers 0-1 did not hide
@@ -1194,6 +1210,8 @@ class IndexerSSDManager:
         self._cp_proxy_fallback_logged: Set[Tuple[int, str]] = set()
         self._hca_fired_request_id: str = ""
         self._hca_fired_layers: Set[int] = set()
+        self._dense_fired_request_id: str = ""
+        self._dense_fired_layers: Set[int] = set()
 
         # CSA layer index → position in csa_layer_ids list (for "next CSA layer" lookup)
         self._csa_pos: Dict[int, int] = {lid: i for i, lid in enumerate(csa_layer_ids)}
@@ -1877,6 +1895,7 @@ class IndexerSSDManager:
         self,
         tutti_loader: Any,
         layer_tensors: Dict[int, torch.Tensor],
+        shard_config: Optional[SSDTPShardedPrefetchConfig] = None,
     ) -> None:
         """Attach the compact layer-major loader for native indexer caches.
 
@@ -1889,6 +1908,9 @@ class IndexerSSDManager:
             tutti_loader: Active Tutti direct-NVMe loader for this rank.
             layer_tensors: Native indexer K-cache tensors keyed by transformer
                 layer id. Every configured CSA layer must be present.
+            shard_config: Centralized TP-sharded SSD configuration. When
+                omitted, environment-backed defaults preserve compatibility
+                with direct manager construction.
 
         Raises:
             ValueError: If a configured layer or tensor is missing.
@@ -1901,12 +1923,42 @@ class IndexerSSDManager:
         from lmcache.v1.csa_attention_kv_prefetch_manager import (
             CSAAttentionKVPrefetchManager,
         )
+        from lmcache.v1.ssd_tp_sharded_prefetch import (
+            SSDTPShardedPrefetchConfig,
+        )
+
+        shard_config = shard_config or SSDTPShardedPrefetchConfig.from_env()
+        cp_rank = 0
+        cp_world_size = 1
+        if shard_config.enabled and shard_config.indexer_enabled:
+            if not shard_config.indexer_cp_verified:
+                logger.warning(
+                    "Indexer CP-local read requested without "
+                    "LMCACHE_SSD_TP_INDEXER_CP_VERIFIED=1; retaining "
+                    "LOCAL_DIRECT"
+                )
+            else:
+                try:
+                    from vllm.distributed import get_tp_group
+
+                    tp_group = get_tp_group()
+                    cp_rank = int(tp_group.rank_in_group)
+                    cp_world_size = int(tp_group.world_size)
+                except Exception:
+                    logger.exception(
+                        "IndexerSSDManager: cannot resolve TP ownership; compact "
+                        "native indexer reads will use LOCAL_DIRECT"
+                    )
 
         loader = CSAAttentionKVPrefetchManager(
             tutti_loader=tutti_loader,
             csa_layer_ids=self._csa_layer_ids,
             compressed_block_size=DEEPGEMM_PAGED_BLOCK_SIZE,
             token_bytes=self._token_bytes,
+            data_group="indexer",
+            shard_config=shard_config,
+            cp_rank=cp_rank,
+            cp_world_size=cp_world_size,
         )
         for layer_id in self._csa_layer_ids:
             loader.register_layer(int(layer_id), layer_tensors[int(layer_id)])
@@ -2259,6 +2311,62 @@ class IndexerSSDManager:
                 track(layer_id, future, request_token=request_token)
             self._log_timing(
                 "hca_deterministic_submit",
+                layer_id,
+                request_id=request_id,
+            )
+
+    def dense_layer_fired_for_active_request(self, layer_id: int) -> bool:
+        """Return whether dense CSA I/O was scheduled for this request.
+
+        Args:
+            layer_id: Target CSA transformer layer id.
+
+        Returns:
+            ``True`` when the request already owns one dense submission.
+        """
+        manager = getattr(self, "_csa_attention_kv_manager", None)
+        request_id = str(getattr(manager, "active_request_id", ""))
+        with self._lock:
+            return (
+                request_id == self._dense_fired_request_id
+                and int(layer_id) in self._dense_fired_layers
+            )
+
+    def fire_dense_csa_layers(self, layer_ids: Sequence[int]) -> None:
+        """Schedule deterministic dense CSA shard-gather in an FFN window.
+
+        Args:
+            layer_ids: Upcoming early CSA transformer layers. The manager's
+                decision table may consistently fall back to ``LOCAL_DIRECT``.
+        """
+        manager = getattr(self, "_csa_attention_kv_manager", None)
+        fire_layer = getattr(manager, "fire_dense_layer", None)
+        track = getattr(manager, "track_layer_submission", None)
+        if not callable(fire_layer):
+            return
+        request_id = str(getattr(manager, "active_request_id", ""))
+        request_token = getattr(manager, "active_request_token", (request_id, -1))
+        for raw_layer_id in layer_ids:
+            layer_id = int(raw_layer_id)
+            with self._lock:
+                if request_id != self._dense_fired_request_id:
+                    self._dense_fired_request_id = request_id
+                    self._dense_fired_layers.clear()
+                if layer_id in self._dense_fired_layers:
+                    continue
+                self._dense_fired_layers.add(layer_id)
+
+            def _fire(
+                target_layer_id: int = layer_id,
+                token: Tuple[str, int] = request_token,
+            ) -> None:
+                fire_layer(target_layer_id, request_token=token)
+
+            future = self._dense_shard_executor.submit(_fire)
+            if callable(track):
+                track(layer_id, future, request_token=request_token)
+            self._log_timing(
+                "csa_dense_shard_submit",
                 layer_id,
                 request_id=request_id,
             )
@@ -2739,6 +2847,59 @@ class IndexerSSDManager:
             residual_f,
             positions,
         )
+        cp_context = self._prefill_cp_context(layer_id) if enable_prefill_cp else None
+        query_sample_stride: Optional[int] = None
+        if cp_context is not None:
+            _rank, world_size, interleave, _oversubscribe = cp_context
+            query_sample_stride = _env_int(
+                "LMCACHE_CSA_PREFETCH_CP_QUERY_SAMPLE_STRIDE",
+                1,
+            )
+            minimum_cp_span = (
+                int(world_size)
+                * int(interleave)
+                * int(query_sample_stride)
+            )
+            if selected_rows < minimum_cp_span:
+                # Query sampling expands the virtual CP world by ``stride``.
+                # Below one complete sampled interleave cycle, one or more
+                # physical ranks receive zero rows. Let every rank score the
+                # small suffix locally instead; otherwise only the non-empty
+                # ranks enter the proxy ID collective and TP workers deadlock.
+                self._log_timing(
+                    "prefill_cp_proxy_fallback",
+                    layer_id,
+                    rows=selected_rows,
+                    minimum_rows=minimum_cp_span,
+                    query_sample_stride=query_sample_stride,
+                    reason="incomplete_interleave_cycle",
+                )
+                cp_context = None
+        preselected_query_rows: Optional[torch.Tensor] = None
+        preselected_query_span: Optional[int] = None
+        if cp_context is not None:
+            from lmcache.v1.csa_prefill_cp_scorer import (
+                prefill_cp_query_indices,
+            )
+
+            rank, world_size, interleave, _oversubscribe = cp_context
+            assert query_sample_stride is not None
+            preselected_query_span = selected_rows
+            preselected_query_rows = prefill_cp_query_indices(
+                0,
+                selected_rows,
+                rank,
+                world_size,
+                interleave,
+                residual_f.device,
+                sample_stride=query_sample_stride,
+            )
+            residual_f = residual_f.index_select(0, preselected_query_rows)
+            position_rows = preselected_query_rows
+            if positions.device != preselected_query_rows.device:
+                position_rows = preselected_query_rows.to(positions.device)
+            positions = positions.index_select(0, position_rows)
+            selected_rows = int(preselected_query_rows.numel())
         proxy_hidden = self._v4_attention_proxy_hidden(decoder_layer, residual_f)
         if timing_events is not None:
             timing_events["hidden_done"] = torch.cuda.Event(enable_timing=True)
@@ -2750,7 +2911,6 @@ class IndexerSSDManager:
         if timing_events is not None:
             timing_events["inputs_done"] = torch.cuda.Event(enable_timing=True)
             timing_events["inputs_done"].record()
-        cp_context = self._prefill_cp_context(layer_id) if enable_prefill_cp else None
         topk_buf, cp_used = self._v4_proxy_topk_direct(
             layer_id,
             proxy_hidden,
@@ -2763,6 +2923,8 @@ class IndexerSSDManager:
             timing_events=timing_events,
             proxy_topk_tokens=proxy_topk_tokens,
             metadata_query_row_start=metadata_query_row_start,
+            preselected_query_rows=preselected_query_rows,
+            preselected_query_span=preselected_query_span,
             runtime_info=runtime_info,
         )
         if cp_used and cp_context is not None:
@@ -2877,6 +3039,8 @@ class IndexerSSDManager:
         timing_events: Optional[dict[str, Any]] = None,
         proxy_topk_tokens: Optional[int] = None,
         metadata_query_row_start: Optional[int] = None,
+        preselected_query_rows: Optional[torch.Tensor] = None,
+        preselected_query_span: Optional[int] = None,
         runtime_info: Optional[dict[str, int]] = None,
     ) -> tuple[torch.Tensor, bool]:
         """Compute V4 proxy top-K without running ``DeepseekV4Indexer.forward``.
@@ -2969,6 +3133,8 @@ class IndexerSSDManager:
                         oversubscribe=oversubscribe,
                         topk_tokens_override=proxy_width,
                         metadata_query_row_start=metadata_query_row_start,
+                        preselected_query_rows=preselected_query_rows,
+                        preselected_query_span=preselected_query_span,
                         runtime_info=runtime_info,
                     )
                     cp_used = True
@@ -4237,6 +4403,7 @@ class IndexerSSDManager:
         self._proxy_executor.shutdown(wait=True)
         self._proxy_io_executor.shutdown(wait=True)
         self._executor.shutdown(wait=True)
+        self._dense_shard_executor.shutdown(wait=True)
         self._persistence_executor.shutdown(wait=True)
         self._native_indexer_stream_executor.shutdown(wait=True)
         native_loader = self._native_indexer_cache_manager

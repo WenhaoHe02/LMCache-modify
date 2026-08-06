@@ -394,9 +394,10 @@ class LMCacheLookupServer:
                         fast_start = time.perf_counter()
                         lookup_result: Optional[int] = None
                         terminal_fast_hit = False
+                        hint_candidate_index = -1
+                        hint_candidate_hash = 0
                         if (
-                            (lookup_result is None or lookup_result == 0)
-                            and terminal_hint is not None
+                            terminal_hint is not None
                             and terminal_hint.get("mode")
                             == "streaming_terminal_prefix"
                         ):
@@ -421,18 +422,8 @@ class LMCacheLookupServer:
                                 == candidate_hash
                             )
                             if hint_valid:
-                                candidate_result = (
-                                    self.lmcache_engine.lookup_streaming_terminal(
-                                        terminal_hash=candidate_hash,
-                                        token_count=candidate_tokens,
-                                        lookup_id=lookup_id,
-                                        pin=True,
-                                        request_configs=request_configs,
-                                    )
-                                )
-                                if candidate_result == candidate_tokens:
-                                    lookup_result = candidate_result
-                                    terminal_fast_hit = True
+                                hint_candidate_index = candidate_chunks - 1
+                                hint_candidate_hash = candidate_hash
                         if _env_flag("LMCACHE_INDEXER_ENABLE_PREFETCH"):
                             # Admission publishes one immutable layer-major
                             # generation per cached prefix.  The current
@@ -450,11 +441,18 @@ class LMCacheLookupServer:
                                 ):
                                     break
                                 full_chunk_indices.append(index)
-                            for candidate_index in (
-                                reversed(full_chunk_indices)
-                                if lookup_result is None or lookup_result == 0
-                                else ()
-                            ):
+                            # A recent-prefix hint is only a lower bound.  A
+                            # longer request may have published a composed
+                            # generation since the hint was learned.  Probe
+                            # newer terminals first, then pin the hint only as
+                            # a fallback.  Pinning the hint before this scan
+                            # would leak its pin when a longer generation wins.
+                            newer_indices = (
+                                index
+                                for index in reversed(full_chunk_indices)
+                                if index > hint_candidate_index
+                            )
+                            for candidate_index in newer_indices:
                                 candidate_tokens = (
                                     candidate_index + 1
                                 ) * self.lmcache_engine.config.chunk_size
@@ -467,10 +465,50 @@ class LMCacheLookupServer:
                                         request_configs=request_configs,
                                     )
                                 )
+                                if (
+                                    os.getenv(
+                                        "LMCACHE_LOOKUP_TOKEN_DIAGNOSTICS", "0"
+                                    ).lower()
+                                    in {"1", "true", "yes", "on"}
+                                    and (
+                                        candidate_result > 0
+                                        or candidate_tokens % (256 * 256) == 0
+                                    )
+                                ):
+                                    logger.info(
+                                        "LMCache streaming terminal candidate "
+                                        "req=%s tokens=%d hash=%s result=%d "
+                                        "hint_tokens=%d",
+                                        lookup_id,
+                                        candidate_tokens,
+                                        hashes[candidate_index],
+                                        candidate_result,
+                                        (hint_candidate_index + 1)
+                                        * self.lmcache_engine.config.chunk_size,
+                                    )
                                 if candidate_result == candidate_tokens:
                                     lookup_result = candidate_result
                                     terminal_fast_hit = True
                                     break
+                            if (
+                                (lookup_result is None or lookup_result == 0)
+                                and hint_candidate_index >= 0
+                            ):
+                                hint_tokens = (
+                                    hint_candidate_index + 1
+                                ) * self.lmcache_engine.config.chunk_size
+                                hint_result = (
+                                    self.lmcache_engine.lookup_streaming_terminal(
+                                        terminal_hash=hint_candidate_hash,
+                                        token_count=hint_tokens,
+                                        lookup_id=lookup_id,
+                                        pin=True,
+                                        request_configs=request_configs,
+                                    )
+                                )
+                                if hint_result == hint_tokens:
+                                    lookup_result = hint_result
+                                    terminal_fast_hit = True
                         fast_done = time.perf_counter()
                         if lookup_result is None:
                             lookup_result = self.lmcache_engine.lookup(

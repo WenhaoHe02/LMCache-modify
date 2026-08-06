@@ -123,7 +123,7 @@ class TestIocHelpers:
 
 
 class TestRawWriteWindow:
-    """Verify that overdue background writes never bypass active readers."""
+    """Verify demand-first admission and bounded speculative-reader priority."""
 
     def test_idle_writer_can_run_after_slack(self) -> None:
         assert _raw_write_window_ready(0, 0.051, 0.1, 0.05, 2.0)
@@ -133,6 +133,34 @@ class TestRawWriteWindow:
 
     def test_overdue_writer_cannot_bypass_waiting_reader(self) -> None:
         assert not _raw_write_window_ready(1, 10.0, 100.0, 0.05, 2.0)
+
+    def test_speculative_reader_yields_only_after_writer_delay(self) -> None:
+        assert not _raw_write_window_ready(
+            1,
+            10.0,
+            1.9,
+            0.05,
+            2.0,
+            demand_readers_waiting=0,
+        )
+        assert _raw_write_window_ready(
+            1,
+            10.0,
+            2.1,
+            0.05,
+            2.0,
+            demand_readers_waiting=0,
+        )
+
+    def test_demand_reader_remains_strict_priority(self) -> None:
+        assert not _raw_write_window_ready(
+            2,
+            10.0,
+            100.0,
+            0.05,
+            2.0,
+            demand_readers_waiting=1,
+        )
 
 
 class TestTuttiProfileGate:
@@ -207,6 +235,7 @@ class TestFiemapHelper:
         fake_bytes = self._make_fake_fiemap_buf([(0, 512 * 100, 512 * 8)])
 
         with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.truncate(512 * 8)
             tmp = f.name
 
         try:
@@ -234,6 +263,7 @@ class TestFiemapHelper:
             ]
         )
         with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.truncate(512 * 8)
             tmp = f.name
         try:
             with patch("fcntl.ioctl") as mock_ioctl:
@@ -260,6 +290,7 @@ class TestFiemapHelper:
     def test_single_contiguous_ok(self) -> None:
         fake_bytes = self._make_fake_fiemap_buf([(0, 512 * 42, 512 * 16)])
         with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.truncate(512 * 16)
             tmp = f.name
         try:
             with patch("fcntl.ioctl") as mock_ioctl:
@@ -280,6 +311,7 @@ class TestFiemapHelper:
             [(0, 512 * 1, 512 * 4), (512 * 4, 512 * 9, 512 * 4)]
         )
         with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.truncate(512 * 8)
             tmp = f.name
         try:
             with patch("fcntl.ioctl") as mock_ioctl:
@@ -462,7 +494,6 @@ class TestRawStoreStreamIsolation:
                 ],
                 base_file_offset=0,
                 profile_start=time.perf_counter(),
-                dev="cuda:0",
             )
 
         assert records == [LbaRecord(file_offset=0, slba=0, n_sectors=1)]
@@ -1442,6 +1473,52 @@ class TestTuttiDirectLoaderLoadChunksToHbm:
         assert submit_kwargs["byte_lens"].cpu().tolist() == [512, 512]
         assert submit_kwargs["slbas"].cpu().tolist() == [100, 200]
         assert submit_kwargs["staging_iovas"].cpu().tolist() == [0, 512]
+
+    def test_unaligned_composed_ranges_submit_in_ordered_waves(self) -> None:
+        """A suffix overwrites the padded base tail only after it completes."""
+        loader, _ctrl = _make_loader(n_slots=2, q_depth=8)
+        size = 1100
+        keys = [_fake_key(0)]
+        metas = [_disk_meta_for(size)]
+        read_ranges = [
+            [
+                KVObjectByteRange(offset=0, length=700, target_offset=0),
+                KVObjectByteRange(offset=2048, length=400, target_offset=700),
+            ]
+        ]
+        extents = [
+            LbaRecord(slba=100, n_sectors=2, file_offset=0),
+            LbaRecord(slba=200, n_sectors=1, file_offset=2048),
+        ]
+
+        with patch.object(_tdl.FiemapHelper, "query_extents", return_value=extents):
+            with patch.object(_tdl, "_c_ops") as mock_c:
+                mock_c.tutti_submit_batch_sgl_read = MagicMock()
+
+                def fake_poll(**kwargs):
+                    n_ios = kwargs.get("n_ios", 0)
+                    loader._status_buf[:n_ios] = 0
+
+                mock_c.tutti_poll_batch.side_effect = fake_poll
+
+                with _patch_cuda_runtime_for_cpu_tests():
+                    results = loader.load_chunks_to_hbm(
+                        keys,
+                        metas,
+                        read_ranges_per_key=read_ranges,
+                    )
+
+        assert results[0] is not None
+        assert results[0].get_size() == size
+        assert mock_c.tutti_submit_batch_sgl_read.call_count == 2
+        first_submit, second_submit = (
+            call.kwargs
+            for call in mock_c.tutti_submit_batch_sgl_read.call_args_list
+        )
+        assert first_submit["byte_lens"].cpu().tolist() == [1024]
+        assert first_submit["staging_iovas"].cpu().tolist() == [0]
+        assert second_submit["byte_lens"].cpu().tolist() == [512]
+        assert second_submit["staging_iovas"].cpu().tolist() == [700]
 
     def test_explicit_single_read_range_reads_padded_tail(self) -> None:
         loader, _ctrl = _make_loader(n_slots=2, q_depth=8)

@@ -174,12 +174,12 @@ class TestLMCacheLookupClientServer:
         assert hint["tokens"] == 512
         assert hint["terminal_hash"] == messages[0][0][-1]
 
-    @pytest.mark.parametrize("terminal_hit", [True, False])
+    @pytest.mark.parametrize("terminal_hit", ["longer", "hint", "miss"])
     def test_server_streaming_terminal_fastpath_and_fallback(
         self,
-        terminal_hit: bool,
+        terminal_hit: str,
     ) -> None:
-        """The server uses exact manifest lookup and falls back on a miss."""
+        """The server prefers a longer generation, then hint, then fallback."""
 
         class FakeTransport:
             def __init__(self) -> None:
@@ -230,7 +230,11 @@ class TestLMCacheLookupClientServer:
                 **_kwargs,
             ) -> int:
                 self.terminal_calls.append((terminal_hash, token_count, lookup_id))
-                return token_count if terminal_hit else 0
+                if terminal_hit == "longer" and terminal_hash == 33:
+                    return token_count
+                if terminal_hit == "hint" and terminal_hash == 22:
+                    return token_count
+                return 0
 
             def lookup(self, *, hashes, offsets, **_kwargs) -> int:
                 self.calls.append((hashes, offsets))
@@ -244,9 +248,16 @@ class TestLMCacheLookupClientServer:
         finally:
             server.close()
 
-        assert int.from_bytes(transport.response, "big") == 512
-        assert engine.terminal_calls == [(22, 512, "request")]
-        if terminal_hit:
+        expected_result = 768 if terminal_hit == "longer" else 512
+        assert int.from_bytes(transport.response, "big") == expected_result
+        if terminal_hit == "longer":
+            assert engine.terminal_calls == [(33, 768, "request")]
+        else:
+            assert engine.terminal_calls == [
+                (33, 768, "request"),
+                (22, 512, "request"),
+            ]
+        if terminal_hit != "miss":
             assert engine.calls == []
         else:
             assert engine.calls == [([11, 22, 33], [256, 256, 256])]

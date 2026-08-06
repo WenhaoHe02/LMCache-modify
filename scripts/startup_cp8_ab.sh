@@ -2,7 +2,11 @@
 set -euo pipefail
 
 MODEL_PATH=${MODEL_PATH:-/pro_model}
+LMCACHE_STORAGE_MODE=${LMCACHE_STORAGE_MODE:-tutti}
 CSA_FILTER=${LMCACHE_ABLATION_CSA_ATTENTION_KV_FILTER:-0}
+if [ "$LMCACHE_STORAGE_MODE" = "cpu" ]; then
+  CSA_FILTER=0
+fi
 if [ "$CSA_FILTER" = "1" ]; then
   CSA_ON=1
 else
@@ -19,7 +23,30 @@ else
   INDEXER_ON=0
 fi
 
-echo "=== dsv4 csa prefill startup filter=${CSA_FILTER} model=${MODEL_PATH} ===" >&2
+echo "=== dsv4 csa prefill startup storage=${LMCACHE_STORAGE_MODE} filter=${CSA_FILTER} model=${MODEL_PATH} ===" >&2
+
+# Engine startup loads the tokenizer again after weight/DeepGEMM warmup. The
+# cache filesystem is deliberately unmounted before snvme takes ownership, so
+# keep the small tokenizer metadata on the container root filesystem instead
+# of pinning the multi-terabyte model mount for the lifetime of the service.
+TOKENIZER_PATH=/tmp/dsv4_tokenizer_snapshot
+rm -rf "$TOKENIZER_PATH"
+mkdir -p "$TOKENIZER_PATH"
+for tokenizer_file in \
+  tokenizer.json \
+  tokenizer_config.json \
+  special_tokens_map.json \
+  added_tokens.json \
+  chat_template.json \
+  config.json; do
+  if [ -f "$MODEL_PATH/$tokenizer_file" ]; then
+    cp -a "$MODEL_PATH/$tokenizer_file" "$TOKENIZER_PATH/"
+  fi
+done
+if [ ! -f "$TOKENIZER_PATH/tokenizer.json" ]; then
+  echo "missing tokenizer snapshot: $TOKENIZER_PATH/tokenizer.json" >&2
+  exit 2
+fi
 
 LMCACHE_SITE=/usr/local/lib/python3.12/site-packages/lmcache
 VLLM_SITE=/usr/local/lib/python3.12/site-packages/vllm
@@ -71,6 +98,30 @@ if changed:
     print("lmcache_connector.py: patched SupportsHMA/request_finished_all_groups")
 else:
     print("lmcache_connector.py: SupportsHMA already present, skipping")
+PY
+
+python3 - <<'PY'
+from pathlib import Path
+
+p = Path(
+    "/usr/local/lib/python3.12/site-packages/vllm/entrypoints/openai/api_server.py"
+)
+s = p.read_text()
+hook = '''from lmcache.integration.vllm.tool_slack_hook import (
+    install_vllm_tool_slack_hook,
+)
+
+install_vllm_tool_slack_hook()
+
+'''
+if "install_vllm_tool_slack_hook" not in s:
+    marker = 'if __name__ == "__main__":\n'
+    if marker not in s:
+        raise RuntimeError("vLLM api_server __main__ marker not found")
+    p.write_text(s.replace(marker, hook + marker, 1))
+    print("api_server.py: installed LMCache tool-slack hook bootstrap")
+else:
+    print("api_server.py: LMCache tool-slack hook already present, skipping")
 PY
 
 python3 - <<'PY'
@@ -133,8 +184,14 @@ fi
 python3 -m compileall \
   "$LMCACHE_SITE/integration/vllm/lmcache_connector_v1.py" \
   "$LMCACHE_SITE/integration/vllm/vllm_v1_adapter.py" \
+  "$LMCACHE_SITE/integration/vllm/tool_slack_hook.py" \
+  "$LMCACHE_SITE/v1/config.py" \
   "$LMCACHE_SITE/v1/indexer_ssd_manager.py" \
   "$LMCACHE_SITE/v1/csa_attention_kv_prefetch_manager.py" \
+  "$LMCACHE_SITE/v1/ssd_tp_sharded_prefetch.py" \
+  "$LMCACHE_SITE/v1/write_planner.py" \
+  "$LMCACHE_SITE/v1/write_slack_client.py" \
+  "$LMCACHE_SITE/v1/internal_api_server/vllm/write_slack_api.py" \
   "$LMCACHE_SITE/v1/cache_engine.py" \
   "$LMCACHE_SITE/v1/csa_pipeline_nvtx.py" \
   "$LMCACHE_SITE/v1/csa_prefetch_policy.py" \
@@ -150,9 +207,15 @@ from pathlib import Path
 site = Path("/usr/local/lib/python3.12/site-packages/lmcache")
 files = (
     "integration/vllm/vllm_v1_adapter.py",
+    "integration/vllm/tool_slack_hook.py",
+    "v1/config.py",
     "v1/cache_engine.py",
     "v1/csa_attention_kv_prefetch_manager.py",
     "v1/indexer_ssd_manager.py",
+    "v1/ssd_tp_sharded_prefetch.py",
+    "v1/write_planner.py",
+    "v1/write_slack_client.py",
+    "v1/internal_api_server/vllm/write_slack_api.py",
     "v1/indexer_tutti_backend.py",
     "v1/csa_pipeline_nvtx.py",
     "v1/csa_prefetch_policy.py",
@@ -192,6 +255,23 @@ print(
 PY
 fi
 
+if [ "$LMCACHE_STORAGE_MODE" = "cpu" ]; then
+cat > /tmp/lmcache_ssd_tutti_kvobj.yaml <<YAML
+chunk_size: 256
+local_cpu: true
+max_local_cpu_size: ${LMCACHE_CPU_PER_RANK_GB:-160.0}
+reserve_local_cpu_size: ${LMCACHE_CPU_RESERVE_GB:-128.0}
+use_gpu_connector_v3: true
+use_layerwise: false
+numa_mode: ${LMCACHE_CPU_NUMA_MODE:-null}
+store_location: "LocalCPUBackend"
+retrieve_locations: ["LocalCPUBackend"]
+extra_config:
+  save_only_first_rank: ${LMCACHE_CPU_SAVE_ONLY_FIRST_RANK:-false}
+  first_rank_max_local_cpu_size: ${LMCACHE_CPU_FIRST_RANK_GB:-160.0}
+  dsv4_optimized_kv: false
+YAML
+else
 cat > /tmp/lmcache_ssd_tutti_kvobj.yaml <<YAML
 chunk_size: 256
 local_cpu: false
@@ -202,6 +282,9 @@ max_local_disk_size: 4096.0
 use_gpu_connector_v3: true
 use_layerwise: false
 layer_group_size: 1
+internal_api_server_enabled: ${LMCACHE_WRITE_SLACK_API_ENABLED:-true}
+internal_api_server_host: ${LMCACHE_WRITE_SLACK_API_HOST:-127.0.0.1}
+internal_api_server_port_start: ${LMCACHE_WRITE_SLACK_API_PORT_START:-6999}
 extra_config:
   use_odirect: false
   save_only_first_rank: false
@@ -220,6 +303,7 @@ extra_config:
   tutti_slot_mb: ${LMCACHE_ABLATION_TUTTI_SLOT_MB:-128}
   tutti_nsid: 1
 YAML
+fi
 
 RAW_REGION_PATH="/mnt/nvme0/tutti_raw_reserve/rank_raw_region_3g.bin,/mnt/nvme2/tutti_raw_reserve/rank_raw_region_3g.bin,/mnt/nvme3/tutti_raw_reserve/rank_raw_region_3g.bin,/mnt/nvme4/tutti_raw_reserve/rank_raw_region_3g.bin,/mnt/nvme5/tutti_raw_reserve/rank_raw_region_3g.bin,/mnt/nvme6/tutti_raw_reserve/rank_raw_region_3g.bin,/mnt/nvme8/tutti_raw_reserve/rank_raw_region_3g.bin,/mnt/nvme9/tutti_raw_reserve/rank_raw_region_3g.bin"
 INDEXER_RAW_REGION_PATH="/mnt/nvme0/tutti_raw_reserve/indexer_raw_region_512m.bin,/mnt/nvme2/tutti_raw_reserve/indexer_raw_region_512m.bin,/mnt/nvme3/tutti_raw_reserve/indexer_raw_region_512m.bin,/mnt/nvme4/tutti_raw_reserve/indexer_raw_region_512m.bin,/mnt/nvme5/tutti_raw_reserve/indexer_raw_region_512m.bin,/mnt/nvme6/tutti_raw_reserve/indexer_raw_region_512m.bin,/mnt/nvme8/tutti_raw_reserve/indexer_raw_region_512m.bin,/mnt/nvme9/tutti_raw_reserve/indexer_raw_region_512m.bin"
@@ -244,6 +328,18 @@ export LMCACHE_INDEXER_ENABLE_DECODE_PREFETCH=0
 export LMCACHE_INDEXER_ENABLE_PREFILL_RESIDUAL_PROXY=0
 export LMCACHE_INDEXER_ENABLE_PREFILL_EVICTION=0
 export LMCACHE_INDEXER_ENABLE_POOL_SCORING=0
+if [ "$LMCACHE_STORAGE_MODE" = "cpu" ]; then
+  export LMCACHE_DSV4_OPTIMIZED_KV=0
+  export LMCACHE_DSV4_CSA_ATTENTION_KV_FILTER=0
+  export LMCACHE_KV_OBJECT_STORE_ENABLE=0
+  export LMCACHE_KV_OBJECT_STORE_TUTTI_RAW_ENABLE=0
+  export LMCACHE_INDEXER_ENABLE_PREFETCH=0
+  export LMCACHE_INDEXER_FULL_OVERLAP=0
+  export LMCACHE_INDEXER_ENABLE_RESIDUAL_PROXY=0
+  export LMCACHE_INDEXER_ENABLE_REUSE_PREFETCH=0
+  export LMCACHE_INDEXER_TUTTI_BACKEND=0
+  export LMCACHE_DSV4_HCA_WALKER=0
+fi
 if [ "$CSA_ON" = "1" ]; then
   export LMCACHE_CSA_PREFETCH_LOOKAHEAD_BY_LAYER=${LMCACHE_CSA_PREFETCH_LOOKAHEAD_BY_LAYER:-profile80_hybrid}
   export LMCACHE_CSA_PREFETCH_CP_SIZE=${LMCACHE_CSA_PREFETCH_CP_SIZE:-8}
@@ -277,19 +373,24 @@ export LMCACHE_NSYS_FULL_CAPTURE_SKIP_REQUESTS=${LMCACHE_NSYS_FULL_CAPTURE_SKIP_
 export LMCACHE_NSYS_FULL_CAPTURE_SCOPE=${LMCACHE_NSYS_FULL_CAPTURE_SCOPE:-decoder}
 export LMCACHE_CSA_ATTENTION_KV_TIMING=0
 export LMCACHE_TUTTI_PROFILE=${LMCACHE_TUTTI_PROFILE:-0}
+export LMCACHE_TOOL_SLACK_HOOK=${LMCACHE_TOOL_SLACK_HOOK:-1}
+export LMCACHE_WRITE_SLACK_WORKER_COUNT=${LMCACHE_WRITE_SLACK_WORKER_COUNT:-8}
+export LMCACHE_WRITE_SLACK_FIRST_WORKER_PORT=${LMCACHE_WRITE_SLACK_FIRST_WORKER_PORT:-7000}
+export LMCACHE_TOOL_SLACK_DEFAULT_SEC=${LMCACHE_TOOL_SLACK_DEFAULT_SEC:-30}
 export LMCACHE_TTFT_STAGE_PROFILE=${LMCACHE_TTFT_STAGE_PROFILE:-0}
 export LMCACHE_HCA_ENABLE_PREFETCH=0
 export LMCACHE_HCA_ENABLE_PINNED_BOUNCE=0
 export LMCACHE_DSV4_DEFER_HCA_TO_MOE=0
 export LMCACHE_HCA_ENABLE_DECODE_HOOK=0
 export LMCACHE_HCA_TIMING=0
+export LMCACHE_D2H_TIMING=${LMCACHE_D2H_TIMING:-0}
 export LMCACHE_TUTTI_WARMUP_AFTER_STORE_DELAY_SEC=${LMCACHE_ABLATION_TUTTI_AFTER_STORE_DELAY:-10}
 export LMCACHE_TUTTI_STARTUP_WARMUP_DELAY_SEC=${LMCACHE_ABLATION_TUTTI_STARTUP_DELAY:-120}
 export PYTHONHASHSEED=${PYTHONHASHSEED:-0}
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 printf '%s\n' \
-  "EXPERIMENT_CONFIG csa_filter=${CSA_FILTER} indexer_prefetch=${INDEXER_ON} ${CP_CONFIG} hca_walker=${LMCACHE_DSV4_HCA_WALKER} accuracy=${LMCACHE_INDEXER_PROFILE_ACCURACY} indexer_timing=${LMCACHE_INDEXER_TIMING} csa_timing=${LMCACHE_CSA_ATTENTION_KV_TIMING} ttft_profile=${LMCACHE_TTFT_STAGE_PROFILE} nvtx=${LMCACHE_CSA_PIPELINE_NVTX}" >&2
+  "EXPERIMENT_CONFIG csa_filter=${CSA_FILTER} indexer_prefetch=${INDEXER_ON} ${CP_CONFIG} hca_walker=${LMCACHE_DSV4_HCA_WALKER} accuracy=${LMCACHE_INDEXER_PROFILE_ACCURACY} indexer_timing=${LMCACHE_INDEXER_TIMING} csa_timing=${LMCACHE_CSA_ATTENTION_KV_TIMING} ttft_profile=${LMCACHE_TTFT_STAGE_PROFILE} d2h_timing=${LMCACHE_D2H_TIMING} nvtx=${LMCACHE_CSA_PIPELINE_NVTX}" >&2
 
 IFS=',' read -ra _CSA_DIRS <<< "$LMCACHE_INDEXER_SSD_DIR"
 for d in "${_CSA_DIRS[@]}"; do
@@ -324,6 +425,8 @@ fi
 
 exec ${LMCACHE_EXEC_PREFIX:-} python3 -m vllm.entrypoints.openai.api_server \
   --model "$MODEL_PATH" \
+  --tokenizer "$TOKENIZER_PATH" \
+  --generation-config vllm \
   --served-model-name deepseek-v4-pro \
   --tensor-parallel-size 8 \
   --enable-expert-parallel \

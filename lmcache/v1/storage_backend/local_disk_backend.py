@@ -126,12 +126,240 @@ class _CSAStreamingLayoutBuild:
     covered_tokens: int
     required_entries: frozenset[tuple[str, int]]
     objects: dict[tuple[str, int], _CSAStreamingObject]
+    terminal: bool
+    admission_started_at: float
+
+
+@dataclass(slots=True)
+class _LayerMajorSidecar:
+    """One physical sidecar being prepared for a layer-major generation."""
+
+    source_role: str
+    layer_id: int
+    object_role: str
+    physical_role: str
+    payload_nbytes: int
+    segments: list[memoryview]
+    segment_sources: list[Optional[tuple[int, int]]]
+    record: KVObjectRecord
+    ready_record: Optional[KVObjectRecord] = None
+
+
+LayerSegmentLayout = tuple[
+    tuple[tuple[str, int], tuple[tuple[int, int], ...]],
+    ...,
+]
+
+KVObjectLayerMajorPacker = Callable[
+    [
+        Sequence[int],
+        Sequence[int],
+        Sequence[int],
+        Sequence[int],
+        Sequence[int],
+        torch.Tensor,
+    ],
+    float,
+]
+
+
+def _layer_major_wave_record(
+    wave: Sequence[_LayerMajorSidecar],
+) -> tuple[KVObjectRecord, int]:
+    """Return the physical record and byte length for one write wave."""
+    if not wave:
+        raise ValueError("layer-major wave must be non-empty")
+    if len(wave) == 1:
+        return wave[0].record, wave[0].payload_nbytes
+    first_record = wave[0].record
+    last_record = wave[-1].record
+    wave_nbytes = (
+        last_record.offset + last_record.aligned_length - first_record.offset
+    )
+    return (
+        KVObjectRecord(
+            object_id=first_record.object_id,
+            pool_id=first_record.pool_id,
+            offset=first_record.offset,
+            length=wave_nbytes,
+            aligned_length=wave_nbytes,
+            shape=(wave_nbytes,),
+            dtype="torch.uint8",
+        ),
+        wave_nbytes,
+    )
+
+
+def _pack_layer_major_wave(
+    wave: Sequence[_LayerMajorSidecar],
+    buffer: bytearray,
+) -> tuple[KVObjectRecord, memoryview, float]:
+    """Pack one layer-major wave into a reusable native buffer.
+
+    Equal-length ``bytearray`` slice assignment enters CPython's buffer fast
+    path directly. It avoids two ``ctypes`` object constructions per segment;
+    a 480K snapshot contains more than 100,000 small source segments, so that
+    call overhead is material even though the copied byte count is unchanged.
+    The caller still double-buffers packing with Tutti H2D/NVMe writes.
+    """
+    started = time.perf_counter()
+    writer_record, wave_nbytes = _layer_major_wave_record(wave)
+    if len(buffer) < wave_nbytes:
+        raise ValueError("layer-major pack buffer is smaller than the wave")
+
+    target_offset = 0
+    for sidecar in wave:
+        for segment in sidecar.segments:
+            source = segment.cast("B")
+            source_nbytes = len(source)
+            if source_nbytes <= 0:
+                continue
+            buffer[target_offset : target_offset + source_nbytes] = source
+            target_offset += source_nbytes
+        if len(wave) > 1:
+            padding_nbytes = sidecar.record.aligned_length - sidecar.payload_nbytes
+            if padding_nbytes > 0:
+                buffer[target_offset : target_offset + padding_nbytes] = (
+                    b"\0" * padding_nbytes
+                )
+                target_offset += padding_nbytes
+    if target_offset != wave_nbytes:
+        raise RuntimeError(
+            "layer-major packed payload does not match wave allocations"
+        )
+    return (
+        writer_record,
+        memoryview(buffer)[:wave_nbytes],
+        time.perf_counter() - started,
+    )
+
+
+def _pack_layer_major_wave_on_gpu(
+    wave: Sequence[_LayerMajorSidecar],
+    destination: torch.Tensor,
+    packer: KVObjectLayerMajorPacker,
+) -> tuple[KVObjectRecord, memoryview, float]:
+    """Pack one wave through mapped pinned memory on a CUDA stream."""
+    started = time.perf_counter()
+    writer_record, wave_nbytes = _layer_major_wave_record(wave)
+    if destination.device.type != "cpu" or destination.dtype != torch.uint8:
+        raise ValueError("GPU pack destination must be a CPU uint8 tensor")
+    if destination.numel() < wave_nbytes:
+        raise ValueError("GPU pack destination is smaller than the wave")
+
+    unique_sources: list[int] = []
+    source_lookup: dict[int, int] = {}
+    source_indices: list[int] = []
+    source_offsets: list[int] = []
+    destination_offsets: list[int] = []
+    lengths: list[int] = []
+    target_offset = 0
+    for sidecar in wave:
+        if len(sidecar.segment_sources) != len(sidecar.segments):
+            raise ValueError("layer-major segment source descriptors disagree")
+        for segment, source in zip(
+            sidecar.segments,
+            sidecar.segment_sources,
+            strict=True,
+        ):
+            if source is None:
+                raise ValueError("layer-major source is not pinned CPU memory")
+            source_ptr, source_offset = source
+            source_idx = source_lookup.get(source_ptr)
+            if source_idx is None:
+                source_idx = len(unique_sources)
+                source_lookup[source_ptr] = source_idx
+                unique_sources.append(source_ptr)
+            segment_nbytes = len(segment)
+            source_indices.append(source_idx)
+            source_offsets.append(source_offset)
+            destination_offsets.append(target_offset)
+            lengths.append(segment_nbytes)
+            target_offset += segment_nbytes
+        if len(wave) > 1:
+            target_offset += sidecar.record.aligned_length - sidecar.payload_nbytes
+    if target_offset != wave_nbytes:
+        raise RuntimeError("GPU-packed layer-major wave length mismatch")
+
+    destination_view = destination[:wave_nbytes]
+    # Reused pack slots may retain bytes in alignment gaps. Clear on the CPU
+    # before the mapped-host kernel overwrites every logical segment.
+    destination_view.zero_()
+    packer(
+        unique_sources,
+        source_indices,
+        source_offsets,
+        destination_offsets,
+        lengths,
+        destination_view,
+    )
+    return (
+        writer_record,
+        memoryview(destination_view.numpy()),
+        time.perf_counter() - started,
+    )
+
+
+def _pack_layer_major_wave_with_fallback(
+    wave: Sequence[_LayerMajorSidecar],
+    cpu_buffer: Optional[bytearray],
+    gpu_buffer: Optional[torch.Tensor],
+    packer: Optional[KVObjectLayerMajorPacker],
+) -> tuple[KVObjectRecord, memoryview, float]:
+    """Use GPU packing when available and fail closed to the CPU packer."""
+    if gpu_buffer is not None and packer is not None:
+        try:
+            return _pack_layer_major_wave_on_gpu(wave, gpu_buffer, packer)
+        except Exception:
+            logger.exception(
+                "GPU layer-major pack failed; using CPU pack for this wave"
+            )
+    if cpu_buffer is None:
+        _writer_record, wave_nbytes = _layer_major_wave_record(wave)
+        cpu_buffer = bytearray(wave_nbytes)
+    return _pack_layer_major_wave(wave, cpu_buffer)
 
 
 KVObjectRawWriter = Callable[
     [KVObjectRecord, memoryview],
     tuple[Sequence[tuple[int, int, int]], float],
 ]
+
+
+def _clip_raw_extents(
+    raw_extents: Sequence[tuple[int, int, int]],
+    *,
+    offset: int,
+    aligned_length: int,
+) -> tuple[tuple[int, int, int], ...]:
+    """Clip one raw-write wave's extents to a sidecar allocation."""
+    object_end = offset + aligned_length
+    clipped: list[tuple[int, int, int]] = []
+    covered = 0
+    for file_offset, slba, n_sectors in raw_extents:
+        extent_end = file_offset + n_sectors * 512
+        write_start = max(offset, file_offset)
+        write_end = min(object_end, extent_end)
+        if write_start >= write_end:
+            continue
+        extent_skip = write_start - file_offset
+        write_nbytes = write_end - write_start
+        if extent_skip % 512 != 0 or write_nbytes % 512 != 0:
+            raise ValueError("raw write wave produced a non-sector-aligned extent")
+        clipped.append(
+            (
+                write_start,
+                slba + extent_skip // 512,
+                write_nbytes // 512,
+            )
+        )
+        covered += write_nbytes
+    if covered != aligned_length:
+        raise RuntimeError(
+            "raw write wave does not cover sidecar allocation "
+            f"{offset}:{object_end}; covered={covered}"
+        )
+    return tuple(clipped)
 
 
 def _env_flag(name: str) -> bool:
@@ -155,6 +383,26 @@ def _env_int(name: str, default: int = 0) -> int:
         return int(value)
     except ValueError:
         return default
+
+
+def _write_wave_limit_bytes(staging_bytes: Optional[int]) -> int:
+    """Return the physical write quantum without changing logical chunks.
+
+    ``LMCACHE_DSV4_WRITE_QUANTUM_MB`` is the scheduler-facing setting.  The
+    older raw-wave setting remains the fallback so existing deployments keep
+    their behavior until they opt in to a smaller preemption quantum.
+
+    Args:
+        staging_bytes: Tutti staging capacity, or ``None`` when unavailable.
+
+    Returns:
+        The effective byte limit, or zero when bounded grouping is disabled.
+    """
+    legacy_wave_mb = _env_int("LMCACHE_DSV4_RAW_WRITE_WAVE_MB", 128)
+    quantum_mb = _env_int("LMCACHE_DSV4_WRITE_QUANTUM_MB", legacy_wave_mb)
+    if staging_bytes is None or staging_bytes <= 0 or quantum_mb <= 0:
+        return 0
+    return min(staging_bytes, quantum_mb * 1024**2)
 
 
 def _select_rank_int(value: Any, rank_id: int) -> int:
@@ -326,11 +574,29 @@ class LocalDiskBackend(StorageBackendInterface):
         self._hca_write_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="lmcache-hca-disk-write"
         )
+        self._layer_major_pack_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="lmcache-layer-major-pack",
+        )
+        self._layer_segment_layout_cache: dict[
+            tuple[tuple[tuple[int, ...], str], ...],
+            LayerSegmentLayout,
+        ] = {}
         self._diagnose_contains_misses = _env_flag("LMCACHE_DISK_CONTAINS_DIAGNOSTICS")
         self._contains_miss_log_counts: dict[str, int] = {}
         self._object_write_skip_log_counts: dict[str, int] = {}
         self.kv_object_tutti_raw_enabled = _env_flag(
             "LMCACHE_KV_OBJECT_STORE_TUTTI_RAW_ENABLE"
+        )
+        self.kv_object_cpu_raw_write_enabled = _env_flag_default(
+            "LMCACHE_DSV4_CPU_RAW_WRITE",
+            False,
+        )
+        self.kv_object_cpu_raw_write_mibps = float(
+            os.getenv("LMCACHE_DSV4_CPU_RAW_WRITE_MIBPS", "512")
+        )
+        self.kv_object_cpu_raw_write_block_bytes = (
+            _env_int("LMCACHE_DSV4_CPU_RAW_WRITE_BLOCK_MB", 4) * 1024**2
         )
         self.kv_object_tutti_raw_cold_store_enabled = (
             self.kv_object_tutti_raw_enabled
@@ -350,6 +616,10 @@ class LocalDiskBackend(StorageBackendInterface):
         )
         self.kv_object_tutti_raw_region_extents: list[tuple[int, int, int]] = []
         self.kv_object_tutti_raw_writer: Optional[KVObjectRawWriter] = None
+        self.kv_object_gpu_layer_major_packer: Optional[
+            KVObjectLayerMajorPacker
+        ] = None
+        self._kv_object_tutti_raw_writer_ready = threading.Event()
         self.kv_object_tutti_raw_staging_bytes: Optional[int] = None
         if self.kv_object_store_enabled:
             slot_mb = int(os.getenv("LMCACHE_KV_OBJECT_STORE_SLOT_MB", "128"))
@@ -377,6 +647,24 @@ class LocalDiskBackend(StorageBackendInterface):
                         self.kv_object_tutti_raw_enabled,
                     )
                 )
+                self.kv_object_cpu_raw_write_enabled = bool(
+                    config.extra_config.get(
+                        "kv_object_store_cpu_raw_write_enable",
+                        self.kv_object_cpu_raw_write_enabled,
+                    )
+                )
+                self.kv_object_cpu_raw_write_mibps = float(
+                    config.extra_config.get(
+                        "kv_object_store_cpu_raw_write_mibps",
+                        self.kv_object_cpu_raw_write_mibps,
+                    )
+                )
+                self.kv_object_cpu_raw_write_block_bytes = int(
+                    config.extra_config.get(
+                        "kv_object_store_cpu_raw_write_block_mb",
+                        self.kv_object_cpu_raw_write_block_bytes // 1024**2,
+                    )
+                ) * 1024**2
                 self.kv_object_tutti_raw_cold_store_enabled = bool(
                     config.extra_config.get(
                         "kv_object_store_tutti_raw_cold_store",
@@ -422,6 +710,21 @@ class LocalDiskBackend(StorageBackendInterface):
                     self.kv_object_tutti_raw_enabled
                     and self.kv_object_tutti_raw_cold_store_enabled
                 )
+            if self.kv_object_cpu_raw_write_mibps < 0:
+                raise ValueError(
+                    "kv_object_store_cpu_raw_write_mibps must be non-negative"
+                )
+            if (
+                self.kv_object_cpu_raw_write_block_bytes <= 0
+                or self.kv_object_cpu_raw_write_block_bytes % 512
+            ):
+                raise ValueError(
+                    "kv_object_store_cpu_raw_write_block_mb must be positive"
+                )
+            self.kv_object_cpu_raw_write_enabled = (
+                self.kv_object_tutti_raw_enabled
+                and self.kv_object_cpu_raw_write_enabled
+            )
             if raw_slot_mb > 0 and raw_n_slots > 0:
                 self.kv_object_tutti_raw_staging_bytes = (
                     raw_slot_mb * 1024 * 1024 * raw_n_slots
@@ -444,7 +747,8 @@ class LocalDiskBackend(StorageBackendInterface):
             logger.info(
                 "KV object store enabled: pool_id=%s path=%s slot_mb=%d "
                 "capacity=%d tutti_raw=%s raw_cold_store=%s raw_base_lba=%d "
-                "raw_staging_bytes=%s",
+                "raw_staging_bytes=%s cpu_raw_write=%s cpu_raw_mibps=%.1f "
+                "cpu_raw_block_mib=%.1f",
                 pool_id,
                 pool_path,
                 slot_mb,
@@ -453,6 +757,9 @@ class LocalDiskBackend(StorageBackendInterface):
                 self.kv_object_tutti_raw_cold_store_enabled,
                 self.kv_object_tutti_raw_base_lba,
                 self.kv_object_tutti_raw_staging_bytes,
+                self.kv_object_cpu_raw_write_enabled,
+                self.kv_object_cpu_raw_write_mibps,
+                self.kv_object_cpu_raw_write_block_bytes / 1024**2,
             )
             if self.kv_object_tutti_raw_region_path:
                 logger.info(
@@ -548,10 +855,20 @@ class LocalDiskBackend(StorageBackendInterface):
         layer_id: int,
     ) -> Optional[KVObjectId]:
         """Resolve one logical role through the key's active generation."""
+        entry = self._resolve_streaming_object(key, logical_role, layer_id)
+        return entry.object_id if entry is not None else None
+
+    def _resolve_streaming_object(
+        self,
+        key: CacheEngineKey,
+        logical_role: str,
+        layer_id: int,
+    ) -> Optional[_CSAStreamingObject]:
+        """Resolve one logical object entry through the active generation."""
         layout = self._active_csa_layout(key)
         if layout is None or not self._csa_layout_matches_runtime(layout):
             return None
-        return layout.find(logical_role, int(layer_id))
+        return layout.find_object(logical_role, int(layer_id))
 
     def _required_csa_streaming_entries(self) -> set[tuple[str, int]]:
         """Return every logical object required by the active ON layout."""
@@ -624,23 +941,54 @@ class LocalDiskBackend(StorageBackendInterface):
             return False
         present = {(entry.logical_role, entry.layer_id) for entry in layout.objects}
         if layout.layout_version != _DSV4_CSA_STREAMING_LAYOUT_VERSION:
+            logger.warning(
+                "CSA layout validation failed: generation=%s reason=layout_version",
+                layout.generation,
+            )
             return False
         if not layout.required_entries.issubset(present):
+            logger.warning(
+                "CSA layout validation failed: generation=%s "
+                "reason=missing_entries missing=%s",
+                layout.generation,
+                sorted(layout.required_entries - present),
+            )
             return False
-        for entry in layout.objects:
+        records = self.kv_object_metadata_store.get_many(
+            [entry.object_id for entry in layout.objects],
+            ready_only=False,
+        )
+        for entry, record in zip(layout.objects, records, strict=True):
             if entry.length == 0:
                 if entry.logical_role not in {
                     _DSV4_CSA_DEFERRED_RETRIEVE_ROLE,
                     _DSV4_CSA_HCA_DEFERRED_RETRIEVE_ROLE,
                 }:
+                    logger.warning(
+                        "CSA layout validation failed: generation=%s "
+                        "reason=unexpected_empty role=%s layer=%d",
+                        layout.generation,
+                        entry.logical_role,
+                        entry.layer_id,
+                    )
                     return False
                 continue
-            record = self.kv_object_metadata_store.get(entry.object_id)
             if (
                 not self._ready_tutti_raw_record(record)
                 or record is None
-                or record.length != entry.length
+                or record.length < entry.length
+                or (record.length > entry.length and not record.is_contiguous)
             ):
+                logger.warning(
+                    "CSA layout validation failed: generation=%s "
+                    "reason=object_unreadable role=%s layer=%d expected=%d "
+                    "record=%s",
+                    layout.generation,
+                    entry.logical_role,
+                    entry.layer_id,
+                    entry.length,
+                    record,
+                )
                 return False
         return True
 
@@ -672,13 +1020,40 @@ class LocalDiskBackend(StorageBackendInterface):
                 build.objects[entry_key] for entry_key in sorted(build.objects)
             ),
         )
-        if not self._csa_layout_matches_runtime(
-            layout
-        ) or not self._csa_layout_records_readable(layout):
+        if not self._csa_layout_matches_runtime(layout):
+            logger.warning(
+                "CSA layout publication failed: key=%s generation=%s "
+                "reason=runtime_mismatch covered_tokens=%d required=%d",
+                key.to_string(),
+                layout.generation,
+                layout.covered_tokens,
+                len(layout.required_entries),
+            )
+            return False
+        if not self._csa_layout_records_readable(layout):
             return False
         with self._csa_layout_lock:
             self._csa_active_layouts[key.to_string()] = layout
             self._csa_pending_layouts.pop(key.to_string(), None)
+        if build.terminal:
+            logger.info(
+                "CSA terminal layout published: key=%s generation=%s "
+                "covered_tokens=%d objects=%d admission_total_ms=%.3f",
+                key.to_string(),
+                layout.generation,
+                layout.covered_tokens,
+                len(layout.objects),
+                (time.perf_counter() - build.admission_started_at) * 1000.0,
+            )
+        else:
+            logger.debug(
+                "CSA prefix layout published: key=%s generation=%s "
+                "covered_tokens=%d objects=%d",
+                key.to_string(),
+                layout.generation,
+                layout.covered_tokens,
+                len(layout.objects),
+            )
         return True
 
     def get_kv_object_records(
@@ -707,14 +1082,15 @@ class LocalDiskBackend(StorageBackendInterface):
         if roles is not None and len(roles) != len(keys):
             raise ValueError("roles and keys must have the same length")
         object_ids: list[Optional[KVObjectId]] = []
+        logical_lengths: list[Optional[int]] = []
         streaming_roles = self._streaming_logical_roles()
         for index, key in enumerate(keys):
             layer_id = layer_ids[index] if layer_ids is not None else 0
             role = roles[index] if roles is not None else "full"
             if self._csa_streaming_layout_requested() and role in streaming_roles:
-                object_ids.append(
-                    self._resolve_streaming_object_id(key, role, int(layer_id))
-                )
+                entry = self._resolve_streaming_object(key, role, int(layer_id))
+                object_ids.append(entry.object_id if entry is not None else None)
+                logical_lengths.append(entry.length if entry is not None else None)
             else:
                 object_ids.append(
                     self._key_to_object_id(
@@ -723,16 +1099,46 @@ class LocalDiskBackend(StorageBackendInterface):
                         role=role,
                     )
                 )
+                logical_lengths.append(None)
         resolved = [object_id for object_id in object_ids if object_id is not None]
         records = self.kv_object_metadata_store.get_many(resolved, ready_only=True)
         result: list[Optional[KVObjectRecord]] = []
         record_index = 0
-        for object_id in object_ids:
+        for object_id, logical_length in zip(
+            object_ids,
+            logical_lengths,
+            strict=True,
+        ):
             if object_id is None:
                 result.append(None)
                 continue
-            result.append(records[record_index])
+            record = records[record_index]
             record_index += 1
+            if (
+                record is not None
+                and logical_length is not None
+                and logical_length > record.length
+            ):
+                result.append(None)
+                continue
+            if (
+                record is not None
+                and logical_length is not None
+                and 0 < logical_length < record.length
+            ):
+                if not record.is_contiguous:
+                    result.append(None)
+                    continue
+                record = record.with_byte_ranges(
+                    [
+                        KVObjectByteRange(
+                            offset=record.offset,
+                            length=logical_length,
+                        )
+                    ],
+                    length=logical_length,
+                )
+            result.append(record)
         return result
 
     def get_kv_object_payload_lengths(
@@ -920,6 +1326,8 @@ class LocalDiskBackend(StorageBackendInterface):
         memory_objs: Sequence[MemoryObj],
         prefix_keys: Optional[Sequence[CacheEngineKey]] = None,
         prefix_token_count: Optional[int] = None,
+        base_prefix_key: Optional[CacheEngineKey] = None,
+        base_prefix_token_count: int = 0,
     ) -> int:
         """Persist compact layer-major CSA/HCA/indexer sidecar objects.
 
@@ -940,6 +1348,11 @@ class LocalDiskBackend(StorageBackendInterface):
                 copying data or reading beyond the requested prefix.
             prefix_token_count: Exact logical-token count represented by all
                 supplied chunks. Omit only when every chunk is full-sized.
+            base_prefix_key: Terminal key of an already READY prefix that
+                immediately precedes ``prefix_keys`` during partial-hit
+                admission.
+            base_prefix_token_count: Logical-token coverage of
+                ``base_prefix_key``. Zero denotes a cold admission.
 
         Returns:
             Number of layer-major sidecar objects READY after the call.
@@ -958,16 +1371,65 @@ class LocalDiskBackend(StorageBackendInterface):
             else None
         )
         if self.kv_object_tutti_raw_cold_store_enabled and raw_writer is None:
+            try:
+                timeout_s = max(
+                    0.0,
+                    float(
+                        os.getenv(
+                            "LMCACHE_KV_OBJECT_STORE_RAW_WRITER_READY_TIMEOUT_SEC",
+                            "180",
+                        )
+                    ),
+                )
+            except ValueError:
+                timeout_s = 180.0
+            wait_start = time.perf_counter()
+            writer_ready = self.wait_for_kv_object_tutti_raw_writer(timeout_s)
+            wait_ms = (time.perf_counter() - wait_start) * 1000.0
+            raw_writer = self.kv_object_tutti_raw_writer if writer_ready else None
+            if raw_writer is None:
+                logger.error(
+                    "KV_OBJECT_STORE_PROFILE op=write_attention_layer_major "
+                    "key=%s status=fail reason=raw_writer_ready_timeout "
+                    "timeout_s=%.3f wait_ms=%.3f",
+                    prefix_key.to_string(),
+                    timeout_s,
+                    wait_ms,
+                )
+                return 0
             logger.info(
-                "KV_OBJECT_STORE_PROFILE op=write_attention_layer_major key=%s "
-                "status=skip reason=raw_writer_missing",
+                "KV_OBJECT_STORE_PROFILE op=write_attention_layer_major "
+                "key=%s status=raw_writer_ready wait_ms=%.3f",
                 prefix_key.to_string(),
+                wait_ms,
             )
-            return 0
 
         if prefix_keys is not None and len(prefix_keys) != len(memory_objs):
             raise ValueError("prefix_keys and memory_objs must have the same length")
         original_prefix_keys = list(prefix_keys) if prefix_keys is not None else None
+        base_prefix_token_count = int(base_prefix_token_count)
+        if (base_prefix_key is None) != (base_prefix_token_count == 0):
+            raise ValueError(
+                "base_prefix_key and base_prefix_token_count must be supplied together"
+            )
+        if base_prefix_token_count < 0:
+            raise ValueError("base_prefix_token_count must be non-negative")
+        if base_prefix_key is not None:
+            base_layout = self._active_csa_layout(base_prefix_key)
+            if (
+                base_layout is None
+                or base_layout.covered_tokens != base_prefix_token_count
+                or not self._active_csa_layout_ready(base_prefix_key)
+            ):
+                logger.warning(
+                    "KV_OBJECT_STORE_PROFILE op=write_attention_layer_major "
+                    "key=%s status=skip reason=base_generation_unavailable "
+                    "base_key=%s base_tokens=%d",
+                    prefix_key.to_string(),
+                    base_prefix_key.to_string(),
+                    base_prefix_token_count,
+                )
+                return 0
         chunk_size = self._chunk_size
         represented_tokens = (
             len(memory_objs) * chunk_size
@@ -988,39 +1450,48 @@ class LocalDiskBackend(StorageBackendInterface):
         effective_memory_objs = list(memory_objs)
         effective_prefix_keys = original_prefix_keys
         effective_token_counts = chunk_token_counts
+        generation_covered_tokens = base_prefix_token_count + sum(
+            effective_token_counts
+        )
         if streaming_layout and effective_prefix_keys is not None:
             terminal_layout = self._active_csa_layout(effective_prefix_keys[-1])
             if (
                 terminal_layout is not None
-                and terminal_layout.covered_tokens == represented_tokens
+                and terminal_layout.covered_tokens == generation_covered_tokens
                 and self._active_csa_layout_ready(effective_prefix_keys[-1])
             ):
                 return max(0, len(self._required_csa_streaming_entries()) - 1)
 
             # A layer-major generation is a prefix object, not a set of
-            # independently composable chunk objects.  Reusing READY chunks
-            # from an older generation here would omit their bytes from the
-            # new physical sidecars.  It would also reset covered_tokens at
-            # the first missing chunk, so the first request after cold store
-            # could never prove the complete prefix.  Materialize the entire
-            # supplied prefix whenever its terminal generation is not already
-            # an exact READY match.
-        generation_covered_tokens = sum(effective_token_counts)
+            # independently composable chunk object. Cold admission therefore
+            # materializes the supplied prefix. Partial-hit admission instead
+            # supplies an explicit READY base generation whose immutable byte
+            # ranges are composed with the newly written suffix below.
         coverage_by_key: dict[str, int] = {}
+        effective_prefix_key_strings = (
+            [key.to_string() for key in effective_prefix_keys]
+            if effective_prefix_keys is not None
+            else None
+        )
         if effective_prefix_keys is not None:
-            cumulative_tokens = 0
-            for key, token_count in zip(
-                effective_prefix_keys,
+            assert effective_prefix_key_strings is not None
+            cumulative_tokens = base_prefix_token_count
+            for key_string, token_count in zip(
+                effective_prefix_key_strings,
                 effective_token_counts,
                 strict=True,
             ):
                 cumulative_tokens += int(token_count)
-                coverage_by_key[key.to_string()] = cumulative_tokens
+                coverage_by_key[key_string] = cumulative_tokens
         else:
             coverage_by_key[prefix_key.to_string()] = generation_covered_tokens
         generation_keys = (
-            effective_prefix_keys if effective_prefix_keys is not None else [prefix_key]
+            list(effective_prefix_keys)
+            if effective_prefix_keys is not None
+            else [prefix_key]
         )
+        if base_prefix_key is not None:
+            generation_keys.insert(0, base_prefix_key)
         generation = (
             self._csa_streaming_generation(
                 generation_keys,
@@ -1034,50 +1505,105 @@ class LocalDiskBackend(StorageBackendInterface):
             str,
             dict[tuple[str, int], _CSAStreamingObject],
         ] = {}
+        gather_started = time.perf_counter()
         layer_segments: dict[tuple[str, int], list[memoryview]] = {}
+        layer_segment_sources: dict[
+            tuple[str, int],
+            list[Optional[tuple[int, int]]],
+        ] = {}
         layer_chunk_nbytes: dict[tuple[str, int], list[int]] = {}
+        layout_cache_hits = 0
+        layout_cache_misses = 0
         for memory_obj in effective_memory_objs:
             buffer = memory_obj.byte_array
-            group_ranges = self._object_group_ranges_for_offset(memory_obj, 0)
-            for layer_id, role, byte_ranges in self._object_layer_view_specs(
-                memory_obj,
-                group_ranges,
+            raw_tensor = memory_obj.raw_tensor
+            source_base_ptr: Optional[int] = None
+            if (
+                raw_tensor is not None
+                and raw_tensor.device.type == "cpu"
+                and raw_tensor.is_pinned()
             ):
-                if role not in {
-                    "csa_attention_kv",
-                    "hca_attention_kv",
-                    "csa_indexer_cache",
-                }:
-                    continue
+                source_base_ptr = int(raw_tensor.data_ptr())
+            layout, cache_hit = self._layer_segment_layout(memory_obj)
+            layout_cache_hits += int(cache_hit)
+            layout_cache_misses += int(not cache_hit)
+            for (role, layer_id), byte_ranges in layout:
                 segments = layer_segments.setdefault(
                     (role, int(layer_id)),
                     [],
                 )
+                segment_sources = layer_segment_sources.setdefault(
+                    (role, int(layer_id)),
+                    [],
+                )
                 chunk_nbytes = 0
-                for byte_range in byte_ranges:
-                    start = int(byte_range.offset)
+                for start, length in byte_ranges:
                     # ``MemoryObj.metadata.shapes`` already contains the
                     # physical row count (logical tokens / compress_ratio;
                     # see ``LMCacheEngineMetadata.get_shapes``).  Applying
                     # the ratio again truncates CSA to 1/4 and HCA to 1/128,
                     # then aliases those bytes as later prefix blocks.  Copy
                     # the complete per-layer range exactly once.
-                    length = int(byte_range.length)
                     if length <= 0:
                         continue
                     end = start + length
                     segments.append(buffer[start:end])
+                    segment_sources.append(
+                        (source_base_ptr, start)
+                        if source_base_ptr is not None
+                        else None
+                    )
                     chunk_nbytes += length
                 layer_chunk_nbytes.setdefault((role, int(layer_id)), []).append(
                     chunk_nbytes
                 )
         if not layer_segments:
             return 0
+        gather_time_s = time.perf_counter() - gather_started
+
+        base_records: dict[tuple[str, int], KVObjectRecord] = {}
+        if base_prefix_key is not None:
+            assert self.kv_object_metadata_store is not None
+            for source_role, layer_id in layer_segments:
+                object_role = {
+                    "csa_attention_kv": _DSV4_CSA_LAYER_MAJOR_ROLE,
+                    "hca_attention_kv": _DSV4_HCA_LAYER_MAJOR_ROLE,
+                    "csa_indexer_cache": _DSV4_INDEXER_LAYER_MAJOR_ROLE,
+                }[source_role]
+                object_id = self._resolve_streaming_object_id(
+                    base_prefix_key,
+                    object_role,
+                    int(layer_id),
+                )
+                record = (
+                    self.kv_object_metadata_store.get(object_id)
+                    if object_id is not None
+                    else None
+                )
+                if not self._ready_tutti_raw_record(record) or record is None:
+                    logger.warning(
+                        "KV_OBJECT_STORE_PROFILE op=write_attention_layer_major "
+                        "key=%s status=skip reason=base_sidecar_unavailable "
+                        "base_key=%s role=%s layer=%d",
+                        prefix_key.to_string(),
+                        base_prefix_key.to_string(),
+                        source_role,
+                        layer_id,
+                    )
+                    return 0
+                base_records[(source_role, int(layer_id))] = record
 
         start_time = time.perf_counter()
         ready_count = 0
         total_bytes = 0
+        packed_time_s = 0.0
+        pack_wait_time_s = 0.0
+        storage_write_time_s = 0.0
+        alias_time_s = 0.0
+        metadata_record_count = 0
+        raw_write_wave_count = 0
         with self.kv_object_store_lock:
+            sidecars: list[_LayerMajorSidecar] = []
             for (source_role, layer_id), segments in sorted(layer_segments.items()):
                 payload_nbytes = sum(len(segment) for segment in segments)
                 if payload_nbytes <= 0:
@@ -1098,7 +1624,8 @@ class LocalDiskBackend(StorageBackendInterface):
                     role=physical_role,
                 )
                 existing = self.kv_object_metadata_store.get(object_id)
-                ready_record: Optional[KVObjectRecord] = None
+                ready_record = None
+                record = existing
                 if (
                     existing is not None
                     and existing.state == KVObjectState.READY
@@ -1155,57 +1682,279 @@ class LocalDiskBackend(StorageBackendInterface):
                         )
                     else:
                         record = existing
+                assert record is not None
+                sidecars.append(
+                    _LayerMajorSidecar(
+                        source_role=source_role,
+                        layer_id=int(layer_id),
+                        object_role=object_role,
+                        physical_role=physical_role,
+                        payload_nbytes=payload_nbytes,
+                        segments=segments,
+                        segment_sources=layer_segment_sources[
+                            (source_role, int(layer_id))
+                        ],
+                        record=record,
+                        ready_record=ready_record,
+                    )
+                )
 
-                    # ``bytearray.join`` performs the chunk gather in native
-                    # code; no Python byte-by-byte packing occurs on the cold
-                    # path.
-                    payload = bytearray().join(segments)
-                    payload_view = memoryview(payload)
-                    if raw_writer is not None:
-                        raw_extents, _write_ms = raw_writer(record, payload_view)
-                        ready_record = record.with_raw_extents(raw_extents).mark_ready()
+            pending_writes = [
+                sidecar for sidecar in sidecars if sidecar.ready_record is None
+            ]
+            physical_records: list[KVObjectRecord] = []
+            if raw_writer is not None:
+                staging_bytes = self.kv_object_tutti_raw_staging_bytes
+                wave_limit = _write_wave_limit_bytes(staging_bytes)
+                raw_waves: list[list[_LayerMajorSidecar]] = []
+                current_wave: list[_LayerMajorSidecar] = []
+                for sidecar in pending_writes:
+                    if not current_wave:
+                        current_wave = [sidecar]
+                        continue
+                    first_record = current_wave[0].record
+                    previous_record = current_wave[-1].record
+                    wave_end = sidecar.record.offset + sidecar.record.aligned_length
+                    contiguous = (
+                        sidecar.record.pool_id == first_record.pool_id
+                        and sidecar.record.offset
+                        == previous_record.offset + previous_record.aligned_length
+                    )
+                    fits_wave = (
+                        wave_limit > 0 and wave_end - first_record.offset <= wave_limit
+                    )
+                    if contiguous and fits_wave:
+                        current_wave.append(sidecar)
                     else:
-                        if self.kv_object_pool_io is None:
-                            continue
-                        self.kv_object_pool_io.write_object(record, payload_view)
-                        ready_record = record.mark_ready()
-                    self.kv_object_metadata_store.put(ready_record)
-                assert ready_record is not None
+                        raw_waves.append(current_wave)
+                        current_wave = [sidecar]
+                if current_wave:
+                    raw_waves.append(current_wave)
+
+                wave_buffer_nbytes = [
+                    (
+                        wave[0].payload_nbytes
+                        if len(wave) == 1
+                        else wave[-1].record.offset
+                        + wave[-1].record.aligned_length
+                        - wave[0].record.offset
+                    )
+                    for wave in raw_waves
+                ]
+                gpu_pack_enabled = (
+                    _env_flag("LMCACHE_DSV4_GPU_LAYER_MAJOR_PACK")
+                    and not self.kv_object_cpu_raw_write_enabled
+                    and self.kv_object_gpu_layer_major_packer is not None
+                )
+                pack_buffers: list[Optional[bytearray]] = (
+                    [None, None]
+                    if gpu_pack_enabled
+                    else [
+                        bytearray(
+                            max(
+                                wave_buffer_nbytes[index::2],
+                                default=0,
+                            )
+                        )
+                        for index in range(2)
+                    ]
+                )
+                gpu_pack_buffers: list[Optional[torch.Tensor]] = [None, None]
+                if gpu_pack_enabled:
+                    try:
+                        gpu_pack_buffers = [
+                            torch.empty(
+                                max(
+                                    wave_buffer_nbytes[index::2],
+                                    default=0,
+                                ),
+                                dtype=torch.uint8,
+                                device="cpu",
+                                pin_memory=True,
+                            )
+                            for index in range(2)
+                        ]
+                    except Exception:
+                        logger.exception(
+                            "Unable to allocate pinned GPU-pack buffers; "
+                            "using CPU layer-major pack"
+                        )
+                        gpu_pack_buffers = [None, None]
+                pending_pack: Optional[
+                    Future[tuple[KVObjectRecord, memoryview, float]]
+                ] = None
+                if raw_waves:
+                    pending_pack = self._layer_major_pack_executor.submit(
+                        _pack_layer_major_wave_with_fallback,
+                        raw_waves[0],
+                        pack_buffers[0],
+                        gpu_pack_buffers[0],
+                        self.kv_object_gpu_layer_major_packer,
+                    )
+                for wave_index, wave in enumerate(raw_waves):
+                    assert pending_pack is not None
+                    pack_wait_started = time.perf_counter()
+                    writer_record, payload, pack_cpu_time_s = pending_pack.result()
+                    pack_wait_time_s += time.perf_counter() - pack_wait_started
+                    packed_time_s += pack_cpu_time_s
+                    next_wave_index = wave_index + 1
+                    if next_wave_index < len(raw_waves):
+                        next_slot = next_wave_index % 2
+                        pending_pack = self._layer_major_pack_executor.submit(
+                            _pack_layer_major_wave_with_fallback,
+                            raw_waves[next_wave_index],
+                            pack_buffers[next_slot],
+                            gpu_pack_buffers[next_slot],
+                            self.kv_object_gpu_layer_major_packer,
+                        )
+                    write_started = time.perf_counter()
+                    raw_extents, _write_ms = raw_writer(
+                        writer_record,
+                        payload,
+                    )
+                    storage_write_time_s += time.perf_counter() - write_started
+                    raw_write_wave_count += 1
+                    for sidecar in wave:
+                        record_extents = (
+                            tuple(raw_extents)
+                            if len(wave) == 1
+                            else _clip_raw_extents(
+                                raw_extents,
+                                offset=sidecar.record.offset,
+                                aligned_length=sidecar.record.aligned_length,
+                            )
+                        )
+                        sidecar.ready_record = sidecar.record.with_raw_extents(
+                            record_extents
+                        ).mark_ready()
+                        physical_records.append(sidecar.ready_record)
+            else:
+                if self.kv_object_pool_io is not None:
+                    for sidecar in pending_writes:
+                        pack_started = time.perf_counter()
+                        payload = bytearray().join(sidecar.segments)
+                        packed_time_s += time.perf_counter() - pack_started
+                        write_started = time.perf_counter()
+                        self.kv_object_pool_io.write_object(
+                            sidecar.record,
+                            memoryview(payload),
+                        )
+                        storage_write_time_s += time.perf_counter() - write_started
+                        sidecar.ready_record = sidecar.record.mark_ready()
+                        physical_records.append(sidecar.ready_record)
+
+            self.kv_object_metadata_store.extend(physical_records)
+            metadata_record_count += len(physical_records)
+
+            for sidecar in sidecars:
+                source_role = sidecar.source_role
+                layer_id = sidecar.layer_id
+                object_role = sidecar.object_role
+                physical_role = sidecar.physical_role
+                payload_nbytes = sidecar.payload_nbytes
+                ready_record = sidecar.ready_record
+                if ready_record is None:
+                    continue
                 if effective_prefix_keys is not None:
+                    assert effective_prefix_key_strings is not None
+                    alias_started = time.perf_counter()
+                    alias_records: list[KVObjectRecord] = []
                     prefix_nbytes = 0
-                    for alias_key, chunk_nbytes in zip(
+                    base_record = base_records.get((source_role, int(layer_id)))
+                    for alias_key, alias_key_string, chunk_nbytes in zip(
                         effective_prefix_keys,
+                        effective_prefix_key_strings,
                         layer_chunk_nbytes[(source_role, layer_id)],
                         strict=True,
                     ):
                         prefix_nbytes += int(chunk_nbytes)
+                        if streaming_layout and base_record is None:
+                            # Cold prefix views differ only in logical length.
+                            # Point every manifest entry at the immutable full
+                            # physical sidecar and synthesize its prefix record
+                            # on lookup instead of materializing
+                            # O(chunks * layers) metadata aliases here.
+                            pending_entries.setdefault(
+                                alias_key_string,
+                                {},
+                            )[(object_role, int(layer_id))] = _CSAStreamingObject(
+                                logical_role=object_role,
+                                layer_id=int(layer_id),
+                                object_id=ready_record.object_id,
+                                length=prefix_nbytes,
+                            )
+                            continue
                         alias_object_id = self._key_to_object_id(
                             alias_key,
                             layer_id=layer_id,
                             role=physical_role,
                         )
-                        alias_record = KVObjectRecord(
-                            object_id=alias_object_id,
-                            pool_id=ready_record.pool_id,
-                            offset=ready_record.offset,
-                            length=prefix_nbytes,
-                            aligned_length=ready_record.aligned_length,
-                            shape=(prefix_nbytes,),
-                            dtype=ready_record.dtype,
-                            state=KVObjectState.READY,
-                            raw_extents=ready_record.raw_extents,
-                        )
-                        self.kv_object_metadata_store.put(alias_record)
+                        if base_record is None:
+                            alias_record = KVObjectRecord(
+                                object_id=alias_object_id,
+                                pool_id=ready_record.pool_id,
+                                offset=ready_record.offset,
+                                length=prefix_nbytes,
+                                aligned_length=ready_record.aligned_length,
+                                shape=(prefix_nbytes,),
+                                dtype=ready_record.dtype,
+                                state=KVObjectState.READY,
+                                raw_extents=ready_record.raw_extents,
+                            )
+                        else:
+                            logical_length = base_record.length + prefix_nbytes
+                            combined_ranges = [
+                                KVObjectByteRange(
+                                    offset=byte_range.offset,
+                                    length=byte_range.length,
+                                    target_offset=byte_range.target_offset,
+                                )
+                                for byte_range in base_record.read_ranges
+                            ]
+                            combined_ranges.append(
+                                KVObjectByteRange(
+                                    offset=ready_record.offset,
+                                    length=prefix_nbytes,
+                                    target_offset=base_record.length,
+                                )
+                            )
+                            combined_extents = tuple(
+                                dict.fromkeys(
+                                    (
+                                        *base_record.raw_extents,
+                                        *ready_record.raw_extents,
+                                    )
+                                )
+                            )
+                            alias_record = KVObjectRecord(
+                                object_id=alias_object_id,
+                                pool_id=ready_record.pool_id,
+                                offset=combined_ranges[0].offset,
+                                length=logical_length,
+                                # A composed record has no single physical
+                                # allocation, but consumers still use this as
+                                # its sector-sized logical DMA envelope.
+                                aligned_length=((logical_length + 511) // 512) * 512,
+                                shape=(logical_length,),
+                                dtype=ready_record.dtype,
+                                state=KVObjectState.READY,
+                                raw_extents=combined_extents,
+                                byte_ranges=tuple(combined_ranges),
+                            )
+                        alias_records.append(alias_record)
                         if streaming_layout:
                             pending_entries.setdefault(
-                                alias_key.to_string(),
+                                alias_key_string,
                                 {},
                             )[(object_role, int(layer_id))] = _CSAStreamingObject(
                                 logical_role=object_role,
                                 layer_id=int(layer_id),
                                 object_id=alias_object_id,
-                                length=prefix_nbytes,
+                                length=alias_record.length,
                             )
+                    self.kv_object_metadata_store.extend(alias_records)
+                    metadata_record_count += len(alias_records)
+                    alias_time_s += time.perf_counter() - alias_started
                 elif streaming_layout:
                     pending_entries.setdefault(
                         prefix_key.to_string(),
@@ -1220,6 +1969,7 @@ class LocalDiskBackend(StorageBackendInterface):
                 total_bytes += payload_nbytes
 
         if streaming_layout:
+            terminal_key_string = prefix_key.to_string()
             with self._csa_layout_lock:
                 for key_string, objects in pending_entries.items():
                     self._csa_pending_layouts[key_string] = _CSAStreamingLayoutBuild(
@@ -1227,14 +1977,28 @@ class LocalDiskBackend(StorageBackendInterface):
                         covered_tokens=coverage_by_key[key_string],
                         required_entries=required_entries,
                         objects=objects,
+                        terminal=key_string == terminal_key_string,
+                        admission_started_at=gather_started,
                     )
 
         logger.info(
             "KV_OBJECT_STORE_PROFILE op=write_attention_layer_major key=%s "
-            "layers=%d bytes=%d total_ms=%.3f",
+            "layers=%d bytes=%d metadata_records=%d gather_ms=%.3f "
+            "layout_cache_hits=%d layout_cache_misses=%d raw_write_waves=%d "
+            "pack_cpu_ms=%.3f pack_wait_ms=%.3f storage_write_ms=%.3f "
+            "alias_ms=%.3f total_ms=%.3f",
             prefix_key.to_string(),
             ready_count,
             total_bytes,
+            metadata_record_count,
+            gather_time_s * 1000.0,
+            layout_cache_hits,
+            layout_cache_misses,
+            raw_write_wave_count,
+            packed_time_s * 1000.0,
+            pack_wait_time_s * 1000.0,
+            storage_write_time_s * 1000.0,
+            alias_time_s * 1000.0,
             (time.perf_counter() - start_time) * 1000.0,
         )
         return ready_count
@@ -1259,18 +2023,82 @@ class LocalDiskBackend(StorageBackendInterface):
                 ``None`` to disable raw writes and use the filesystem path.
         """
         self.kv_object_tutti_raw_writer = writer
+        if writer is None:
+            self._kv_object_tutti_raw_writer_ready.clear()
+        else:
+            self._kv_object_tutti_raw_writer_ready.set()
+
+    def set_kv_object_gpu_layer_major_packer(
+        self,
+        packer: Optional[KVObjectLayerMajorPacker],
+    ) -> None:
+        """Install the optional CUDA-assisted pinned-host wave packer.
+
+        Args:
+            packer: Callable that packs mapped pinned CPU segments into one
+                pinned CPU destination. Pass ``None`` to retain the native CPU
+                pack path.
+        """
+        self.kv_object_gpu_layer_major_packer = packer
+
+    def wait_for_kv_object_tutti_raw_writer(self, timeout_s: float) -> bool:
+        """Wait until the Tutti raw cold-store writer is installed.
+
+        Args:
+            timeout_s: Maximum number of seconds to wait. Must be non-negative.
+
+        Returns:
+            ``True`` when raw cold-store is disabled or a writer is installed;
+            otherwise ``False`` after the timeout expires.
+
+        Raises:
+            ValueError: If ``timeout_s`` is negative.
+        """
+        if timeout_s < 0:
+            raise ValueError("timeout_s must be non-negative")
+        if not self.kv_object_tutti_raw_cold_store_enabled:
+            return True
+        if self.kv_object_tutti_raw_writer is not None:
+            return True
+        if not self._kv_object_tutti_raw_writer_ready.wait(timeout_s):
+            return False
+        return self.kv_object_tutti_raw_writer is not None
 
     def has_kv_object_tutti_raw_writer(self) -> bool:
         """Return whether Tutti raw-object writes are currently available."""
         return self.kv_object_tutti_raw_writer is not None
 
     def reset_kv_object_pool_allocation(self) -> None:
-        """Reset logical KV object allocation offsets for future writes."""
+        """Start a new raw-object generation at offset zero.
+
+        Raw-object manifests are process-local. Recovered legacy cache entries
+        cannot remain lookup-visible when the allocator is rewound because new
+        writes would reuse their LBAs while stale keys still referenced the old
+        contents. Atomically invalidate those lookup and object records before
+        resetting allocation. Existing filesystem files are left untouched;
+        they are intentionally unreachable for this raw-mode process.
+        """
         with self._csa_layout_lock:
             self._csa_active_layouts.clear()
             self._csa_pending_layouts.clear()
+        with self.disk_lock:
+            recovered_keys = len(self.dict)
+            self.dict.clear()
+            self.current_cache_size = 0.0
+            self.usage = 0
+            self.stats_monitor.update_local_storage_usage(0)
+        metadata_records = 0
+        if self.kv_object_metadata_store is not None:
+            metadata_records = self.kv_object_metadata_store.clear()
         if self.kv_object_pool_layout is not None:
             self.kv_object_pool_layout.reset_allocation()
+        if recovered_keys or metadata_records:
+            logger.info(
+                "KV object raw-generation reset invalidated recovered_keys=%d "
+                "metadata_records=%d",
+                recovered_keys,
+                metadata_records,
+            )
 
     def set_kv_object_tutti_raw_region_extents(
         self,
@@ -1444,12 +2272,7 @@ class LocalDiskBackend(StorageBackendInterface):
         expected_bytes = 0
         for byte_range in record.read_ranges:
             range_dma_length = ((byte_range.length + 511) // 512) * 512
-            is_tail_range = (
-                byte_range.target_offset + byte_range.length == record.length
-            )
             if byte_range.offset % 512 != 0:
-                return 0
-            if range_dma_length != byte_range.length and not is_tail_range:
                 return 0
             expected_bytes += range_dma_length
         return expected_bytes
@@ -1463,10 +2286,7 @@ class LocalDiskBackend(StorageBackendInterface):
         for byte_range in record.read_ranges:
             range_length = byte_range.length
             range_dma_length = ((range_length + 511) // 512) * 512
-            is_tail_range = byte_range.target_offset + range_length == record.length
-            if byte_range.offset % 512 != 0 or (
-                range_dma_length != range_length and not is_tail_range
-            ):
+            if byte_range.offset % 512 != 0:
                 logger.warning(
                     "KV object raw range is not 512-byte aligned: "
                     "object=%s offset=%d length=%d",
@@ -2018,6 +2838,65 @@ class LocalDiskBackend(StorageBackendInterface):
         """Derive per-group byte ranges for one stored chunk."""
         return self._object_group_ranges_for_offset(memory_obj, full_record.offset)
 
+    def _layer_segment_layout(
+        self,
+        memory_obj: MemoryObj,
+    ) -> tuple[LayerSegmentLayout, bool]:
+        """Return cached DSv4 layer segments for one MemoryObj layout.
+
+        Args:
+            memory_obj: Chunk whose shape and dtype metadata define the byte
+                layout. Returned offsets are relative to its byte buffer.
+
+        Returns:
+            An immutable role/layer segment layout and whether it came from
+            the cache. Layout calculation is shape-dependent but independent
+            of chunk contents, so full chunks in a long prefix share it.
+        """
+        shapes = memory_obj.metadata.shapes
+        dtypes = memory_obj.metadata.dtypes
+        if shapes is None or dtypes is None or len(shapes) != len(dtypes):
+            return (), False
+        signature = tuple(
+            (
+                tuple(int(dimension) for dimension in shape),
+                str(dtype),
+            )
+            for shape, dtype in zip(shapes, dtypes, strict=True)
+        )
+        cached = self._layer_segment_layout_cache.get(signature)
+        if cached is not None:
+            return cached, True
+
+        group_ranges = self._object_group_ranges_for_offset(memory_obj, 0)
+        entries: list[
+            tuple[tuple[str, int], tuple[tuple[int, int], ...]]
+        ] = []
+        for layer_id, role, byte_ranges in self._object_layer_view_specs(
+            memory_obj,
+            group_ranges,
+        ):
+            if role not in {
+                "csa_attention_kv",
+                "hca_attention_kv",
+                "csa_indexer_cache",
+            }:
+                continue
+            entries.append(
+                (
+                    (role, int(layer_id)),
+                    tuple(
+                        (int(byte_range.offset), int(byte_range.length))
+                        for byte_range in byte_ranges
+                    ),
+                )
+            )
+        layout = tuple(entries)
+        # Concurrent duplicate calculations are harmless: layouts are
+        # immutable and setdefault publishes one equivalent value.
+        layout = self._layer_segment_layout_cache.setdefault(signature, layout)
+        return layout, False
+
     def _object_group_ranges_for_offset(
         self,
         memory_obj: MemoryObj,
@@ -2249,18 +3128,61 @@ class LocalDiskBackend(StorageBackendInterface):
             return False
         with self.disk_lock:
             if key not in self.dict:
+                self._log_streaming_terminal_miss_unlocked(
+                    key,
+                    token_count,
+                    reason="dict_miss",
+                )
                 return False
             layout = self._active_csa_layout(key)
-            if (
-                layout is None
-                or layout.covered_tokens != int(token_count)
-                or not self._csa_layout_matches_runtime(layout)
-            ):
+            if layout is None:
+                self._log_streaming_terminal_miss_unlocked(
+                    key,
+                    token_count,
+                    reason="layout_missing",
+                )
+                return False
+            if layout.covered_tokens != int(token_count):
+                self._log_streaming_terminal_miss_unlocked(
+                    key,
+                    token_count,
+                    reason=f"coverage_{layout.covered_tokens}",
+                )
+                return False
+            if not self._csa_layout_matches_runtime(layout):
+                self._log_streaming_terminal_miss_unlocked(
+                    key,
+                    token_count,
+                    reason="runtime_mismatch",
+                )
                 return False
             if pin:
                 self.dict[key].pin()
                 self.keys_in_request.append(key)
             return True
+
+    def _log_streaming_terminal_miss_unlocked(
+        self,
+        key: CacheEngineKey,
+        token_count: int,
+        *,
+        reason: str,
+    ) -> None:
+        """Log a bounded exact-generation miss without affecting lookup."""
+        log_key = f"streaming_terminal:{reason}"
+        count = self._contains_miss_log_counts.get(log_key, 0)
+        if count >= 8:
+            return
+        self._contains_miss_log_counts[log_key] = count + 1
+        logger.info(
+            "CSA streaming terminal miss: key=%s requested_tokens=%d "
+            "reason=%s dict_size=%d pending=%s",
+            key.to_string(),
+            token_count,
+            reason,
+            len(self.dict),
+            key.to_string() in self._csa_pending_layouts,
+        )
 
     def touch_cache(self):
         # flip the order of the keys in the request
@@ -3438,4 +4360,5 @@ class LocalDiskBackend(StorageBackendInterface):
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.close()
         self._hca_write_executor.shutdown(wait=False)
+        self._layer_major_pack_executor.shutdown(wait=False)
         self.disk_worker.close()

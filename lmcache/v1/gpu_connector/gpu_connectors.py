@@ -3,6 +3,7 @@
 import abc
 import os
 import re
+import time
 from typing import Any, List, Optional, Sequence, Tuple, Union
 
 # Third Party
@@ -2146,6 +2147,8 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         keeps tail shapes and partially aligned chunks on the proven path while
         making the common full-chunk admission path strictly equivalent.
         """
+        timing_enabled = self._read_env_flag("LMCACHE_D2H_TIMING")
+        call_started_ns = time.perf_counter_ns() if timing_enabled else 0
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs")
         slot_mapping = kwargs["slot_mapping"]
@@ -2187,7 +2190,14 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                 group_ptrs[group_idx].append(destination.data_ptr())
                 group_ranges[group_idx].append((start, end))
 
+        setup_finished_ns = time.perf_counter_ns() if timing_enabled else 0
+        start_event = torch.cuda.Event(enable_timing=True) if timing_enabled else None
+        copy_done_event = (
+            torch.cuda.Event(enable_timing=True) if timing_enabled else None
+        )
         with torch.cuda.stream(self.store_stream):
+            if start_event is not None:
+                start_event.record(self.store_stream)
             for group_idx, pointers in enumerate(group_ptrs):
                 if not pointers:
                     continue
@@ -2218,6 +2228,10 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
                     self.gpu_kv_format,
                     0,
                 )
+            if copy_done_event is not None:
+                copy_done_event.record(self.store_stream)
+
+        launch_finished_ns = time.perf_counter_ns() if timing_enabled else 0
 
         # Host-backed destinations must be complete before storage and
         # layer-major admission consume them.  One batch-wide barrier replaces
@@ -2228,6 +2242,30 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
             for memory_obj in memory_objs
         ):
             self.store_stream.synchronize()
+        sync_finished_ns = time.perf_counter_ns() if timing_enabled else 0
+
+        if timing_enabled:
+            gpu_elapsed_ms = 0.0
+            if start_event is not None and copy_done_event is not None:
+                gpu_elapsed_ms = start_event.elapsed_time(copy_done_event)
+            rank = -1
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+            logger.info(
+                "LMCACHE_D2H_TIMING rank=%d objects=%d groups=%d "
+                "fallbacks=%d bytes=%d setup_ms=%.3f launch_ms=%.3f "
+                "gpu_stream_ms=%.3f sync_wait_ms=%.3f total_ms=%.3f",
+                rank,
+                len(memory_objs),
+                sum(bool(pointers) for pointers in group_ptrs),
+                len(fallback_objects),
+                sum(memory_obj.get_size() for memory_obj in memory_objs),
+                (setup_finished_ns - call_started_ns) / 1_000_000.0,
+                (launch_finished_ns - setup_finished_ns) / 1_000_000.0,
+                gpu_elapsed_ms,
+                (sync_finished_ns - launch_finished_ns) / 1_000_000.0,
+                (sync_finished_ns - call_started_ns) / 1_000_000.0,
+            )
 
         # Tail or irregular ranges are rare and preserve exact legacy
         # semantics.  Run them after the vectorized full chunks so a fallback
