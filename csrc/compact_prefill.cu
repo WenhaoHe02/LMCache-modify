@@ -82,6 +82,24 @@ __global__ void mark_selected_and_missing_blocks_kernel(
   }
 }
 
+template <typename index_t>
+__global__ void mark_selected_blocks_into_kernel(
+    const index_t* topk_indices, int64_t num_entries,
+    int64_t selected_max_blocks, int64_t block_size,
+    int32_t* selected_blocks) {
+  const int64_t index =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= num_entries) return;
+  const int64_t entry = static_cast<int64_t>(topk_indices[index]);
+  if (entry < 0) return;
+  const int64_t block = entry / block_size;
+  if (block >= selected_max_blocks) return;
+  // Every writer stores the same aligned 32-bit value. No thread ever clears
+  // the bitmap inside this kernel, so an atomic exchange only serializes hot
+  // pages without changing the result.
+  selected_blocks[block] = 1;
+}
+
 template <typename block_t, typename length_t>
 __global__ void compact_selected_pages_kernel(
     const int32_t* page_seen, const block_t* block_table, int64_t max_pages,
@@ -263,7 +281,7 @@ std::vector<at::Tensor>
 build_compact_csa_prefill_gather_plan_from_page_seen_cuda(
     at::Tensor topk_indices, at::Tensor block_table,
     at::Tensor compressed_seq_lens, at::Tensor query_row_offsets,
-    int64_t block_size, at::Tensor page_seen) {
+    int64_t block_size, at::Tensor page_seen, bool remap_topk) {
   check_integral_metadata(topk_indices, "topk_indices");
   check_integral_metadata(block_table, "block_table");
   check_integral_metadata(compressed_seq_lens, "compressed_seq_lens");
@@ -302,7 +320,9 @@ build_compact_csa_prefill_gather_plan_from_page_seen_cuda(
   auto page_to_compact = at::full({num_requests, max_pages}, -1, int_options);
   auto compact_block_table = at::zeros_like(block_table);
   auto compact_seq_lens = at::zeros_like(compressed_seq_lens);
-  auto remapped_topk = at::full_like(topk_indices, -1);
+  auto remapped_topk = remap_topk
+                            ? at::full_like(topk_indices, -1)
+                            : at::empty({0}, topk_indices.options());
   auto lengths64 = compressed_seq_lens.to(at::kLong);
   auto offsets64 = query_row_offsets.to(at::kLong);
   const int64_t num_entries = topk_indices.numel();
@@ -327,7 +347,7 @@ build_compact_csa_prefill_gather_plan_from_page_seen_cuda(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 
-  if (num_entries > 0 && num_requests > 0 && max_pages > 0) {
+  if (remap_topk && num_entries > 0 && num_requests > 0 && max_pages > 0) {
     const int64_t blocks = (num_entries + kThreads - 1) / kThreads;
     AT_DISPATCH_INTEGRAL_TYPES(
         topk_indices.scalar_type(), "remap_compact_csa_topk_from_seen", [&] {
@@ -341,7 +361,8 @@ build_compact_csa_prefill_gather_plan_from_page_seen_cuda(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
 
-  return {compact_block_table, compact_seq_lens, remapped_topk};
+  return {compact_block_table, compact_seq_lens, remapped_topk,
+          page_to_compact};
 }
 
 at::Tensor select_missing_csa_blocks_cuda(at::Tensor topk_indices,
@@ -421,4 +442,39 @@ std::vector<at::Tensor> select_missing_csa_blocks_with_seen_cuda(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
   return {at::nonzero(missing_blocks).reshape({-1}), selected_blocks};
+}
+
+void mark_csa_selected_blocks_into_cuda(at::Tensor topk_indices,
+                                        at::Tensor selected_blocks,
+                                        int64_t selected_max_blocks,
+                                        int64_t block_size) {
+  check_integral_metadata(topk_indices, "topk_indices");
+  TORCH_CHECK(selected_blocks.is_cuda(),
+              "selected_blocks must be a CUDA tensor");
+  TORCH_CHECK(selected_blocks.is_contiguous(),
+              "selected_blocks must be contiguous");
+  TORCH_CHECK(selected_blocks.scalar_type() == at::kInt,
+              "selected_blocks must use int32 dtype");
+  TORCH_CHECK(topk_indices.device() == selected_blocks.device(),
+              "topk_indices and selected_blocks must use one CUDA device");
+  TORCH_CHECK(selected_max_blocks >= 0 &&
+                  selected_max_blocks <= selected_blocks.numel(),
+              "selected_max_blocks must fit selected_blocks");
+  TORCH_CHECK(block_size > 0, "block_size must be positive");
+
+  c10::cuda::CUDAGuard device_guard(topk_indices.device());
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const int64_t num_entries = topk_indices.numel();
+  if (num_entries > 0 && selected_max_blocks > 0) {
+    const int64_t blocks = (num_entries + kThreads - 1) / kThreads;
+    AT_DISPATCH_INTEGRAL_TYPES(
+        topk_indices.scalar_type(), "mark_csa_selected_blocks_into", [&] {
+          mark_selected_blocks_into_kernel<scalar_t>
+              <<<blocks, kThreads, 0, stream>>>(
+                  topk_indices.data_ptr<scalar_t>(), num_entries,
+                  selected_max_blocks, block_size,
+                  selected_blocks.data_ptr<int32_t>());
+        });
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
 }

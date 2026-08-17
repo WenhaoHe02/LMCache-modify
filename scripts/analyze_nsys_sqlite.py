@@ -71,6 +71,96 @@ def _ns_to_ms(value: int) -> float:
     return value / 1_000_000.0
 
 
+def summarize_csa_overlap(events: Sequence[GpuEvent]) -> dict[str, Any]:
+    """Summarize actual CSA SSD/NVLink intervals against model compute.
+
+    The classifier intentionally consumes CUDA kernel intervals rather than
+    prediction or ``io_in_flight`` NVTX ranges. Consequently dense layers with
+    no predictor are included, and lifecycle wall ranges are never added as
+    if they were SSD service time.
+
+    Args:
+        events: Normalized GPU events returned by the Nsys reader.
+
+    Returns:
+        Aggregate, per-process/device, and max-rank exposed-wall metrics.
+    """
+
+    def _is_ssd_kernel(event: GpuEvent) -> bool:
+        if event[2] != "kernel":
+            return False
+        name = event[3].lower()
+        backend = any(tag in name for tag in ("tutti", "snvme", "nvme", "gds"))
+        operation = any(
+            tag in name for tag in ("read", "submit", "poll", "completion", "io_status")
+        )
+        return backend and operation
+
+    def _is_gather_kernel(event: GpuEvent) -> bool:
+        if event[2] != "kernel":
+            return False
+        name = event[3].lower().replace("_", "")
+        return "nccl" in name and "allgather" in name
+
+    def _is_model_compute(event: GpuEvent) -> bool:
+        return (
+            event[2] == "kernel"
+            and "nccl" not in event[3].lower()
+            and not _is_ssd_kernel(event)
+        )
+
+    def _row(group: Sequence[GpuEvent]) -> dict[str, float | int]:
+        ssd = [(event[0], event[1]) for event in group if _is_ssd_kernel(event)]
+        gather = [(event[0], event[1]) for event in group if _is_gather_kernel(event)]
+        compute = [(event[0], event[1]) for event in group if _is_model_compute(event)]
+        ssd_ns = _interval_total(ssd)
+        gather_ns = _interval_total(gather)
+        ssd_overlap_ns = _intersection_total(ssd, compute)
+        gather_overlap_ns = _intersection_total(gather, compute)
+        return {
+            "ssd_kernel_count": sum(_is_ssd_kernel(event) for event in group),
+            "gather_kernel_count": sum(_is_gather_kernel(event) for event in group),
+            "ssd_service_union_ms": _ns_to_ms(ssd_ns),
+            "ssd_compute_overlap_ms": _ns_to_ms(ssd_overlap_ns),
+            "ssd_exposed_wall_ms": _ns_to_ms(max(0, ssd_ns - ssd_overlap_ns)),
+            "nvlink_gather_union_ms": _ns_to_ms(gather_ns),
+            "nvlink_compute_overlap_ms": _ns_to_ms(gather_overlap_ns),
+            "nvlink_exposed_wall_ms": _ns_to_ms(max(0, gather_ns - gather_overlap_ns)),
+        }
+
+    grouped: dict[tuple[int, int], list[GpuEvent]] = defaultdict(list)
+    for event in events:
+        grouped[(event[6], event[4])].append(event)
+    per_rank: list[dict[str, Any]] = []
+    for (global_pid, device), group in sorted(grouped.items()):
+        per_rank.append(
+            {
+                "global_pid": global_pid,
+                "device": device,
+                **_row(group),
+            }
+        )
+    aggregate = _row(events)
+    return {
+        "interval_source": (
+            "actual CUDA SSD submit/poll and NCCL all-gather kernels; "
+            "NVTX lifecycle ranges excluded"
+        ),
+        "aggregate": aggregate,
+        "per_process_device": per_rank,
+        "max_rank": {
+            "ssd_exposed_wall_ms": max(
+                (row["ssd_exposed_wall_ms"] for row in per_rank),
+                default=0.0,
+            ),
+            "nvlink_exposed_wall_ms": max(
+                (row["nvlink_exposed_wall_ms"] for row in per_rank),
+                default=0.0,
+            ),
+        },
+    }
+
+
 class NsysSqliteAnalysis:
     """Schema-aware analyzer for one Nsight Systems SQLite export."""
 
@@ -180,8 +270,23 @@ class NsysSqliteAnalysis:
             "top_cuda_runtime": self._runtime_summary(top),
             "top_os_runtime": self._os_runtime_summary(top),
             "longest_nvtx_ranges": self._nvtx_summary(top),
+            "csa_ssd_nvlink_overlap": summarize_csa_overlap(events),
         }
         return result
+
+    def analyze_csa_overlap(self) -> dict[str, Any]:
+        """Return the standalone CSA SSD/NVLink overlap report.
+
+        Returns:
+            JSON-serializable actual-service overlap metrics.
+
+        Raises:
+            RuntimeError: If the export contains no GPU activity.
+        """
+        events = self._gpu_events()
+        if not events:
+            raise RuntimeError("the export contains no GPU activities")
+        return summarize_csa_overlap(events)
 
     def save_queries(self, path: Path) -> None:
         """Save the exact custom SQL used by this analysis.

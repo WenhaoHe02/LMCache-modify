@@ -794,7 +794,11 @@ class LMCacheMPWorkerAdapter:
             cfg = _resolve_extra_config(extra_config)
             mq_timeout = cfg[ExtraConfigDefault.mq_timeout.name]
             heartbeat_interval = cfg[ExtraConfigDefault.heartbeat_interval.name]
-        self.mq_client = MessageQueueClient(server_url, context)
+        self.mq_client = MessageQueueClient(
+            server_url,
+            context,
+            routing_key=parallel_strategy.actual_worker_id,
+        )
         self._mq_timeout = mq_timeout
 
         # Instance id for GPU worker

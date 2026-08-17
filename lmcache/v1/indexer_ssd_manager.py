@@ -44,6 +44,8 @@ from __future__ import annotations
 
 import os
 import inspect
+import math
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -1090,6 +1092,9 @@ class IndexerSSDManager:
         # Dense CSA work contains collectives. Preserve one submission order
         # across ranks even though ordinary Indexer/HCA I/O uses a wider pool.
         self._dense_shard_executor = ThreadPoolExecutor(max_workers=1)
+        self._dense_eager_shard_group = (
+            _env_int("LMCACHE_SSD_TP_DENSE_EAGER_GROUP_SIZE", 1) > 1
+        )
         # Native indexer-cache restore is deliberately ordered by transformer
         # layer. The first layer is submitted as Stage0 before model forward;
         # its existing consumption gate waits only if layers 0-1 did not hide
@@ -1154,7 +1159,7 @@ class IndexerSSDManager:
         self._drain_cuda_events: Dict[int, Optional[torch.cuda.Event]] = {
             lid: None for lid in csa_layer_ids
         }
-        self._proxy_futures: Dict[int, List[Future[None]]] = {
+        self._proxy_futures: Dict[int, List[Future[Any]]] = {
             lid: [] for lid in csa_layer_ids
         }
         self._expired_proxy_layers: Set[int] = set()
@@ -2332,12 +2337,19 @@ class IndexerSSDManager:
                 and int(layer_id) in self._dense_fired_layers
             )
 
-    def fire_dense_csa_layers(self, layer_ids: Sequence[int]) -> None:
+    def fire_dense_csa_layers(
+        self,
+        layer_ids: Sequence[int],
+        *,
+        source_layer_id: Optional[int] = None,
+    ) -> None:
         """Schedule deterministic dense CSA shard-gather in an FFN window.
 
         Args:
             layer_ids: Upcoming early CSA transformer layers. The manager's
                 decision table may consistently fall back to ``LOCAL_DIRECT``.
+            source_layer_id: Decoder layer whose FFN boundary submitted the
+                ordered group. This is recorded for diagnostics only.
         """
         manager = getattr(self, "_csa_attention_kv_manager", None)
         fire_layer = getattr(manager, "fire_dense_layer", None)
@@ -2346,7 +2358,8 @@ class IndexerSSDManager:
             return
         request_id = str(getattr(manager, "active_request_id", ""))
         request_token = getattr(manager, "active_request_token", (request_id, -1))
-        for raw_layer_id in layer_ids:
+        pending_group: list[int] = []
+        for raw_layer_id in dict.fromkeys(int(value) for value in layer_ids):
             layer_id = int(raw_layer_id)
             with self._lock:
                 if request_id != self._dense_fired_request_id:
@@ -2355,12 +2368,64 @@ class IndexerSSDManager:
                 if layer_id in self._dense_fired_layers:
                     continue
                 self._dense_fired_layers.add(layer_id)
+                pending_group.append(layer_id)
+
+        if not pending_group:
+            return
+        if len(pending_group) > 1 and self._dense_eager_shard_group:
+            layer_completions: Dict[int, Future[Any]] = {
+                layer_id: Future() for layer_id in pending_group
+            }
+
+            def _fire_group(
+                target_layer_ids: Tuple[int, ...] = tuple(pending_group),
+                token: Tuple[str, int] = request_token,
+            ) -> None:
+                # All ranks enter dense private-NCCL work in the same layer
+                # order. Keeping the whole eager group on one executor task
+                # prevents model execution from interleaving a later layer's
+                # collective between ranks.
+                try:
+                    for target_layer_id in target_layer_ids:
+                        prepared = fire_layer(target_layer_id, request_token=token)
+                        if not prepared:
+                            raise RuntimeError(
+                                "dense CSA shard preparation rejected layer "
+                                f"{target_layer_id}"
+                            )
+                        layer_completions[target_layer_id].set_result(prepared)
+                except Exception as exc:
+                    # A completed early target must not wait for later work in
+                    # the ordered group. If one producer fails, publish that
+                    # failure to every target that has not completed yet.
+                    for completion in layer_completions.values():
+                        if not completion.done():
+                            completion.set_exception(exc)
+
+            self._dense_shard_executor.submit(_fire_group)
+            for layer_id in pending_group:
+                if callable(track):
+                    track(
+                        layer_id,
+                        layer_completions[layer_id],
+                        request_token=request_token,
+                    )
+                self._log_timing(
+                    "csa_dense_group_submit",
+                    layer_id,
+                    request_id=request_id,
+                    source_layer_id=source_layer_id,
+                    group_size=len(pending_group),
+                )
+            return
+
+        for layer_id in pending_group:
 
             def _fire(
                 target_layer_id: int = layer_id,
                 token: Tuple[str, int] = request_token,
-            ) -> None:
-                fire_layer(target_layer_id, request_token=token)
+            ) -> Any:
+                return fire_layer(target_layer_id, request_token=token)
 
             future = self._dense_shard_executor.submit(_fire)
             if callable(track):
@@ -2369,6 +2434,7 @@ class IndexerSSDManager:
                 "csa_dense_shard_submit",
                 layer_id,
                 request_id=request_id,
+                source_layer_id=source_layer_id,
             )
 
     def drain_for_layer(
@@ -2785,7 +2851,7 @@ class IndexerSSDManager:
             with self._lock:
                 self._proxy_futures[layer_id].append(io_future)
 
-            def _clear_io_done(done_future: Future[None]) -> None:
+            def _report_io_done(done_future: Future[Any]) -> None:
                 try:
                     if not done_future.cancelled():
                         done_future.result()
@@ -2795,12 +2861,12 @@ class IndexerSSDManager:
                         "failed for layer %d",
                         layer_id,
                     )
-                with self._lock:
-                    futures = self._proxy_futures.get(layer_id)
-                    if futures is not None and done_future in futures:
-                        futures.remove(done_future)
+                # Keep the completed Future in _proxy_futures until the true
+                # target-layer gate consumes its result. TP-sharded predicted
+                # reads return rank-local work whose private collective must
+                # run on the aligned model-forward thread, not this callback.
 
-            io_future.add_done_callback(_clear_io_done)
+            io_future.add_done_callback(_report_io_done)
             dispatched_batches = 1
         proxy_ms = (time.perf_counter() - t0) * 1000.0
         self._log_timing(
@@ -2856,9 +2922,7 @@ class IndexerSSDManager:
                 1,
             )
             minimum_cp_span = (
-                int(world_size)
-                * int(interleave)
-                * int(query_sample_stride)
+                int(world_size) * int(interleave) * int(query_sample_stride)
             )
             if selected_rows < minimum_cp_span:
                 # Query sampling expands the virtual CP world by ``stride``.
@@ -2943,30 +3007,56 @@ class IndexerSSDManager:
     @staticmethod
     def _is_deepseek_v4_layer(decoder_layer: Any) -> bool:
         """Return True when *decoder_layer* exposes the DeepSeek V4 HC API."""
-        required = (
-            "hc_pre",
+        common = (
             "hc_attn_fn",
             "hc_attn_scale",
             "hc_attn_base",
             "attn_norm",
             "attn",
         )
-        return all(hasattr(decoder_layer, name) for name in required)
+        if not all(hasattr(decoder_layer, name) for name in common):
+            return False
+        if callable(getattr(decoder_layer, "hc_pre", None)):
+            return True
+        modern = (
+            "rms_norm_eps",
+            "hc_eps",
+            "hc_post_alpha",
+            "hc_sinkhorn_iters",
+        )
+        if not all(hasattr(decoder_layer, name) for name in modern):
+            return False
+        module = sys.modules.get(type(decoder_layer).__module__)
+        return callable(getattr(module, "mhc_pre_tilelang", None))
 
     @staticmethod
     def _v4_attention_proxy_hidden(
         decoder_layer: Any,
         residual_f: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute ``attn_norm(HC_pre(residual_f, hc_attn_*))`` for V4."""
+        """Compute the canonical V4 attention input for proxy scoring.
+
+        Supports both the legacy decoder-bound ``hc_pre`` API and vLLM 0.26's
+        module-level ``mhc_pre_tilelang`` API. The latter returns the normalized
+        attention input as its third result, matching the model forward path.
+
+        vLLM 0.26's TileLang MHC kernel specializes on the exact token-row
+        count. Trace replays have a different final scheduler chunk on nearly
+        every turn, so calling it with the unpadded row count triggers seconds
+        of JIT compilation in the speculative path. Small proxy chunks are
+        therefore padded to the same 8192-row shape warmed during cold cache
+        admission, then sliced back to their logical row count. MHC is row
+        local, so zero padding cannot change the retained rows.
+        """
         attn_norm = decoder_layer.attn_norm
         norm_weight = getattr(attn_norm, "weight", None)
         norm_eps = getattr(attn_norm, "variance_epsilon", None)
         if norm_eps is None:
             norm_eps = getattr(decoder_layer, "rms_norm_eps", 1e-6)
-        if norm_weight is not None:
+        legacy_hc_pre = getattr(decoder_layer, "hc_pre", None)
+        if callable(legacy_hc_pre) and norm_weight is not None:
             try:
-                proxy_hidden, _, _ = decoder_layer.hc_pre(
+                proxy_hidden, _, _ = legacy_hc_pre(
                     residual_f,
                     decoder_layer.hc_attn_fn,
                     decoder_layer.hc_attn_scale,
@@ -2977,13 +3067,61 @@ class IndexerSSDManager:
                 return proxy_hidden
             except TypeError:
                 pass
-        proxy_hidden, _, _ = decoder_layer.hc_pre(
-            residual_f,
+        if callable(legacy_hc_pre):
+            proxy_hidden, _, _ = legacy_hc_pre(
+                residual_f,
+                decoder_layer.hc_attn_fn,
+                decoder_layer.hc_attn_scale,
+                decoder_layer.hc_attn_base,
+            )
+            return attn_norm(proxy_hidden)
+
+        module = sys.modules.get(type(decoder_layer).__module__)
+        mhc_pre = getattr(module, "mhc_pre_tilelang", None)
+        if not callable(mhc_pre):
+            raise RuntimeError("DeepSeek V4 layer has no compatible MHC pre kernel")
+        outer_shape = tuple(int(value) for value in residual_f.shape[:-2])
+        logical_rows = math.prod(outer_shape)
+        mhc_residual = residual_f
+        if 0 < logical_rows < _COLD_PROXY_WARM_ROWS:
+            residual_flat = residual_f.reshape(
+                logical_rows,
+                int(residual_f.shape[-2]),
+                int(residual_f.shape[-1]),
+            )
+            mhc_residual = residual_f.new_zeros(
+                (
+                    _COLD_PROXY_WARM_ROWS,
+                    int(residual_f.shape[-2]),
+                    int(residual_f.shape[-1]),
+                )
+            )
+            mhc_residual[:logical_rows].copy_(residual_flat)
+        norm_kwargs: dict[str, Any] = {"norm_eps": float(norm_eps)}
+        if norm_weight is not None:
+            norm_kwargs["norm_weight"] = norm_weight.data
+        _, _, proxy_hidden = mhc_pre(
+            mhc_residual,
             decoder_layer.hc_attn_fn,
             decoder_layer.hc_attn_scale,
             decoder_layer.hc_attn_base,
+            decoder_layer.rms_norm_eps,
+            decoder_layer.hc_eps,
+            decoder_layer.hc_eps,
+            decoder_layer.hc_post_alpha,
+            decoder_layer.hc_sinkhorn_iters,
+            **norm_kwargs,
         )
-        return attn_norm(proxy_hidden)
+        if mhc_residual is not residual_f:
+            proxy_hidden = proxy_hidden.reshape(
+                _COLD_PROXY_WARM_ROWS,
+                int(proxy_hidden.shape[-1]),
+            )[:logical_rows]
+            proxy_hidden = proxy_hidden.reshape(
+                *outer_shape,
+                int(proxy_hidden.shape[-1]),
+            )
+        return proxy_hidden
 
     @staticmethod
     def _v4_indexer_inputs(
@@ -3061,14 +3199,20 @@ class IndexerSSDManager:
             raise RuntimeError("DeepSeek V4 CSA topk buffer is missing")
 
         try:
-            from vllm.v1.attention.ops.deepseek_v4_ops import (
+            from vllm.models.deepseek_v4.common.ops import (
                 fused_indexer_q_rope_quant,
             )
-        except ImportError as exc:
-            self._log_residual_proxy_skip(layer_id, "fused_indexer_q_missing")
-            raise RuntimeError(
-                "DeepSeek V4 fused_indexer_q_rope_quant is missing"
-            ) from exc
+        except ImportError:
+            try:
+                # Compatibility with the pre-0.26 DeepSeek V4 module layout.
+                from vllm.v1.attention.ops.deepseek_v4_ops import (
+                    fused_indexer_q_rope_quant,
+                )
+            except ImportError as exc:
+                self._log_residual_proxy_skip(layer_id, "fused_indexer_q_missing")
+                raise RuntimeError(
+                    "DeepSeek V4 fused_indexer_q_rope_quant is missing"
+                ) from exc
 
         wq_b = getattr(indexer, "wq_b", None)
         if not callable(wq_b):
@@ -3392,14 +3536,26 @@ class IndexerSSDManager:
                 within the configured target-gate timeout.
         """
         gate_start = time.perf_counter()
+        layer_id = int(layer_id)
         with self._lock:
-            futures = tuple(self._proxy_futures.get(int(layer_id), ()))
+            futures = tuple(self._proxy_futures.get(layer_id, ()))
             prediction_submitted = bool(futures) or bool(
-                self._last_proxy_blocks.get(int(layer_id))
+                self._last_proxy_blocks.get(layer_id)
             )
             ready = prediction_submitted and all(future.done() for future in futures)
-            if not ready:
-                self._expired_proxy_layers.add(int(layer_id))
+            manager = getattr(self, "_csa_attention_kv_manager", None)
+            gate_aligned = bool(
+                callable(
+                    uses_gate_aligned := getattr(
+                        manager,
+                        "uses_gate_aligned_shard_gather",
+                        None,
+                    )
+                )
+                and uses_gate_aligned()
+            )
+            if not ready and not gate_aligned:
+                self._expired_proxy_layers.add(layer_id)
         if not prediction_submitted:
             if _profile_accuracy_enabled():
                 logger.info(
@@ -3418,39 +3574,56 @@ class IndexerSSDManager:
             return True
 
         cancelled = False
-        running: list[Future[None]] = []
-        for future in futures:
-            if future.done():
-                continue
-            if future.cancel():
-                cancelled = True
-            else:
-                running.append(future)
-        if cancelled:
-            logger.debug(
-                "IndexerSSDManager: cancelled queued CSA prediction for layer %d",
-                layer_id,
-            )
+        running_count = 0
         timeout_s = max(
             0.0,
             float(getattr(self, "_prediction_gate_timeout_s", 5.0)),
         )
         deadline = time.monotonic() + timeout_s
-        completed = [future for future in futures if not future.cancelled()]
-        for future in completed:
-            try:
-                future.result(timeout=max(0.0, deadline - time.monotonic()))
-            except CancelledError:
-                cancelled = True
-            except TimeoutError as exc:
-                raise RuntimeError(
-                    f"CSA prediction for layer {layer_id} exceeded the "
-                    f"{timeout_s:.1f}s target-gate timeout"
-                ) from exc
-            except Exception as exc:
-                raise RuntimeError(
-                    f"CSA prediction for layer {layer_id} failed at target gate"
-                ) from exc
+        # Completing the proxy-scoring Future can append a second I/O Future.
+        # Drain in generations so the target gate cannot miss that nested
+        # submission. Completed I/O Futures deliberately remain tracked until
+        # this loop consumes their deferred shard-gather result.
+        while True:
+            with self._lock:
+                current = tuple(self._proxy_futures.get(layer_id, ()))
+                self._proxy_futures[layer_id] = []
+            if not current:
+                break
+            for future in current:
+                if not gate_aligned and not future.done() and future.cancel():
+                    cancelled = True
+                    continue
+                if not future.done():
+                    running_count += 1
+                try:
+                    result = future.result(
+                        timeout=max(0.0, deadline - time.monotonic())
+                    )
+                    manager = getattr(self, "_csa_attention_kv_manager", None)
+                    finalize = getattr(
+                        manager,
+                        "finalize_deferred_shard_gather",
+                        None,
+                    )
+                    if callable(finalize):
+                        finalize(result)
+                except CancelledError:
+                    cancelled = True
+                except TimeoutError as exc:
+                    raise RuntimeError(
+                        f"CSA prediction for layer {layer_id} exceeded the "
+                        f"{timeout_s:.1f}s target-gate timeout"
+                    ) from exc
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"CSA prediction for layer {layer_id} failed at target gate"
+                    ) from exc
+        if cancelled:
+            logger.debug(
+                "IndexerSSDManager: cancelled queued CSA prediction for layer %d",
+                layer_id,
+            )
         if _profile_accuracy_enabled():
             logger.info(
                 "IndexerSSDManager: prediction_target_gate layer %d "
@@ -3458,7 +3631,7 @@ class IndexerSSDManager:
                 layer_id,
                 int(ready),
                 int(cancelled),
-                len(running),
+                running_count,
                 (time.perf_counter() - gate_start) * 1000.0,
             )
         return not cancelled

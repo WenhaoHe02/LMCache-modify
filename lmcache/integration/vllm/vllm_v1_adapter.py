@@ -10,6 +10,7 @@ import inspect
 import math
 import os
 import re
+import sys
 import threading
 import time
 import weakref
@@ -73,6 +74,14 @@ logger = init_logger(__name__)
 
 _INDEXER_PREFETCH_MANAGER: Any = None
 _CSA_ATTENTION_KV_PREFETCH_MANAGER: Any = None
+_GLM_DSA_PREDICTIVE_PREFETCH_MANAGER: Any = None
+_GLM_DSA_VLLM_HOOKS: Any = None
+_GLM_DSA_PHYSICAL_PREFETCH_SINK: Any = None
+_GLM_DSA_TOPOLOGY: Any = None
+_GLM_DSA_DECODER_LAYERS: dict[int, Any] = {}
+_GLM_DSA_PREFILL_FORWARD_ACTIVE: bool = False
+_DSV4_PREFETCH_FORWARD_ACTIVE: bool = False
+_DSV4_PREFETCH_FORWARD_MODULES: tuple[Any, ...] = ()
 # Tutti loader recorded by the loader-ready callback (may run on a background
 # daemon thread). Main-thread lazy attach consumes it for the independent
 # indexer and CSA attention-KV managers.
@@ -365,6 +374,50 @@ def _ttft_stage_profile_enabled() -> bool:
     return _env_flag("LMCACHE_TTFT_STAGE_PROFILE")
 
 
+def _tutti_decode_write_guard_s() -> float:
+    """Return the expiry guard for decode-phase write blocking."""
+    value = os.environ.get("LMCACHE_TUTTI_DECODE_WRITE_GUARD_S", "2")
+    try:
+        guard_s = float(value)
+    except ValueError:
+        logger.warning(
+            "Invalid LMCACHE_TUTTI_DECODE_WRITE_GUARD_S=%r; using 2 seconds",
+            value,
+        )
+        return 2.0
+    if guard_s <= 0:
+        logger.warning(
+            "Non-positive LMCACHE_TUTTI_DECODE_WRITE_GUARD_S=%r; using 2 seconds",
+            value,
+        )
+        return 2.0
+    return guard_s
+
+
+def _attn_metadata_has_decode_tokens(attn_metadata: Any) -> bool:
+    """Return whether a vLLM forward contains any decode tokens.
+
+    vLLM 0.26 stores attention metadata as a mapping from layer name to
+    backend metadata. DBO uses a list of those mappings, while older paths
+    may still pass one metadata object directly. Only the boolean result is
+    needed here; values repeated for every attention layer must not be summed.
+
+    Args:
+        attn_metadata: One metadata object, a layer mapping, or DBO mappings.
+
+    Returns:
+        ``True`` when at least one contained metadata object reports decode
+        tokens.
+    """
+    if isinstance(attn_metadata, dict):
+        return any(
+            _attn_metadata_has_decode_tokens(item) for item in attn_metadata.values()
+        )
+    if isinstance(attn_metadata, (list, tuple)):
+        return any(_attn_metadata_has_decode_tokens(item) for item in attn_metadata)
+    return int(getattr(attn_metadata, "num_decode_tokens", 0) or 0) > 0
+
+
 def _normalize_block_ids_by_group(
     block_ids: Optional[Union[tuple[list[int], ...], list[int], list[list[int]]]],
 ) -> tuple[list[int], ...]:
@@ -457,15 +510,455 @@ def _indexer_prefetch_enabled() -> bool:
     return value.lower() in {"1", "true", "yes", "on"}
 
 
+def _glm_dsa_predictive_prefetch_enabled() -> bool:
+    """Return whether experimental GLM DSA prediction is enabled."""
+    return _env_flag("LMCACHE_GLM_DSA_PREDICTIVE_PREFETCH")
+
+
+def _glm_dsa_layer_major_enabled() -> bool:
+    """Return whether the GLM layer-major consumer pipeline is enabled."""
+    return _env_flag("LMCACHE_GLM_DSA_LAYER_MAJOR") or (
+        _glm_dsa_predictive_prefetch_enabled()
+    )
+
+
+def _glm_dsa_vllm_module() -> Any:
+    """Return the version-specific GLM DSA integration module, if supported."""
+    normalized = VLLM_VERSION.strip().removeprefix("v")
+    if normalized == "0.26.0" or normalized.startswith("0.26.0+"):
+        module_name = "lmcache.integration.vllm.glm_dsa_vllm_0260"
+    elif normalized == "0.20.2" or normalized.startswith("0.20.2+"):
+        module_name = "lmcache.integration.vllm.glm_dsa_vllm_0202"
+    else:
+        return None
+    return __import__(module_name, fromlist=["install_decoder_registry_hook"])
+
+
+def _install_glm_dsa_vllm_registry_hook() -> None:
+    """Install the GLM decoder discovery hook for the active vLLM version."""
+    if not _glm_dsa_layer_major_enabled():
+        return
+    try:
+        module = _glm_dsa_vllm_module()
+    except ImportError as exc:
+        logger.warning("GLM DSA vLLM adapter is unavailable: %s", exc)
+        return
+    if module is None:
+        logger.warning(
+            "GLM DSA predictive prefetch does not support vLLM %s",
+            VLLM_VERSION,
+        )
+        return
+    install_decoder_registry_hook = module.install_decoder_registry_hook
+    if not install_decoder_registry_hook(VLLM_VERSION):
+        logger.warning(
+            "GLM DSA predictive prefetch cannot hook runtime vLLM %s",
+            VLLM_VERSION,
+        )
+
+
+def _hf_config_mapping(hf_config: Any) -> dict[str, Any]:
+    """Return a plain mapping for structural GLM topology extraction."""
+    to_dict = getattr(hf_config, "to_dict", None)
+    if callable(to_dict):
+        config = to_dict()
+        if isinstance(config, dict):
+            return config
+    keys = (
+        "model_type",
+        "num_hidden_layers",
+        "index_topk",
+        "index_topk_freq",
+        "index_topk_pattern",
+        "index_skip_topk_offset",
+        "indexer_rope_interleave",
+        "indexer_types",
+        "index_share_for_mtp_iteration",
+    )
+    return {key: getattr(hf_config, key) for key in keys if hasattr(hf_config, key)}
+
+
+def _decoder_glm_dsa_attention(decoder_layer: Any) -> Any:
+    """Return a GLM sparse MLA object with a materialized 3-D KV cache."""
+    attention = getattr(decoder_layer, "self_attn", None)
+    wrapper = getattr(attention, "mla_attn", None)
+    candidates = (getattr(wrapper, "mla_attn", None), wrapper, attention)
+    for candidate in candidates:
+        kv_cache = getattr(candidate, "kv_cache", None)
+        if (
+            isinstance(kv_cache, torch.Tensor)
+            and kv_cache.ndim == 3
+            and kv_cache.numel() > 0
+        ):
+            return candidate
+    return None
+
+
+def _attach_glm_dsa_physical_prefetch(
+    tutti_loader: Any,
+    schedules: tuple[Any, ...] = (),
+) -> Any:
+    """Attach GLM attention-KV tensors to the production Tutti read engine."""
+    global _CSA_ATTENTION_KV_PREFETCH_MANAGER, _GLM_DSA_PHYSICAL_PREFETCH_SINK
+
+    if _GLM_DSA_PHYSICAL_PREFETCH_SINK is not None:
+        return _GLM_DSA_PHYSICAL_PREFETCH_SINK
+    if tutti_loader is None or _GLM_DSA_TOPOLOGY is None or not _GLM_DSA_DECODER_LAYERS:
+        return None
+    try:
+        from lmcache.v1.csa_attention_kv_prefetch_manager import (
+            CSAAttentionKVPrefetchManager,
+            set_csa_attention_kv_prefetch_manager,
+        )
+        from lmcache.v1.glm_dsa_predictive_prefetch import (
+            GLMDSAPhysicalPrefetchSink,
+        )
+    except ImportError as exc:
+        logger.warning("GLM DSA physical KV prefetch is unavailable: %s", exc)
+        return None
+
+    entries: list[tuple[int, torch.Tensor]] = []
+    for layer_id, decoder in sorted(_GLM_DSA_DECODER_LAYERS.items()):
+        attention = _decoder_glm_dsa_attention(decoder)
+        kv_cache = getattr(attention, "kv_cache", None)
+        if isinstance(kv_cache, torch.Tensor):
+            entries.append((int(layer_id), kv_cache))
+    expected_layers = len(_GLM_DSA_TOPOLOGY.layers)
+    if len(entries) != expected_layers:
+        logger.warning(
+            "GLM DSA physical KV attach requires %d layer caches; found %d",
+            expected_layers,
+            len(entries),
+        )
+        return None
+    block_sizes = {int(kv_cache.shape[1]) for _, kv_cache in entries}
+    token_bytes = {int(kv_cache.shape[2]) for _, kv_cache in entries}
+    if len(block_sizes) != 1 or len(token_bytes) != 1:
+        logger.warning(
+            "GLM DSA physical KV caches have mixed shapes blocks=%s bytes=%s",
+            sorted(block_sizes),
+            sorted(token_bytes),
+        )
+        return None
+
+    from lmcache.v1.ssd_tp_sharded_prefetch import (
+        SSDTPShardedPrefetchConfig,
+        TorchDistributedShardGather,
+    )
+
+    shard_config = SSDTPShardedPrefetchConfig.from_engine_config(
+        lmcache_get_or_create_config()
+    )
+    shard_transport = None
+    if (
+        shard_config.enabled
+        and shard_config.csa_enabled
+        and shard_config.csa_replica_verified
+    ):
+        try:
+            from vllm.distributed import get_tp_group
+
+            tp_group = get_tp_group()
+            if int(tp_group.world_size) != shard_config.cp_size:
+                raise RuntimeError(
+                    f"configured CP size {shard_config.cp_size} does not match "
+                    f"runtime TP size {int(tp_group.world_size)}"
+                )
+            shard_transport = TorchDistributedShardGather.from_model_group(
+                tp_group.device_group,
+                shard_config,
+            )
+        except Exception:
+            logger.exception(
+                "GLM DSA shard-gather communicator initialization failed; "
+                "retaining LOCAL_DIRECT"
+            )
+    elif shard_config.enabled and shard_config.csa_enabled:
+        logger.warning(
+            "GLM DSA shard-gather requested without "
+            "LMCACHE_SSD_TP_CSA_REPLICA_VERIFIED=1; retaining LOCAL_DIRECT"
+        )
+
+    manager = CSAAttentionKVPrefetchManager(
+        tutti_loader=tutti_loader,
+        csa_layer_ids=[layer_id for layer_id, _ in entries],
+        compressed_block_size=next(iter(block_sizes)),
+        token_bytes=next(iter(token_bytes)),
+        shard_config=shard_config,
+        shard_transport=shard_transport,
+    )
+    try:
+        for layer_id, kv_cache in entries:
+            manager.register_layer(layer_id, kv_cache)
+        manager.warm_runtime_resources()
+        if not schedules and _GLM_DSA_PREDICTIVE_PREFETCH_MANAGER is not None:
+            schedules = _GLM_DSA_PREDICTIVE_PREFETCH_MANAGER.schedules
+        requested_io_workers = max(
+            1,
+            _env_int("LMCACHE_GLM_DSA_IO_WORKERS", 4),
+        )
+        # Every TP rank must enter shard-gather collectives in the same layer
+        # order.  Multiple sink workers can acquire the per-rank collective
+        # lock in different orders (for example L2 first on one rank and L5
+        # first on another), which makes preflight reject an otherwise valid
+        # descriptor.  A single FIFO worker preserves the model-hook order;
+        # LOCAL_DIRECT keeps the configured parallelism.
+        io_workers = 1 if shard_transport is not None else requested_io_workers
+        if io_workers != requested_io_workers:
+            logger.info(
+                "GLM DSA shard-gather serializing physical submissions "
+                "requested_workers=%d effective_workers=%d",
+                requested_io_workers,
+                io_workers,
+            )
+        sink = GLMDSAPhysicalPrefetchSink(
+            manager,
+            schedules,
+            {
+                group.source_layer: group.consumer_layers
+                for group in _GLM_DSA_TOPOLOGY.index_groups
+            },
+            next(iter(block_sizes)),
+            io_workers=io_workers,
+            enable_prediction=(
+                _glm_dsa_predictive_prefetch_enabled()
+                and os.environ.get(
+                    "LMCACHE_GLM_DSA_PHYSICAL_PREDICTION",
+                    "1",
+                ).lower()
+                in {"1", "true", "yes", "on"}
+            ),
+        )
+    except Exception:
+        manager.close()
+        logger.exception("GLM DSA physical KV manager attach failed")
+        return None
+
+    set_csa_attention_kv_prefetch_manager(manager)
+    _CSA_ATTENTION_KV_PREFETCH_MANAGER = manager
+    _GLM_DSA_PHYSICAL_PREFETCH_SINK = sink
+    if _GLM_DSA_PREDICTIVE_PREFETCH_MANAGER is not None:
+        _GLM_DSA_PREDICTIVE_PREFETCH_MANAGER.set_submit_prefetch(sink.submit)
+    logger.info(
+        "GLM DSA physical KV prefetch attached layers=%d block_size=%d token_bytes=%d",
+        len(entries),
+        next(iter(block_sizes)),
+        next(iter(token_bytes)),
+    )
+    return sink
+
+
+def _glm_dsa_observe_authoritative(
+    target_layer: int,
+    true_topk: torch.Tensor,
+) -> None:
+    """Forward correction-only Full indices to the physical sink."""
+    sink = _GLM_DSA_PHYSICAL_PREFETCH_SINK
+    if sink is not None:
+        sink.submit_authoritative(target_layer, true_topk)
+
+
+def _glm_dsa_forward_enabled() -> bool:
+    """Return whether GLM external-KV I/O belongs to this model forward."""
+    return _GLM_DSA_PREFILL_FORWARD_ACTIVE
+
+
+def _set_glm_dsa_prefill_forward_active(active: bool) -> None:
+    """Enable GLM SSD hooks only for an external-KV prefill forward."""
+    global _GLM_DSA_PREFILL_FORWARD_ACTIVE
+    _GLM_DSA_PREFILL_FORWARD_ACTIVE = bool(active)
+
+
+def _set_dsv4_prefetch_forward_active(active: bool) -> None:
+    """Enable DSv4 overlap hooks only for external-KV prefill forwards."""
+    global _DSV4_PREFETCH_FORWARD_ACTIVE, _DSV4_PREFETCH_FORWARD_MODULES
+    _DSV4_PREFETCH_FORWARD_ACTIVE = bool(active)
+    manager = _CSA_ATTENTION_KV_PREFETCH_MANAGER
+    if manager is not None:
+        set_forward_active = getattr(
+            manager,
+            "set_external_kv_forward_active",
+            None,
+        )
+        if callable(set_forward_active):
+            set_forward_active(bool(active))
+    if active and not _DSV4_PREFETCH_FORWARD_MODULES:
+        modules: dict[int, Any] = {}
+        for decoder_layer in _deepseek_decoder_layers():
+            module = sys.modules.get(type(decoder_layer).__module__)
+            if module is None or not hasattr(
+                module,
+                "_LMCACHE_DSV4_PREFETCH_ACTIVE",
+            ):
+                continue
+            modules[id(module)] = module
+        _DSV4_PREFETCH_FORWARD_MODULES = tuple(modules.values())
+    for module in _DSV4_PREFETCH_FORWARD_MODULES:
+        module._LMCACHE_DSV4_PREFETCH_ACTIVE = bool(active)
+
+
+def _glm_dsa_wait_for_consumer(layer_id: int) -> bool:
+    """Gate a GLM sparse-attention consumer on its physical KV reads."""
+    sink = _GLM_DSA_PHYSICAL_PREFETCH_SINK
+    return sink is None or bool(sink.wait_for_consumer(layer_id))
+
+
+def _attach_glm_dsa_predictive_prefetch(
+    vllm_config: Any,
+    engine: Any,
+) -> None:
+    """Attach GLM IndexShare prediction to live supported vLLM layers.
+
+    Args:
+        vllm_config: Active server configuration containing the GLM HF config.
+        engine: Active LMCache engine, optionally exposing a physical GLM DSA
+            prefetch event sink.
+    """
+    global _GLM_DSA_DECODER_LAYERS, _GLM_DSA_PREDICTIVE_PREFETCH_MANAGER
+    global _GLM_DSA_TOPOLOGY, _GLM_DSA_VLLM_HOOKS
+
+    if not _glm_dsa_layer_major_enabled():
+        return
+    if _GLM_DSA_PREDICTIVE_PREFETCH_MANAGER is not None:
+        return
+    try:
+        vllm_module = _glm_dsa_vllm_module()
+        from lmcache.v1.glm_dsa_predictive_prefetch import (
+            GLMDSAPredictivePrefetchManager,
+            build_glm_dsa_prediction_schedule,
+        )
+        from lmcache.v1.index_to_io_profile import extract_glm_dsa_topology
+    except ImportError as exc:
+        logger.warning("GLM DSA predictive prefetch is unavailable: %s", exc)
+        return
+    if vllm_module is None:
+        logger.warning(
+            "Refusing GLM DSA hooks for unsupported vLLM version %s",
+            VLLM_VERSION,
+        )
+        return
+    if VLLM_VERSION.strip().removeprefix("v").startswith("0.26.0"):
+        proxy_type = vllm_module.VLLM0260GLMDSAProxy
+        hooks_type = vllm_module.VLLM0260GLMDSAHooks
+    else:
+        proxy_type = vllm_module.VLLM0202GLMDSAProxy
+        hooks_type = vllm_module.VLLM0202GLMDSAHooks
+    decoder_layer_map = vllm_module.decoder_layer_map
+    is_supported_vllm_version = vllm_module.is_supported_vllm_version
+    registered_glm_decoder_layers = vllm_module.registered_glm_decoder_layers
+    if not is_supported_vllm_version(VLLM_VERSION):
+        logger.warning(
+            "Refusing GLM DSA hooks for unsupported vLLM version %s",
+            VLLM_VERSION,
+        )
+        return
+
+    hf_config = getattr(getattr(vllm_config, "model_config", None), "hf_config", None)
+    if getattr(hf_config, "model_type", None) != "glm_moe_dsa":
+        return
+    try:
+        config = _hf_config_mapping(hf_config)
+        model_name = str(
+            getattr(getattr(vllm_config, "model_config", None), "model", "glm")
+        )
+        topology = extract_glm_dsa_topology(config, model_name)
+        schedules = build_glm_dsa_prediction_schedule(
+            topology,
+            bootstrap_source_layer=_env_int(
+                "LMCACHE_GLM_DSA_BOOTSTRAP_SOURCE_LAYER",
+                0,
+            ),
+            steady_full_layer_lookahead=_env_int(
+                "LMCACHE_GLM_DSA_FULL_LAYER_LOOKAHEAD",
+                1,
+            ),
+        )
+        layers = decoder_layer_map(registered_glm_decoder_layers())
+        required_layer_ids = {
+            layer_id
+            for schedule in schedules
+            for layer_id in (schedule.source_layer, schedule.target_layer)
+        }
+        missing = sorted(required_layer_ids - layers.keys())
+        if missing:
+            raise RuntimeError(f"registered decoder layers missing {missing}")
+        proxy = proxy_type(layers)
+        proxy.validate_schedule(schedules)
+        _GLM_DSA_TOPOLOGY = topology
+        _GLM_DSA_DECODER_LAYERS = dict(layers)
+        physical_sink = _attach_glm_dsa_physical_prefetch(
+            getattr(engine, "_tutti_loader", None),
+            schedules,
+        )
+        submit_prefetch = physical_sink.submit if physical_sink is not None else None
+        if submit_prefetch is None:
+            logger.warning(
+                "GLM DSA prediction attached in accuracy-only mode because "
+                "the Tutti loader is not ready; physical attach remains pending"
+            )
+        manager = GLMDSAPredictivePrefetchManager(
+            schedules,
+            proxy.predict,
+            submit_prefetch,
+            sample_rows=_env_int("LMCACHE_GLM_DSA_ACCURACY_ROWS", 32),
+            enable_prediction=_glm_dsa_predictive_prefetch_enabled(),
+        )
+        hooks = hooks_type(
+            layers,
+            manager,
+            indexer_types=tuple(layer.indexer_mode.value for layer in topology.layers),
+            authoritative_observer=_glm_dsa_observe_authoritative,
+            consumer_waiter=_glm_dsa_wait_for_consumer,
+            forward_enabled=_glm_dsa_forward_enabled,
+        )
+        hooks.attach()
+    except Exception:
+        logger.exception(
+            "Failed to attach GLM DSA prediction; leaving the normal vLLM "
+            "path unchanged"
+        )
+        return
+
+    _GLM_DSA_PREDICTIVE_PREFETCH_MANAGER = manager
+    _GLM_DSA_VLLM_HOOKS = hooks
+    logger.info(
+        "Attached GLM DSA layer-major pipeline prediction=%s edges=%s accuracy_rows=%d",
+        _glm_dsa_predictive_prefetch_enabled(),
+        [(schedule.source_layer, schedule.target_layer) for schedule in schedules],
+        _env_int("LMCACHE_GLM_DSA_ACCURACY_ROWS", 32),
+    )
+
+
 def close_vllm_prefetch_managers() -> None:
     """Close and detach process-local Tutti prefetch managers.
 
     The operation is idempotent and clears both adapter-owned and
     manager-module global references before releasing resources.
     """
-    global _CSA_ATTENTION_KV_PREFETCH_MANAGER, _INDEXER_PREFETCH_MANAGER
+    global _CSA_ATTENTION_KV_PREFETCH_MANAGER, _GLM_DSA_DECODER_LAYERS
+    global _GLM_DSA_PHYSICAL_PREFETCH_SINK, _GLM_DSA_PREDICTIVE_PREFETCH_MANAGER
+    global _GLM_DSA_TOPOLOGY, _GLM_DSA_VLLM_HOOKS, _INDEXER_PREFETCH_MANAGER
 
     _FULL_NSYS_CAPTURE_CONTROLLER.reset()
+
+    glm_hooks = _GLM_DSA_VLLM_HOOKS
+    _GLM_DSA_VLLM_HOOKS = None
+    _GLM_DSA_PREDICTIVE_PREFETCH_MANAGER = None
+    if glm_hooks is not None:
+        try:
+            glm_hooks.close()
+        except Exception:
+            logger.exception("Failed to restore vLLM GLM DSA prediction hooks")
+
+    physical_sink = _GLM_DSA_PHYSICAL_PREFETCH_SINK
+    _GLM_DSA_PHYSICAL_PREFETCH_SINK = None
+    _GLM_DSA_TOPOLOGY = None
+    _GLM_DSA_DECODER_LAYERS = {}
+    if physical_sink is not None:
+        try:
+            physical_sink.close()
+        except Exception:
+            logger.exception("Failed to close the GLM DSA physical prefetch sink")
 
     csa_manager = _CSA_ATTENTION_KV_PREFETCH_MANAGER
     _CSA_ATTENTION_KV_PREFETCH_MANAGER = None
@@ -553,12 +1046,23 @@ def _install_deepseek_decoder_registry_hook() -> None:
 
     if _DEEPSEEK_DECODER_REGISTRY_HOOK_INSTALLED:
         return
-    try:
-        module = __import__(
-            "vllm.model_executor.models.deepseek_v4",
-            fromlist=["DeepseekV4DecoderLayer"],
-        )
-    except ImportError:
+    module = None
+    for module_name in (
+        "vllm.models.deepseek_v4.nvidia.model",
+        "vllm.models.deepseek_v4.amd.model",
+        "vllm.model_executor.models.deepseek_v4",
+    ):
+        try:
+            candidate = __import__(
+                module_name,
+                fromlist=["DeepseekV4DecoderLayer"],
+            )
+        except ImportError:
+            continue
+        if getattr(candidate, "DeepseekV4DecoderLayer", None) is not None:
+            module = candidate
+            break
+    if module is None:
         return
     module_registry = getattr(module, "_DEEPSEEK_V4_DECODER_LAYER_REGISTRY", None)
     if module_registry is None:
@@ -676,9 +1180,10 @@ def _is_deepseek_decoder_layer_candidate(obj: Any) -> bool:
         obj_type = type(obj)
         type_name = getattr(obj_type, "__name__", "")
         module_name = getattr(obj_type, "__module__", "")
-        is_deepseek_decoder_type = (
-            type_name == "DeepseekV4DecoderLayer"
-            and module_name == "vllm.model_executor.models.deepseek_v4"
+        is_deepseek_decoder_type = type_name == "DeepseekV4DecoderLayer" and (
+            module_name == "vllm.model_executor.models.deepseek_v4"
+            or module_name == "vllm.models.deepseek_v4.nvidia.model"
+            or module_name == "vllm.models.deepseek_v4.amd.model"
         )
         if (
             not is_deepseek_decoder_type
@@ -961,6 +1466,8 @@ def _install_decoder_forward_position_hook(decoder_layer: Any) -> bool:
         signature = None
 
     def _lmcache_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if not _DSV4_PREFETCH_FORWARD_ACTIVE:
+            return original_forward(*args, **kwargs)
         previous_source = getattr(self, "_lmcache_forward_position_source", None)
         previous_overlap_fired = getattr(
             self,
@@ -1193,7 +1700,7 @@ def _fire_decoder_ffn_overlap(
                 if not (callable(already_fired) and already_fired(target))
             )
             if pending_dense and callable(fire_dense):
-                fire_dense(pending_dense)
+                fire_dense(pending_dense, source_layer_id=int(layer_id))
             fired = True
         except Exception as exc:
             _log_overlap_hook_error_once("CSA_DENSE", int(layer_id), exc)
@@ -1251,6 +1758,77 @@ def _maybe_fire_decoder_ffn_overlap(
         decoder_layer._lmcache_pre_ffn_overlap_fired = True
 
 
+def fire_dsv4_prefetch_from_ffn_boundary(
+    decoder_layer: Any,
+    residual_after_attention: torch.Tensor,
+    positions: torch.Tensor,
+) -> bool:
+    """Fire LMCache prefetch at vLLM 0.26's native pre-FFN boundary.
+
+    The vLLM 0.26 DeepSeek V4 decoder calls module-level fused HC kernels, so
+    the earlier Python method wrappers cannot observe this boundary.  The
+    versioned vLLM overlay calls this stable public entry point immediately
+    after attention post-normalization and before the MoE/MLP begins.
+
+    Args:
+        decoder_layer: Live ``DeepseekV4DecoderLayer`` instance.
+        residual_after_attention: Post-attention state consumed by the FFN.
+        positions: Query positions aligned with ``residual_after_attention``.
+
+    Returns:
+        Whether at least one CSA, HCA, or dense-CSA manager was fired.
+    """
+    # vLLM invokes this Python boundary once per decoder layer for every
+    # decode token too. Decode consumes KV already resident in GPU memory, so
+    # touching three manager graphs here is both unnecessary and a measurable
+    # fixed TPOT tax. The connector owns the authoritative phase bit and sets
+    # it before model execution; reject decode/mixed/cold forwards before any
+    # tensor or decoder introspection.
+    if not _DSV4_PREFETCH_FORWARD_ACTIVE:
+        return False
+    if not isinstance(residual_after_attention, torch.Tensor):
+        return False
+    if not isinstance(positions, torch.Tensor):
+        return False
+    if getattr(decoder_layer, "_lmcache_pre_ffn_overlap_fired", False):
+        return False
+    fired = _fire_decoder_ffn_overlap(
+        decoder_layer,
+        residual_after_attention,
+        positions,
+        "vllm_0260_native",
+    )
+    if fired:
+        decoder_layer._lmcache_pre_ffn_overlap_fired = True
+    return fired
+
+
+def wait_dsv4_attention_kv_from_decoder_boundary(decoder_layer: Any) -> None:
+    """Wait for HCA KV immediately before a DSv4 attention consumer.
+
+    The vLLM 0.26 overlay calls this only for an external-KV prefill. Decode
+    bypasses the call in the native model module, so no Python layer wrapper
+    remains on the steady-state decode path.
+
+    Args:
+        decoder_layer: Live ``DeepseekV4DecoderLayer`` about to run attention.
+
+    Raises:
+        RuntimeError: If the HCA layer's asynchronous KV read did not finish.
+    """
+    if not _DSV4_PREFETCH_FORWARD_ACTIVE:
+        return
+    manager = _CSA_ATTENTION_KV_PREFETCH_MANAGER
+    layer_id = getattr(decoder_layer, "layer_idx", -1)
+    if (
+        manager is not None
+        and isinstance(layer_id, int)
+        and layer_id in manager.hca_layer_ids
+        and not manager.wait_for_layer(layer_id)
+    ):
+        raise RuntimeError(f"HCA KV is unavailable for decoder layer {layer_id}")
+
+
 def _install_decoder_hc_pre_overlap_hook(decoder_layer: Any) -> bool:
     """Install an FFN-entry hook that fires CSA/HCA prefetch before MoE."""
     hc_pre = getattr(decoder_layer, "hc_pre", None)
@@ -1267,6 +1845,8 @@ def _install_decoder_hc_pre_overlap_hook(decoder_layer: Any) -> bool:
         *args: Any,
         **kwargs: Any,
     ) -> Any:
+        if not _DSV4_PREFETCH_FORWARD_ACTIVE:
+            return original_hc_pre(hidden_states, *args, **kwargs)
         if isinstance(hidden_states, torch.Tensor) and _is_ffn_hc_pre_call(
             self,
             args,
@@ -1299,6 +1879,8 @@ def _install_decoder_hc_post_overlap_hook(decoder_layer: Any) -> bool:
         **kwargs: Any,
     ) -> Any:
         result = original_hc_post(*args, **kwargs)
+        if not _DSV4_PREFETCH_FORWARD_ACTIVE:
+            return result
         call_index = int(getattr(self, "_lmcache_hc_post_call_index", 0))
         self._lmcache_hc_post_call_index = call_index + 1
         if call_index == 0 and isinstance(result, torch.Tensor):
@@ -1327,6 +1909,8 @@ def _install_decoder_mhc_fused_post_pre_overlap_hook(decoder_layer: Any) -> bool
         **kwargs: Any,
     ) -> Any:
         result = original_forward(*args, **kwargs)
+        if not _DSV4_PREFETCH_FORWARD_ACTIVE:
+            return result
         if not _is_ffn_mhc_fused_post_pre_call(decoder_layer, args, kwargs):
             return result
         residual_after_attention = None
@@ -1367,6 +1951,8 @@ def _install_decoder_native_indexer_prefetch_guard(decoder_layer: Any) -> None:
         residual_f: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
     ) -> Any:
+        if not _DSV4_PREFETCH_FORWARD_ACTIVE:
+            return original_native_fire(residual_f, positions)
         if getattr(self, "_lmcache_pre_ffn_overlap_fired", False):
             return None
         self._lmcache_pre_ffn_overlap_fired = True
@@ -1406,6 +1992,8 @@ def _configure_decoder_csa_overlap(
     native_hook = callable(
         getattr(decoder_layer, "_lmcache_fire_pre_ffn_overlap", None)
     )
+    if native_hook:
+        return True
     if not isinstance(next_csa_layer_id, int) or next_csa_layer_id < 0:
         return native_hook
     return _install_decoder_pre_ffn_overlap_hooks(decoder_layer) or native_hook
@@ -1423,6 +2011,8 @@ def _configure_decoder_hca_overlap(
     native_hook = callable(
         getattr(decoder_layer, "_lmcache_fire_pre_ffn_overlap", None)
     )
+    if native_hook:
+        return True
     if (
         not isinstance(next_hca_layer_id, int) or next_hca_layer_id < 0
     ) and not next_hca_layer_ids:
@@ -1441,6 +2031,8 @@ def _configure_decoder_dense_csa_overlap(
     native_hook = callable(
         getattr(decoder_layer, "_lmcache_fire_pre_ffn_overlap", None)
     )
+    if native_hook:
+        return True
     if not target_layer_ids:
         return native_hook
     return _install_decoder_pre_ffn_overlap_hooks(decoder_layer) or native_hook
@@ -1645,6 +2237,11 @@ def _attach_indexer_prefetch(tutti_loader: Optional[Any] = None) -> None:
     """
     global _INDEXER_PREFETCH_MANAGER
 
+    # GLM DSA has a separate layer registry and physical prefetch manager.
+    # The legacy manager below discovers only DeepSeek decoder layers and its
+    # GC fallback is expensive when retried once per forward on GLM.
+    if _glm_dsa_layer_major_enabled():
+        return
     if not _indexer_prefetch_enabled():
         return
     if _INDEXER_PREFETCH_MANAGER is not None:
@@ -1795,12 +2392,29 @@ def _attach_indexer_prefetch(tutti_loader: Optional[Any] = None) -> None:
     attached_decoders = 0
     early_overlap_hooks = 0
     source_prefetch: dict[int, tuple[int, int]] = {}
+    dense_prediction_exclusions: frozenset[int] = frozenset()
+    if _env_flag("LMCACHE_SSD_TP_SHARDED_PREFETCH") and _env_flag(
+        "LMCACHE_SSD_TP_SHARD_CSA"
+    ):
+        from lmcache.v1.ssd_tp_sharded_prefetch import parse_layer_ranges
+
+        dense_prediction_exclusions = parse_layer_ranges(
+            os.getenv("LMCACHE_SSD_TP_DENSE_LAYERS", "2-24")
+        )
     source_prefetch = build_residual_prefetch_sources(
         csa_layer_ids,
         lookahead_policy,
+        excluded_target_layer_ids=dense_prediction_exclusions,
     )
     manager.configure_prefetch_lookahead(
-        {target: lookahead_policy.lookahead_for(target) for target in csa_layer_ids}
+        {
+            target: (
+                0
+                if target in dense_prediction_exclusions
+                else lookahead_policy.lookahead_for(target)
+            )
+            for target in csa_layer_ids
+        }
     )
     for decoder_layer in decoder_layers:
         decoder_layer_id = getattr(decoder_layer, "layer_idx", -1)
@@ -1867,11 +2481,22 @@ def _attach_indexer_prefetch(tutti_loader: Optional[Any] = None) -> None:
     )
     logger.info(
         "IndexerSSDManager: canonical policy=%s one_layer_targets=%s "
-        "two_layer_targets=%s demand_only_targets=%s",
+        "two_layer_targets=%s demand_only_targets=%s "
+        "dense_deterministic_targets=%s",
         lookahead_policy.specification,
-        sorted(lookahead_policy.one_layer_targets(csa_layer_ids)),
-        sorted(lookahead_policy.two_layer_targets(csa_layer_ids)),
-        sorted(lookahead_policy.disabled_targets(csa_layer_ids)),
+        sorted(
+            lookahead_policy.one_layer_targets(csa_layer_ids)
+            - dense_prediction_exclusions
+        ),
+        sorted(
+            lookahead_policy.two_layer_targets(csa_layer_ids)
+            - dense_prediction_exclusions
+        ),
+        sorted(
+            lookahead_policy.disabled_targets(csa_layer_ids)
+            | dense_prediction_exclusions
+        ),
+        sorted(set(csa_layer_ids) & dense_prediction_exclusions),
     )
 
 
@@ -2096,7 +2721,16 @@ def _attach_csa_attention_kv_prefetch(tutti_loader: Optional[Any] = None) -> Non
                 # explicitly on every registered HCA layer; otherwise its
                 # staged submission is never drained and the I/O NVTX range
                 # remains open until request teardown.
-                if not _install_decoder_forward_position_hook(decoder_layer):
+                has_native_boundary = callable(
+                    getattr(
+                        decoder_layer,
+                        "_lmcache_fire_pre_ffn_overlap",
+                        None,
+                    )
+                )
+                if not has_native_boundary and not (
+                    _install_decoder_forward_position_hook(decoder_layer)
+                ):
                     raise RuntimeError(
                         f"could not install HCA decoder gate for layer {layer_id}"
                     )
@@ -2169,10 +2803,35 @@ def _attach_csa_attention_kv_prefetch(tutti_loader: Optional[Any] = None) -> Non
     # cost table and all-rank preflight still decide whether the data path is
     # shard-gather or the preserved local read.
     dense_by_source: dict[int, list[int]] = {}
-    for target_layer_id in manager.dense_shard_layer_ids:
-        source_layer_id = int(target_layer_id) - shard_config.early_lookahead
-        if source_layer_id >= 0:
-            dense_by_source.setdefault(source_layer_id, []).append(int(target_layer_id))
+    try:
+        dense_eager_group_size = max(
+            1,
+            int(os.environ.get("LMCACHE_SSD_TP_DENSE_EAGER_GROUP_SIZE", "1")),
+        )
+    except ValueError:
+        logger.warning(
+            "Invalid LMCACHE_SSD_TP_DENSE_EAGER_GROUP_SIZE=%r; using 1",
+            os.environ.get("LMCACHE_SSD_TP_DENSE_EAGER_GROUP_SIZE"),
+        )
+        dense_eager_group_size = 1
+    dense_layer_ids = tuple(sorted(manager.dense_shard_layer_ids))
+    if dense_eager_group_size > 1:
+        for start in range(0, len(dense_layer_ids), dense_eager_group_size):
+            target_group = dense_layer_ids[start : start + dense_eager_group_size]
+            if not target_group:
+                continue
+            source_layer_id = int(target_group[0]) - shard_config.early_lookahead
+            if source_layer_id >= 0:
+                dense_by_source.setdefault(source_layer_id, []).extend(
+                    int(target_layer_id) for target_layer_id in target_group
+                )
+    else:
+        for target_layer_id in dense_layer_ids:
+            source_layer_id = int(target_layer_id) - shard_config.early_lookahead
+            if source_layer_id >= 0:
+                dense_by_source.setdefault(source_layer_id, []).append(
+                    int(target_layer_id)
+                )
     for decoder_layer in decoder_layers:
         decoder_layer_id = getattr(decoder_layer, "layer_idx", -1)
         targets = tuple(sorted(dense_by_source.get(int(decoder_layer_id), ())))
@@ -2186,11 +2845,12 @@ def _attach_csa_attention_kv_prefetch(tutti_loader: Optional[Any] = None) -> Non
     _CSA_ATTENTION_KV_PREFETCH_MANAGER = manager
     logger.info(
         "CSAAttentionKVPrefetchManager: attached with %d/%d CSA layers, "
-        "compressed_block_size=%d token_bytes=%d",
+        "compressed_block_size=%d token_bytes=%d dense_eager_group_size=%d",
         patched_layers,
         len(csa_layer_entries),
         compressed_block_size,
         token_bytes,
+        dense_eager_group_size,
     )
 
 
@@ -2241,6 +2901,8 @@ def _maybe_lazy_attach_indexer_prefetch(engine: Any) -> None:
     Args:
         engine: Active LMCache engine used as a fallback loader source.
     """
+    if _glm_dsa_layer_major_enabled():
+        return
     if _INDEXER_PREFETCH_MANAGER is not None:
         return
     with _INDEXER_PREFETCH_PENDING_LOCK:
@@ -2263,7 +2925,12 @@ def _maybe_lazy_attach_csa_prefetch(engine: Any) -> None:
     Args:
         engine: The active LMCache engine, or ``None``.
     """
-    if _CSA_ATTENTION_KV_PREFETCH_MANAGER is not None:
+    glm_pending = bool(
+        _glm_dsa_layer_major_enabled()
+        and _GLM_DSA_PHYSICAL_PREFETCH_SINK is None
+        and _GLM_DSA_TOPOLOGY is not None
+    )
+    if _CSA_ATTENTION_KV_PREFETCH_MANAGER is not None and not glm_pending:
         return
     with _CSA_PREFETCH_PENDING_LOCK:
         loader = _CSA_PREFETCH_PENDING_LOADER
@@ -2273,7 +2940,10 @@ def _maybe_lazy_attach_csa_prefetch(engine: Any) -> None:
         loader = getattr(engine, "_tutti_loader", None) if engine is not None else None
     if loader is None:
         return
-    _ensure_csa_attention_kv_prefetch_attached(loader)
+    if glm_pending:
+        _attach_glm_dsa_physical_prefetch(loader)
+    else:
+        _ensure_csa_attention_kv_prefetch_attached(loader)
 
 
 @dataclass
@@ -2774,6 +3444,7 @@ class LMCacheConnectorV1Impl:
     ) -> None:
         """Initialize connector-specific state variables."""
         _install_deepseek_decoder_registry_hook()
+        _install_glm_dsa_vllm_registry_hook()
 
         self.async_loading = config.enable_async_loading
         self.layerwise_retrievers: list[
@@ -2831,6 +3502,8 @@ class LMCacheConnectorV1Impl:
         self.current_layer = 0
         self._tutti_compute_slack_requests: set[str] = set()
         self._tutti_read_sensitive_requests: set[str] = set()
+        self._tutti_decode_write_request_id = "__lmcache_decode_forward__"
+        self._tutti_decode_write_guard_s = _tutti_decode_write_guard_s()
 
         self.force_skip_save = bool(os.environ.get("LMCACHE_FORCE_SKIP_SAVE", False))
         self._requests_priority: dict[str, int] = {}
@@ -3007,6 +3680,10 @@ class LMCacheConnectorV1Impl:
         )
         _attach_indexer_prefetch(tutti_loader=engine_tutti_loader)
         _attach_csa_attention_kv_prefetch(tutti_loader=engine_tutti_loader)
+        _attach_glm_dsa_predictive_prefetch(
+            self._vllm_config,
+            self.lmcache_engine,
+        )
         _attach_full_nsys_capture_stop_hook()
         # The Tutti loader is usually still None here (created lazily after the
         # warmup delay), so the attach above no-ops. Register a callback so the
@@ -3098,6 +3775,12 @@ class LMCacheConnectorV1Impl:
             forward_context (ForwardContext): the forward context.
             **kwargs: additional arguments for the load operation
         """
+        self._update_tutti_decode_write_state(forward_context.attn_metadata)
+        # Fail closed until _start_load_kv_impl confirms one cache-hit prefill.
+        # Decode must use the already-resident GPU KV without entering any
+        # GLM SSD miss-selection or per-layer completion gate.
+        _set_glm_dsa_prefill_forward_active(False)
+        _set_dsv4_prefetch_forward_active(False)
         self._clear_tutti_write_request_state()
         try:
             self._start_load_kv_impl(forward_context, **kwargs)
@@ -3105,6 +3788,7 @@ class LMCacheConnectorV1Impl:
             import traceback as _tb
 
             self._clear_tutti_write_request_state()
+            self._clear_tutti_decode_write_state()
             logger.error(
                 "start_load_kv unhandled exception (worker traceback):\n%s",
                 _tb.format_exc(),
@@ -3152,6 +3836,26 @@ class LMCacheConnectorV1Impl:
             return
 
         self._open_tutti_write_request_state(metadata)
+        if not _attn_metadata_has_decode_tokens(attn_metadata):
+            # _open_tutti_write_request_state established either the stricter
+            # read-sensitive gate or an explicit compute-slack state. It is
+            # now safe to release the between-forward decode-transition hold.
+            self._clear_tutti_decode_write_state()
+
+        loadable_requests = [
+            request
+            for request in metadata.requests
+            if request.load_spec is not None and request.load_spec.can_load
+        ]
+        # ``num_decode_tokens`` is a backend execution-shape hint in vLLM
+        # 0.26, not a reliable request-phase signal.  In particular, a short
+        # chunked prefill (currently the 256-token matrix row) may be routed
+        # through the decode-shaped sparse-attention kernel.  Treating that as
+        # real decode silently disables the external-KV consumers after the
+        # streaming-only path has already skipped generic retrieval.  A
+        # loadable connector request is the authoritative signal that this
+        # forward must consume externally cached KV.
+        _set_dsv4_prefetch_forward_active(bool(loadable_requests))
 
         # Attach the CSA attention-KV prefetch manager if the Tutti loader
         # became ready after register_kv_caches. Runs on the main thread before
@@ -3160,6 +3864,26 @@ class LMCacheConnectorV1Impl:
             _maybe_lazy_attach_indexer_prefetch(self.lmcache_engine)
         if _CSA_ATTENTION_KV_PREFETCH_MANAGER is None:
             _maybe_lazy_attach_csa_prefetch(self.lmcache_engine)
+
+        glm_manager = _GLM_DSA_PREDICTIVE_PREFETCH_MANAGER
+        if glm_manager is not None:
+            glm_requests = [
+                request
+                for request in metadata.requests
+                if request.load_spec is not None and request.load_spec.can_load
+            ]
+            if len(glm_requests) == 1:
+                glm_manager.begin_request(str(glm_requests[0].req_id))
+                _set_glm_dsa_prefill_forward_active(True)
+            else:
+                glm_manager.cancel_active_request()
+                if len(glm_requests) > 1:
+                    logger.warning(
+                        "GLM DSA prediction disabled for a batched load of %d "
+                        "requests; the experimental vLLM 0.20.2 adapter is "
+                        "single-request only",
+                        len(glm_requests),
+                    )
 
         full_nsys_manager = _CSA_ATTENTION_KV_PREFETCH_MANAGER
         if full_nsys_manager is not None:
@@ -3265,15 +3989,11 @@ class LMCacheConnectorV1Impl:
                             token_mask[:lmcache_cached_tokens],
                             kvcaches=kvcaches,
                             slot_mapping=slot_mapping[:lmcache_cached_tokens],
-                            vllm_cached_tokens=(
-                                request.load_spec.vllm_cached_tokens
-                            ),
+                            vllm_cached_tokens=(request.load_spec.vllm_cached_tokens),
                             request_total_tokens=request.prompt_len,
                             request_configs=request.request_configs,
                             req_id=request.req_id,
-                            terminal_chunk_hash=(
-                                request.load_spec.terminal_chunk_hash
-                            ),
+                            terminal_chunk_hash=(request.load_spec.terminal_chunk_hash),
                             **hma_kwargs,
                         )
                     )
@@ -3419,6 +4139,9 @@ class LMCacheConnectorV1Impl:
         Args:
             layer_name: the name of that layer
         """
+        if not _DSV4_PREFETCH_FORWARD_ACTIVE:
+            return
+
         # V28 HCA walker gate: HCA layers have no indexer forward to patch,
         # so this per-layer connector hook blocks until the layer-major
         # walker has landed the layer's attention-KV bytes.  No-op for CSA
@@ -3592,6 +4315,19 @@ class LMCacheConnectorV1Impl:
     def wait_for_save(self):
         """Blocking until the KV cache is saved to the connector buffer."""
 
+        # This callback runs after the model forward. Physical prediction,
+        # authoritative miss correction, and layer gates are prefill-only;
+        # the following decode forwards consume the now-resident GPU KV.
+        _set_glm_dsa_prefill_forward_active(False)
+        _set_dsv4_prefetch_forward_active(False)
+
+        # Keep new write waves parked across the prefill-to-decode boundary.
+        # Waiting for the next decode start is too late: a writer can otherwise
+        # be admitted after read sensitivity closes and remain active during
+        # the first decode steps. get_finished releases this hold for tool
+        # slack; a following prefill replaces it with its own read/compute gate.
+        self._hold_tutti_writes_between_forwards()
+
         # Forward compute has ended. Close the no-external-KV slack before any
         # save-side gather or metadata work can overlap the next demand read.
         self._clear_tutti_write_request_state()
@@ -3691,6 +4427,14 @@ class LMCacheConnectorV1Impl:
                     aligned_token_len = (
                         token_len // self._lmcache_chunk_size * self._lmcache_chunk_size
                     )
+                    # Decode usually advances by one token. Until it completes
+                    # another LMCache chunk, alignment truncates the request
+                    # back to the already-saved boundary. Do not enter the
+                    # engine store path with an all-false mask: doing so once
+                    # per decode step adds staging/bookkeeping overhead even
+                    # though no KV bytes are eligible for publication.
+                    if aligned_token_len <= skip_leading_tokens:
+                        continue
                     token_ids = token_ids[:aligned_token_len]
                     store_mask = store_mask[:aligned_token_len]
                     slot_mapping = slot_mapping[:aligned_token_len]
@@ -3716,6 +4460,7 @@ class LMCacheConnectorV1Impl:
                 request_configs=request.request_configs,
                 req_id=request.req_id,
                 is_last_prefill=is_last_prefill,
+                request_total_tokens=request.prompt_len,
                 lmcache_cached_tokens=(
                     request.load_spec.lmcache_cached_tokens
                     if request.load_spec is not None and request.load_spec.can_load
@@ -3833,6 +4578,20 @@ class LMCacheConnectorV1Impl:
     def get_finished(
         self, finished_req_ids: set[str]
     ) -> tuple[Optional[set[str]], Optional[set[str]]]:
+        if finished_req_ids:
+            self._clear_tutti_decode_write_state()
+        glm_sink = _GLM_DSA_PHYSICAL_PREFETCH_SINK
+        if glm_sink is not None:
+            for request_id in finished_req_ids:
+                if not glm_sink.finish_request(str(request_id)):
+                    raise RuntimeError(
+                        "GLM DSA physical request teardown timed out for "
+                        f"{request_id}"
+                    )
+        glm_manager = _GLM_DSA_PREDICTIVE_PREFETCH_MANAGER
+        if glm_manager is not None:
+            for request_id in finished_req_ids:
+                glm_manager.end_request(str(request_id))
         if (
             os.getenv("LMCACHE_NSYS_FULL_CAPTURE_SCOPE", "decoder").lower()
             == "connector"
@@ -4501,6 +5260,53 @@ class LMCacheConnectorV1Impl:
                 active_requests = set()
                 self._tutti_compute_slack_requests = active_requests
             active_requests.add(request_id)
+
+    def _update_tutti_decode_write_state(self, attn_metadata: Any) -> None:
+        """Refresh the write blocker for a vLLM decode forward.
+
+        vLLM exposes the exact decode-token count on attention metadata. The
+        marker uses a short expiry guard because worker connectors do not get
+        a reliable final-token callback. Explicit tool-call slack overrides
+        the marker, so queued writes drain immediately during the tool gap.
+
+        Args:
+            attn_metadata: Current vLLM attention metadata, if available.
+        """
+        if not _env_flag("LMCACHE_TUTTI_PAUSE_WRITES_DURING_DECODE"):
+            self._clear_tutti_decode_write_state()
+            return
+        engine = self.lmcache_engine
+        if engine is None:
+            return
+        is_decode = _attn_metadata_has_decode_tokens(attn_metadata)
+        if is_decode:
+            engine.set_tutti_decode_write_state(
+                self._tutti_decode_write_request_id,
+                True,
+                self._tutti_decode_write_guard_s,
+            )
+
+    def _hold_tutti_writes_between_forwards(self) -> None:
+        """Park new write waves until the next forward state is known."""
+        if not _env_flag("LMCACHE_TUTTI_PAUSE_WRITES_DURING_DECODE"):
+            return
+        engine = self.lmcache_engine
+        if engine is not None:
+            engine.set_tutti_decode_write_state(
+                self._tutti_decode_write_request_id,
+                True,
+                self._tutti_decode_write_guard_s,
+            )
+
+    def _clear_tutti_decode_write_state(self) -> None:
+        """Remove this connector's decode-phase write blocker."""
+        engine = self.lmcache_engine
+        if engine is not None:
+            engine.set_tutti_decode_write_state(
+                self._tutti_decode_write_request_id,
+                False,
+                self._tutti_decode_write_guard_s,
+            )
 
     def _clear_tutti_write_request_state(self) -> None:
         """Close all write-planning request state owned by this connector."""

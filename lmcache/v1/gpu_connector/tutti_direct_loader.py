@@ -73,6 +73,7 @@ from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey, DiskCacheMetadata
 from lmcache.v1.kv_object_store import KVObjectByteRange
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj, MemoryObjMetadata
+from lmcache.v1.storage_backend.cpu_raw_writer import CPURawBlockWriter
 from lmcache.v1.write_planner import TuttiWritePlanManager, WritePlanSnapshot
 
 # TensorMemoryObj lives here; import carefully to avoid circular deps
@@ -138,12 +139,10 @@ try:
     import lmcache.c_ops as _c_ops  # type: ignore[import]
 
     _HAS_C_OPS: bool = hasattr(_c_ops, "tutti_submit_batch_sgl_read")
-    _HAS_WRITE_C_OPS: bool = hasattr(_c_ops, "tutti_submit_batch_sgl_write")
     _HAS_HOST_PACK_C_OPS: bool = hasattr(_c_ops, "pack_pinned_host_segments")
 except ImportError:
     _c_ops = None  # type: ignore[assignment]
     _HAS_C_OPS = False
-    _HAS_WRITE_C_OPS = False
     _HAS_HOST_PACK_C_OPS = False
 
 # ── constants ────────────────────────────────────────────────────────────────
@@ -990,7 +989,8 @@ class SnvmeSession:
         self._device_path = os.path.join(ctrl_dev_dir, f"ssnvme{minor}")
         self._ensure_dev_node(ctrl_path, self._device_path, minor)
 
-        # 2. Open the per-controller device, set cap (per-dev ioctl), bind (ctrl ioctl).
+        # 2. Open the per-controller device, configure kernel IO queue cap,
+        # and bind the controller to snvme.
         self._fd_dev = os.open(self._device_path, os.O_RDWR)
         cap_buf = _struct.pack("I", kernel_ioq_cap)
         fcntl.ioctl(self._fd_dev, _NVM_SET_KERNEL_IOQ_CAP, cap_buf)
@@ -1284,7 +1284,13 @@ class TuttiDirectLoader:
         # which manifests as NVMe poll timeouts, kernel-side
         # cuda-EvtHandlr/cache_mgr_main blocking, and CUDA illegal memory
         # access (see docs/design/v1/csa_prefetch_illegal_access_bug.md).
-        self._io_lock = threading.Lock()
+        # Extent-table replacement and NVMe submit/consume must share one
+        # lock. A background raw write publishes its new extent after the
+        # WRITE completes; without this lock it can replace a demand read's
+        # request-wide synthetic-path table between preflight and submit.
+        # RLock is required because ``before_batch`` callbacks restore their
+        # table while the load path already owns this lock.
+        self._io_lock = threading.RLock()
         # High-priority (synchronous retrieve) readers currently inside
         # load_chunks_to_hbm.  Bulk prefetch batches wait until this drops
         # to zero before grabbing _io_lock for their next batch.
@@ -1320,11 +1326,18 @@ class TuttiDirectLoader:
         # reader: otherwise thousands of overdue cold-store tasks can barge
         # ahead of a new request and create multi-second hit-1 tails.
         self._last_read_end = 0.0
+        self._layer_major_pack_paused = False
         self._write_slack_s = float(
             os.environ.get("LMCACHE_TUTTI_WRITE_SLACK_SEC", "0.05")
         )
         self._write_max_delay_s = float(
             os.environ.get("LMCACHE_TUTTI_WRITE_MAX_DELAY_SEC", "2.0")
+        )
+        self._unlimited_decode_writes = (
+            os.environ.get(
+                "LMCACHE_TUTTI_UNLIMITED_WRITES_DURING_DECODE", "0"
+            ).lower()
+            in ("1", "true")
         )
         self._write_plan_manager = TuttiWritePlanManager(
             write_slack_s=self._write_slack_s,
@@ -1335,7 +1348,35 @@ class TuttiDirectLoader:
             deadline_guard_s=float(
                 os.environ.get("LMCACHE_TUTTI_WRITE_DEADLINE_GUARD_SEC", "0.01")
             ),
+            background_rate_mib_s=float(
+                os.environ.get("LMCACHE_TUTTI_BACKGROUND_WRITE_MIBPS", "0")
+            ),
+            background_burst_mib=float(
+                os.environ.get("LMCACHE_TUTTI_BACKGROUND_WRITE_BURST_MIB", "8")
+            ),
+            unlimited_decode_writes=self._unlimited_decode_writes,
+            decode_rate_mib_s=float(
+                os.environ.get("LMCACHE_TUTTI_DECODE_WRITE_MIBPS", "0")
+            ),
         )
+        self._cpu_raw_writer: Optional[CPURawBlockWriter] = None
+        self._cpu_raw_writer_lock = threading.Lock()
+        self._cpu_raw_writer_mib_s = float(
+            os.getenv("LMCACHE_DSV4_CPU_RAW_WRITE_MIBPS", "0")
+        )
+        self._cpu_raw_writer_block_bytes = (
+            int(os.getenv("LMCACHE_DSV4_CPU_RAW_WRITE_BLOCK_MB", "64")) * 1024**2
+        )
+        if self._cpu_raw_writer_mib_s < 0:
+            raise ValueError("LMCACHE_DSV4_CPU_RAW_WRITE_MIBPS must be non-negative")
+        if (
+            self._cpu_raw_writer_block_bytes <= 0
+            or self._cpu_raw_writer_block_bytes % _NVME_LBS
+        ):
+            raise ValueError(
+                "LMCACHE_DSV4_CPU_RAW_WRITE_BLOCK_MB must be a positive "
+                "LBA-aligned size"
+            )
         speculative_rate_mbps = float(
             os.environ.get("LMCACHE_TUTTI_SPECULATIVE_RATE_MBPS", "256")
         )
@@ -1370,77 +1411,6 @@ class TuttiDirectLoader:
         # Reusable GPU tensor for per-CQE status codes.
         self._status_buf = status_buf
 
-        # Raw writes used to construct three tiny CUDA tensors from Python
-        # lists for every submission batch. The first allocation on the
-        # deferred-admission thread can enter cudaMalloc and synchronize the
-        # device after a long prefill (measured at 11.8-12.1 seconds on seven
-        # TP ranks for a 480K cold store). Keep fixed queue-depth descriptor
-        # buffers instead. The single shared SQ/CQ lock also serializes access
-        # to these buffers, so one set per loader is sufficient.
-        write_descriptor_capacity = max(1, int(session.info.q_depth) - 1)
-        self._write_staging_iovas_cpu = torch.empty(
-            write_descriptor_capacity,
-            dtype=torch.int64,
-            device="cpu",
-            pin_memory=torch.cuda.is_available(),
-        )
-        self._write_slbas_cpu = torch.empty(
-            write_descriptor_capacity,
-            dtype=torch.int64,
-            device="cpu",
-            pin_memory=torch.cuda.is_available(),
-        )
-        self._write_byte_lens_cpu = torch.empty(
-            write_descriptor_capacity,
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=torch.cuda.is_available(),
-        )
-        # CPU mirrors keep the mocked, CUDA-free unit path executable. A real
-        # Tutti loader always replaces them with device buffers below.
-        self._write_staging_iovas_gpu = torch.empty(
-            write_descriptor_capacity,
-            dtype=torch.int64,
-        )
-        self._write_slbas_gpu = torch.empty(
-            write_descriptor_capacity,
-            dtype=torch.int64,
-        )
-        self._write_byte_lens_gpu = torch.empty(
-            write_descriptor_capacity,
-            dtype=torch.int32,
-        )
-        if torch.cuda.is_available():
-            assert self._io_stream is not None
-            with (
-                torch.cuda.device(cuda_device),
-                torch.cuda.stream(self._io_stream),
-            ):
-                descriptor_device = torch.device("cuda", cuda_device)
-                self._write_staging_iovas_gpu = torch.empty(
-                    write_descriptor_capacity,
-                    dtype=torch.int64,
-                    device=descriptor_device,
-                )
-                self._write_slbas_gpu = torch.empty(
-                    write_descriptor_capacity,
-                    dtype=torch.int64,
-                    device=descriptor_device,
-                )
-                self._write_byte_lens_gpu = torch.empty(
-                    write_descriptor_capacity,
-                    dtype=torch.int32,
-                    device=descriptor_device,
-                )
-                # Establish the descriptor buffers on the same private stream
-                # that submits every raw write. If they are first touched on
-                # the model default stream, their first cross-stream H2D copy
-                # can inherit the complete long-prefill tail.
-                self._write_staging_iovas_gpu.zero_()
-                self._write_slbas_gpu.zero_()
-                self._write_byte_lens_gpu.zero_()
-            self._io_stream.synchronize()
-
         # Persistent lookup used by the indexed CSA submit kernel. snvme
         # exposes one IOVA per 64-KiB GPU page; keeping the table on-device
         # avoids rebuilding a staging-IOVA list for every layer.
@@ -1469,11 +1439,29 @@ class TuttiDirectLoader:
         # would be both brittle and wasteful. A range template is independent
         # of its staging destination and can be reused by any subset that
         # touches the same object bytes.
-        self._lba_cache_versions: dict[str, int] = {path: 0 for path in self._lba_cache}
-        self._resolved_range_cache: OrderedDict[
-            tuple[str, int, int, int, int],
-            Optional[tuple[tuple[int, int, int], ...]],
+        # Multiple immutable extent tables can legitimately share one synthetic
+        # raw-pool path: demand retrieve installs its filtered table while CSA
+        # prefetch installs a request-wide table.  Retain a small identity-keyed
+        # LRU of their versions and sorted indexes so switching back to a table
+        # does not invalidate every resolved range or sort it again.
+        self._lba_table_states: OrderedDict[
+            tuple[str, int],
+            tuple[list[LbaRecord], int, list[LbaRecord], list[int]],
         ] = OrderedDict()
+        self._lba_table_state_capacity = max(
+            2,
+            int(os.environ.get("LMCACHE_TUTTI_LBA_TABLE_CACHE_CAPACITY", "64")),
+        )
+        self._next_lba_table_version = 1
+        self._lba_cache_versions: dict[str, int] = {}
+        self._resolved_range_cache: OrderedDict[
+            tuple[str, int],
+            OrderedDict[
+                tuple[int, int, int],
+                Optional[tuple[tuple[int, int, int], ...]],
+            ],
+        ] = OrderedDict()
+        self._resolved_range_cache_size = 0
         self._resolved_range_cache_capacity = max(
             1,
             int(os.environ.get("LMCACHE_TUTTI_RANGE_CACHE_CAPACITY", "131072")),
@@ -1677,9 +1665,9 @@ class TuttiDirectLoader:
     def _get_extents(self, file_path: str) -> list[LbaRecord]:
         """Look up or populate the LBA records for file_path."""
         if file_path not in self._lba_cache:
-            self._lba_cache[file_path] = FiemapHelper.query_extents(file_path)
-            self._lba_cache_versions[file_path] = (
-                self._lba_cache_versions.get(file_path, 0) + 1
+            self._activate_lba_table(
+                file_path,
+                FiemapHelper.query_extents(file_path),
             )
         return self._lba_cache[file_path]
 
@@ -1730,17 +1718,13 @@ class TuttiDirectLoader:
                 ``tutti://rank0-full`` because no filesystem file exists after
                 snvme bind.
         """
-        for path, records in records_by_path.items():
-            if records:
-                self._lba_cache[path] = list(records)
-                self._lba_cache_versions[path] = (
-                    self._lba_cache_versions.get(path, 0) + 1
-                )
-                # Build the sorted range-query index NOW, outside any read
-                # path: pool paths carry tens of thousands of extents and
-                # sorting them inside the first _load_batch (under _io_lock)
-                # stalls the whole loader.
-                self._build_extent_index(path)
+        with self._io_lock:
+            for path, records in records_by_path.items():
+                if records:
+                    # Explicit registration represents a new snapshot. Copy it
+                    # once, then retain that immutable snapshot if callers later
+                    # switch away from and back to it.
+                    self._activate_lba_table(path, list(records))
 
     def get_lba_records(self, file_path: str) -> list[LbaRecord]:
         """Return cached extents for a path without touching the filesystem.
@@ -1754,34 +1738,100 @@ class TuttiDirectLoader:
         """
         return list(self._lba_cache.get(file_path, ()))
 
-    def ensure_lba_cache(self, records_by_path: dict[str, list[LbaRecord]]) -> None:
+    def ensure_lba_cache(
+        self,
+        records_by_path: dict[str, list[LbaRecord]],
+        *,
+        records_are_sorted: bool = False,
+    ) -> None:
         """Idempotently ensure ``records_by_path`` is the active extent table.
 
-        Stores the caller's list objects by reference so a later call can
-        detect "still ours" via identity and skip the O(n log n) index
-        rebuild entirely.  Only when another path (e.g. a retrieve that
-        registered CSA-filtered extents) has overwritten an entry do we
-        restore it and re-sort. Identity short-circuiting avoids
-        rebuilding a large pool extent table for repeated staged reads.
+        Stores the first immutable snapshot and interns later snapshots with
+        identical records. Identity handles repeated callbacks in one request;
+        content interning handles newly constructed equal lists in later
+        requests. Only a genuinely changed physical table receives a new
+        version and invalidates its own resolved-range templates.
         """
-        for path, records in records_by_path.items():
-            if not records:
-                continue
-            if self._lba_cache.get(path) is records:
-                continue
-            self._lba_cache[path] = records
-            self._lba_cache_versions[path] = self._lba_cache_versions.get(path, 0) + 1
-            self._build_extent_index(path)
+        with self._io_lock:
+            for path, records in records_by_path.items():
+                if not records:
+                    continue
+                if self._lba_cache.get(path) is records:
+                    continue
+                self._activate_lba_table(
+                    path,
+                    records,
+                    records_are_sorted=records_are_sorted,
+                )
 
-    def _build_extent_index(self, file_path: str) -> None:
+    def _build_extent_index(
+        self,
+        file_path: str,
+        *,
+        records_are_sorted: bool = False,
+    ) -> None:
         """(Re)build the sorted extent index for one path."""
         extents = self._lba_cache.get(file_path)
         if not extents:
             self._extent_index.pop(file_path, None)
             return
-        ordered = sorted(extents, key=lambda record: record.file_offset)
-        starts = [record.file_offset for record in ordered]
-        self._extent_index[file_path] = (extents, ordered, starts)
+        self._activate_lba_table(
+            file_path,
+            extents,
+            records_are_sorted=records_are_sorted,
+        )
+
+    def _activate_lba_table(
+        self,
+        file_path: str,
+        records: list[LbaRecord],
+        *,
+        records_are_sorted: bool = False,
+    ) -> None:
+        """Activate one immutable extent-table snapshot and reuse its index."""
+        table_key = (file_path, id(records))
+        state = self._lba_table_states.get(table_key)
+        if state is not None and state[0] is records:
+            self._lba_table_states.move_to_end(table_key)
+            _records, version, ordered, starts = state
+        else:
+            ordered = (
+                records
+                if records_are_sorted
+                else sorted(
+                    records,
+                    key=lambda record: record.file_offset,
+                )
+            )
+            starts = [record.file_offset for record in ordered]
+            version = self._next_lba_table_version
+            self._next_lba_table_version += 1
+            self._lba_table_states[table_key] = (
+                records,
+                version,
+                ordered,
+                starts,
+            )
+            self._lba_table_states.move_to_end(table_key)
+            while len(self._lba_table_states) > self._lba_table_state_capacity:
+                _evicted_key, evicted_state = self._lba_table_states.popitem(
+                    last=False
+                )
+                self._drop_resolved_range_table(
+                    _evicted_key[0],
+                    evicted_state[1],
+                )
+
+        self._lba_cache[file_path] = records
+        self._lba_cache_versions[file_path] = version
+        self._extent_index[file_path] = (records, ordered, starts)
+
+    def _drop_resolved_range_table(self, file_path: str, version: int) -> None:
+        """Remove cached range templates owned by an evicted extent table."""
+        owner = (file_path, version)
+        bucket = self._resolved_range_cache.pop(owner, None)
+        if bucket is not None:
+            self._resolved_range_cache_size -= len(bucket)
 
     def _staging_slice(self, slot_idx: int, nbytes: int) -> torch.Tensor:
         """Return the uint8 view into staging slot slot_idx, trimmed to nbytes."""
@@ -1921,12 +1971,14 @@ class TuttiDirectLoader:
         self._get_extents(file_path)
         version = self._lba_cache_versions.get(file_path, 0)
         max_io = int(self._session.info.max_data_size)
-        cache_key = (file_path, version, file_offset, nbytes, max_io)
-        cached = self._resolved_range_cache.get(cache_key)
-        if cached is not None or cache_key in self._resolved_range_cache:
+        owner = (file_path, version)
+        cache_key = (file_offset, nbytes, max_io)
+        bucket = self._resolved_range_cache.get(owner)
+        if bucket is not None and cache_key in bucket:
             self._resolved_range_cache_hits += 1
-            self._resolved_range_cache.move_to_end(cache_key)
-            return cached
+            self._resolved_range_cache.move_to_end(owner)
+            bucket.move_to_end(cache_key)
+            return bucket[cache_key]
         self._resolved_range_cache_misses += 1
 
         resolved: list[tuple[int, int, int]] = []
@@ -1965,10 +2017,23 @@ class TuttiDirectLoader:
                 break
 
         result = tuple(resolved) if covered == nbytes else None
-        self._resolved_range_cache[cache_key] = result
-        self._resolved_range_cache.move_to_end(cache_key)
-        while len(self._resolved_range_cache) > self._resolved_range_cache_capacity:
-            self._resolved_range_cache.popitem(last=False)
+        bucket = self._resolved_range_cache.get(owner)
+        if bucket is None:
+            bucket = OrderedDict()
+            self._resolved_range_cache[owner] = bucket
+        if cache_key not in bucket:
+            self._resolved_range_cache_size += 1
+        bucket[cache_key] = result
+        bucket.move_to_end(cache_key)
+        self._resolved_range_cache.move_to_end(owner)
+        while (
+            self._resolved_range_cache_size
+            > self._resolved_range_cache_capacity
+        ):
+            _evicted_owner, evicted_bucket = self._resolved_range_cache.popitem(
+                last=False
+            )
+            self._resolved_range_cache_size -= len(evicted_bucket)
         return result
 
     def _debug_verify_direct_read(
@@ -3010,6 +3075,38 @@ class TuttiDirectLoader:
                 self._reader_gate.notify_all()
             return removed
 
+    def configure_background_write_limit(
+        self,
+        rate_mib_s: float,
+        burst_mib: float,
+    ) -> WritePlanSnapshot:
+        """Update the non-tool write limit and wake parked writers.
+
+        Args:
+            rate_mib_s: Long-run per-rank rate. Zero disables limiting.
+            burst_mib: Maximum per-rank background burst.
+
+        Returns:
+            Planner state immediately after reconfiguration.
+
+        Raises:
+            ValueError: If the rate or burst is invalid.
+        """
+        with self._reader_gate:
+            self._write_plan_manager.configure_background_limit(
+                rate_mib_s,
+                burst_mib,
+            )
+            self._reader_gate.notify_all()
+            return self._write_plan_manager.snapshot()
+
+    def configure_decode_write_limit(self, rate_mib_s: float) -> WritePlanSnapshot:
+        """Update the decode-phase rate and wake parked writers."""
+        with self._reader_gate:
+            self._write_plan_manager.configure_decode_limit(rate_mib_s)
+            self._reader_gate.notify_all()
+            return self._write_plan_manager.snapshot()
+
     def set_compute_write_slack(self, request_id: str, active: bool) -> None:
         """Mark compute that performs no external KV read as write slack.
 
@@ -3037,6 +3134,51 @@ class TuttiDirectLoader:
                 self._last_read_end = time.perf_counter()
             if changed:
                 self._reader_gate.notify_all()
+
+    def set_decode_write_state(
+        self,
+        request_id: str,
+        active: bool,
+        guard_s: float,
+    ) -> None:
+        """Pause writes during decode while allowing explicit tool slack.
+
+        Args:
+            request_id: Serving request identifier.
+            active: Whether the request is currently decoding.
+            guard_s: Expiry guard refreshed by each decode step.
+        """
+        with self._reader_gate:
+            changed = self._write_plan_manager.set_decode_active(
+                request_id,
+                active,
+                guard_s,
+            )
+            if changed and not active:
+                self._last_read_end = time.perf_counter()
+            self._reader_gate.notify_all()
+            if not active:
+                return
+
+            # A wave admitted near the end of a tool gap cannot be cancelled
+            # after reaching the device. Hold the first decode forward until
+            # that bounded wave finishes; subsequent decode steps normally
+            # observe zero active waves and do not wait.
+            if self._unlimited_decode_writes:
+                return
+            deadline_s = time.perf_counter() + guard_s
+            while self._write_plan_manager.snapshot().active_waves > 0:
+                remaining_s = deadline_s - time.perf_counter()
+                if remaining_s <= 0:
+                    logger.warning(
+                        "Timed out draining active Tutti writes before decode "
+                        "request=%s active_waves=%d guard_s=%.3f",
+                        request_id,
+                        self._write_plan_manager.snapshot().active_waves,
+                        guard_s,
+                    )
+                    break
+                self._reader_gate.wait(timeout=min(0.01, remaining_s))
 
     def get_write_plan_snapshot(self) -> WritePlanSnapshot:
         """Return current write-planner state for observability.
@@ -3143,6 +3285,35 @@ class TuttiDirectLoader:
                     timeout=max(0.001, min(0.05, decision.retry_after_s))
                 )
 
+    def wait_for_layer_major_pack_slot(self) -> None:
+        """Wait until Python layer-major packing cannot contend with decode.
+
+        Physical CPU-to-SSD writes have their own admission policy and may be
+        explicitly allowed during decode. Layer-major pack preparation is a
+        separate CPU/Python stage, so it always yields while any decode marker
+        is active.
+        """
+        with self._reader_gate:
+            while self._layer_major_pack_paused:
+                self._reader_gate.wait(timeout=0.05)
+
+    def set_layer_major_pack_paused(self, paused: bool) -> None:
+        """Pause or resume CPU layer-major sidecar preparation.
+
+        Args:
+            paused: Whether new bounded pack waves must remain parked.
+
+        Notes:
+            Unlike the physical-write decode marker, this state has no expiry.
+            The adapter owns the exact forward boundary and must explicitly
+            resume packing after decode or on a known non-decode window.
+        """
+        with self._reader_gate:
+            changed = self._layer_major_pack_paused != paused
+            self._layer_major_pack_paused = paused
+            if changed and not paused:
+                self._reader_gate.notify_all()
+
     def start_background_write(self) -> None:
         """Record one admitted CPU raw-write wave becoming active."""
         self._write_plan_manager.wave_started()
@@ -3242,377 +3413,136 @@ class TuttiDirectLoader:
         base_file_offset: int,
         logical_nbytes: Optional[int] = None,
     ) -> list[LbaRecord]:
-        """Store one KV object through Tutti into known raw LBA extents.
+        """Store CPU-resident bytes into raw NVMe extents through the CPU.
+
+        GPU-direct access is intentionally read-only. Cold-store and indexer
+        writes use the rank-local snvme block device with ``O_DIRECT`` so a
+        background write cannot launch GPU staging copies or polling kernels
+        while the model is decoding.
 
         Args:
             payload: Source bytes to persist.
-            raw_extents: Physical destination extents covering the object's
-                logical byte range.
-            base_file_offset: Logical byte offset corresponding to
-                ``payload[0]``.
-            logical_nbytes: Optional logical reservation size.  Bytes after the
-                payload are zero padded before WRITE.
+            raw_extents: Physical destination extents covering the object.
+            base_file_offset: Logical offset corresponding to ``payload[0]``.
+            logical_nbytes: Optional aligned reservation size.
 
         Returns:
-            The normalized raw extents that cover this object.
+            Normalized raw extents covering the persisted object.
 
         Raises:
-            RuntimeError: If WRITE support is unavailable, extents do not cover
-                the object, or NVMe reports an error.
-            ValueError: If arguments are invalid.
+            RuntimeError: If the CPU writer cannot be initialized or a write
+                fails. The method never falls back to a GPU write.
+            ValueError: If the payload or extent geometry is invalid.
         """
-        if not _HAS_WRITE_C_OPS:
-            raise RuntimeError(
-                "lmcache.c_ops.tutti_submit_batch_sgl_write not found; "
-                "rebuild lmcache with csrc/tutti_kv_ops.cu"
-            )
         if base_file_offset < 0:
             raise ValueError("base_file_offset must be non-negative")
         if not raw_extents:
             raise ValueError("raw_extents must be non-empty")
-
         payload_view = memoryview(payload).cast("B")
-        payload_nbytes = len(payload_view)
-        if payload_nbytes <= 0:
+        if not payload_view:
             raise ValueError("payload must be non-empty")
         if logical_nbytes is None:
-            logical_nbytes = payload_nbytes
-        if logical_nbytes < payload_nbytes:
+            logical_nbytes = len(payload_view)
+        if logical_nbytes < len(payload_view):
             raise ValueError("logical_nbytes cannot be smaller than payload")
 
-        dma_nbytes = _align_up(logical_nbytes, _NVME_LBS)
-        aligned_nbytes = _align_up(dma_nbytes, _GPU_PAGE_SIZE)
-        if aligned_nbytes > self._staging_capacity_bytes():
-            raise RuntimeError(
-                f"Tutti raw store needs {aligned_nbytes} bytes of staging, "
-                f"but only {self._staging_capacity_bytes()} bytes are available"
-            )
-
-        self._write_plan_manager.wave_queued(dma_nbytes)
-
-        profile_start = time.perf_counter()
-        # Same single SQ/CQ ring and staging pool as the read path: a raw
-        # store racing a concurrent load corrupts both. Serialise on _io_lock
-        # from the staging copy through the last poll/status batch.
-        # Slack-only scheduling (Tutti design): writes wait for an idle
-        # window -- no reader waiting AND no read finished within
-        # _write_slack_s.  During an active request, prefetch reads arrive
-        # every few ms, so the queue never looks idle and writes park until
-        # the inter-request gap, where they drain at full bandwidth.
-        # _write_max_delay_s may bypass only the idle-slack requirement; an
-        # announced reader always keeps priority over overdue writes.
-        park_start = time.perf_counter()
-        with self._reader_gate:
-            self._writers_waiting += 1
-            self._reader_gate.notify_all()
-        writer_active = False
-        device_start = 0.0
-        write_succeeded = False
+        writer = self._ensure_cpu_raw_writer()
+        wave_nbytes = _align_up(int(logical_nbytes), _NVME_LBS)
+        self.queue_background_write(wave_nbytes)
+        self.start_background_write()
+        started_s = time.perf_counter()
         try:
-            while True:
-                with self._reader_gate:
-                    now = time.perf_counter()
-                    decision = self._write_plan_manager.decide(
-                        now_s=now,
-                        readers_waiting=self._readers_waiting,
-                        demand_readers_waiting=self._hp_readers,
-                        last_read_end_s=self._last_read_end,
-                        writer_wait_started_s=park_start,
-                        wave_nbytes=dma_nbytes,
-                    )
-                    if decision.admitted:
-                        break
-                    self._reader_gate.wait(timeout=decision.retry_after_s)
-            with self._reader_gate:
-                self._active_writers += 1
-                writer_active = True
-                self._reader_gate.notify_all()
-            self._write_plan_manager.wave_started()
-            gate_wait_ms = _elapsed_ms(park_start)
-            lock_wait_start = time.perf_counter()
-            with self._io_lock:
-                lock_wait_ms = _elapsed_ms(lock_wait_start)
-                device_start = time.perf_counter()
-                result = self._store_bytes_to_raw_extents_locked(
-                    payload_view=payload_view,
-                    payload_nbytes=payload_nbytes,
-                    dma_nbytes=dma_nbytes,
-                    aligned_nbytes=aligned_nbytes,
-                    raw_extents=raw_extents,
-                    base_file_offset=base_file_offset,
-                    profile_start=profile_start,
-                    gate_wait_ms=gate_wait_ms,
-                    lock_wait_ms=lock_wait_ms,
-                )
-                write_succeeded = True
-                return result
-        finally:
-            duration_s = (
-                time.perf_counter() - device_start if device_start > 0 else 0.0
+            normalized, _write_ms = writer.write(
+                payload_view,
+                raw_extents=[
+                    (extent.file_offset, extent.slba, extent.n_sectors)
+                    for extent in raw_extents
+                ],
+                base_file_offset=base_file_offset,
+                logical_nbytes=wave_nbytes,
             )
-            self._write_plan_manager.wave_finished(
-                dma_nbytes,
-                duration_s,
-                write_succeeded,
+        except Exception:
+            self.finish_background_write(
+                wave_nbytes,
+                time.perf_counter() - started_s,
+                False,
             )
-            with self._reader_gate:
-                if writer_active:
-                    self._active_writers -= 1
-                self._writers_waiting -= 1
-                self._reader_gate.notify_all()
+            with self._cpu_raw_writer_lock:
+                if self._cpu_raw_writer is writer:
+                    self._cpu_raw_writer = None
+            try:
+                writer.close()
+            except Exception:
+                logger.exception("Failed to close broken CPU raw writer")
+            raise
+        self.finish_background_write(
+            wave_nbytes,
+            time.perf_counter() - started_s,
+            True,
+        )
+        return [
+            LbaRecord(
+                file_offset=file_offset,
+                slba=slba,
+                n_sectors=n_sectors,
+            )
+            for file_offset, slba, n_sectors in normalized
+        ]
 
-    def _store_bytes_to_raw_extents_locked(
+    def _ensure_cpu_raw_writer(self) -> CPURawBlockWriter:
+        """Return the rank-local CPU writer, creating it exactly once."""
+        with self._cpu_raw_writer_lock:
+            if self._cpu_raw_writer is None:
+                self._cpu_raw_writer = CPURawBlockWriter(
+                    self.kernel_block_device_path(),
+                    target_mib_s=self._cpu_raw_writer_mib_s,
+                    block_bytes=self._cpu_raw_writer_block_bytes,
+                    wait_for_admission=self.wait_for_background_write_slot,
+                )
+                logger.info(
+                    "CPU raw writer initialised: device=%s qd=1 "
+                    "block_mib=%.1f target_mib_s=%.1f",
+                    self._cpu_raw_writer.device_path,
+                    self._cpu_raw_writer.block_bytes / 1024**2,
+                    self._cpu_raw_writer.target_mib_s,
+                )
+            return self._cpu_raw_writer
+
+    def initialize_cpu_raw_writer(
         self,
         *,
-        payload_view: memoryview,
-        payload_nbytes: int,
-        dma_nbytes: int,
-        aligned_nbytes: int,
-        raw_extents: list[LbaRecord],
-        base_file_offset: int,
-        profile_start: float,
-        gate_wait_ms: float = 0.0,
-        lock_wait_ms: float = 0.0,
-    ) -> list[LbaRecord]:
-        """Body of :meth:`store_bytes_to_raw_extents`; caller holds _io_lock."""
-        profile_enabled = _tutti_profile_enabled()
-        io_stream = self._io_stream
-        with torch.cuda.device(self._cuda_device):
-            copy_start = time.perf_counter()
-            staging = self._staging_slice_at(0, aligned_nbytes)
-            copy_stream = io_stream or torch.cuda.current_stream()
-            # Cold admission runs on a Python worker after the request that
-            # produced ``payload_view`` has finished.  Issuing this H2D copy
-            # on the device default stream makes it wait behind the *next*
-            # request's forward kernels, while the worker holds ``_io_lock``.
-            # Different TP ranks then stop at different points and the model
-            # collective can hang.  Keep the complete write transaction on
-            # the loader's dedicated stream and synchronize only that stream.
-            with torch.cuda.stream(copy_stream):
-                # The source overwrites every payload byte. Only the sector
-                # padding that NVMe will actually write needs initialization;
-                # zeroing the whole GPU-page-aligned wave adds a redundant HBM
-                # pass and another kernel to every background transaction.
-                if payload_nbytes < dma_nbytes:
-                    staging[payload_nbytes:dma_nbytes].zero_()
-                cpu_tensor = torch.frombuffer(payload_view, dtype=torch.uint8)
-                staging[:payload_nbytes].copy_(cpu_tensor, non_blocking=True)
-            copy_stream.synchronize()
-            h2d_ms = _elapsed_ms(copy_start)
+        target_mib_s: float = 0.0,
+        block_bytes: int = 64 * 1024**2,
+    ) -> None:
+        """Initialize the mandatory CPU-to-SSD writer.
 
-        max_io = self._session.info.max_data_size
-        q_depth = self._q_depth()
-        usable_queue_depth = q_depth - 1
-        if usable_queue_depth <= 0:
-            raise RuntimeError("Tutti NVMe queue must have at least two slots")
-        object_end = base_file_offset + dma_nbytes
-        normalized_extents: list[LbaRecord] = []
-        io_specs: list[tuple[int, int, int]] = []
-        covered_nbytes = 0
-        for extent in sorted(raw_extents, key=lambda item: item.file_offset):
-            extent_start = extent.file_offset
-            extent_end = extent.file_offset + extent.n_sectors * _NVME_LBS
-            write_start = max(base_file_offset, extent_start)
-            write_end = min(object_end, extent_end)
-            if write_start >= write_end:
-                continue
-            write_nbytes = write_end - write_start
-            if write_nbytes % _NVME_LBS != 0:
-                raise ValueError("raw extent write size must be 512-byte aligned")
-            object_skip = write_start - base_file_offset
-            extent_skip = write_start - extent_start
-            normalized_extents.append(
-                LbaRecord(
-                    slba=extent.slba + extent_skip // _NVME_LBS,
-                    n_sectors=write_nbytes // _NVME_LBS,
-                    file_offset=write_start,
-                )
-            )
-            cursor = 0
-            while cursor < write_nbytes:
-                io_nbytes = write_nbytes - cursor
-                if max_io > 0:
-                    io_nbytes = min(io_nbytes, max_io)
-                io_nbytes = (io_nbytes // _NVME_LBS) * _NVME_LBS
-                if io_nbytes <= 0:
-                    raise ValueError("Tutti raw store tail is smaller than one LBA")
-                io_specs.append(
-                    (
-                        object_skip + cursor,
-                        extent.slba + (extent_skip + cursor) // _NVME_LBS,
-                        io_nbytes,
+        Args:
+            target_mib_s: Optional physical-writer cap. Zero leaves phase-aware
+                throttling entirely to the write planner.
+            block_bytes: Maximum non-preemptible ``O_DIRECT`` write quantum.
+
+        Raises:
+            ValueError: If the rate or block size is invalid.
+            RuntimeError: If the rank-local snvme block device is unavailable.
+        """
+        if target_mib_s < 0:
+            raise ValueError("target_mib_s must be non-negative")
+        if block_bytes <= 0 or block_bytes % _NVME_LBS:
+            raise ValueError("block_bytes must be a positive LBA multiple")
+        with self._cpu_raw_writer_lock:
+            if self._cpu_raw_writer is not None:
+                if (
+                    self._cpu_raw_writer_mib_s != target_mib_s
+                    or self._cpu_raw_writer_block_bytes != block_bytes
+                ):
+                    raise RuntimeError(
+                        "CPU raw writer is already initialized with different "
+                        "settings"
                     )
-                )
-                cursor += io_nbytes
-            covered_nbytes += write_nbytes
-        if covered_nbytes != dma_nbytes:
-            raise RuntimeError(
-                f"Tutti raw extents cover {covered_nbytes}/{dma_nbytes} bytes"
-            )
-
-        cursor = 0
-        n_ios = 0
-        submit_ms = 0.0
-        poll_sync_ms = 0.0
-        status_ms = 0.0
-        arg_ms = 0.0
-        arg_cpu_ms = 0.0
-        arg_h2d_ms = 0.0
-        while cursor < len(io_specs):
-            batch_iovas: list[int] = []
-            batch_slbas: list[int] = []
-            batch_lens: list[int] = []
-            batch_paths: list[str] = []
-            while cursor < len(io_specs) and len(batch_iovas) < usable_queue_depth:
-                staging_offset, slba, io_nbytes = io_specs[cursor]
-                batch_iovas.append(self._staging_iova_at(staging_offset))
-                batch_slbas.append(slba)
-                batch_lens.append(io_nbytes)
-                batch_paths.append(f"raw://slba/{slba}")
-                cursor += 1
-
-            batch_n_ios = len(batch_iovas)
-            if batch_n_ios > self._write_staging_iovas_cpu.numel():
-                raise RuntimeError("Tutti raw write exceeds descriptor capacity")
-            arg_start = time.perf_counter()
-            cpu_arg_start = time.perf_counter()
-            self._write_staging_iovas_cpu[:batch_n_ios].copy_(
-                torch.tensor(batch_iovas, dtype=torch.int64),
-            )
-            self._write_slbas_cpu[:batch_n_ios].copy_(
-                torch.tensor(batch_slbas, dtype=torch.int64),
-            )
-            self._write_byte_lens_cpu[:batch_n_ios].copy_(
-                torch.tensor(batch_lens, dtype=torch.int32),
-            )
-            arg_cpu_ms += _elapsed_ms(cpu_arg_start)
-            copy_stream = io_stream or torch.cuda.current_stream()
-            arg_h2d_start = time.perf_counter()
-            staging_iovas_t = self._write_staging_iovas_gpu[:batch_n_ios]
-            slbas_t = self._write_slbas_gpu[:batch_n_ios]
-            byte_lens_t = self._write_byte_lens_gpu[:batch_n_ios]
-            descriptor_pairs = (
-                (staging_iovas_t, self._write_staging_iovas_cpu),
-                (slbas_t, self._write_slbas_cpu),
-                (byte_lens_t, self._write_byte_lens_cpu),
-            )
-            if io_stream is not None:
-                # The tensors are persistent, so direct runtime copies are
-                # safe without allocator lifetime tracking.  Supplying the
-                # stream pointer also avoids changing PyTorch's current-stream
-                # state on this background thread.
-                for gpu_descriptors, cpu_descriptors in descriptor_pairs:
-                    _cuda_memcpy_async_h2d(
-                        gpu_descriptors.data_ptr(),
-                        cpu_descriptors.data_ptr(),
-                        gpu_descriptors.nbytes,
-                        io_stream.cuda_stream,
-                    )
-            else:
-                with torch.cuda.stream(copy_stream):
-                    for gpu_descriptors, cpu_descriptors in descriptor_pairs:
-                        gpu_descriptors.copy_(
-                            cpu_descriptors[:batch_n_ios],
-                            non_blocking=True,
-                        )
-            arg_h2d_ms += _elapsed_ms(arg_h2d_start)
-            batch_arg_ms = _elapsed_ms(arg_start)
-            arg_ms += batch_arg_ms
-
-            q = self._session.queue
-            sq_dev_ptr = q.sq_tensor.data_ptr()
-            cq_dev_ptr = q.cq_tensor.data_ptr()
-            sq_db_ptr = self._session.db_gpu_ptr(q.sq_db_offset)
-            cq_db_ptr = self._session.db_gpu_ptr(q.cq_db_offset)
-
-            # Same dedicated-stream rationale as the read path: keep the
-            # spinning poll kernel off the shared default stream so raw
-            # stores cannot serialise against forward/NCCL kernels.
-            io_stream_ptr = io_stream.cuda_stream if io_stream is not None else 0
-            with torch.cuda.device(self._cuda_device):
-                submit_start = time.perf_counter()
-                _c_ops.tutti_submit_batch_sgl_write(
-                    sq_dev_ptr=sq_dev_ptr,
-                    cq_dev_ptr=cq_dev_ptr,
-                    sq_db_ptr=sq_db_ptr,
-                    cq_db_ptr=cq_db_ptr,
-                    sq_tail_ptr=self._sq_tail_ptr,
-                    q_depth=q_depth,
-                    qid=q.qid,
-                    nsid=self._session.nsid,
-                    staging_iovas=staging_iovas_t,
-                    slbas=slbas_t,
-                    byte_lens=byte_lens_t,
-                    stream_ptr=io_stream_ptr,
-                )
-                submit_ms += _elapsed_ms(submit_start)
-
-                poll_start = time.perf_counter()
-                _c_ops.tutti_poll_batch(
-                    sq_dev_ptr=sq_dev_ptr,
-                    cq_dev_ptr=cq_dev_ptr,
-                    sq_db_ptr=sq_db_ptr,
-                    cq_db_ptr=cq_db_ptr,
-                    cq_head_ptr=self._cq_head_ptr,
-                    cq_phase_ptr=self._cq_phase_ptr,
-                    q_depth=q_depth,
-                    n_ios=len(batch_iovas),
-                    status_out=self._status_buf,
-                    timed_out_ptr=self._timed_out_ptr,
-                    max_iters=self.POLL_MAX_ITERS,
-                    stream_ptr=io_stream_ptr,
-                )
-                status_has_error = self._enqueue_nvme_status_reduction(
-                    len(batch_iovas),
-                    io_stream,
-                )
-                if io_stream is not None:
-                    io_stream.synchronize()
-                else:
-                    torch.cuda.synchronize(device=self._cuda_device)
-                poll_sync_ms += _elapsed_ms(poll_start)
-
-            status_start = time.perf_counter()
-            self._check_nvme_status(
-                op_name="WRITE",
-                n_ios=len(batch_iovas),
-                paths=batch_paths,
-                gpu_has_error=status_has_error,
-            )
-            status_ms += _elapsed_ms(status_start)
-            n_ios += len(batch_iovas)
-            if profile_enabled:
-                logger.debug(
-                    "TUTTI_PROFILE store_raw_batch ios=%d bytes_mb=%.3f "
-                    "arg_ms=%.3f",
-                    len(batch_iovas),
-                    sum(batch_lens) / 1024**2,
-                    batch_arg_ms,
-                )
-
-        if profile_enabled:
-            logger.info(
-                "TUTTI_PROFILE store_raw bytes=%d dma_bytes=%d extents=%d ios=%d "
-                "gate_wait_ms=%.3f lock_wait_ms=%.3f h2d_ms=%.3f "
-                "arg_ms=%.3f arg_cpu_ms=%.3f arg_h2d_ms=%.3f "
-                "submit_launch_ms=%.3f poll_sync_ms=%.3f "
-                "status_ms=%.3f total_ms=%.3f",
-                payload_nbytes,
-                dma_nbytes,
-                len(normalized_extents),
-                n_ios,
-                gate_wait_ms,
-                lock_wait_ms,
-                h2d_ms,
-                arg_ms,
-                arg_cpu_ms,
-                arg_h2d_ms,
-                submit_ms,
-                poll_sync_ms,
-                status_ms,
-                _elapsed_ms(profile_start),
-            )
-        return normalized_extents
+                return
+            self._cpu_raw_writer_mib_s = float(target_mib_s)
+            self._cpu_raw_writer_block_bytes = int(block_bytes)
+        self._ensure_cpu_raw_writer()
 
     def _load_batch(
         self,
@@ -4135,6 +4065,11 @@ class TuttiDirectLoader:
 
     def close(self) -> None:
         """Release all GPU and NVMe resources."""
+        with self._cpu_raw_writer_lock:
+            cpu_raw_writer = self._cpu_raw_writer
+            self._cpu_raw_writer = None
+        if cpu_raw_writer is not None:
+            cpu_raw_writer.close()
         self._session.close()
         _cuda_free(self._sq_tail_ptr)
         self._sq_tail_ptr = 0
@@ -4145,12 +4080,6 @@ class TuttiDirectLoader:
         _cuda_free(self._timed_out_ptr)
         self._timed_out_ptr = 0
         self._status_buf = torch.empty(0, dtype=torch.int32)
-        self._write_staging_iovas_cpu = torch.empty(0, dtype=torch.int64)
-        self._write_slbas_cpu = torch.empty(0, dtype=torch.int64)
-        self._write_byte_lens_cpu = torch.empty(0, dtype=torch.int32)
-        self._write_staging_iovas_gpu = torch.empty(0, dtype=torch.int64)
-        self._write_slbas_gpu = torch.empty(0, dtype=torch.int64)
-        self._write_byte_lens_gpu = torch.empty(0, dtype=torch.int32)
         self._staging = torch.empty(0, dtype=torch.uint8)
         _cuda_free(self._staging_raw_ptr)
         self._staging_raw_ptr = 0

@@ -298,6 +298,41 @@ __global__ void scatter_rows_from_object_ptrs_kernel(
   destination_row_ptr[scalar_in_row] = source_row[scalar_in_row];
 }
 
+__global__ void pack_pinned_host_segments_kernel(
+    const int64_t* __restrict__ source_ptrs,
+    const int64_t* __restrict__ source_indices,
+    const int64_t* __restrict__ source_offsets,
+    const int64_t* __restrict__ destination_offsets,
+    const int64_t* __restrict__ lengths, uint8_t* __restrict__ destination) {
+  const int64_t segment_idx = blockIdx.x;
+  const int64_t length = lengths[segment_idx];
+  const auto* source = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(
+                           source_ptrs[source_indices[segment_idx]])) +
+                       source_offsets[segment_idx];
+  auto* target = destination + destination_offsets[segment_idx];
+
+  const uintptr_t alignment =
+      reinterpret_cast<uintptr_t>(source) | reinterpret_cast<uintptr_t>(target);
+  if ((alignment & (alignof(uint4) - 1)) == 0) {
+    const int64_t vector_count = length / static_cast<int64_t>(sizeof(uint4));
+    const auto* vector_source = reinterpret_cast<const uint4*>(source);
+    auto* vector_target = reinterpret_cast<uint4*>(target);
+    for (int64_t idx = threadIdx.x; idx < vector_count; idx += blockDim.x) {
+      st_cs(vector_target + idx, ld_cs(vector_source + idx));
+    }
+    const int64_t vector_bytes = vector_count * sizeof(uint4);
+    for (int64_t idx = vector_bytes + threadIdx.x; idx < length;
+         idx += blockDim.x) {
+      target[idx] = source[idx];
+    }
+    return;
+  }
+
+  for (int64_t idx = threadIdx.x; idx < length; idx += blockDim.x) {
+    target[idx] = source[idx];
+  }
+}
+
 #define LAUNCH_KERNEL(DIRECTION, FORMAT)                                 \
   multi_layer_block_transfer_kernel<ScalarType, DIRECTION, FORMAT>       \
       <<<grid, block, 0, stream>>>(lmcache_obj4, paged_buffer_ptrs,      \
@@ -559,6 +594,122 @@ void multi_layer_block_kv_transfer_batched(
   }
 }
 
+void enqueue_layerwise_h2d_scatter(
+    std::vector<torch::Tensor> paged_buffer_ptrs_tensors,
+    std::vector<torch::Tensor> host_sources,
+    std::vector<torch::Tensor> staging_destinations,
+    std::vector<torch::Tensor> block_ids_by_kernel_group,
+    const torch::Device& device,
+    std::vector<PageBufferShapeDesc> shape_descs,
+    std::vector<int64_t> lmcache_chunk_sizes,
+    std::vector<int64_t> gpu_kv_formats,
+    std::vector<int64_t> skip_prefix_n_blocks,
+    std::vector<int64_t> block_id_group_indices,
+    std::vector<int64_t> block_id_starts,
+    std::vector<int64_t> block_id_ends,
+    std::vector<int64_t> event_ptrs,
+    std::vector<int64_t> event_boundaries) {
+  const size_t transfer_count = host_sources.size();
+  const auto require_transfer_count = [transfer_count](size_t actual,
+                                                       const char* name) {
+    TORCH_CHECK(actual == transfer_count, name, " length (", actual,
+                ") must equal transfer count (", transfer_count, ")");
+  };
+  require_transfer_count(paged_buffer_ptrs_tensors.size(),
+                         "paged_buffer_ptrs_tensors");
+  require_transfer_count(staging_destinations.size(),
+                         "staging_destinations");
+  require_transfer_count(shape_descs.size(), "shape_descs");
+  require_transfer_count(lmcache_chunk_sizes.size(), "lmcache_chunk_sizes");
+  require_transfer_count(gpu_kv_formats.size(), "gpu_kv_formats");
+  require_transfer_count(skip_prefix_n_blocks.size(),
+                         "skip_prefix_n_blocks");
+  require_transfer_count(block_id_group_indices.size(),
+                         "block_id_group_indices");
+  require_transfer_count(block_id_starts.size(), "block_id_starts");
+  require_transfer_count(block_id_ends.size(), "block_id_ends");
+  TORCH_CHECK(event_ptrs.size() == event_boundaries.size(),
+              "event_ptrs and event_boundaries lengths must match");
+  TORCH_CHECK(!event_ptrs.empty(), "at least one layer event is required");
+
+  int64_t previous_boundary = 0;
+  for (size_t idx = 0; idx < event_boundaries.size(); ++idx) {
+    const int64_t boundary = event_boundaries[idx];
+    TORCH_CHECK(boundary >= previous_boundary &&
+                    boundary <= static_cast<int64_t>(transfer_count),
+                "invalid event boundary at index ", idx, ": ", boundary);
+    TORCH_CHECK(event_ptrs[idx] != 0, "uninitialized CUDA event at index ", idx);
+    previous_boundary = boundary;
+  }
+  TORCH_CHECK(previous_boundary == static_cast<int64_t>(transfer_count),
+              "final event boundary must equal transfer count");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  size_t event_index = 0;
+  auto record_ready_events = [&](int64_t completed_transfers) {
+    while (event_index < event_boundaries.size() &&
+           event_boundaries[event_index] == completed_transfers) {
+      const auto event = reinterpret_cast<cudaEvent_t>(
+          static_cast<uintptr_t>(event_ptrs[event_index]));
+      const cudaError_t status = cudaEventRecord(event, stream);
+      TORCH_CHECK(status == cudaSuccess, "cudaEventRecord failed for layer ",
+                  event_index, ": ", cudaGetErrorString(status));
+      ++event_index;
+    }
+  };
+  record_ready_events(0);
+
+  for (size_t idx = 0; idx < transfer_count; ++idx) {
+    const torch::Tensor& source = host_sources[idx];
+    const torch::Tensor& destination = staging_destinations[idx];
+    TORCH_CHECK(source.device().is_cpu(), "host source ", idx,
+                " must be on CPU");
+    TORCH_CHECK(source.is_pinned(), "host source ", idx,
+                " must be pinned");
+    TORCH_CHECK(destination.is_cuda(), "staging destination ", idx,
+                " must be on CUDA");
+    TORCH_CHECK(destination.device() == device, "staging destination ", idx,
+                " is on the wrong CUDA device");
+    TORCH_CHECK(source.scalar_type() == destination.scalar_type(),
+                "source/destination dtype mismatch at transfer ", idx);
+    TORCH_CHECK(source.sizes() == destination.sizes(),
+                "source/destination shape mismatch at transfer ", idx);
+
+    const int64_t group_index = block_id_group_indices[idx];
+    TORCH_CHECK(group_index >= 0 &&
+                    group_index <
+                        static_cast<int64_t>(block_ids_by_kernel_group.size()),
+                "block-ID group index out of range at transfer ", idx);
+    const torch::Tensor& group_block_ids =
+        block_ids_by_kernel_group[group_index];
+    TORCH_CHECK(group_block_ids.is_cuda() &&
+                    group_block_ids.scalar_type() == torch::kInt64 &&
+                    group_block_ids.is_contiguous(),
+                "block-ID group ", group_index,
+                " must be a contiguous CUDA int64 tensor");
+    TORCH_CHECK(block_id_starts[idx] >= 0 &&
+                    block_id_starts[idx] <= block_id_ends[idx] &&
+                    block_id_ends[idx] <= group_block_ids.numel(),
+                "block-ID slice is out of range at transfer ", idx);
+
+    destination.copy_(source, true);
+    const torch::Tensor block_ids = group_block_ids.slice(
+        0, block_id_starts[idx], block_id_ends[idx]);
+    multi_layer_block_kv_transfer(
+        paged_buffer_ptrs_tensors[idx],
+        {static_cast<int64_t>(
+            reinterpret_cast<uintptr_t>(destination.data_ptr()))},
+        block_ids, device, TransferDirection::H2D, shape_descs[idx],
+        static_cast<int>(lmcache_chunk_sizes[idx]),
+        static_cast<GPUKVFormat>(gpu_kv_formats[idx]),
+        static_cast<int>(skip_prefix_n_blocks[idx]));
+    record_ready_events(static_cast<int64_t>(idx + 1));
+  }
+  TORCH_CHECK(event_index == event_ptrs.size(),
+              "not all layer events were recorded");
+}
+
 void scatter_rows_from_object_ptrs(const torch::Tensor& source_ptrs,
                                    const torch::Tensor& destination,
                                    const torch::Tensor& destination_rows,
@@ -652,6 +803,87 @@ void scatter_rows_from_object_ptrs(const torch::Tensor& source_ptrs,
             destination.stride(0), destination_stride1,
             logical_slots_per_block);
   }
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void pack_pinned_host_segments(std::vector<int64_t> source_host_ptrs,
+                               std::vector<int64_t> source_indices,
+                               std::vector<int64_t> source_offsets,
+                               std::vector<int64_t> destination_offsets,
+                               std::vector<int64_t> lengths,
+                               const torch::Tensor& destination,
+                               const torch::Device& device) {
+  const size_t segment_count = source_indices.size();
+  TORCH_CHECK(segment_count > 0, "at least one segment is required");
+  TORCH_CHECK(source_offsets.size() == segment_count &&
+                  destination_offsets.size() == segment_count &&
+                  lengths.size() == segment_count,
+              "segment descriptor lengths must match");
+  TORCH_CHECK(!source_host_ptrs.empty(), "source_host_ptrs must not be empty");
+  TORCH_CHECK(destination.device().is_cpu(), "destination must be on CPU");
+  TORCH_CHECK(destination.scalar_type() == torch::kUInt8,
+              "destination must be uint8");
+  TORCH_CHECK(destination.is_contiguous(), "destination must be contiguous");
+  TORCH_CHECK(destination.is_pinned(), "destination must be pinned");
+  TORCH_CHECK(segment_count <= static_cast<size_t>(2147483647),
+              "too many segments for one CUDA launch");
+
+  for (size_t idx = 0; idx < segment_count; ++idx) {
+    TORCH_CHECK(
+        source_indices[idx] >= 0 &&
+            source_indices[idx] < static_cast<int64_t>(source_host_ptrs.size()),
+        "source index is out of range at segment ", idx);
+    TORCH_CHECK(source_offsets[idx] >= 0 && destination_offsets[idx] >= 0 &&
+                    lengths[idx] >= 0,
+                "segment offsets and lengths must be non-negative");
+    TORCH_CHECK(destination_offsets[idx] + lengths[idx] <= destination.numel(),
+                "segment exceeds destination at index ", idx);
+  }
+
+  const at::cuda::OptionalCUDAGuard device_guard(device);
+  std::vector<int64_t> source_device_ptrs;
+  source_device_ptrs.reserve(source_host_ptrs.size());
+  for (const int64_t host_ptr : source_host_ptrs) {
+    void* device_ptr = nullptr;
+    const cudaError_t status = cudaHostGetDevicePointer(
+        &device_ptr, reinterpret_cast<void*>(static_cast<uintptr_t>(host_ptr)),
+        0);
+    TORCH_CHECK(
+        status == cudaSuccess,
+        "source host buffer is not CUDA-mapped: ", cudaGetErrorString(status));
+    source_device_ptrs.push_back(
+        static_cast<int64_t>(reinterpret_cast<uintptr_t>(device_ptr)));
+  }
+
+  void* destination_device_ptr = nullptr;
+  const cudaError_t destination_status = cudaHostGetDevicePointer(
+      &destination_device_ptr, destination.data_ptr(), 0);
+  TORCH_CHECK(destination_status == cudaSuccess,
+              "destination host buffer is not CUDA-mapped: ",
+              cudaGetErrorString(destination_status));
+
+  const auto options =
+      torch::TensorOptions().dtype(torch::kInt64).device(device);
+  const torch::Tensor source_ptrs_tensor =
+      torch::tensor(source_device_ptrs, options);
+  const torch::Tensor source_indices_tensor =
+      torch::tensor(source_indices, options);
+  const torch::Tensor source_offsets_tensor =
+      torch::tensor(source_offsets, options);
+  const torch::Tensor destination_offsets_tensor =
+      torch::tensor(destination_offsets, options);
+  const torch::Tensor lengths_tensor = torch::tensor(lengths, options);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  constexpr int kThreads = 256;
+  pack_pinned_host_segments_kernel<<<static_cast<unsigned int>(segment_count),
+                                     kThreads, 0, stream>>>(
+      source_ptrs_tensor.data_ptr<int64_t>(),
+      source_indices_tensor.data_ptr<int64_t>(),
+      source_offsets_tensor.data_ptr<int64_t>(),
+      destination_offsets_tensor.data_ptr<int64_t>(),
+      lengths_tensor.data_ptr<int64_t>(),
+      reinterpret_cast<uint8_t*>(destination_device_ptr));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

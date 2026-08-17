@@ -689,6 +689,14 @@ class ShardGatherTransport(Protocol):
     ) -> bool:
         """Reach metadata consensus before any rank submits SSD I/O."""
 
+    def exchange_block_union(
+        self,
+        local_block_ids: torch.Tensor,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Exchange rank-local predictions and return one global block union."""
+
     def gather_into(
         self,
         descriptor: CollectiveDescriptor,
@@ -719,10 +727,12 @@ class TorchDistributedShardGather:
         self,
         process_group: Any,
         *,
+        metadata_process_group: Any | None = None,
         rank: int,
         world_size: int,
         config: SSDTPShardedPrefetchConfig,
         owns_process_group: bool = False,
+        owns_metadata_process_group: bool = False,
     ) -> None:
         """Initialize a transport around an independent process group.
 
@@ -738,17 +748,24 @@ class TorchDistributedShardGather:
         if rank < 0 or rank >= world_size:
             raise ValueError("rank must be within the process group")
         self._process_group = process_group
+        self._metadata_process_group = metadata_process_group or process_group
         self._rank = int(rank)
         self._world_size = int(world_size)
         self._config = config
         self._owns_process_group = bool(owns_process_group)
+        self._owns_metadata_process_group = bool(
+            owns_metadata_process_group
+            and self._metadata_process_group is not self._process_group
+        )
         self._healthy = True
         self._stream: Optional[torch.cuda.Stream] = None
+        self._metadata_stream: Optional[torch.cuda.Stream] = None
         self._slots: list[_GatherSlot] = []
         self._slot_cursor = 0
         self._max_union_blocks = 0
         self._block_bytes = 0
         self._lock = threading.Lock()
+        self._metadata_lock = threading.Lock()
 
     @classmethod
     def from_model_group(
@@ -775,12 +792,15 @@ class TorchDistributedShardGather:
             raise RuntimeError("torch.distributed is not initialized")
         ranks = dist.get_process_group_ranks(model_group)
         process_group = dist.new_group(ranks=ranks, backend="nccl")
+        metadata_process_group = dist.new_group(ranks=ranks, backend="nccl")
         return cls(
             process_group,
+            metadata_process_group=metadata_process_group,
             rank=dist.get_rank(group=process_group),
             world_size=dist.get_world_size(group=process_group),
             config=config,
             owns_process_group=True,
+            owns_metadata_process_group=True,
         )
 
     @property
@@ -834,6 +854,7 @@ class TorchDistributedShardGather:
             ):
                 return
             self._stream = torch.cuda.Stream(device=device)
+            self._metadata_stream = torch.cuda.Stream(device=device)
             self._slots = [
                 _GatherSlot(
                     send=torch.empty(
@@ -855,12 +876,120 @@ class TorchDistributedShardGather:
             # A tiny all-reduce forces communicator and stream initialization
             # out of the first request. All ranks call warm at engine attach.
             warm_value = torch.ones(1, dtype=torch.int32, device=device)
+            metadata_warm_value = torch.ones(
+                1,
+                dtype=torch.int32,
+                device=device,
+            )
             with torch.cuda.stream(self._stream):
                 torch.distributed.all_reduce(
                     warm_value,
                     group=self._process_group,
                 )
+            with torch.cuda.stream(self._metadata_stream):
+                torch.distributed.all_reduce(
+                    metadata_warm_value,
+                    group=self._metadata_process_group,
+                )
             self._stream.synchronize()
+            self._metadata_stream.synchronize()
+
+    def exchange_block_union(
+        self,
+        local_block_ids: torch.Tensor,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Exchange local predicted block IDs on the metadata communicator.
+
+        Every rank participates, including ranks with an empty local set. The
+        returned CPU tensor is identical on every rank and is capped to the
+        configured global staging budget.
+
+        Args:
+            local_block_ids: Rank-local predicted logical block IDs.
+            device: CUDA device used by this model rank.
+
+        Returns:
+            Sorted, duplicate-free global block IDs on CPU.
+
+        Raises:
+            ShardCollectiveError: If the metadata exchange fails.
+        """
+        if not self._healthy:
+            raise ShardCollectiveError(
+                "shard-gather metadata communicator is unhealthy",
+                data_submitted=False,
+            )
+        max_blocks = int(self._max_union_blocks)
+        if max_blocks <= 0:
+            raise ShardCollectiveError(
+                "shard-gather metadata resources are not warmed",
+                data_submitted=False,
+            )
+        try:
+            metadata_stream = self._metadata_stream or torch.cuda.current_stream(
+                device
+            )
+            with (
+                self._metadata_lock,
+                torch.cuda.device(device),
+                torch.inference_mode(),
+                torch.cuda.stream(metadata_stream),
+            ):
+                local = torch.as_tensor(
+                    local_block_ids,
+                    dtype=torch.int64,
+                    device=device,
+                ).reshape(-1)
+                local = torch.unique(local[local >= 0], sorted=True)
+                if int(local.numel()) > max_blocks:
+                    local = local[:max_blocks]
+                payload = torch.full(
+                    (max_blocks + 1,),
+                    -1,
+                    dtype=torch.int64,
+                    device=device,
+                )
+                payload[0] = int(local.numel())
+                if local.numel():
+                    payload[1 : 1 + int(local.numel())] = local
+                # Keep the NCCL receive buffer one-dimensional and do all
+                # variable-length parsing on CPU after the stream completes.
+                # Boolean indexing followed by ``torch.unique`` on this
+                # private CUDA stream caused misaligned-address faults on the
+                # serving H100 stack.  Metadata is only a few KiB, so CPU
+                # parsing is both safer and outside the model thread.
+                gathered = torch.empty(
+                    self._world_size * (max_blocks + 1),
+                    dtype=torch.int64,
+                    device=device,
+                )
+                torch.distributed.all_gather_into_tensor(
+                    gathered,
+                    payload,
+                    group=self._metadata_process_group,
+                )
+            metadata_stream.synchronize()
+            gathered_cpu = gathered.cpu().reshape(
+                self._world_size,
+                max_blocks + 1,
+            )
+            rank_blocks: list[torch.Tensor] = []
+            for rank_payload in gathered_cpu:
+                length = max(0, min(int(rank_payload[0].item()), max_blocks))
+                if length:
+                    rank_blocks.append(rank_payload[1 : 1 + length])
+            if not rank_blocks:
+                return torch.empty(0, dtype=torch.int64)
+            union = torch.unique(torch.cat(rank_blocks), sorted=True)
+            return union[:max_blocks]
+        except Exception as exc:
+            self._healthy = False
+            raise ShardCollectiveError(
+                "predicted block-union exchange failed",
+                data_submitted=False,
+            ) from exc
 
     def preflight(
         self,
@@ -896,33 +1025,50 @@ class TorchDistributedShardGather:
             and partition.padded_blocks * self._world_size * self._block_bytes
             <= self._config.staging_slot_bytes
         )
-        metadata = torch.tensor(
-            [
-                descriptor.sequence_number,
-                descriptor.layer_id,
-                mode_code,
-                len(partition.union),
-                partition.union_hash,
-                partition.padded_blocks,
-                int(local_capability and capacity_ok and self._healthy),
-            ],
-            dtype=torch.int64,
-            device=device,
-        )
-        gathered = torch.empty(
-            (self._world_size, int(metadata.numel())),
-            dtype=metadata.dtype,
-            device=device,
-        )
         try:
-            torch.distributed.all_gather_into_tensor(
-                gathered,
-                metadata,
-                group=self._process_group,
-            )
-            reference = gathered[0]
-            metadata_match = bool(torch.all(gathered[:, :-1] == reference[:-1]))
-            all_capable = bool(torch.all(gathered[:, -1] == 1))
+            # Never enqueue an auxiliary NCCL collective on the model's
+            # default stream.  Background dense-prefetch threads can reach
+            # this point with small inter-rank skew; mixing their metadata
+            # all-gather with forward collectives on the shared default
+            # stream creates a cross-communicator dependency cycle.  Keep
+            # both metadata phases on the transport's ordered private stream,
+            # just like the data gather below.
+            collective_stream = self._stream or torch.cuda.current_stream(device)
+            with (
+                self._lock,
+                torch.cuda.device(device),
+                torch.inference_mode(),
+                torch.cuda.stream(collective_stream),
+            ):
+                metadata = torch.tensor(
+                    [
+                        descriptor.sequence_number,
+                        descriptor.layer_id,
+                        mode_code,
+                        len(partition.union),
+                        partition.union_hash,
+                        partition.padded_blocks,
+                        int(local_capability and capacity_ok and self._healthy),
+                    ],
+                    dtype=torch.int64,
+                    device=device,
+                )
+                gathered = torch.empty(
+                    (self._world_size, int(metadata.numel())),
+                    dtype=metadata.dtype,
+                    device=device,
+                )
+                torch.distributed.all_gather_into_tensor(
+                    gathered,
+                    metadata,
+                    group=self._process_group,
+                )
+                reference = gathered[0]
+                metadata_match_tensor = torch.all(gathered[:, :-1] == reference[:-1])
+                all_capable_tensor = torch.all(gathered[:, -1] == 1)
+            collective_stream.synchronize()
+            metadata_match = bool(metadata_match_tensor.item())
+            all_capable = bool(all_capable_tensor.item())
             return metadata_match and all_capable
         except Exception as exc:
             self._healthy = False
@@ -1082,6 +1228,10 @@ class TorchDistributedShardGather:
 
     def close(self) -> None:
         """Synchronize staging and release the owned process group."""
+        with self._metadata_lock:
+            if self._metadata_stream is not None:
+                self._metadata_stream.synchronize()
+            self._metadata_stream = None
         with self._lock:
             for slot in self._slots:
                 if slot.completion_event is not None:
@@ -1093,6 +1243,13 @@ class TorchDistributedShardGather:
                 torch.distributed.destroy_process_group(self._process_group)
             finally:
                 self._owns_process_group = False
+        if self._owns_metadata_process_group:
+            try:
+                torch.distributed.destroy_process_group(
+                    self._metadata_process_group
+                )
+            finally:
+                self._owns_metadata_process_group = False
 
 
 def parse_layer_ranges(specification: str) -> frozenset[int]:

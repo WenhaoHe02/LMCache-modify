@@ -2,6 +2,7 @@
 """Per-layer lookahead policy for speculative CSA KV prefetch."""
 
 # Standard
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 import re
 
@@ -179,12 +180,17 @@ class CSAPrefetchLookaheadPolicy:
 def build_residual_prefetch_sources(
     target_layer_ids: list[int],
     policy: CSAPrefetchLookaheadPolicy,
+    *,
+    excluded_target_layer_ids: Iterable[int] = (),
 ) -> dict[int, tuple[int, int]]:
     """Build one exact-lookahead source hook per enabled target layer.
 
     Args:
         target_layer_ids: Transformer layer ids containing CSA targets.
         policy: Per-target lookahead policy.
+        excluded_target_layer_ids: Targets owned by a deterministic retrieval
+            path, such as early dense shard-gather. Excluded targets never
+            receive a speculative source hook.
 
     Returns:
         Mapping ``source_layer -> (target_layer, prefetch_level)``. Each
@@ -196,8 +202,11 @@ def build_residual_prefetch_sources(
             layer. The current decoder hook supports one target per source.
     """
     sources: dict[int, tuple[int, int]] = {}
+    excluded = {int(layer_id) for layer_id in excluded_target_layer_ids}
     for target_layer_id in target_layer_ids:
         target = int(target_layer_id)
+        if target in excluded:
+            continue
         lookahead = policy.lookahead_for(target)
         if lookahead == 0:
             continue

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import bisect
 from concurrent.futures import Future, ThreadPoolExecutor
+import ctypes
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Sequence
@@ -28,6 +30,7 @@ except ImportError:
     else:
         torch_dev, torch_device_type = torch, "cpu"
 from lmcache.logging import init_logger
+import lmcache.c_ops as lmc_ops
 from lmcache.observability import LMCStatsMonitor
 from lmcache.utils import CacheEngineKey, DiskCacheMetadata, _lmcache_nvtx_annotate
 from lmcache.v1.cache_controller.message import OpType
@@ -46,6 +49,7 @@ from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
 from lmcache.v1.storage_backend.batched_message_sender import BatchedMessageSender
 from lmcache.v1.storage_backend.cache_policy import get_cache_policy
+from lmcache.v1.storage_backend.cpu_raw_writer import CPURawStageQueue
 from lmcache.v1.storage_backend.job_executor.pq_executor import (
     AsyncPQThreadPoolExecutor,
 )
@@ -79,6 +83,36 @@ _DSV4_HCA_LAYER_MAJOR_ROLE = "hca_attention_kv_layer_major"
 _DSV4_CSA_LAYER_MAJOR_ROLE = "csa_attention_kv_layer_major"
 _DSV4_INDEXER_LAYER_MAJOR_ROLE = "csa_indexer_cache_layer_major"
 _DSV4_CSA_STREAMING_LAYOUT_VERSION = 2
+
+
+def _kv_object_prefix_view(
+    record: KVObjectRecord,
+    logical_length: int,
+) -> Optional[KVObjectRecord]:
+    """Return a prefix view of a contiguous or composed object record."""
+    if logical_length <= 0 or logical_length > record.length:
+        return None
+    if logical_length == record.length:
+        return record
+    prefix_ranges: list[KVObjectByteRange] = []
+    remaining = logical_length
+    target_offset = 0
+    for byte_range in record.read_ranges:
+        if remaining <= 0:
+            break
+        range_length = min(byte_range.length, remaining)
+        prefix_ranges.append(
+            KVObjectByteRange(
+                offset=byte_range.offset,
+                length=range_length,
+                target_offset=target_offset,
+            )
+        )
+        target_offset += range_length
+        remaining -= range_length
+    if remaining:
+        return None
+    return record.with_byte_ranges(prefix_ranges, length=logical_length)
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +165,16 @@ class _CSAStreamingLayoutBuild:
 
 
 @dataclass(slots=True)
+class _CSAStagedWriteBatch:
+    """Metadata ticket completed only after all staged waves reach SSD."""
+
+    records: tuple[KVObjectRecord, ...]
+    keys: tuple[CacheEngineKey, ...]
+    remaining_waves: int
+    failed: bool = False
+
+
+@dataclass(slots=True)
 class _LayerMajorSidecar:
     """One physical sidecar being prepared for a layer-major generation."""
 
@@ -173,9 +217,7 @@ def _layer_major_wave_record(
         return wave[0].record, wave[0].payload_nbytes
     first_record = wave[0].record
     last_record = wave[-1].record
-    wave_nbytes = (
-        last_record.offset + last_record.aligned_length - first_record.offset
-    )
+    wave_nbytes = last_record.offset + last_record.aligned_length - first_record.offset
     return (
         KVObjectRecord(
             object_id=first_record.object_id,
@@ -194,39 +236,53 @@ def _pack_layer_major_wave(
     wave: Sequence[_LayerMajorSidecar],
     buffer: bytearray,
 ) -> tuple[KVObjectRecord, memoryview, float]:
-    """Pack one layer-major wave into a reusable native buffer.
+    """Pack one layer-major wave with one GIL-free native copy batch.
 
-    Equal-length ``bytearray`` slice assignment enters CPython's buffer fast
-    path directly. It avoids two ``ctypes`` object constructions per segment;
-    a 480K snapshot contains more than 100,000 small source segments, so that
-    call overhead is material even though the copied byte count is unchanged.
-    The caller still double-buffers packing with Tutti H2D/NVMe writes.
+    The source snapshot remains owned by the deferred admission until this
+    function returns.  Python builds only compact pointer descriptors; the
+    byte copies run in ``lmc_ops.batched_memcpy`` with the GIL released so
+    background packing cannot stall vLLM's decode thread.
     """
     started = time.perf_counter()
     writer_record, wave_nbytes = _layer_major_wave_record(wave)
     if len(buffer) < wave_nbytes:
         raise ValueError("layer-major pack buffer is smaller than the wave")
 
+    # A new bytearray is already zero-filled, which supplies every alignment
+    # gap without per-sidecar Python allocation or slice assignment.
+    destination_base = ctypes.addressof(ctypes.c_char.from_buffer(buffer))
+    source_ptrs: list[int] = []
+    destination_ptrs: list[int] = []
+    copy_sizes: list[int] = []
     target_offset = 0
     for sidecar in wave:
-        for segment in sidecar.segments:
+        if len(sidecar.segment_sources) != len(sidecar.segments):
+            raise ValueError("layer-major segment source descriptors disagree")
+        for segment, source_descriptor in zip(
+            sidecar.segments,
+            sidecar.segment_sources,
+            strict=True,
+        ):
             source = segment.cast("B")
             source_nbytes = len(source)
             if source_nbytes <= 0:
                 continue
-            buffer[target_offset : target_offset + source_nbytes] = source
+            if source_descriptor is None:
+                source_ptr = ctypes.addressof(ctypes.c_char.from_buffer(source))
+            else:
+                source_base_ptr, source_offset = source_descriptor
+                source_ptr = source_base_ptr + source_offset
+            source_ptrs.append(source_ptr)
+            destination_ptrs.append(destination_base + target_offset)
+            copy_sizes.append(source_nbytes)
             target_offset += source_nbytes
         if len(wave) > 1:
             padding_nbytes = sidecar.record.aligned_length - sidecar.payload_nbytes
             if padding_nbytes > 0:
-                buffer[target_offset : target_offset + padding_nbytes] = (
-                    b"\0" * padding_nbytes
-                )
                 target_offset += padding_nbytes
     if target_offset != wave_nbytes:
-        raise RuntimeError(
-            "layer-major packed payload does not match wave allocations"
-        )
+        raise RuntimeError("layer-major packed payload does not match wave allocations")
+    lmc_ops.batched_memcpy(source_ptrs, destination_ptrs, copy_sizes)
     return (
         writer_record,
         memoryview(buffer)[:wave_nbytes],
@@ -324,6 +380,7 @@ KVObjectRawWriter = Callable[
     [KVObjectRecord, memoryview],
     tuple[Sequence[tuple[int, int, int]], float],
 ]
+KVObjectPackWaiter = Callable[[], None]
 
 
 def _clip_raw_extents(
@@ -372,6 +429,13 @@ def _env_flag_default(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _glm_dsa_layer_major_enabled() -> bool:
+    """Return whether GLM uses compact main plus layer-major sidecars."""
+    return _env_flag("LMCACHE_GLM_DSA_LAYER_MAJOR") or _env_flag(
+        "LMCACHE_GLM_DSA_PREDICTIVE_PREFETCH"
+    )
 
 
 def _env_int(name: str, default: int = 0) -> int:
@@ -564,6 +628,8 @@ class LocalDiskBackend(StorageBackendInterface):
         self._csa_layout_lock = threading.RLock()
         self._csa_active_layouts: dict[str, _CSAStreamingLayout] = {}
         self._csa_pending_layouts: dict[str, _CSAStreamingLayoutBuild] = {}
+        self._csa_pending_layout_keys: dict[str, CacheEngineKey] = {}
+        self._csa_staged_write_counts: dict[str, int] = {}
         self._csa_required_entries_by_mode: dict[
             tuple[bool, bool], frozenset[tuple[str, int]]
         ] = {}
@@ -590,13 +656,28 @@ class LocalDiskBackend(StorageBackendInterface):
         )
         self.kv_object_cpu_raw_write_enabled = _env_flag_default(
             "LMCACHE_DSV4_CPU_RAW_WRITE",
-            False,
+            True,
         )
         self.kv_object_cpu_raw_write_mibps = float(
-            os.getenv("LMCACHE_DSV4_CPU_RAW_WRITE_MIBPS", "512")
+            os.getenv("LMCACHE_DSV4_CPU_RAW_WRITE_MIBPS", "0")
         )
         self.kv_object_cpu_raw_write_block_bytes = (
-            _env_int("LMCACHE_DSV4_CPU_RAW_WRITE_BLOCK_MB", 4) * 1024**2
+            _env_int("LMCACHE_DSV4_CPU_RAW_WRITE_BLOCK_MB", 64) * 1024**2
+        )
+        self.kv_object_cpu_stage_enabled = (
+            self.kv_object_cpu_raw_write_enabled
+            and _env_flag("LMCACHE_TUTTI_CPU_STAGE_ENABLE")
+        )
+        self.kv_object_cpu_stage_bytes = (
+            _env_int("LMCACHE_TUTTI_CPU_STAGE_GIB", 16) * 1024**3
+        )
+        self._cpu_raw_stage_queue: Optional[CPURawStageQueue] = (
+            CPURawStageQueue(
+                self.kv_object_cpu_stage_bytes,
+                thread_name_prefix="lmcache-cpu-raw-stage",
+            )
+            if self.kv_object_cpu_stage_enabled
+            else None
         )
         self.kv_object_tutti_raw_cold_store_enabled = (
             self.kv_object_tutti_raw_enabled
@@ -616,10 +697,10 @@ class LocalDiskBackend(StorageBackendInterface):
         )
         self.kv_object_tutti_raw_region_extents: list[tuple[int, int, int]] = []
         self.kv_object_tutti_raw_writer: Optional[KVObjectRawWriter] = None
-        self.kv_object_gpu_layer_major_packer: Optional[
-            KVObjectLayerMajorPacker
-        ] = None
+        self.kv_object_layer_major_pack_waiter: Optional[KVObjectPackWaiter] = None
+        self.kv_object_gpu_layer_major_packer: Optional[KVObjectLayerMajorPacker] = None
         self._kv_object_tutti_raw_writer_ready = threading.Event()
+        self._kv_object_raw_region_full_at_s = 0.0
         self.kv_object_tutti_raw_staging_bytes: Optional[int] = None
         if self.kv_object_store_enabled:
             slot_mb = int(os.getenv("LMCACHE_KV_OBJECT_STORE_SLOT_MB", "128"))
@@ -659,12 +740,15 @@ class LocalDiskBackend(StorageBackendInterface):
                         self.kv_object_cpu_raw_write_mibps,
                     )
                 )
-                self.kv_object_cpu_raw_write_block_bytes = int(
-                    config.extra_config.get(
-                        "kv_object_store_cpu_raw_write_block_mb",
-                        self.kv_object_cpu_raw_write_block_bytes // 1024**2,
+                self.kv_object_cpu_raw_write_block_bytes = (
+                    int(
+                        config.extra_config.get(
+                            "kv_object_store_cpu_raw_write_block_mb",
+                            self.kv_object_cpu_raw_write_block_bytes // 1024**2,
+                        )
                     )
-                ) * 1024**2
+                    * 1024**2
+                )
                 self.kv_object_tutti_raw_cold_store_enabled = bool(
                     config.extra_config.get(
                         "kv_object_store_tutti_raw_cold_store",
@@ -973,12 +1057,12 @@ class LocalDiskBackend(StorageBackendInterface):
                     )
                     return False
                 continue
-            if (
-                not self._ready_tutti_raw_record(record)
-                or record is None
-                or record.length < entry.length
-                or (record.length > entry.length and not record.is_contiguous)
-            ):
+            read_record = (
+                _kv_object_prefix_view(record, entry.length)
+                if record is not None
+                else None
+            )
+            if not self._ready_tutti_raw_record(read_record):
                 logger.warning(
                     "CSA layout validation failed: generation=%s "
                     "reason=object_unreadable role=%s layer=%d expected=%d "
@@ -1056,6 +1140,42 @@ class LocalDiskBackend(StorageBackendInterface):
             )
         return True
 
+    def _complete_csa_staged_wave(
+        self,
+        batch: _CSAStagedWriteBatch,
+        error: Optional[BaseException],
+    ) -> None:
+        """Finalize one staged raw wave and publish only after all succeed."""
+        with self.kv_object_store_lock:
+            if error is not None:
+                batch.failed = True
+                logger.error(
+                    "CSA staged raw write failed; generation remains invisible: %s",
+                    error,
+                )
+            batch.remaining_waves -= 1
+            if batch.remaining_waves > 0:
+                return
+            if not batch.failed and self.kv_object_metadata_store is not None:
+                self.kv_object_metadata_store.extend(batch.records)
+
+        with self._csa_layout_lock:
+            for key in batch.keys:
+                key_string = key.to_string()
+                remaining = self._csa_staged_write_counts.get(key_string, 0) - 1
+                if remaining > 0:
+                    self._csa_staged_write_counts[key_string] = remaining
+                    continue
+                self._csa_staged_write_counts.pop(key_string, None)
+                if batch.failed:
+                    continue
+                build = self._csa_pending_layouts.get(key_string)
+                if (
+                    build is not None
+                    and (self._csa_streaming_compact_role(), 0) in build.objects
+                ):
+                    self._publish_csa_layout(key, build)
+
     def get_kv_object_records(
         self,
         keys: Sequence[CacheEngineKey],
@@ -1126,18 +1246,10 @@ class LocalDiskBackend(StorageBackendInterface):
                 and logical_length is not None
                 and 0 < logical_length < record.length
             ):
-                if not record.is_contiguous:
+                record = _kv_object_prefix_view(record, logical_length)
+                if record is None:
                     result.append(None)
                     continue
-                record = record.with_byte_ranges(
-                    [
-                        KVObjectByteRange(
-                            offset=record.offset,
-                            length=logical_length,
-                        )
-                    ],
-                    length=logical_length,
-                )
             result.append(record)
         return result
 
@@ -1635,6 +1747,7 @@ class LocalDiskBackend(StorageBackendInterface):
                 else:
                     if (
                         raw_writer is not None
+                        and self._cpu_raw_stage_queue is None
                         and not self.kv_object_payload_fits_tutti_staging(
                             payload_nbytes
                         )
@@ -1663,6 +1776,7 @@ class LocalDiskBackend(StorageBackendInterface):
                                 offset,
                                 aligned_length,
                             ):
+                                self.mark_kv_object_raw_region_full()
                                 logger.warning(
                                     "KV_OBJECT_STORE_PROFILE "
                                     "op=write_attention_layer_major key=%s "
@@ -1703,8 +1817,21 @@ class LocalDiskBackend(StorageBackendInterface):
                 sidecar for sidecar in sidecars if sidecar.ready_record is None
             ]
             physical_records: list[KVObjectRecord] = []
+            staged_writes: list[tuple[KVObjectRecord, bytearray]] = []
+            staged_write_futures: list[
+                Future[tuple[Sequence[tuple[int, int, int]], float]]
+            ] = []
+            staged_write_errors: list[BaseException] = []
+            stage_queue = self._cpu_raw_stage_queue if raw_writer is not None else None
             if raw_writer is not None:
-                staging_bytes = self.kv_object_tutti_raw_staging_bytes
+                staging_bytes = (
+                    stage_queue.capacity_bytes
+                    if stage_queue is not None
+                    else self.kv_object_tutti_raw_staging_bytes
+                )
+                # Stage capacity bounds total queued host memory. Physical
+                # pack/write waves retain their independent 64 MiB default so
+                # a large stage never creates a multi-GiB Python preparation.
                 wave_limit = _write_wave_limit_bytes(staging_bytes)
                 raw_waves: list[list[_LayerMajorSidecar]] = []
                 current_wave: list[_LayerMajorSidecar] = []
@@ -1741,8 +1868,84 @@ class LocalDiskBackend(StorageBackendInterface):
                     )
                     for wave in raw_waves
                 ]
+                if (
+                    stage_queue is not None
+                    and sum(wave_buffer_nbytes) > stage_queue.capacity_bytes
+                ):
+                    logger.warning(
+                        "CPU raw-stage generation exceeds configured capacity; "
+                        "falling back to synchronous persistence key=%s bytes=%d "
+                        "capacity_bytes=%d",
+                        prefix_key.to_string(),
+                        sum(wave_buffer_nbytes),
+                        stage_queue.capacity_bytes,
+                    )
+                    stage_queue = None
+                if stage_queue is not None:
+                    for wave, wave_nbytes in zip(
+                        raw_waves,
+                        wave_buffer_nbytes,
+                        strict=True,
+                    ):
+                        pack_waiter = self.kv_object_layer_major_pack_waiter
+                        if pack_waiter is not None:
+                            pack_waiter()
+                        # This is the generation-level host staging copy.  Do
+                        # not pack into a reusable 64 MiB/O_DIRECT bounce
+                        # buffer and do not clone it afterwards: the queued
+                        # bytearray itself owns the full wave until SSD
+                        # persistence completes.
+                        stage_queue.reserve(wave_nbytes)
+                        reservation_owned = True
+                        try:
+                            pack_started = time.perf_counter()
+                            staged_payload = bytearray(wave_nbytes)
+                            writer_record, payload, pack_cpu_time_s = (
+                                _pack_layer_major_wave(wave, staged_payload)
+                            )
+                            packed_time_s += pack_cpu_time_s
+                            pack_wait_time_s += time.perf_counter() - pack_started
+                            staged_writes.append((writer_record, staged_payload))
+                            raw_extents = self.map_kv_object_to_raw_region(
+                                writer_record
+                            )
+                            raw_write_wave_count += 1
+                            for sidecar in wave:
+                                record_extents = (
+                                    tuple(raw_extents)
+                                    if len(wave) == 1
+                                    else _clip_raw_extents(
+                                        raw_extents,
+                                        offset=sidecar.record.offset,
+                                        aligned_length=sidecar.record.aligned_length,
+                                    )
+                                )
+                                sidecar.ready_record = sidecar.record.with_raw_extents(
+                                    record_extents
+                                ).mark_ready()
+                                physical_records.append(sidecar.ready_record)
+                            payload.release()
+                            try:
+                                future = stage_queue.submit_reserved(
+                                    staged_payload,
+                                    lambda payload, record=writer_record: raw_writer(
+                                        record,
+                                        payload,
+                                    ),
+                                )
+                                reservation_owned = False
+                                staged_write_futures.append(future)
+                            except Exception as error:
+                                stage_queue.release_reservation(wave_nbytes)
+                                reservation_owned = False
+                                staged_write_errors.append(error)
+                        except Exception:
+                            if reservation_owned:
+                                stage_queue.release_reservation(wave_nbytes)
+                            raise
                 gpu_pack_enabled = (
                     _env_flag("LMCACHE_DSV4_GPU_LAYER_MAJOR_PACK")
+                    and stage_queue is None
                     and not self.kv_object_cpu_raw_write_enabled
                     and self.kv_object_gpu_layer_major_packer is not None
                 )
@@ -1783,7 +1986,7 @@ class LocalDiskBackend(StorageBackendInterface):
                 pending_pack: Optional[
                     Future[tuple[KVObjectRecord, memoryview, float]]
                 ] = None
-                if raw_waves:
+                if raw_waves and stage_queue is None:
                     pending_pack = self._layer_major_pack_executor.submit(
                         _pack_layer_major_wave_with_fallback,
                         raw_waves[0],
@@ -1792,6 +1995,8 @@ class LocalDiskBackend(StorageBackendInterface):
                         self.kv_object_gpu_layer_major_packer,
                     )
                 for wave_index, wave in enumerate(raw_waves):
+                    if stage_queue is not None:
+                        continue
                     assert pending_pack is not None
                     pack_wait_started = time.perf_counter()
                     writer_record, payload, pack_cpu_time_s = pending_pack.result()
@@ -1828,6 +2033,7 @@ class LocalDiskBackend(StorageBackendInterface):
                             record_extents
                         ).mark_ready()
                         physical_records.append(sidecar.ready_record)
+                    payload.release()
             else:
                 if self.kv_object_pool_io is not None:
                     for sidecar in pending_writes:
@@ -1843,8 +2049,9 @@ class LocalDiskBackend(StorageBackendInterface):
                         sidecar.ready_record = sidecar.record.mark_ready()
                         physical_records.append(sidecar.ready_record)
 
-            self.kv_object_metadata_store.extend(physical_records)
-            metadata_record_count += len(physical_records)
+            if stage_queue is None or not staged_writes:
+                self.kv_object_metadata_store.extend(physical_records)
+                metadata_record_count += len(physical_records)
 
             for sidecar in sidecars:
                 source_role = sidecar.source_role
@@ -1861,12 +2068,30 @@ class LocalDiskBackend(StorageBackendInterface):
                     alias_records: list[KVObjectRecord] = []
                     prefix_nbytes = 0
                     base_record = base_records.get((source_role, int(layer_id)))
-                    for alias_key, alias_key_string, chunk_nbytes in zip(
+                    terminal_alias_object_id = (
+                        self._key_to_object_id(
+                            effective_prefix_keys[-1],
+                            layer_id=layer_id,
+                            role=physical_role,
+                        )
+                        if (
+                            streaming_layout
+                            and base_record is not None
+                            and effective_prefix_keys
+                        )
+                        else None
+                    )
+                    alias_inputs = zip(
                         effective_prefix_keys,
                         effective_prefix_key_strings,
                         layer_chunk_nbytes[(source_role, layer_id)],
                         strict=True,
-                    ):
+                    )
+                    for alias_index, (
+                        alias_key,
+                        alias_key_string,
+                        chunk_nbytes,
+                    ) in enumerate(alias_inputs):
                         prefix_nbytes += int(chunk_nbytes)
                         if streaming_layout and base_record is None:
                             # Cold prefix views differ only in logical length.
@@ -1884,10 +2109,13 @@ class LocalDiskBackend(StorageBackendInterface):
                                 length=prefix_nbytes,
                             )
                             continue
-                        alias_object_id = self._key_to_object_id(
-                            alias_key,
-                            layer_id=layer_id,
-                            role=physical_role,
+                        alias_object_id = (
+                            terminal_alias_object_id
+                            or self._key_to_object_id(
+                                alias_key,
+                                layer_id=layer_id,
+                                role=physical_role,
+                            )
                         )
                         if base_record is None:
                             alias_record = KVObjectRecord(
@@ -1903,6 +2131,22 @@ class LocalDiskBackend(StorageBackendInterface):
                             )
                         else:
                             logical_length = base_record.length + prefix_nbytes
+                            if streaming_layout and alias_index < len(
+                                effective_prefix_keys
+                            ) - 1:
+                                assert terminal_alias_object_id is not None
+                                pending_entries.setdefault(
+                                    alias_key_string,
+                                    {},
+                                )[(object_role, int(layer_id))] = (
+                                    _CSAStreamingObject(
+                                        logical_role=object_role,
+                                        layer_id=int(layer_id),
+                                        object_id=terminal_alias_object_id,
+                                        length=logical_length,
+                                    )
+                                )
+                                continue
                             combined_ranges = [
                                 KVObjectByteRange(
                                     offset=byte_range.offset,
@@ -1952,7 +2196,10 @@ class LocalDiskBackend(StorageBackendInterface):
                                 object_id=alias_object_id,
                                 length=alias_record.length,
                             )
-                    self.kv_object_metadata_store.extend(alias_records)
+                    if stage_queue is None or not staged_writes:
+                        self.kv_object_metadata_store.extend(alias_records)
+                    else:
+                        physical_records.extend(alias_records)
                     metadata_record_count += len(alias_records)
                     alias_time_s += time.perf_counter() - alias_started
                 elif streaming_layout:
@@ -1980,6 +2227,36 @@ class LocalDiskBackend(StorageBackendInterface):
                         terminal=key_string == terminal_key_string,
                         admission_started_at=gather_started,
                     )
+                    self._csa_pending_layout_keys[key_string] = next(
+                        key
+                        for key in generation_keys
+                        if key.to_string() == key_string
+                    )
+                    if staged_writes:
+                        self._csa_staged_write_counts[key_string] = (
+                            self._csa_staged_write_counts.get(key_string, 0) + 1
+                        )
+
+        if stage_queue is not None and staged_writes:
+            staged_keys = tuple(
+                self._csa_pending_layout_keys[key_string]
+                for key_string in pending_entries
+            )
+            batch = _CSAStagedWriteBatch(
+                records=tuple(physical_records),
+                keys=staged_keys,
+                remaining_waves=len(staged_writes),
+            )
+            for future in staged_write_futures:
+                def _finish_staged_write(
+                    completed: Future[tuple[Sequence[tuple[int, int, int]], float]],
+                    staged_batch: _CSAStagedWriteBatch = batch,
+                ) -> None:
+                    self._complete_csa_staged_wave(staged_batch, completed.exception())
+
+                future.add_done_callback(_finish_staged_write)
+            for error in staged_write_errors:
+                self._complete_csa_staged_wave(batch, error)
 
         logger.info(
             "KV_OBJECT_STORE_PROFILE op=write_attention_layer_major key=%s "
@@ -2028,6 +2305,23 @@ class LocalDiskBackend(StorageBackendInterface):
         else:
             self._kv_object_tutti_raw_writer_ready.set()
 
+    def set_kv_object_layer_major_pack_waiter(
+        self,
+        waiter: Optional[KVObjectPackWaiter],
+    ) -> None:
+        """Install the decode-aware admission gate for CPU sidecar packing.
+
+        Args:
+            waiter: Callback invoked before each bounded pack wave. Pass
+                ``None`` to disable pack admission gating.
+
+        Notes:
+            This gate is intentionally separate from physical-write
+            admission. A packed CPU staging buffer may drain to SSD during
+            decode, while Python sidecar preparation must yield to decode.
+        """
+        self.kv_object_layer_major_pack_waiter = waiter
+
     def set_kv_object_gpu_layer_major_packer(
         self,
         packer: Optional[KVObjectLayerMajorPacker],
@@ -2068,7 +2362,7 @@ class LocalDiskBackend(StorageBackendInterface):
         """Return whether Tutti raw-object writes are currently available."""
         return self.kv_object_tutti_raw_writer is not None
 
-    def reset_kv_object_pool_allocation(self) -> None:
+    def reset_kv_object_pool_allocation(self) -> int:
         """Start a new raw-object generation at offset zero.
 
         Raw-object manifests are process-local. Recovered legacy cache entries
@@ -2077,10 +2371,15 @@ class LocalDiskBackend(StorageBackendInterface):
         contents. Atomically invalidate those lookup and object records before
         resetting allocation. Existing filesystem files are left untouched;
         they are intentionally unreachable for this raw-mode process.
+        Returns:
+            Number of lookup-visible keys and object metadata records
+            invalidated by the generation reset.
         """
         with self._csa_layout_lock:
             self._csa_active_layouts.clear()
             self._csa_pending_layouts.clear()
+            self._csa_pending_layout_keys.clear()
+            self._csa_staged_write_counts.clear()
         with self.disk_lock:
             recovered_keys = len(self.dict)
             self.dict.clear()
@@ -2092,6 +2391,7 @@ class LocalDiskBackend(StorageBackendInterface):
             metadata_records = self.kv_object_metadata_store.clear()
         if self.kv_object_pool_layout is not None:
             self.kv_object_pool_layout.reset_allocation()
+        self._kv_object_raw_region_full_at_s = 0.0
         if recovered_keys or metadata_records:
             logger.info(
                 "KV object raw-generation reset invalidated recovered_keys=%d "
@@ -2099,6 +2399,71 @@ class LocalDiskBackend(StorageBackendInterface):
                 recovered_keys,
                 metadata_records,
             )
+        return recovered_keys + metadata_records
+
+    def clear(self) -> int:
+        """Clear disk lookup state and reclaim the Tutti raw object region.
+
+        Raw-object allocation is append-only within one generation. A normal
+        per-arm cache clear must therefore reset both lookup metadata and the
+        allocation cursor; merely dropping ordinary cache keys eventually
+        exhausts the reserved raw region across benchmark arms. Callers must
+        drain ordinary disk puts before clearing. The two private sidecar
+        executors are fenced here so no earlier task can publish stale metadata
+        after the new generation starts.
+
+        Returns:
+            Number of lookup-visible keys and object records invalidated.
+
+        Raises:
+            RuntimeError: If ordinary disk puts are still active.
+        """
+        with self.disk_worker.put_lock:
+            pending_puts = len(self.disk_worker.put_tasks)
+        if pending_puts:
+            raise RuntimeError(
+                f"cannot clear LocalDiskBackend with {pending_puts} active put tasks"
+            )
+
+        # Layer-pack tasks may enqueue HCA writes, so fence them first.
+        self._layer_major_pack_executor.submit(lambda: None).result()
+        self._hca_write_executor.submit(lambda: None).result()
+        if self._cpu_raw_stage_queue is not None:
+            self._cpu_raw_stage_queue.drain()
+
+        paths: set[str] = set()
+        with self.disk_lock:
+            for metadata in self.dict.values():
+                path = str(metadata.path)
+                if os.path.isfile(path):
+                    paths.add(path)
+
+        removed = self.reset_kv_object_pool_allocation()
+        for path in paths:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+        return removed
+
+    def mark_kv_object_raw_region_full(self) -> None:
+        """Record the first failed raw-region allocation in this generation."""
+        if self._kv_object_raw_region_full_at_s <= 0.0:
+            self._kv_object_raw_region_full_at_s = time.perf_counter()
+
+    def kv_object_raw_region_full_since(self, since_s: float) -> bool:
+        """Return whether raw allocation failed after ``since_s``.
+
+        Args:
+            since_s: Monotonic timestamp at which the publication ticket was
+                queued.
+
+        Returns:
+            ``True`` when this generation observed a raw-region allocation
+            failure no earlier than the supplied timestamp.
+        """
+        full_at_s = self._kv_object_raw_region_full_at_s
+        return full_at_s > 0.0 and full_at_s >= since_s
 
     def set_kv_object_tutti_raw_region_extents(
         self,
@@ -2250,6 +2615,31 @@ class LocalDiskBackend(StorageBackendInterface):
         )
         return covered_bytes == expected_bytes
 
+    def count_tutti_raw_readable_prefix(
+        self,
+        keys: Sequence[CacheEngineKey],
+    ) -> int:
+        """Count the contiguous prefix consumable by the Tutti raw loader.
+
+        An ordinary chunk can become visible in the disk dictionary before
+        its raw-object metadata and extents are ready. Reuse barriers must use
+        the same record-readability condition as the direct loader rather than
+        treating the ordinary chunk lookup as sufficient.
+
+        Args:
+            keys: Request-ordered cache keys to validate.
+
+        Returns:
+            Number of leading keys with READY raw-object records whose extents
+            cover every byte required by the direct loader.
+        """
+        readable = 0
+        for record in self.get_kv_object_records(keys):
+            if record is None or not self.kv_object_record_raw_readable(record):
+                break
+            readable += 1
+        return readable
+
     def _ready_tutti_raw_record(
         self,
         record: Optional[KVObjectRecord],
@@ -2283,6 +2673,10 @@ class LocalDiskBackend(StorageBackendInterface):
     ) -> list[tuple[int, int, int]]:
         """Return raw extents covering the record's logical read ranges."""
         extents: list[tuple[int, int, int]] = []
+        ordered_extents = sorted(record.raw_extents, key=lambda item: item[0])
+        extent_starts = [
+            file_offset for file_offset, _slba, _sectors in ordered_extents
+        ]
         for byte_range in record.read_ranges:
             range_length = byte_range.length
             range_dma_length = ((range_length + 511) // 512) * 512
@@ -2297,9 +2691,14 @@ class LocalDiskBackend(StorageBackendInterface):
                 continue
             range_start = byte_range.offset
             range_end = range_start + range_dma_length
-            for file_offset, slba, n_sectors in record.raw_extents:
+            extent_index = bisect.bisect_right(extent_starts, range_start) - 1
+            if extent_index < 0:
+                extent_index = 0
+            for file_offset, slba, n_sectors in ordered_extents[extent_index:]:
                 extent_start = file_offset
                 extent_end = file_offset + n_sectors * 512
+                if extent_start >= range_end:
+                    break
                 read_start = max(range_start, extent_start)
                 read_end = min(range_end, extent_end)
                 if read_start >= read_end:
@@ -2534,6 +2933,7 @@ class LocalDiskBackend(StorageBackendInterface):
                     self.kv_object_pool_layout.next_allocation_bounds(compact_nbytes)
                 )
                 if not self.kv_object_raw_region_covers(offset, aligned_length):
+                    self.mark_kv_object_raw_region_full()
                     logger.warning(
                         "KV_OBJECT_STORE_PROFILE op=%s key=%s "
                         "status=skip reason=raw_region_full offset=%d end=%d "
@@ -2561,6 +2961,7 @@ class LocalDiskBackend(StorageBackendInterface):
                         )
                     )
                     if not self.kv_object_raw_region_covers(offset, aligned_length):
+                        self.mark_kv_object_raw_region_full()
                         logger.warning(
                             "KV_OBJECT_STORE_PROFILE op=%s key=%s "
                             "status=skip reason=raw_region_full offset=%d end=%d "
@@ -2649,7 +3050,12 @@ class LocalDiskBackend(StorageBackendInterface):
             logical_role,
             build.generation,
         )
-        excluded_roles = {"csa_attention_kv", "csa_indexer_cache"}
+        # GLM keeps its compact 21-layer shared IndexCache in the main object;
+        # only the 78 sparse-attention KV layers are materialized as physical
+        # layer-major sidecars.  DSv4 continues to exclude both native streams.
+        excluded_roles = {"csa_attention_kv"}
+        if not _glm_dsa_layer_major_enabled():
+            excluded_roles.add("csa_indexer_cache")
         if _env_flag("LMCACHE_DSV4_HCA_WALKER"):
             excluded_roles.add("hca_attention_kv")
         compact_length = self._write_compact_retrieve_object(
@@ -2688,6 +3094,12 @@ class LocalDiskBackend(StorageBackendInterface):
             object_id=object_id,
             length=compact_length,
         )
+        with self._csa_layout_lock:
+            if self._csa_staged_write_counts.get(key.to_string(), 0) > 0:
+                # Sidecars are already safely owned by the host stage queue,
+                # but the generation must remain lookup-invisible until the
+                # last SSD completion callback publishes it.
+                return True
         return self._publish_csa_layout(key, build)
 
     def _write_hca_slab_object(
@@ -2759,6 +3171,7 @@ class LocalDiskBackend(StorageBackendInterface):
                     self.kv_object_pool_layout.next_allocation_bounds(slab_nbytes)
                 )
                 if not self.kv_object_raw_region_covers(offset, aligned_length):
+                    self.mark_kv_object_raw_region_full()
                     logger.warning(
                         "KV_OBJECT_STORE_PROFILE op=write_hca_slab key=%s "
                         "status=skip reason=raw_region_full offset=%d end=%d "
@@ -2783,6 +3196,7 @@ class LocalDiskBackend(StorageBackendInterface):
                         self.kv_object_pool_layout.next_allocation_bounds(slab_nbytes)
                     )
                     if not self.kv_object_raw_region_covers(offset, aligned_length):
+                        self.mark_kv_object_raw_region_full()
                         logger.warning(
                             "KV_OBJECT_STORE_PROFILE op=write_hca_slab key=%s "
                             "status=skip reason=raw_region_full offset=%d end=%d "
@@ -2869,9 +3283,7 @@ class LocalDiskBackend(StorageBackendInterface):
             return cached, True
 
         group_ranges = self._object_group_ranges_for_offset(memory_obj, 0)
-        entries: list[
-            tuple[tuple[str, int], tuple[tuple[int, int], ...]]
-        ] = []
+        entries: list[tuple[tuple[str, int], tuple[tuple[int, int], ...]]] = []
         for layer_id, role, byte_ranges in self._object_layer_view_specs(
             memory_obj,
             group_ranges,
@@ -3069,6 +3481,8 @@ class LocalDiskBackend(StorageBackendInterface):
             return "compressor_state"
         if dtype != torch.uint8:
             return "kv"
+        if _glm_dsa_layer_major_enabled():
+            return "csa_attention_kv" if hidden_dim == 656 else "kv"
         if hidden_dim == 132:
             return "csa_indexer_cache"
         if hidden_dim != 584:
@@ -3232,6 +3646,8 @@ class LocalDiskBackend(StorageBackendInterface):
         with self._csa_layout_lock:
             self._csa_active_layouts.pop(key.to_string(), None)
             self._csa_pending_layouts.pop(key.to_string(), None)
+            self._csa_pending_layout_keys.pop(key.to_string(), None)
+            self._csa_staged_write_counts.pop(key.to_string(), None)
 
         path = meta.path
         size = meta.size
@@ -3991,6 +4407,7 @@ class LocalDiskBackend(StorageBackendInterface):
                             offset,
                             aligned_length,
                         ):
+                            self.mark_kv_object_raw_region_full()
                             logger.warning(
                                 "KV_OBJECT_STORE_PROFILE op=write key=%s "
                                 "status=skip reason=raw_region_full "
@@ -4323,24 +4740,51 @@ class LocalDiskBackend(StorageBackendInterface):
         )
         return True
 
-    def read_file(self, key, buffer, path):
+    def read_file(
+        self,
+        key: CacheEngineKey,
+        buffer: memoryview,
+        path: str,
+    ) -> None:
+        """Read a serialized KV chunk into an allocator-owned buffer.
+
+        When direct I/O is enabled, the block-aligned prefix is read with
+        ``O_DIRECT`` and only a possible final partial block uses buffered
+        I/O. This keeps GLM KV chunks on the physical SSD path even when their
+        logical byte size is not a multiple of the filesystem block size.
+
+        Args:
+            key: Cache key used to remove stale metadata on a missing file.
+            buffer: Destination byte buffer.
+            path: Source filesystem path.
+        """
         start_time = time.time()
         size = len(buffer)
-        fblock_aligned = size % self.os_disk_bs == 0
-        if not fblock_aligned and self.use_odirect:
-            logger.warning(
-                "Cannot use O_DIRECT for this file, "
-                "size is not aligned to disk block size."
-            )
+        direct_size = size - (size % self.os_disk_bs)
 
         try:
-            if not fblock_aligned or not self.use_odirect:
+            if not self.use_odirect or direct_size == 0:
                 with open(path, "rb") as f:
                     f.readinto(buffer)
             else:
                 fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
                 with os.fdopen(fd, "rb", buffering=0) as fdo:
-                    fdo.readinto(buffer)
+                    direct_read = fdo.readinto(buffer[:direct_size])
+                if direct_read != direct_size:
+                    raise OSError(
+                        f"short O_DIRECT read for {path}: "
+                        f"expected {direct_size}, got {direct_read}"
+                    )
+                if direct_size < size:
+                    with open(path, "rb", buffering=0) as tail_file:
+                        tail_file.seek(direct_size)
+                        tail_read = tail_file.readinto(buffer[direct_size:])
+                    expected_tail = size - direct_size
+                    if tail_read != expected_tail:
+                        raise OSError(
+                            f"short buffered tail read for {path}: "
+                            f"expected {expected_tail}, got {tail_read}"
+                        )
         except FileNotFoundError:
             logger.warning(f"File not found on disk: {path}")
             if self.dict.get(key, None):
@@ -4359,6 +4803,8 @@ class LocalDiskBackend(StorageBackendInterface):
     def close(self) -> None:
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.close()
+        if self._cpu_raw_stage_queue is not None:
+            self._cpu_raw_stage_queue.close(wait=False)
         self._hca_write_executor.shutdown(wait=False)
         self._layer_major_pack_executor.shutdown(wait=False)
         self.disk_worker.close()

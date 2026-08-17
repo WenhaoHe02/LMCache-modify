@@ -99,6 +99,31 @@ void multi_layer_block_kv_transfer_batched(
     int lmcache_chunk_size, GPUKVFormat gpu_kv_format,
     int skip_prefix_n_blocks);
 
+/**
+ * Enqueue a complete layer-wise CPU-to-GPU transfer plan in one native call.
+ *
+ * Host sources, reusable GPU staging tensors, paged-cache pointer tensors,
+ * and static shape metadata are parallel arrays with one entry per registered
+ * cache tensor. Block-ID tensors are supplied once per kernel group and sliced
+ * natively for each transfer. CUDA events are recorded after the cumulative
+ * transfer counts in event_boundaries.
+ */
+void enqueue_layerwise_h2d_scatter(
+    std::vector<torch::Tensor> paged_buffer_ptrs_tensors,
+    std::vector<torch::Tensor> host_sources,
+    std::vector<torch::Tensor> staging_destinations,
+    std::vector<torch::Tensor> block_ids_by_kernel_group,
+    const torch::Device& device,
+    std::vector<PageBufferShapeDesc> shape_descs,
+    std::vector<int64_t> lmcache_chunk_sizes,
+    std::vector<int64_t> gpu_kv_formats,
+    std::vector<int64_t> skip_prefix_n_blocks,
+    std::vector<int64_t> block_id_group_indices,
+    std::vector<int64_t> block_id_starts,
+    std::vector<int64_t> block_id_ends,
+    std::vector<int64_t> event_ptrs,
+    std::vector<int64_t> event_boundaries);
+
 // Scatter fixed-width rows from GPU object pointers. destination_rows maps
 // source rows to flat rows or to (block, slot) locations.
 void scatter_rows_from_object_ptrs(const torch::Tensor& source_ptrs,
@@ -107,3 +132,24 @@ void scatter_rows_from_object_ptrs(const torch::Tensor& source_ptrs,
                                    int rows_per_object, int row_bytes,
                                    int logical_slots_per_block,
                                    bool source_ptrs_aligned);
+
+/**
+ * Pack registered host-memory segments into one pinned host destination.
+
+ * *
+ * The CUDA kernel reads the CPU snapshot through mapped pinned-memory
+ * aliases
+ * and writes the final layer-major byte layout through the
+ * destination's
+ * mapped alias. This removes the Python loop over tens of
+ * thousands of small
+ * memoryview slices while preserving the CPU snapshot
+ * lifetime contract.
+ */
+void pack_pinned_host_segments(std::vector<int64_t> source_host_ptrs,
+                               std::vector<int64_t> source_indices,
+                               std::vector<int64_t> source_offsets,
+                               std::vector<int64_t> destination_offsets,
+                               std::vector<int64_t> lengths,
+                               const torch::Tensor& destination,
+                               const torch::Device& device);

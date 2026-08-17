@@ -266,3 +266,66 @@ def build_compact_csa_prefill_gather_plan(
         device=compressed_seq_lens.device,
     )
     return compact_block_table, compact_seq_lens, remapped_topk
+
+
+def build_compact_csa_prefill_page_plan(
+    topk_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    compressed_seq_lens: torch.Tensor,
+    query_row_offsets: torch.Tensor,
+    block_size: int,
+    selected_page_bitmap: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build compact page metadata without materializing remapped top-K IDs.
+
+    The returned page map is consumed by the final sparse-index combiner, which
+    translates logical top-K entries while it already visits them.
+    """
+    if (
+        topk_indices.ndim != 2
+        or block_table.ndim != 2
+        or compressed_seq_lens.ndim != 1
+        or query_row_offsets.ndim != 1
+    ):
+        raise ValueError("compact page-plan tensors have incompatible ranks")
+    if int(block_table.shape[0]) != 1:
+        raise ValueError("streamed compact page plans require one request")
+    if int(compressed_seq_lens.numel()) != 1 or int(query_row_offsets.numel()) != 2:
+        raise ValueError("compact page plan requires one sequence and two offsets")
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+    tensors = (
+        topk_indices,
+        block_table,
+        compressed_seq_lens,
+        query_row_offsets,
+        selected_page_bitmap,
+    )
+    if not all(tensor.is_cuda for tensor in tensors):
+        raise ValueError("compact page plan requires CUDA tensors")
+    if len({tensor.device for tensor in tensors}) != 1:
+        raise ValueError("compact page-plan tensors must use one CUDA device")
+    if selected_page_bitmap.dtype != torch.int32:
+        raise ValueError("selected_page_bitmap must use int32 dtype")
+    native_op = getattr(
+        _lmc_ops,
+        "build_compact_csa_prefill_gather_plan_from_page_seen",
+        None,
+    )
+    if not callable(native_op):
+        raise RuntimeError("compact page plan requires the LMCache native extension")
+    max_pages = int(block_table.shape[1])
+    flat_seen = selected_page_bitmap.reshape(-1)
+    if int(flat_seen.numel()) < max_pages:
+        raise ValueError("selected page bitmap does not cover the block table")
+    page_seen = flat_seen[:max_pages].reshape(1, max_pages).contiguous()
+    outputs = native_op(
+        topk_indices.contiguous(),
+        block_table.contiguous(),
+        compressed_seq_lens.contiguous(),
+        query_row_offsets.contiguous(),
+        block_size,
+        page_seen,
+        False,
+    )
+    return outputs[0], outputs[1], outputs[3]

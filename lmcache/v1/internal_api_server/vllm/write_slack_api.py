@@ -27,6 +27,25 @@ class EndWriteSlackPayload(BaseModel):
     token: int = Field(gt=0)
 
 
+class BackgroundWriteLimitPayload(BaseModel):
+    """Live per-rank rate and burst for writes outside explicit slack."""
+
+    rate_mib_s: float = Field(ge=0)
+    burst_mib: float = Field(gt=0)
+
+
+class DecodeWriteLimitPayload(BaseModel):
+    """Live per-rank write rate during decode."""
+
+    rate_mib_s: float = Field(ge=0)
+
+
+class ReuseWriteStatusPayload(BaseModel):
+    """Request whose exact SSD generation may gate its next session turn."""
+
+    request_id: str = Field(min_length=1)
+
+
 def _get_engine(request: Request):
     adapter = request.app.state.lmcache_adapter
     engine = getattr(adapter, "lmcache_engine", None)
@@ -129,3 +148,74 @@ async def get_write_slack_status(request: Request) -> JSONResponse:
             content={"error": "Tutti write planner is unavailable"},
         )
     return JSONResponse(content={"status": "success", **asdict(snapshot)})
+
+
+@router.post("/write_slack/background_limit")
+async def configure_background_write_limit(
+    payload: BackgroundWriteLimitPayload,
+    request: Request,
+) -> JSONResponse:
+    """Update one worker's write limit outside explicit slack.
+
+    Args:
+        payload: Per-rank rate and burst in MiB units.
+        request: FastAPI request carrying the LMCache manager.
+
+    Returns:
+        JSON containing the updated planner state.
+    """
+    engine, error = _get_engine(request)
+    if error is not None:
+        return error
+    snapshot = engine.configure_tutti_background_write_limit(
+        payload.rate_mib_s,
+        payload.burst_mib,
+    )
+    if snapshot is None:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Tutti write planner is unavailable"},
+        )
+    return JSONResponse(content={"status": "success", **asdict(snapshot)})
+
+
+@router.post("/write_slack/decode_limit")
+async def configure_decode_write_limit(
+    payload: DecodeWriteLimitPayload,
+    request: Request,
+) -> JSONResponse:
+    """Update one worker's decode-phase write rate."""
+    engine, error = _get_engine(request)
+    if error is not None:
+        return error
+    snapshot = engine.configure_tutti_decode_write_limit(payload.rate_mib_s)
+    if snapshot is None:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Tutti write planner is unavailable"},
+        )
+    return JSONResponse(content={"status": "success", **asdict(snapshot)})
+
+
+@router.post("/write_slack/reuse_ready")
+async def get_reuse_write_status(
+    payload: ReuseWriteStatusPayload,
+    request: Request,
+) -> JSONResponse:
+    """Return request-scoped SSD publication readiness.
+
+    Args:
+        payload: Full serving request ID or OpenAI response-ID prefix.
+        request: FastAPI request carrying the LMCache manager.
+
+    Returns:
+        JSON status for the exact generation written by that request.
+    """
+    engine, error = _get_engine(request)
+    if error is not None:
+        return error
+    try:
+        status = engine.get_tutti_reuse_write_status(payload.request_id)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    return JSONResponse(content={"status": "success", **status})

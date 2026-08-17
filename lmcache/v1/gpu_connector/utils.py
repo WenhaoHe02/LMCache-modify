@@ -184,7 +184,9 @@ def _validate_dim0_padded_layout(tensor: torch.Tensor) -> int:
     * Every interior dim ``i`` satisfies
       ``stride[i] == prod(shape[i+1:])`` 鈥?only dim-0 may carry
       padding, with ``stride[0] >= prod(shape[1:])``.
-    * ``storage_offset == 0`` 鈥?no slice/narrow base shift.
+    * ``storage_offset >= 0``. Per-layer vLLM 0.26 HMA tensors can be
+      slice views into a unified pool. ``Tensor.data_ptr()`` already includes
+      this offset, while ``stride[0]`` remains the physical block step.
 
     Callers must pass the stride-sorted permuted view (not the original
     tensor): for tensors that are both permuted and dim-0-padded, the
@@ -223,8 +225,8 @@ def _validate_dim0_padded_layout(tensor: torch.Tensor) -> int:
         _fail("stride[-1] != 1 (inner dim not contiguous)")
     if stride[-2] != shape[-1]:
         _fail("stride[-2] != shape[-1] (last-two dims not tightly packed)")
-    if storage_offset != 0:
-        _fail("storage_offset != 0 (slice/narrow view, base address shifted)")
+    if storage_offset < 0:
+        _fail("storage_offset < 0")
     # Interior dims (1 .. ndim-2 exclusive) must be tightly packed with
     # respect to the dims to their right. Only dim-0's stride is allowed
     # to exceed the tight value.

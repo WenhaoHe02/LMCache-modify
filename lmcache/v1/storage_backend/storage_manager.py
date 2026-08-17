@@ -982,6 +982,58 @@ class StorageManager:
 
         return total_hit_chunks, block_mapping
 
+    def batched_contains_tutti_raw(
+        self,
+        keys: List[CacheEngineKey],
+        search_range: Optional[List[str]] = None,
+    ) -> int:
+        """Count a contiguous prefix readable by Tutti's raw loader.
+
+        Args:
+            keys: Request-ordered cache keys to validate.
+            search_range: Optional backend names to search. The Tutti raw
+                object store normally uses only ``LocalDiskBackend``.
+
+        Returns:
+            Number of leading keys with complete raw-object records and
+            extents. Backends without raw-readiness support contribute zero.
+        """
+        remaining = keys
+        total_readable = 0
+        for _, backend in self.get_active_storage_backends(search_range=search_range):
+            counter = getattr(backend, "count_tutti_raw_readable_prefix", None)
+            if not callable(counter):
+                continue
+            readable = int(counter(remaining))
+            if readable < 0 or readable > len(remaining):
+                raise RuntimeError("backend returned an invalid raw-readable count")
+            total_readable += readable
+            if total_readable == len(keys):
+                break
+            remaining = remaining[readable:]
+        return total_readable
+
+    def kv_object_raw_region_full_since(
+        self,
+        since_s: float,
+        search_range: Optional[List[str]] = None,
+    ) -> bool:
+        """Return whether a selected backend exhausted raw space recently.
+
+        Args:
+            since_s: Monotonic start time of the publication being checked.
+            search_range: Optional backend names to inspect.
+
+        Returns:
+            ``True`` if any selected backend reports an allocation failure at
+            or after ``since_s``.
+        """
+        for _, backend in self.get_active_storage_backends(search_range=search_range):
+            checker = getattr(backend, "kv_object_raw_region_full_since", None)
+            if callable(checker) and bool(checker(since_s)):
+                return True
+        return False
+
     def contains_streaming_terminal(
         self,
         key: CacheEngineKey,

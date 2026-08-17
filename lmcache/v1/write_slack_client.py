@@ -155,6 +155,50 @@ class TuttiWriteSlackFanoutClient:
         if errors:
             raise RuntimeError("write-slack end failed: " + "; ".join(errors))
 
+    def configure_background_limit(
+        self,
+        rate_mib_s: float,
+        burst_mib: float,
+    ) -> tuple[dict[str, Any], ...]:
+        """Set the live non-tool write limit on every worker.
+
+        Args:
+            rate_mib_s: Long-run per-worker background rate. Zero disables it.
+            burst_mib: Maximum per-worker background burst.
+
+        Returns:
+            Updated worker snapshots in endpoint order.
+
+        Raises:
+            RuntimeError: If any worker rejects or times out.
+        """
+        payload = {"rate_mib_s": rate_mib_s, "burst_mib": burst_mib}
+
+        def configure_worker(endpoint: str) -> dict[str, Any]:
+            return self._request_json(
+                endpoint,
+                "/write_slack/background_limit",
+                payload,
+            )
+
+        results: dict[str, dict[str, Any]] = {}
+        errors: list[str] = []
+        with ThreadPoolExecutor(max_workers=len(self._worker_endpoints)) as executor:
+            futures = {
+                endpoint: executor.submit(configure_worker, endpoint)
+                for endpoint in self._worker_endpoints
+            }
+            for endpoint, future in futures.items():
+                try:
+                    results[endpoint] = future.result()
+                except Exception as exc:
+                    errors.append(f"{endpoint}: {exc}")
+        if errors:
+            raise RuntimeError(
+                "background write-limit update failed: " + "; ".join(errors)
+            )
+        return tuple(results[endpoint] for endpoint in sorted(results))
+
     def _close_tokens(
         self,
         tokens: list[WorkerWriteSlackToken],

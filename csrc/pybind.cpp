@@ -90,11 +90,27 @@ PYBIND11_MODULE(c_ops, m) {
         py::arg("lmcache_chunk_size"), py::arg("gpu_kv_format"),
         py::arg("skip_prefix_n_blocks"),
         py::call_guard<py::gil_scoped_release>());
+  m.def(
+      "enqueue_layerwise_h2d_scatter", &enqueue_layerwise_h2d_scatter,
+      py::arg("paged_buffer_ptrs_tensors"), py::arg("host_sources"),
+      py::arg("staging_destinations"),
+      py::arg("block_ids_by_kernel_group"), py::arg("device"),
+      py::arg("shape_descs"), py::arg("lmcache_chunk_sizes"),
+      py::arg("gpu_kv_formats"), py::arg("skip_prefix_n_blocks"),
+      py::arg("block_id_group_indices"), py::arg("block_id_starts"),
+      py::arg("block_id_ends"), py::arg("event_ptrs"),
+      py::arg("event_boundaries"),
+      py::call_guard<py::gil_scoped_release>());
   m.def("scatter_rows_from_object_ptrs", &scatter_rows_from_object_ptrs,
         py::arg("source_ptrs"), py::arg("destination"),
         py::arg("destination_rows"), py::arg("rows_per_object"),
         py::arg("row_bytes"), py::arg("logical_slots_per_block") = 0,
         py::arg("source_ptrs_aligned") = true,
+        py::call_guard<py::gil_scoped_release>());
+  m.def("pack_pinned_host_segments", &pack_pinned_host_segments,
+        py::arg("source_host_ptrs"), py::arg("source_indices"),
+        py::arg("source_offsets"), py::arg("destination_offsets"),
+        py::arg("lengths"), py::arg("destination"), py::arg("device"),
         py::call_guard<py::gil_scoped_release>());
   py::class_<PageBufferShapeDesc>(m, "PageBufferShapeDesc")
       .def(py::init<>())
@@ -149,7 +165,8 @@ PYBIND11_MODULE(c_ops, m) {
         &build_compact_csa_prefill_gather_plan_from_page_seen_cuda,
         py::arg("topk_indices"), py::arg("block_table"),
         py::arg("compressed_seq_lens"), py::arg("query_row_offsets"),
-        py::arg("block_size"), py::arg("page_seen"));
+        py::arg("block_size"), py::arg("page_seen"),
+        py::arg("remap_topk") = true);
   m.def("select_missing_csa_blocks", &select_missing_csa_blocks_cuda,
         py::arg("topk_indices"), py::arg("resident_blocks"),
         py::arg("max_blocks"), py::arg("block_size"));
@@ -157,4 +174,8 @@ PYBIND11_MODULE(c_ops, m) {
         &select_missing_csa_blocks_with_seen_cuda, py::arg("topk_indices"),
         py::arg("resident_blocks"), py::arg("max_blocks"),
         py::arg("selected_max_blocks"), py::arg("block_size"));
+  m.def("mark_csa_selected_blocks_into",
+        &mark_csa_selected_blocks_into_cuda, py::arg("topk_indices"),
+        py::arg("selected_blocks"), py::arg("selected_max_blocks"),
+        py::arg("block_size"));
 }

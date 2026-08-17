@@ -428,6 +428,29 @@ class CSAAttentionKVLayerState:
     layer_major_dst_rows_table: Optional[torch.Tensor] = None
     true_selected_blocks_bitmap: Optional[torch.Tensor] = None
     true_selected_covers_cached_prefix: bool = False
+    streamed_selected_blocks_bitmap: Optional[torch.Tensor] = None
+    streamed_selected_rows: int = 0
+    streamed_selected_chunks: int = 0
+    streamed_selected_request_token: Optional[Tuple[str, int]] = None
+    streamed_selected_event: Optional[torch.cuda.Event] = None
+    streamed_selected_failed: bool = False
+
+
+@dataclass(slots=True)
+class _DeferredShardGather:
+    """Rank-local read whose private collective is deferred to a model gate."""
+
+    state: CSAAttentionKVLayerState
+    descriptor: CollectiveDescriptor
+    selected: torch.Tensor
+    owned: torch.Tensor
+    local_ready_event: Optional[torch.cuda.Event]
+    local_objects: List[Any]
+    local_complete: bool
+    local_capability: bool
+    pending_ids: Optional[torch.Tensor] = None
+    io_range: Optional[CsaNvtxRange] = None
+    operation_id: str = ""
 
 
 class CSAAttentionKVPrefetchManager:
@@ -522,6 +545,7 @@ class CSAAttentionKVPrefetchManager:
         # wait_for_layer instead of a patched indexer forward.
         self._hca_layer_ids: Tuple[int, ...] = ()
         self._patched_modules: List[Tuple[Any, str, Callable]] = []
+        self._external_kv_forward_active = False
         self._patch_lock = threading.Lock()
         self._active_request_id: Optional[str] = None
         self._full_nsys_seen_request_id = ""
@@ -704,6 +728,14 @@ class CSAAttentionKVPrefetchManager:
                 return "", -1
             return self._active_request_id, self._request_generation
 
+    def set_external_kv_forward_active(self, active: bool) -> None:
+        """Enable correction work only for the external-KV prefill forward.
+
+        Args:
+            active: Whether the current model forward consumes external KV.
+        """
+        self._external_kv_forward_active = bool(active)
+
     def request_stream_available(self) -> bool:
         """Return whether a prior request cleanup left the consumer usable."""
         with self._request_state:
@@ -866,6 +898,12 @@ class CSAAttentionKVPrefetchManager:
             state.layer_major_dst_rows_table = None
             state.true_selected_blocks_bitmap = None
             state.true_selected_covers_cached_prefix = False
+            state.streamed_selected_blocks_bitmap = None
+            state.streamed_selected_rows = 0
+            state.streamed_selected_chunks = 0
+            state.streamed_selected_request_token = None
+            state.streamed_selected_event = None
+            state.streamed_selected_failed = False
         with self._request_state:
             self._request_cleanup_failed = False
             self._request_lifecycle = "inactive"
@@ -1239,9 +1277,7 @@ class CSAAttentionKVPrefetchManager:
                     req_id,
                 )
 
-        layer_major_table_cache: dict[
-            tuple[str, tuple[int, ...]], torch.Tensor
-        ] = {}
+        layer_major_table_cache: dict[tuple[str, tuple[int, ...]], torch.Tensor] = {}
         for layer_id, state in self._layers.items():
             chunks = chunks_by_layer.get(int(layer_id), [])
             ordered = sorted(chunks, key=lambda chunk: chunk.first_compressed_block)
@@ -1274,6 +1310,12 @@ class CSAAttentionKVPrefetchManager:
                 state.in_pool_bitmap.zero_()
                 state.true_selected_blocks_bitmap = None
                 state.true_selected_covers_cached_prefix = False
+                state.streamed_selected_blocks_bitmap = None
+                state.streamed_selected_rows = 0
+                state.streamed_selected_chunks = 0
+                state.streamed_selected_request_token = None
+                state.streamed_selected_event = None
+                state.streamed_selected_failed = False
                 with state.pending_reads_lock:
                     state.pending_reads_bitmap.zero_()
                     state.resident_blocks_bitmap.zero_()
@@ -1533,7 +1575,7 @@ class CSAAttentionKVPrefetchManager:
         prefetch_level: int = 2,
         *,
         request_token: Optional[Tuple[str, int]] = None,
-    ) -> None:
+    ) -> bool | _DeferredShardGather:
         """Submit Tutti reads for the predicted ``top-K`` of one CSA layer.
 
         Called from :class:`IndexerSSDManager` after its HC-proxy emits a
@@ -1551,7 +1593,21 @@ class CSAAttentionKVPrefetchManager:
         """
         if prefetch_level not in (1, 2):
             raise ValueError("prefetch_level must be 1 or 2")
-        self._submit_reads(
+        state = self._layers.get(int(layer_id))
+        active_sharding = bool(
+            state is not None
+            and self._shard_transport is not None
+            and self._shard_config.enabled
+            and self._shard_config.csa_enabled
+        )
+        if active_sharding:
+            return self._prepare_predicted_shard_gather(
+                state,
+                compressed_block_ids,
+                label=f"predicted_l{prefetch_level}",
+                request_token=request_token,
+            )
+        return self._submit_reads(
             layer_id,
             compressed_block_ids,
             label=f"predicted_l{prefetch_level}",
@@ -1622,16 +1678,18 @@ class CSAAttentionKVPrefetchManager:
         layer_id: int,
         *,
         request_token: Optional[Tuple[str, int]] = None,
-    ) -> bool:
-        """Submit a complete CSA layer through dense shard-gather planning.
+    ) -> bool | _DeferredShardGather:
+        """Prepare a complete CSA layer for dense shard-gather.
 
         Args:
             layer_id: Registered CSA transformer layer id.
             request_token: Request generation captured by the source hook.
 
         Returns:
-            ``True`` when a non-empty layer plan was submitted. Capability or
-            cost rejection transparently uses the complete local path.
+            Deferred gate work when TP sharding is active, or ``True`` when a
+            non-empty local layer plan was submitted. The background producer
+            reads only this rank's owner shard; private-NCCL consensus and
+            gather run later after all model ranks reach the target-layer gate.
         """
         if self._data_group != "csa":
             return False
@@ -1639,6 +1697,19 @@ class CSAAttentionKVPrefetchManager:
         if state is None or not state.chunks:
             return False
         covered_end = int(state.chunks[-1].end_compressed_block)
+        active_sharding = bool(
+            self._shard_transport is not None
+            and self._shard_config.enabled
+            and self._shard_config.csa_enabled
+        )
+        if active_sharding:
+            return self._prepare_shard_gather(
+                state,
+                range(covered_end),
+                mode=SSDReadMode.SHARD_GATHER_DENSE,
+                io_priority="lookahead",
+                request_token=request_token,
+            )
         self._submit_reads(
             int(layer_id),
             range(covered_end),
@@ -1704,7 +1775,9 @@ class CSAAttentionKVPrefetchManager:
         if future is None:
             return True
         try:
-            future.result(timeout=max(0.0, timeout_s))
+            result = future.result(timeout=max(0.0, timeout_s))
+            if isinstance(result, _DeferredShardGather):
+                self.finalize_deferred_shard_gather(result)
             return True
         except Exception:
             logger.exception(
@@ -1713,6 +1786,28 @@ class CSAAttentionKVPrefetchManager:
                 layer_id,
             )
             return False
+
+    def finalize_deferred_shard_gather(self, work: Any) -> bool:
+        """Finish a deferred TP shard gather at an aligned model-layer gate.
+
+        Args:
+            work: Value returned by a background dense or predicted read.
+
+        Returns:
+            ``True`` when ``work`` was a deferred gather and was finalized.
+        """
+        if not isinstance(work, _DeferredShardGather):
+            return False
+        self._finalize_shard_gather(work)
+        return True
+
+    def uses_gate_aligned_shard_gather(self) -> bool:
+        """Return whether predicted TP collectives must run at model gates."""
+        return bool(
+            self._shard_transport is not None
+            and self._shard_config.enabled
+            and self._shard_config.csa_enabled
+        )
 
     def submit_miss_reads(
         self,
@@ -1740,6 +1835,37 @@ class CSAAttentionKVPrefetchManager:
             request_token=request_token,
         )
 
+    def submit_topk_miss_reads(
+        self,
+        layer_id: int,
+        true_topk: torch.Tensor,
+        *,
+        request_token: Optional[Tuple[str, int]] = None,
+    ) -> None:
+        """Submit only non-resident blocks selected by an indexer result.
+
+        Args:
+            layer_id: Transformer-side sparse-attention layer id.
+            true_topk: Authoritative indexer output containing compressed-entry
+                ids, with shape ``[num_queries, top_k]`` or ``[top_k]``.
+            request_token: Optional request generation captured before the
+                indexer ran. A stale generation is rejected by the normal
+                submission path.
+
+        Notes:
+            Miss selection stays on the GPU and copies only the compact miss
+            set to the CPU. This avoids synchronizing the complete top-K tensor
+            once per Full layer, which is especially expensive during decode.
+        """
+        missing_ids = self._miss_ids_for_topk(layer_id, true_topk)
+        if missing_ids.numel() == 0:
+            return
+        self.submit_miss_reads(
+            layer_id,
+            missing_ids,
+            request_token=request_token,
+        )
+
     def wait_for_layer(self, layer_id: int, timeout_s: float = 2.0) -> bool:
         """Block until scheduled and in-flight reads for a layer complete.
 
@@ -1757,9 +1883,13 @@ class CSAAttentionKVPrefetchManager:
             ``True`` when the layer has no pending reads (fully landed or
             never registered), ``False`` on timeout.
         """
+        profile = _timing_enabled()
+        wait_start = time.perf_counter()
         deadline = time.monotonic() + max(0.0, timeout_s)
         with self._scheduled_layer_futures_lock:
             scheduled = self._scheduled_layer_futures.pop(int(layer_id), None)
+        scheduled_present = scheduled is not None
+        scheduled_start = time.perf_counter()
         if scheduled is not None:
             try:
                 scheduled.result(timeout=max(0.0, deadline - time.monotonic()))
@@ -1770,10 +1900,13 @@ class CSAAttentionKVPrefetchManager:
                     layer_id,
                 )
                 return False
+        scheduled_wait_ms = (time.perf_counter() - scheduled_start) * 1000.0
         state = self._layers.get(int(layer_id))
         if state is None:
             return True
+        pending_start = time.perf_counter()
         with state.pending_reads_lock:
+            pending_before = int(state.pending_read_count)
             while state.pending_read_count:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -1785,7 +1918,24 @@ class CSAAttentionKVPrefetchManager:
                     )
                     return False
                 state.pending_reads_lock.wait(remaining)
+        pending_wait_ms = (time.perf_counter() - pending_start) * 1000.0
+        drain_start = time.perf_counter()
         self.drain_for_layer(int(layer_id))
+        drain_ms = (time.perf_counter() - drain_start) * 1000.0
+        if profile and self.active_request_id:
+            logger.info(
+                "CSA_GATE_PROFILE request=%s layer=%d scheduled=%d "
+                "pending_before=%d scheduled_wait_ms=%.3f "
+                "pending_wait_ms=%.3f drain_ms=%.3f total_ms=%.3f",
+                self.active_request_id,
+                int(layer_id),
+                int(scheduled_present),
+                pending_before,
+                scheduled_wait_ms,
+                pending_wait_ms,
+                drain_ms,
+                (time.perf_counter() - wait_start) * 1000.0,
+            )
         return True
 
     def drain_for_layer(self, layer_id: int) -> None:
@@ -1895,48 +2045,57 @@ class CSAAttentionKVPrefetchManager:
             orig_forward = indexer_module.forward
             mgr = self
 
-            if getattr(self, "_exact_chunk_prefetch_executor", None) is not None:
-                try:
-                    from vllm.model_executor.layers.sparse_attn_indexer import (
-                        register_lmcache_topk_chunk_callback,
+            try:
+                from vllm.model_executor.layers.sparse_attn_indexer import (
+                    register_lmcache_topk_chunk_callback,
+                )
+
+                cache = getattr(indexer_module, "k_cache", None)
+                hook_prefix = str(cache.prefix)
+
+                def _observe_topk_chunk(
+                    topk_indices: torch.Tensor,
+                    chunk_index: int,
+                    *,
+                    _layer_id: int = int(layer_id),
+                ) -> None:
+                    mgr._accumulate_true_topk_chunk(
+                        _layer_id,
+                        topk_indices,
+                        chunk_index,
+                    )
+                    mgr._schedule_exact_topk_chunk(
+                        _layer_id,
+                        topk_indices,
+                        chunk_index,
                     )
 
-                    cache = getattr(indexer_module, "k_cache", None)
-                    hook_prefix = str(cache.prefix)
-
-                    def _observe_topk_chunk(
-                        topk_indices: torch.Tensor,
-                        chunk_index: int,
-                        *,
-                        _layer_id: int = int(layer_id),
-                    ) -> None:
-                        mgr._schedule_exact_topk_chunk(
-                            _layer_id,
-                            topk_indices,
-                            chunk_index,
-                        )
-
-                    register_lmcache_topk_chunk_callback(
-                        hook_prefix,
-                        _observe_topk_chunk,
-                    )
-                    self._exact_chunk_hook_prefixes[indexer_module] = hook_prefix
-                    logger.info(
-                        "CSAAttentionKVPrefetchManager: exact top-K chunk "
-                        "prefetch attached layer=%d prefix=%s max_chunks=%d",
-                        layer_id,
-                        hook_prefix,
-                        self._exact_chunk_prefetch_limit,
-                    )
-                except (AttributeError, ImportError, TypeError):
-                    logger.exception(
-                        "CSAAttentionKVPrefetchManager: failed to attach exact "
-                        "top-K chunk hook for layer %d; final correction "
-                        "remains active",
-                        layer_id,
-                    )
+                register_lmcache_topk_chunk_callback(
+                    hook_prefix,
+                    _observe_topk_chunk,
+                )
+                self._exact_chunk_hook_prefixes[indexer_module] = hook_prefix
+                logger.info(
+                    "CSAAttentionKVPrefetchManager: streamed true-topK union "
+                    "attached layer=%d prefix=%s exact_prefetch_chunks=%d",
+                    layer_id,
+                    hook_prefix,
+                    (
+                        self._exact_chunk_prefetch_limit
+                        if self._exact_chunk_prefetch_executor is not None
+                        else 0
+                    ),
+                )
+            except (AttributeError, ImportError, TypeError):
+                logger.exception(
+                    "CSAAttentionKVPrefetchManager: failed to attach true-topK "
+                    "chunk observer for layer %d; final correction remains active",
+                    layer_id,
+                )
 
             def _patched_forward(*args: Any, **kwargs: Any) -> torch.Tensor:
+                if not getattr(mgr, "_external_kv_forward_active", True):
+                    return orig_forward(*args, **kwargs)
                 request_token = mgr.active_request_token
                 if not request_token[0]:
                     return orig_forward(*args, **kwargs)
@@ -1964,10 +2123,20 @@ class CSAAttentionKVPrefetchManager:
                         raise RuntimeError(
                             f"native indexer cache is unavailable for layer {layer_id}"
                         )
-                # Never wait for speculative proxy work before the
-                # official Lightning Indexer.  Running true scoring first
-                # overlaps its GPU work with pending I/O and preserves the
-                # exact target-layer semantics on every request.
+                # Dense shard-gather owns an independent NCCL communicator,
+                # but its background producer can arrive with inter-rank
+                # skew.  Join it before the official indexer's forward
+                # collectives: otherwise vLLM 0.26 can enqueue the two
+                # communicator domains in a different order across ranks and
+                # deadlock at the third dense layer on a reused request.
+                # This is still the end of the two-layer FFN prefetch window;
+                # speculative proxy work remains asynchronous below.
+                if hasattr(mgr, "_scheduled_layer_futures_lock") and not (
+                    mgr.wait_for_tracked_submission(layer_id)
+                ):
+                    raise RuntimeError(
+                        f"tracked shard submission failed for layer {layer_id}"
+                    )
                 reused_residual = False
                 true_indexer_start = time.perf_counter() if _timing_enabled() else 0.0
                 with csa_pipeline_nvtx.range(
@@ -2004,15 +2173,6 @@ class CSAAttentionKVPrefetchManager:
                     else 0.0
                 )
                 try:
-                    # Dense early-layer work is queued on a background
-                    # producer. Join that producer after true-indexer compute
-                    # but before miss filtering reads the resident bitmap.
-                    if hasattr(mgr, "_scheduled_layer_futures_lock") and not (
-                        mgr.wait_for_tracked_submission(layer_id)
-                    ):
-                        raise RuntimeError(
-                            f"tracked shard submission failed for layer {layer_id}"
-                        )
                     # Prediction remains asynchronous through the complete
                     # official indexer. Join only now, immediately before
                     # miss filtering needs a stable pending/resident view.
@@ -2165,6 +2325,90 @@ class CSAAttentionKVPrefetchManager:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _accumulate_true_topk_chunk(
+        self,
+        layer_id: int,
+        topk_indices: torch.Tensor,
+        chunk_index: int,
+    ) -> None:
+        """Accumulate one completed true-topK chunk into a page bitmap."""
+        marker = getattr(_csa_c_ops, "mark_csa_selected_blocks_into", None)
+        state = self._layers.get(int(layer_id))
+        request_token = self.active_request_token
+        if (
+            not callable(marker)
+            or state is None
+            or not request_token[0]
+            or not isinstance(topk_indices, torch.Tensor)
+            or not topk_indices.is_cuda
+            or topk_indices.numel() == 0
+        ):
+            return
+        expected_chunk = state.streamed_selected_chunks
+        same_request = state.streamed_selected_request_token == request_token
+        if chunk_index == 0:
+            same_request = False
+        elif not same_request or int(chunk_index) != expected_chunk:
+            state.streamed_selected_failed = True
+            return
+
+        device = state.in_pool_bitmap.device
+        ready_event = torch.cuda.Event()
+        ready_event.record(torch.cuda.current_stream(topk_indices.device))
+        prepare_stream = self._prepare_stream_for(device)
+        with (
+            torch.cuda.device(device),
+            torch.inference_mode(),
+            torch.cuda.stream(prepare_stream),
+        ):
+            prepare_stream.wait_event(ready_event)
+            if not same_request:
+                state.streamed_selected_blocks_bitmap = torch.zeros(
+                    int(state.in_pool_bitmap.numel()),
+                    dtype=torch.int32,
+                    device=device,
+                )
+                state.streamed_selected_rows = 0
+                state.streamed_selected_chunks = 0
+                state.streamed_selected_request_token = request_token
+                state.streamed_selected_failed = False
+            bitmap = state.streamed_selected_blocks_bitmap
+            if bitmap is None:
+                state.streamed_selected_failed = True
+                return
+            topk_indices.record_stream(prepare_stream)
+            marker(
+                topk_indices.contiguous(),
+                bitmap,
+                int(bitmap.numel()),
+                state.compressed_block_size,
+            )
+            done_event = torch.cuda.Event()
+            done_event.record(prepare_stream)
+        state.streamed_selected_rows += int(topk_indices.shape[0])
+        state.streamed_selected_chunks += 1
+        state.streamed_selected_event = done_event
+
+    def _streamed_true_topk_union(
+        self,
+        state: CSAAttentionKVLayerState,
+        active_rows: int,
+    ) -> Optional[torch.Tensor]:
+        """Return the complete streamed page union, or ``None`` to fall back."""
+        bitmap = state.streamed_selected_blocks_bitmap
+        event = state.streamed_selected_event
+        if (
+            state.streamed_selected_failed
+            or state.streamed_selected_request_token != self.active_request_token
+            or state.streamed_selected_rows != int(active_rows)
+            or state.streamed_selected_chunks <= 0
+            or bitmap is None
+            or event is None
+        ):
+            return None
+        torch.cuda.current_stream(bitmap.device).wait_event(event)
+        return bitmap
+
     def _schedule_exact_topk_chunk(
         self,
         layer_id: int,
@@ -2302,11 +2546,7 @@ class CSAAttentionKVPrefetchManager:
         if limit <= 0:
             return torch.empty(0, dtype=torch.int64)
         native_select = getattr(_csa_c_ops, "select_missing_csa_blocks", None)
-        if (
-            callable(native_select)
-            and entries.is_cuda
-            and state.in_pool_bitmap.is_cuda
-        ):
+        if callable(native_select) and entries.is_cuda and state.in_pool_bitmap.is_cuda:
             return native_select(
                 entries.contiguous(),
                 state.in_pool_bitmap,
@@ -2390,9 +2630,7 @@ class CSAAttentionKVPrefetchManager:
             ValueError: If ``io_priority`` is invalid.
         """
         if io_priority not in {"demand", "lookahead", "speculative"}:
-            raise ValueError(
-                "io_priority must be demand, lookahead, or speculative"
-            )
+            raise ValueError("io_priority must be demand, lookahead, or speculative")
         state = self._layers.get(int(layer_id))
         if state is None:
             if raise_on_error:
@@ -2521,8 +2759,7 @@ class CSAAttentionKVPrefetchManager:
             k_cache_tensor = getattr(state, "k_cache_tensor", None)
             device_guard = (
                 torch.cuda.device(k_cache_tensor.device)
-                if isinstance(k_cache_tensor, torch.Tensor)
-                and k_cache_tensor.is_cuda
+                if isinstance(k_cache_tensor, torch.Tensor) and k_cache_tensor.is_cuda
                 else nullcontext()
             )
             with torch.inference_mode(), device_guard:
@@ -2718,11 +2955,9 @@ class CSAAttentionKVPrefetchManager:
             len(state.chunks) > 1
             and all(chunk.layer_major for chunk in state.chunks)
             and state.layer_major_dst_rows_table is not None
-            and selected_cpu.numel()
-            == int(state.chunks[-1].end_compressed_block)
+            and selected_cpu.numel() == int(state.chunks[-1].end_compressed_block)
             and int(selected_cpu[0]) == 0
-            and int(selected_cpu[-1])
-            == int(state.chunks[-1].end_compressed_block) - 1
+            and int(selected_cpu[-1]) == int(state.chunks[-1].end_compressed_block) - 1
         )
         if full_layer_major:
             return self._issue_full_multi_layer_major_read(
@@ -3208,9 +3443,9 @@ class CSAAttentionKVPrefetchManager:
                         raise RuntimeError(
                             "multi-generation layer-major tensor is truncated"
                         )
-                    source = flat[
-                        payload_skip : payload_skip + payload_nbytes
-                    ].view(int(chunk.n_compressed_blocks), block_nbytes)
+                    source = flat[payload_skip : payload_skip + payload_nbytes].view(
+                        int(chunk.n_compressed_blocks), block_nbytes
+                    )
                     rows = dst_rows_table[
                         chunk.first_compressed_block : chunk.end_compressed_block
                     ]
@@ -3250,9 +3485,7 @@ class CSAAttentionKVPrefetchManager:
                         raise RuntimeError(
                             "multi-generation raw layer-major read is truncated"
                         )
-                    source_ptr = (
-                        int(staging.data_ptr()) + int(offset) + payload_skip
-                    )
+                    source_ptr = int(staging.data_ptr()) + int(offset) + payload_skip
                     source_ptrs = torch.tensor(
                         [source_ptr],
                         dtype=torch.int64,
@@ -3336,11 +3569,25 @@ class CSAAttentionKVPrefetchManager:
         # extents.  A 256-block bound stays well below the 1023 usable entries
         # of the production Tutti queue even on fragmented object-store files,
         # while keeping the number of callbacks small for a 480K prefix.
-        blocks_per_segment = min(int(selected.numel()), 256)
-        segments = [
-            selected[start : start + blocks_per_segment]
-            for start in range(0, int(selected.numel()), blocks_per_segment)
-        ]
+        # Keep each loader key contiguous.  Besides avoiding one I/O command
+        # per sparse block, this lets us sector-align the physical read while
+        # retaining one simple payload offset for the scatter callback.
+        # ``bytes_per_block`` is 8448 for the compact DSV4 indexer, so an odd
+        # run start is only 256B-aligned even though the layer object itself
+        # starts on a 4KiB boundary.
+        segment_bounds: List[Tuple[int, int]] = []
+        segment_start = 0
+        selected_ids = selected.tolist()
+        for index in range(1, len(selected_ids) + 1):
+            at_end = index == len(selected_ids)
+            run_broken = not at_end and int(selected_ids[index]) != (
+                int(selected_ids[index - 1]) + 1
+            )
+            size_limit = index - segment_start == 256
+            if at_end or run_broken or size_limit:
+                segment_bounds.append((segment_start, index))
+                segment_start = index
+        segments = [selected[start:end] for start, end in segment_bounds]
         scatter_stream = self._scatter_stream_for(state.k_cache_tensor.device)
         if dst_rows_table.device.type == "cuda":
             # Build destination rows on the same private stream that consumes
@@ -3366,33 +3613,29 @@ class CSAAttentionKVPrefetchManager:
                 dst_rows_table.index_select(0, segment) for segment in segments
             ]
 
-        def _ranges_for_segment(
+        def _read_plan_for_segment(
             segment: torch.Tensor,
-        ) -> Tuple[KVObjectByteRange, ...]:
-            ranges: List[KVObjectByteRange] = []
-            ids = segment.tolist()
-            target_offset = 0
-            run_start = int(ids[0])
-            run_length = 1
-            for block_id in ids[1:] + [None]:
-                if block_id is not None and int(block_id) == run_start + run_length:
-                    run_length += 1
-                    continue
-                length = run_length * block_nbytes
-                ranges.append(
+        ) -> Tuple[Tuple[KVObjectByteRange, ...], int]:
+            """Return a direct-I/O range and payload skip for one block run."""
+            payload_offset = int(chunk.layer_byte_offset) + (
+                int(segment[0]) * block_nbytes
+            )
+            payload_length = int(segment.numel()) * block_nbytes
+            aligned_offset = payload_offset - payload_offset % 512
+            aligned_end = ((payload_offset + payload_length + 511) // 512) * 512
+            payload_skip = payload_offset - aligned_offset
+            return (
+                (
                     KVObjectByteRange(
-                        offset=(
-                            int(chunk.layer_byte_offset) + run_start * block_nbytes
-                        ),
-                        length=length,
-                        target_offset=target_offset,
-                    )
-                )
-                target_offset += length
-                if block_id is not None:
-                    run_start = int(block_id)
-                    run_length = 1
-            return tuple(ranges)
+                        offset=aligned_offset,
+                        length=aligned_end - aligned_offset,
+                        target_offset=0,
+                    ),
+                ),
+                payload_skip,
+            )
+
+        segment_read_plans = [_read_plan_for_segment(segment) for segment in segments]
 
         def _restore_lba_cache() -> None:
             if self._pending_raw_lba_cache:
@@ -3421,17 +3664,18 @@ class CSAAttentionKVPrefetchManager:
                     segment = segments[key_index]
                     segment_blocks = int(segment.numel())
                     segment_nbytes = segment_blocks * block_nbytes
+                    payload_skip = segment_read_plans[key_index][1]
                     tensor = memory_obj.raw_tensor
                     if tensor is None:
                         raise RuntimeError(
                             "layer-major Tutti segment has no raw tensor"
                         )
                     flat = tensor.view(torch.uint8).reshape(-1)
-                    if int(flat.numel()) < segment_nbytes:
+                    if int(flat.numel()) < payload_skip + segment_nbytes:
                         raise RuntimeError(
                             "layer-major Tutti segment returned a short payload"
                         )
-                    source = flat[:segment_nbytes].view(
+                    source = flat[payload_skip : payload_skip + segment_nbytes].view(
                         segment_blocks,
                         block_nbytes,
                     )
@@ -3479,11 +3723,12 @@ class CSAAttentionKVPrefetchManager:
                     segment = segments[key_index]
                     segment_blocks = int(segment.numel())
                     segment_nbytes = segment_blocks * block_nbytes
-                    if int(nbytes) < segment_nbytes:
+                    payload_skip = segment_read_plans[key_index][1]
+                    if int(nbytes) < payload_skip + segment_nbytes:
                         raise RuntimeError(
                             "layer-major raw Tutti segment returned a short payload"
                         )
-                    source_ptr = int(staging.data_ptr()) + int(offset)
+                    source_ptr = int(staging.data_ptr()) + int(offset) + payload_skip
                     source_ptrs = torch.tensor(
                         [source_ptr],
                         dtype=torch.int64,
@@ -3504,9 +3749,7 @@ class CSAAttentionKVPrefetchManager:
         load_kwargs: Dict[str, Any] = {
             "shapes_per_key": None,
             "file_offsets": [0] * len(segments),
-            "read_ranges_per_key": [
-                _ranges_for_segment(segment) for segment in segments
-            ],
+            "read_ranges_per_key": [read_plan[0] for read_plan in segment_read_plans],
             "io_priority": io_priority,
             "before_batch": _restore_lba_cache,
             "max_batch_ios": 256,
@@ -3687,6 +3930,17 @@ class CSAAttentionKVPrefetchManager:
         limit = min(int(max_block_id), bitmap_len)
         if limit <= 0:
             return torch.empty(0, dtype=torch.int64)
+        active_rows = int(true_topk.shape[0]) if true_topk.ndim >= 2 else 1
+        streamed_union = self._streamed_true_topk_union(state, active_rows)
+        if streamed_union is not None:
+            selected_prefix = streamed_union[:limit].ne(0)
+            state.true_selected_blocks_bitmap = streamed_union
+            state.true_selected_covers_cached_prefix = bool(
+                selected_prefix.all().item()
+            )
+            return (
+                selected_prefix & ~state.in_pool_bitmap[:limit]
+            ).nonzero(as_tuple=False).reshape(-1).cpu()
         native_select = getattr(
             _csa_c_ops,
             "select_missing_csa_blocks",
@@ -3708,7 +3962,6 @@ class CSAAttentionKVPrefetchManager:
             # generic PyTorch path. Only the <=1.9K compact miss ids cross to
             # the CPU for Tutti submission.
             if callable(native_select_with_seen):
-                active_rows = int(true_topk.shape[0]) if true_topk.ndim >= 2 else 1
                 suffix_blocks = (
                     active_rows
                     + state.compressed_block_size * _DSV4_CSA_COMPRESS_RATIO
@@ -3819,6 +4072,284 @@ class CSAAttentionKVPrefetchManager:
             )
             == mode
         )
+
+    def _prepare_predicted_shard_gather(
+        self,
+        state: CSAAttentionKVLayerState,
+        block_ids: Sequence[int] | torch.Tensor,
+        *,
+        label: str,
+        request_token: Optional[Tuple[str, int]],
+    ) -> bool | _DeferredShardGather:
+        """Book predicted blocks and read only this rank's owner shard."""
+        selected = torch.as_tensor(
+            block_ids,
+            dtype=torch.int64,
+            device="cpu",
+        ).reshape(-1)
+        limit = min(
+            int(state.chunks[-1].end_compressed_block),
+            int(state.in_pool_bitmap.numel()),
+        )
+        selected = torch.unique(
+            selected[(selected >= 0) & (selected < limit)],
+            sorted=True,
+        )
+        if selected.numel() == 0:
+            return True
+        with state.pending_reads_lock:
+            pending_ids = selected[
+                ~state.resident_blocks_bitmap[selected]
+                & ~state.pending_reads_bitmap[selected]
+            ]
+            with torch.inference_mode():
+                state.pending_reads_bitmap[pending_ids] = True
+            state.pending_read_count += int(pending_ids.numel())
+        operation_id = f"{label}-{time.monotonic_ns()}"
+        io_range = csa_pipeline_nvtx.start_io(
+            layer_id=state.layer_id,
+            target_layer_id=state.layer_id,
+            operation_id=operation_id,
+            request_id=self.active_request_id,
+            attributes={"kind": label, "blocks": int(pending_ids.numel())},
+        )
+        try:
+            work = self._prepare_shard_gather(
+                state,
+                selected,
+                mode=SSDReadMode.SHARD_GATHER_PREDICTED,
+                io_priority="lookahead",
+                request_token=request_token,
+            )
+        except Exception:
+            with state.pending_reads_lock:
+                with torch.inference_mode():
+                    state.pending_reads_bitmap[pending_ids] = False
+                state.pending_read_count = max(
+                    0,
+                    state.pending_read_count - int(pending_ids.numel()),
+                )
+                state.pending_reads_lock.notify_all()
+            csa_pipeline_nvtx.finish_io(
+                io_range,
+                layer_id=state.layer_id,
+                target_layer_id=state.layer_id,
+                operation_id=operation_id,
+                request_id=self.active_request_id,
+                status="error",
+            )
+            raise
+        work.pending_ids = pending_ids
+        work.io_range = io_range
+        work.operation_id = operation_id
+        return work
+
+    def _prepare_shard_gather(
+        self,
+        state: CSAAttentionKVLayerState,
+        block_ids: Sequence[int] | torch.Tensor,
+        *,
+        mode: SSDReadMode,
+        io_priority: str,
+        request_token: Optional[Tuple[str, int]],
+    ) -> _DeferredShardGather:
+        """Read this rank's owner shard without launching a collective."""
+        with self._request_state:
+            current_token = (
+                self._active_request_id or "",
+                self._request_generation,
+            )
+            if self._request_lifecycle != "active" or (
+                request_token is not None and request_token != current_token
+            ):
+                raise RuntimeError("request shard read plan is inactive or stale")
+            self._active_submissions += 1
+        try:
+            transport = self._shard_transport
+            if transport is None:
+                raise RuntimeError("shard transport is unavailable")
+            selected = torch.as_tensor(
+                block_ids,
+                dtype=torch.int64,
+                device="cpu",
+            ).reshape(-1)
+            selected = torch.unique(selected, sorted=True)
+            partition = partition_block_union(selected.tolist(), transport.world_size)
+            descriptor = CollectiveDescriptor(
+                request_generation=int(self._request_generation),
+                layer_id=state.layer_id,
+                phase=2 if mode == SSDReadMode.SHARD_GATHER_DENSE else 1,
+                mode=mode,
+                partition=partition,
+            )
+            local_capability = self._shard_capability_for(
+                state,
+                selected,
+                mode=mode,
+            )
+            owned = torch.as_tensor(
+                partition.blocks_for_rank(transport.rank),
+                dtype=torch.int64,
+                device="cpu",
+            )
+            local_event: Optional[torch.cuda.Event] = None
+            local_objects: List[Any] = []
+            local_completed = torch.empty(0, dtype=torch.int64)
+            local_error: Optional[Exception] = None
+            if local_capability:
+                try:
+                    local_event, local_objects, local_completed = (
+                        self._issue_local_reads(
+                            state,
+                            owned,
+                            io_priority=io_priority,
+                        )
+                    )
+                except Exception as exc:
+                    local_error = exc
+            local_complete = bool(
+                local_error is None
+                and torch.equal(
+                    torch.unique(local_completed.cpu(), sorted=True),
+                    owned,
+                )
+            )
+            if local_complete and owned.numel():
+                with state.pending_reads_lock, torch.inference_mode():
+                    state.resident_blocks_bitmap[owned] = True
+            return _DeferredShardGather(
+                state=state,
+                descriptor=descriptor,
+                selected=selected,
+                owned=owned,
+                local_ready_event=local_event,
+                local_objects=local_objects,
+                local_complete=local_complete,
+                local_capability=local_capability,
+            )
+        finally:
+            with self._request_state:
+                self._active_submissions -= 1
+                self._request_state.notify_all()
+
+    def _finalize_shard_gather(
+        self,
+        prepared: _DeferredShardGather,
+    ) -> None:
+        """Run consensus/gather after all model ranks reach the layer gate."""
+        state = prepared.state
+        transport = self._shard_transport
+        descriptor = prepared.descriptor
+        device = state.k_cache_tensor.device
+        retained_objects = list(prepared.local_objects)
+        completed = False
+        try:
+            if transport is None:
+                raise RuntimeError("shard transport disappeared before its gate")
+            with self._shard_collective_lock:
+                agreed = transport.preflight(
+                    descriptor,
+                    local_capability=prepared.local_capability,
+                    device=device,
+                )
+                ready_descriptor = CollectiveDescriptor(
+                    request_generation=descriptor.request_generation,
+                    layer_id=descriptor.layer_id,
+                    phase=descriptor.phase + 128,
+                    mode=descriptor.mode,
+                    partition=descriptor.partition,
+                )
+                all_reads_ready = agreed and transport.preflight(
+                    ready_descriptor,
+                    local_capability=prepared.local_complete,
+                    device=device,
+                )
+                if not all_reads_ready:
+                    missing = prepared.selected[
+                        ~state.resident_blocks_bitmap[prepared.selected]
+                    ]
+                    event, objects, completed = self._issue_local_reads(
+                        state,
+                        missing,
+                        io_priority="demand",
+                    )
+                    retained_objects.extend(objects)
+                    if event is not None:
+                        event.synchronize()
+                    if not torch.equal(
+                        torch.unique(completed.cpu(), sorted=True),
+                        torch.unique(missing.cpu(), sorted=True),
+                    ):
+                        raise RuntimeError(
+                            f"shard fallback is incomplete for layer {state.layer_id}"
+                        )
+                    with state.pending_reads_lock, torch.inference_mode():
+                        state.resident_blocks_bitmap[prepared.selected] = True
+                    completed = True
+                    return
+                logical_rows = self._logical_destination_rows(state)
+                if logical_rows is None or state.block_slot_scatter:
+                    raise RuntimeError("shard destination layout is unavailable")
+                k_cache_rows = state.k_cache_tensor.view(torch.uint8).reshape(
+                    int(state.k_cache_tensor.shape[0]),
+                    -1,
+                )
+                gather_event = transport.gather_into(
+                    descriptor,
+                    source_rows=k_cache_rows,
+                    logical_destination_rows=logical_rows,
+                    destination_rows=k_cache_rows,
+                    local_ready_event=prepared.local_ready_event,
+                    resident_bitmap=state.in_pool_bitmap,
+                )
+                gather_event.synchronize()
+                with state.pending_reads_lock, torch.inference_mode():
+                    state.resident_blocks_bitmap[prepared.selected] = True
+                completed = True
+                partition = descriptor.partition
+                logger.info(
+                    "CSA_SHARD_GATHER layer=%d mode=%s union_blocks=%d "
+                    "owned_blocks=%d ssd_bytes=%d gather_send_bytes=%d "
+                    "gather_total_bytes=%d union_hash=%d sequence=%d "
+                    "gate_aligned=1",
+                    state.layer_id,
+                    descriptor.mode.value,
+                    len(partition.union),
+                    len(partition.blocks_for_rank(transport.rank)),
+                    len(partition.blocks_for_rank(transport.rank))
+                    * self._bytes_per_block,
+                    partition.padded_blocks * self._bytes_per_block,
+                    partition.padded_blocks
+                    * partition.world_size
+                    * self._bytes_per_block,
+                    partition.union_hash,
+                    descriptor.sequence_number,
+                )
+        finally:
+            if prepared.local_ready_event is not None:
+                prepared.local_ready_event.synchronize()
+            for memory_obj in retained_objects:
+                ref_count_down = getattr(memory_obj, "ref_count_down", None)
+                if callable(ref_count_down):
+                    ref_count_down()
+            if prepared.pending_ids is not None:
+                with state.pending_reads_lock:
+                    with torch.inference_mode():
+                        state.pending_reads_bitmap[prepared.pending_ids] = False
+                    state.pending_read_count = max(
+                        0,
+                        state.pending_read_count - int(prepared.pending_ids.numel()),
+                    )
+                    state.pending_reads_lock.notify_all()
+            if prepared.io_range is not None:
+                csa_pipeline_nvtx.finish_io(
+                    prepared.io_range,
+                    layer_id=state.layer_id,
+                    target_layer_id=state.layer_id,
+                    operation_id=prepared.operation_id,
+                    request_id=self.active_request_id,
+                    status="complete" if completed else "error",
+                )
 
     def _issue_shard_gather(
         self,

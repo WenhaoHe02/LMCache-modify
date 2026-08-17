@@ -19,6 +19,8 @@ import pyarrow.parquet as pq
 
 
 ENDPOINT = os.environ.get("VLLM_ENDPOINT", "http://127.0.0.1:8000")
+MP_PROFILE_ENDPOINT = os.environ.get("LMCACHE_MP_PROFILE_ENDPOINT", "").rstrip("/")
+PROFILE_STOP = os.environ.get("PROFILE_STOP", "1") == "1"
 MODEL = os.environ.get("MODEL_NAME", "deepseek-v4-pro")
 DATASET = Path(
     "/home/zbuser02/datasets/hermes-agent-reasoning-traces/glm-5.1/train.parquet"
@@ -26,7 +28,7 @@ DATASET = Path(
 BASE_TOKENS = int(os.environ.get("BASE_TOKENS", "480000"))
 RECOMPUTE_TOKENS = int(os.environ.get("RECOMPUTE_TOKENS", "200"))
 HIT_TOKENS = BASE_TOKENS + RECOMPUTE_TOKENS
-SKIP_ROWS = 512
+SKIP_ROWS = int(os.environ.get("SKIP_ROWS", "512"))
 
 
 def post_json(
@@ -43,6 +45,49 @@ def post_json(
     with urllib.request.urlopen(request, timeout=timeout) as response:
         body = response.read()
     return json.loads(body.decode()) if body else {}
+
+
+def set_mp_cuda_profiler(enabled: bool) -> None:
+    """Start or stop CUDA profiling inside an LMCache MP server.
+
+    This optional hook lets an Nsight Systems capture include CUDA work issued
+    by the server-driven transfer process. It is inactive unless
+    ``LMCACHE_MP_PROFILE_ENDPOINT`` is set.
+
+    Args:
+        enabled: Start the CUDA profiler when true; stop it when false.
+
+    Raises:
+        RuntimeError: If the MP server rejects the profiling script.
+    """
+    if not MP_PROFILE_ENDPOINT:
+        return
+    action = "start" if enabled else "stop"
+    script = (
+        "import torch\n"
+        f"torch.cuda.profiler.{action}()\n"
+        f"result = 'cuda_profiler_{action}ed'\n"
+    ).encode()
+    boundary = "lmcache-cuda-profiler-boundary"
+    body = (
+        f"--{boundary}\r\n"
+        'Content-Disposition: form-data; name="script"; '
+        f'filename="cuda_profiler_{action}.py"\r\n'
+        "Content-Type: text/x-python\r\n\r\n"
+    ).encode() + script + f"\r\n--{boundary}--\r\n".encode()
+    request = urllib.request.Request(
+        f"{MP_PROFILE_ENDPOINT}/run_script",
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    with urllib.request.urlopen(request, timeout=120) as response:
+        result = response.read().decode(errors="replace")
+    expected = f"cuda_profiler_{action}ed"
+    if expected not in result:
+        raise RuntimeError(
+            f"LMCache MP CUDA profiler {action} failed: {result[:500]}"
+        )
+    emit("mp_cuda_profiler", action=action, response=result)
 
 
 def count_tokens(prompt: str) -> int:
@@ -149,6 +194,7 @@ def run_distinct_prompt_hits(
     num_hits: int,
     warmup_wait_s: float,
     hit_wait_s: float,
+    profile: bool,
 ) -> int:
     """Run hits with one shared prefix and disjoint continuation token IDs."""
     if num_warmup_hits != 1:
@@ -184,7 +230,7 @@ def run_distinct_prompt_hits(
         recompute_tokens=RECOMPUTE_TOKENS,
         distinct_hit_prompts=True,
         continuation_hashes=continuation_hashes,
-        profile=False,
+        profile=profile,
     )
 
     completion("cold_store", base_prompt)
@@ -194,11 +240,29 @@ def run_distinct_prompt_hits(
     if warmup_wait_s > 0:
         emit("sleep", seconds=warmup_wait_s, reason="after_warmup")
         time.sleep(warmup_wait_s)
-    for hit_index, prompt in enumerate(prompts[1:], start=1):
-        completion(f"hit_trial2_{RECOMPUTE_TOKENS}_{hit_index}", prompt)
-        if hit_index < num_hits and hit_wait_s > 0:
-            emit("sleep", seconds=hit_wait_s)
-            time.sleep(hit_wait_s)
+    if profile:
+        set_mp_cuda_profiler(True)
+        try:
+            post_json("/start_profile", {}, timeout=120)
+        except BaseException:
+            set_mp_cuda_profiler(False)
+            raise
+        emit("profile_started")
+    try:
+        for hit_index, prompt in enumerate(prompts[1:], start=1):
+            completion(f"hit_trial2_{RECOMPUTE_TOKENS}_{hit_index}", prompt)
+            if hit_index < num_hits and hit_wait_s > 0:
+                emit("sleep", seconds=hit_wait_s)
+                time.sleep(hit_wait_s)
+    finally:
+        if profile and PROFILE_STOP:
+            try:
+                post_json("/stop_profile", {}, timeout=600)
+                emit("profile_stopped")
+            finally:
+                set_mp_cuda_profiler(False)
+        elif profile:
+            emit("profile_left_running_for_process_exit")
     return 0
 
 
@@ -232,9 +296,9 @@ def main() -> int:
     emit("building_corpus", dataset=str(DATASET), skip_rows=SKIP_ROWS)
     corpus = dataset_corpus()
     if os.environ.get("DISTINCT_HIT_PROMPTS", "0") == "1":
-        if profile or shape_sequence:
+        if shape_sequence:
             raise ValueError(
-                "distinct-prompt mode does not support profiling or shape sequences"
+                "distinct-prompt mode does not support shape sequences"
             )
         return run_distinct_prompt_hits(
             corpus,
@@ -243,6 +307,7 @@ def main() -> int:
             num_hits,
             warmup_wait_s,
             hit_wait_s,
+            profile,
         )
     measured_recomputes = shape_sequence or [RECOMPUTE_TOKENS]
     all_recomputes = set(measured_recomputes)
@@ -302,7 +367,12 @@ def main() -> int:
         time.sleep(warmup_wait_s)
 
     if profile:
-        post_json("/start_profile", {}, timeout=120)
+        set_mp_cuda_profiler(True)
+        try:
+            post_json("/start_profile", {}, timeout=120)
+        except BaseException:
+            set_mp_cuda_profiler(False)
+            raise
         emit("profile_started")
     hit_results: list[dict[str, Any]] = []
     try:
@@ -320,9 +390,14 @@ def main() -> int:
                 emit("sleep", seconds=hit_wait_s)
                 time.sleep(hit_wait_s)
     finally:
-        if profile:
-            post_json("/stop_profile", {}, timeout=600)
-            emit("profile_stopped")
+        if profile and PROFILE_STOP:
+            try:
+                post_json("/stop_profile", {}, timeout=600)
+                emit("profile_stopped")
+            finally:
+                set_mp_cuda_profiler(False)
+        elif profile:
+            emit("profile_left_running_for_process_exit")
     if any(hit["status"] != 200 for hit in hit_results):
         return 1
     return 0

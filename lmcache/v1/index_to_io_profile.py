@@ -313,10 +313,10 @@ def extract_glm_dsa_topology(
 ) -> ModelTopologyProfile:
     """Extract GLM DSA and IndexShare topology from a model config.
 
-    The extractor treats ``indexer_types`` as the source of truth.  A ``full``
-    layer starts a new group; following ``shared`` layers consume that full
-    layer's index.  This describes the shipped model semantics and does not
-    infer sharing from empirical layer similarity.
+    The extractor prefers the model's explicit ``indexer_types``.  vLLM 0.26
+    also accepts ``index_topk_pattern`` or the frequency/offset form, so those
+    native rules are used when the explicit list is absent. A ``full`` layer
+    starts a new group; following ``shared`` layers consume that Full result.
 
     Args:
         config: Parsed GLM model ``config.json`` mapping.
@@ -337,11 +337,44 @@ def extract_glm_dsa_topology(
     layer_count = _require_int(config, "num_hidden_layers")
     index_topk = _require_int(config, "index_topk")
     raw_types = config.get("indexer_types")
-    if not isinstance(raw_types, Sequence) or isinstance(raw_types, (str, bytes)):
-        raise ValueError("indexer_types must be a sequence")
-    indexer_types = tuple(str(value) for value in raw_types)
-    if len(indexer_types) != layer_count:
-        raise ValueError("indexer_types must match num_hidden_layers")
+    if isinstance(raw_types, Sequence) and not isinstance(raw_types, (str, bytes)):
+        indexer_types = tuple(str(value).lower() for value in raw_types)
+        # GLM-5.2 publishes one additional entry for its MTP decoder while
+        # ``num_hidden_layers`` describes only the main decoder stack. The MTP
+        # layer reuses the final main-stack index, so it must not create an
+        # extra prefetch edge or require another registered decoder here.
+        if (
+            len(indexer_types) == layer_count + 1
+            and bool(config.get("index_share_for_mtp_iteration", False))
+            and config.get("num_nextn_predict_layers") == 1
+        ):
+            indexer_types = indexer_types[:layer_count]
+        if len(indexer_types) != layer_count:
+            raise ValueError("indexer_types must match num_hidden_layers")
+    else:
+        raw_pattern = config.get("index_topk_pattern")
+        if isinstance(raw_pattern, Sequence) and not isinstance(
+            raw_pattern, (str, bytes)
+        ):
+            if len(raw_pattern) != layer_count:
+                raise ValueError("index_topk_pattern must match num_hidden_layers")
+            indexer_types = tuple(
+                "shared" if str(value).upper() == "S" else "full"
+                for value in raw_pattern
+            )
+        else:
+            frequency = config.get("index_topk_freq", 1)
+            offset = config.get("index_skip_topk_offset", 2)
+            if not isinstance(frequency, int) or frequency <= 0:
+                raise ValueError("index_topk_freq must be a positive integer")
+            if not isinstance(offset, int):
+                raise ValueError("index_skip_topk_offset must be an integer")
+            indexer_types = tuple(
+                "shared"
+                if max(layer_id - offset + 1, 0) % frequency != 0
+                else "full"
+                for layer_id in range(layer_count)
+            )
 
     layers: list[LayerTopology] = []
     group_consumers: list[list[int]] = []

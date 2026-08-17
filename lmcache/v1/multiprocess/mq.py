@@ -48,6 +48,25 @@ def decode_request_uid(b_uid: bytes) -> RequestUID:
     return msgspec.msgpack.decode(b_uid, type=RequestUID)
 
 
+def affinity_key_from_identity(identity: bytes) -> int:
+    """Return a stable affinity key for a ZMQ client identity.
+
+    Worker clients set their physical rank as a decimal DEALER identity. Legacy
+    and non-worker clients keep an opaque identity and retain hash-based routing.
+
+    Args:
+        identity: The ROUTER-visible ZMQ client identity.
+
+    Returns:
+        The physical worker rank for decimal identities, otherwise a hash of
+        the opaque identity.
+    """
+    try:
+        return int(identity)
+    except ValueError:
+        return hash(identity)
+
+
 def unwrap_request_payloads(
     b_payloads: list[bytes], payload_clss: list[Any]
 ) -> list[Any]:
@@ -115,10 +134,25 @@ class MessageQueueClient:
         request_type: RequestType
         request_payloads: list[Any]
 
-    def __init__(self, server_url: str, context: zmq.Context):
+    def __init__(
+        self,
+        server_url: str,
+        context: zmq.Context,
+        routing_key: int | None = None,
+    ) -> None:
+        """Create a message-queue client.
+
+        Args:
+            server_url: Message-queue server URL.
+            context: ZMQ context used to create the DEALER socket.
+            routing_key: Optional dense worker rank used as the DEALER identity
+                for deterministic GPU affinity routing.
+        """
         # Socket
         self.ctx = context
         self.socket = self.ctx.socket(zmq.DEALER)
+        if routing_key is not None:
+            self.socket.setsockopt(zmq.IDENTITY, str(routing_key).encode("ascii"))
         self.socket.connect(server_url)
 
         # Input queue
@@ -413,7 +447,7 @@ class MessageQueueServer:
             prefix_frames (list[bytes]): The prefix frames to send back.
                 prefix_frames[0] is the zmq identity used as affinity key.
         """
-        affinity_key = hash(prefix_frames[0])
+        affinity_key = affinity_key_from_identity(prefix_frames[0])
         future = handler_entry(payloads, affinity_key=affinity_key)
 
         def _notify_response(fut: Future):

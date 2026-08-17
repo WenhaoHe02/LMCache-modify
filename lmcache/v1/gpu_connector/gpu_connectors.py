@@ -46,6 +46,16 @@ import lmcache.c_ops as lmc_ops
 logger = init_logger(__name__)
 
 
+def _glm_dsa_layer_major_enabled() -> bool:
+    """Return whether GLM uses the layer-major attention-KV layout."""
+    truthy = {"1", "true", "yes", "on"}
+    return (
+        os.getenv("LMCACHE_GLM_DSA_LAYER_MAJOR", "0").lower() in truthy
+        or os.getenv("LMCACHE_GLM_DSA_PREDICTIVE_PREFETCH", "0").lower()
+        in truthy
+    )
+
+
 class GPUConnectorInterface(metaclass=abc.ABCMeta):
     @abc.abstractmethod
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
@@ -750,6 +760,9 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
 
         if group.dtype != torch.uint8:
             return "unknown"
+
+        if _glm_dsa_layer_major_enabled():
+            return "csa_attention_kv" if hidden_dim == 656 else "unknown"
 
         if hidden_dim == 132:
             return "csa_indexer_cache"
@@ -2233,14 +2246,12 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
 
         launch_finished_ns = time.perf_counter_ns() if timing_enabled else 0
 
-        # Host-backed destinations must be complete before storage and
-        # layer-major admission consume them.  One batch-wide barrier replaces
-        # the legacy per-chunk barriers.
-        if any(
+        host_backed = any(
             memory_obj.raw_tensor is not None
             and not memory_obj.raw_tensor.is_cuda
             for memory_obj in memory_objs
-        ):
+        )
+        if host_backed:
             self.store_stream.synchronize()
         sync_finished_ns = time.perf_counter_ns() if timing_enabled else 0
 
@@ -2296,13 +2307,12 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
             return
         if hasattr(lmc_ops, "multi_layer_block_kv_transfer_batched"):
             try:
-                self._batched_from_gpu_vectorized(
+                return self._batched_from_gpu_vectorized(
                     list(memory_objs),
                     list(starts),
                     list(ends),
                     **kwargs,
                 )
-                return
             except Exception:
                 logger.exception(
                     "Vectorized batched_from_gpu failed; falling back to "
