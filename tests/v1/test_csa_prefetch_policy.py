@@ -90,6 +90,23 @@ def test_source_mapping_supports_selected_one_layer_targets() -> None:
     }
 
 
+def test_deterministic_dense_targets_are_excluded_from_prediction() -> None:
+    """Dense early layers do not also receive speculative source hooks."""
+    policy = CSAPrefetchLookaheadPolicy("default:2,36:1,42:1")
+
+    sources = build_residual_prefetch_sources(
+        [2, 4, 24, 26, 36, 42],
+        policy,
+        excluded_target_layer_ids={2, 4, 24},
+    )
+
+    assert sources == {
+        24: (26, 2),
+        35: (36, 1),
+        41: (42, 1),
+    }
+
+
 def test_dsv4_flash_21_layer_profile_has_nine_deep_targets_without_conflicts() -> None:
     """V4-Flash has 21 even CSA layers, not the legacy 30-layer geometry."""
     csa_layer_ids = list(range(2, 43, 2))

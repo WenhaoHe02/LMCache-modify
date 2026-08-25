@@ -45,6 +45,7 @@ import bisect
 import ctypes
 import glob
 import hashlib
+import json
 import mmap
 import os
 import re
@@ -72,6 +73,10 @@ except ImportError:  # pragma: no cover - exercised only on non-POSIX hosts
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey, DiskCacheMetadata
 from lmcache.v1.kv_object_store import KVObjectByteRange
+from lmcache.v1.csa_pipeline_nvtx import (
+    CsaNvtxEvent,
+    detailed_io_nvtx,
+)
 from lmcache.v1.memory_management import MemoryFormat, MemoryObj, MemoryObjMetadata
 from lmcache.v1.storage_backend.cpu_raw_writer import CPURawBlockWriter
 from lmcache.v1.write_planner import TuttiWritePlanManager, WritePlanSnapshot
@@ -205,6 +210,16 @@ def _tutti_profile_enabled() -> bool:
     if value is None:
         value = os.environ.get("LMCACHE_CSA_ATTENTION_KV_TIMING", "0")
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _device_timestamp_profile_enabled() -> bool:
+    """Return whether exact Tutti device timestamp collection is enabled."""
+    return os.getenv("LMCACHE_TUTTI_DEVICE_TIMESTAMPS", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _effective_shapes(
@@ -974,7 +989,8 @@ class SnvmeSession:
         #    addr.domain (the kernel modifies the struct in-place) and
         #    returns 0 on success.  Do NOT read the minor from the ioctl
         #    return value (that would always be 0).
-        self._fd_ctrl = os.open(ctrl_path, os.O_RDWR)
+        open_flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        self._fd_ctrl = os.open(ctrl_path, open_flags)
         bdf_create = self._parse_bdf(pci_bdf)
         size = ctypes.sizeof(bdf_create)
         buf = ctypes.create_string_buffer(bytes(bdf_create), size)
@@ -991,7 +1007,7 @@ class SnvmeSession:
 
         # 2. Open the per-controller device, configure kernel IO queue cap,
         # and bind the controller to snvme.
-        self._fd_dev = os.open(self._device_path, os.O_RDWR)
+        self._fd_dev = os.open(self._device_path, open_flags)
         cap_buf = _struct.pack("I", kernel_ioq_cap)
         fcntl.ioctl(self._fd_dev, _NVM_SET_KERNEL_IOQ_CAP, cap_buf)
         _wait_for_mount_handoff_before_bind()
@@ -1154,20 +1170,32 @@ class SnvmeSession:
         self._staging_tensor = torch.empty(0, dtype=torch.uint8)
 
         if self._bar0_cpu_ptr != 0:
-            _cuda_host_unregister(self._bar0_cpu_ptr)
+            try:
+                _cuda_host_unregister(self._bar0_cpu_ptr)
+            except Exception as exc:
+                logger.warning("cudaHostUnregister(BAR0) failed: %s", exc)
             self._bar0_gpu_ptr = 0
             self._bar0_cpu_ptr = 0
 
         if self._bar0_mmap is not None:
             self._bar0_arr = None  # release ctypes ref before closing mmap
-            self._bar0_mmap.close()
+            try:
+                self._bar0_mmap.close()
+            except (BufferError, OSError) as exc:
+                logger.warning("BAR0 munmap failed: %s", exc)
             self._bar0_mmap = None
 
         if self._fd_dev >= 0:
-            os.close(self._fd_dev)
+            try:
+                os.close(self._fd_dev)
+            except OSError as exc:
+                logger.warning("Closing snvme device fd failed: %s", exc)
             self._fd_dev = -1
         if self._fd_ctrl >= 0:
-            os.close(self._fd_ctrl)
+            try:
+                os.close(self._fd_ctrl)
+            except OSError as exc:
+                logger.warning("Closing snvme control fd failed: %s", exc)
             self._fd_ctrl = -1
 
     def __del__(self) -> None:
@@ -1268,6 +1296,7 @@ class TuttiDirectLoader:
         pci_bdf: str = "",
     ) -> None:
         self._session = session
+        self._closed = False
         self._staging = staging_tensor
         self._staging_raw_ptr = staging_raw_ptr
         self._n_slots = n_slots
@@ -1410,6 +1439,46 @@ class TuttiDirectLoader:
 
         # Reusable GPU tensor for per-CQE status codes.
         self._status_buf = status_buf
+        self._device_timestamp_profile = _device_timestamp_profile_enabled()
+        self._doorbell_timestamps: Optional[torch.Tensor] = None
+        self._cqe_timestamps: Optional[torch.Tensor] = None
+        self._observed_cids: Optional[torch.Tensor] = None
+        self._device_profile_call_seq = 0
+        if self._device_timestamp_profile:
+            required_symbols = (
+                "tutti_submit_batch_sgl_read_profiled",
+                "tutti_submit_indexed_sgl_read_profiled",
+                "tutti_poll_batch_profiled",
+            )
+            missing = [
+                symbol
+                for symbol in required_symbols
+                if _c_ops is None or not hasattr(_c_ops, symbol)
+            ]
+            if missing:
+                raise RuntimeError(
+                    "LMCACHE_TUTTI_DEVICE_TIMESTAMPS=1 requires rebuilt "
+                    f"profile CUDA ops; missing {missing}"
+                )
+            with torch.cuda.device(cuda_device):
+                profile_device = f"cuda:{cuda_device}"
+                profile_size = int(status_buf.numel())
+                self._doorbell_timestamps = torch.zeros(
+                    profile_size,
+                    dtype=torch.int64,
+                    device=profile_device,
+                )
+                self._cqe_timestamps = torch.zeros(
+                    profile_size,
+                    dtype=torch.int64,
+                    device=profile_device,
+                )
+                self._observed_cids = torch.full(
+                    (profile_size,),
+                    -1,
+                    dtype=torch.int32,
+                    device=profile_device,
+                )
 
         # Persistent lookup used by the indexed CSA submit kernel. snvme
         # exposes one IOVA per 64-KiB GPU page; keeping the table on-device
@@ -2082,6 +2151,9 @@ class TuttiDirectLoader:
         on_batch_loaded: IndexedBatchLoadedCallback,
         io_priority: str = "demand",
         profile_layer_id: Optional[int] = None,
+        profile_kind: Optional[str] = None,
+        profile_operation_id: Optional[str] = None,
+        profile_source_layer: Optional[int] = None,
         input_ready_event: Optional[torch.cuda.Event] = None,
         wait_for_active_io: bool = False,
     ) -> None:
@@ -2188,6 +2260,9 @@ class TuttiDirectLoader:
                     io_nbytes,
                     on_batch_loaded,
                     profile_layer_id=profile_layer_id,
+                    profile_kind=profile_kind,
+                    profile_operation_id=profile_operation_id,
+                    profile_source_layer=profile_source_layer,
                     lock_wait_ms=lock_wait_ms,
                     input_ready_event=input_ready_event,
                 )
@@ -2221,6 +2296,10 @@ class TuttiDirectLoader:
         deadline_monotonic: Optional[float] = None,
         throttle_speculative: bool = True,
         wait_for_active_io: bool = False,
+        profile_layer_id: Optional[int] = None,
+        profile_kind: Optional[str] = None,
+        profile_operation_id: Optional[str] = None,
+        profile_source_layer: Optional[int] = None,
     ) -> list[Optional[MemoryObj]]:
         """Thread-safe wrapper around the GPU-direct NVMe read path.
 
@@ -2361,6 +2440,10 @@ class TuttiDirectLoader:
                     deadline_monotonic=deadline_monotonic,
                     throttle_speculative=throttle_speculative,
                     wait_for_active_io=wait_for_active_io,
+                    profile_layer_id=profile_layer_id,
+                    profile_kind=profile_kind,
+                    profile_operation_id=profile_operation_id,
+                    profile_source_layer=profile_source_layer,
                 )
             profile_enabled = _tutti_profile_enabled()
             lock_wait_start = time.perf_counter() if profile_enabled else 0.0
@@ -2388,6 +2471,10 @@ class TuttiDirectLoader:
                     deadline_monotonic=deadline_monotonic,
                     throttle_speculative=throttle_speculative,
                     wait_for_active_io=wait_for_active_io,
+                    profile_layer_id=profile_layer_id,
+                    profile_kind=profile_kind,
+                    profile_operation_id=profile_operation_id,
+                    profile_source_layer=profile_source_layer,
                 )
         finally:
             with self._reader_gate:
@@ -2405,6 +2492,9 @@ class TuttiDirectLoader:
         on_batch_loaded: IndexedBatchLoadedCallback,
         *,
         profile_layer_id: Optional[int] = None,
+        profile_kind: Optional[str] = None,
+        profile_operation_id: Optional[str] = None,
+        profile_source_layer: Optional[int] = None,
         lock_wait_ms: float = 0.0,
         input_ready_event: Optional[torch.cuda.Event] = None,
     ) -> None:
@@ -2439,6 +2529,11 @@ class TuttiDirectLoader:
             else:
                 io_stream.wait_stream(torch.cuda.current_stream())
         total = int(selected_ids.numel())
+        device_call_seq = (
+            self._next_device_profile_call()
+            if getattr(self, "_device_timestamp_profile", False)
+            else -1
+        )
         batch_start = 0
         batch_count = 0
         submit_cpu_ms = 0.0
@@ -2453,7 +2548,27 @@ class TuttiDirectLoader:
             batch_ids = selected_ids[batch_start:batch_end]
             n_ios = int(batch_ids.numel())
             batch_profile_start = time.perf_counter() if profile_enabled else 0.0
+            batch_range = detailed_io_nvtx.start(
+                CsaNvtxEvent.NVME_DEVICE_BATCH,
+                layer_id=(
+                    int(profile_source_layer)
+                    if profile_source_layer is not None
+                    else int(profile_layer_id or -1)
+                ),
+                target_layer_id=profile_layer_id,
+                operation_id=profile_operation_id,
+                attributes={
+                    "kind": profile_kind or "unknown",
+                    "call": device_call_seq,
+                    "batch": batch_count,
+                    "mode": "indexed",
+                    "qid": int(q.qid),
+                    "n_ios": n_ios,
+                    "bytes": n_ios * io_nbytes,
+                },
+            )
             with torch.cuda.device(self._cuda_device):
+                self._prepare_device_timestamp_batch(n_ios, io_stream)
                 phase_events = (
                     tuple(torch.cuda.Event(enable_timing=True) for _ in range(4))
                     if cuda_phase_profile
@@ -2462,41 +2577,62 @@ class TuttiDirectLoader:
                 if phase_events is not None:
                     phase_events[0].record(io_stream)
                 submit_start = time.perf_counter() if profile_enabled else 0.0
-                _c_ops.tutti_submit_indexed_sgl_read(
-                    sq_dev_ptr=sq_dev_ptr,
-                    cq_dev_ptr=cq_dev_ptr,
-                    sq_db_ptr=sq_db_ptr,
-                    cq_db_ptr=cq_db_ptr,
-                    sq_tail_ptr=self._sq_tail_ptr,
-                    q_depth=self._q_depth(),
-                    qid=q.qid,
-                    nsid=self._session.nsid,
-                    staging_page_iovas=self._staging_page_iovas_gpu,
-                    staging_stride=staging_stride,
-                    slba_table=slba_table,
-                    selected_ids=batch_ids,
-                    byte_len=io_nbytes,
-                    stream_ptr=io_stream_ptr,
+                submit_op = (
+                    _c_ops.tutti_submit_indexed_sgl_read_profiled
+                    if getattr(self, "_device_timestamp_profile", False)
+                    else _c_ops.tutti_submit_indexed_sgl_read
+                )
+                submit_kwargs = {
+                    "sq_dev_ptr": sq_dev_ptr,
+                    "cq_dev_ptr": cq_dev_ptr,
+                    "sq_db_ptr": sq_db_ptr,
+                    "cq_db_ptr": cq_db_ptr,
+                    "sq_tail_ptr": self._sq_tail_ptr,
+                    "q_depth": self._q_depth(),
+                    "qid": q.qid,
+                    "nsid": self._session.nsid,
+                    "staging_page_iovas": self._staging_page_iovas_gpu,
+                    "staging_stride": staging_stride,
+                    "slba_table": slba_table,
+                    "selected_ids": batch_ids,
+                    "byte_len": io_nbytes,
+                    "stream_ptr": io_stream_ptr,
+                }
+                if getattr(self, "_device_timestamp_profile", False):
+                    submit_kwargs["doorbell_timestamps"] = (
+                        self._doorbell_timestamps
+                    )
+                submit_op(
+                    **submit_kwargs,
                 )
                 if profile_enabled:
                     submit_cpu_ms += _elapsed_ms(submit_start)
                 if phase_events is not None:
                     phase_events[1].record(io_stream)
                 poll_launch_start = time.perf_counter() if profile_enabled else 0.0
-                _c_ops.tutti_poll_batch(
-                    sq_dev_ptr=sq_dev_ptr,
-                    cq_dev_ptr=cq_dev_ptr,
-                    sq_db_ptr=sq_db_ptr,
-                    cq_db_ptr=cq_db_ptr,
-                    cq_head_ptr=self._cq_head_ptr,
-                    cq_phase_ptr=self._cq_phase_ptr,
-                    q_depth=self._q_depth(),
-                    n_ios=n_ios,
-                    status_out=self._status_buf,
-                    timed_out_ptr=self._timed_out_ptr,
-                    max_iters=self.POLL_MAX_ITERS,
-                    stream_ptr=io_stream_ptr,
+                poll_op = (
+                    _c_ops.tutti_poll_batch_profiled
+                    if getattr(self, "_device_timestamp_profile", False)
+                    else _c_ops.tutti_poll_batch
                 )
+                poll_kwargs = {
+                    "sq_dev_ptr": sq_dev_ptr,
+                    "cq_dev_ptr": cq_dev_ptr,
+                    "sq_db_ptr": sq_db_ptr,
+                    "cq_db_ptr": cq_db_ptr,
+                    "cq_head_ptr": self._cq_head_ptr,
+                    "cq_phase_ptr": self._cq_phase_ptr,
+                    "q_depth": self._q_depth(),
+                    "n_ios": n_ios,
+                    "status_out": self._status_buf,
+                    "timed_out_ptr": self._timed_out_ptr,
+                    "max_iters": self.POLL_MAX_ITERS,
+                    "stream_ptr": io_stream_ptr,
+                }
+                if getattr(self, "_device_timestamp_profile", False):
+                    poll_kwargs["cqe_timestamps"] = self._cqe_timestamps
+                    poll_kwargs["observed_cids"] = self._observed_cids
+                poll_op(**poll_kwargs)
                 if profile_enabled:
                     poll_launch_cpu_ms += _elapsed_ms(poll_launch_start)
                 if phase_events is not None:
@@ -2521,6 +2657,7 @@ class TuttiDirectLoader:
                     status_gpu_ms += float(
                         phase_events[2].elapsed_time(phase_events[3])
                     )
+            detailed_io_nvtx.finish(batch_range)
 
             status_start = time.perf_counter() if profile_enabled else 0.0
             self._check_nvme_status(
@@ -2528,6 +2665,16 @@ class TuttiDirectLoader:
                 n_ios=n_ios,
                 path_for_io=lambda _index: "<indexed-slba-table>",
                 gpu_has_error=status_has_error,
+            )
+            self._finish_device_timestamp_batch(
+                call_seq=device_call_seq,
+                batch_seq=batch_count,
+                mode="indexed",
+                byte_lens=[io_nbytes] * n_ios,
+                profile_layer_id=profile_layer_id,
+                profile_source_layer=profile_source_layer,
+                profile_kind=profile_kind,
+                profile_operation_id=profile_operation_id,
             )
             if profile_enabled:
                 status_cpu_ms += _elapsed_ms(status_start)
@@ -2604,6 +2751,10 @@ class TuttiDirectLoader:
         deadline_monotonic: Optional[float] = None,
         throttle_speculative: bool = True,
         wait_for_active_io: bool = False,
+        profile_layer_id: Optional[int] = None,
+        profile_kind: Optional[str] = None,
+        profile_operation_id: Optional[str] = None,
+        profile_source_layer: Optional[int] = None,
     ) -> list[Optional[MemoryObj]]:
         """Load KV chunks directly from NVMe into HBM staging.
 
@@ -2896,6 +3047,10 @@ class TuttiDirectLoader:
                             on_batch_loaded is None and on_raw_batch_loaded is None
                         ),
                         on_raw_batch_loaded=local_raw_callback,
+                        profile_layer_id=profile_layer_id,
+                        profile_kind=profile_kind,
+                        profile_operation_id=profile_operation_id,
+                        profile_source_layer=profile_source_layer,
                     )
                     n_batches += 1
                     batch_loaded = (
@@ -2937,6 +3092,10 @@ class TuttiDirectLoader:
                 ),
                 clone_results=(on_batch_loaded is None and on_raw_batch_loaded is None),
                 on_raw_batch_loaded=local_raw_callback,
+                profile_layer_id=profile_layer_id,
+                profile_kind=profile_kind,
+                profile_operation_id=profile_operation_id,
+                profile_source_layer=profile_source_layer,
             )
             n_batches += 1
             batch_loaded = (
@@ -2979,6 +3138,142 @@ class TuttiDirectLoader:
                 _elapsed_ms(profile_start),
             )
         return results
+
+    def _next_device_profile_call(self) -> int:
+        """Return a process-local I/O call id for profile correlation."""
+        call_seq = self._device_profile_call_seq
+        self._device_profile_call_seq += 1
+        return call_seq
+
+    def _prepare_device_timestamp_batch(
+        self,
+        n_ios: int,
+        io_stream: Optional[torch.cuda.Stream],
+    ) -> None:
+        """Clear profile-only outputs on the same stream as the I/O batch."""
+        if not getattr(self, "_device_timestamp_profile", False):
+            return
+        if (
+            self._doorbell_timestamps is None
+            or self._cqe_timestamps is None
+            or self._observed_cids is None
+        ):
+            raise RuntimeError("Tutti timestamp profile buffers are unavailable")
+        if n_ios > int(self._doorbell_timestamps.numel()):
+            raise RuntimeError("Tutti timestamp profile batch exceeds buffer size")
+        if io_stream is not None:
+            with torch.cuda.stream(io_stream):
+                self._doorbell_timestamps[:n_ios].zero_()
+                self._cqe_timestamps[:n_ios].zero_()
+                self._observed_cids[:n_ios].fill_(-1)
+        else:
+            self._doorbell_timestamps[:n_ios].zero_()
+            self._cqe_timestamps[:n_ios].zero_()
+            self._observed_cids[:n_ios].fill_(-1)
+
+    def _finish_device_timestamp_batch(
+        self,
+        *,
+        call_seq: int,
+        batch_seq: int,
+        mode: str,
+        byte_lens: Sequence[int],
+        profile_layer_id: Optional[int],
+        profile_source_layer: Optional[int],
+        profile_kind: Optional[str],
+        profile_operation_id: Optional[str],
+    ) -> None:
+        """Validate and emit one device-timestamped NVMe batch.
+
+        The reported interval begins immediately before an SQ doorbell store
+        and ends when the polling kernel first observes the corresponding CQE.
+        It is therefore a conservative queue/service/observation envelope,
+        not pure media or DMA time.
+        """
+        if not getattr(self, "_device_timestamp_profile", False):
+            return
+        if (
+            self._doorbell_timestamps is None
+            or self._cqe_timestamps is None
+            or self._observed_cids is None
+        ):
+            raise RuntimeError("Tutti timestamp profile buffers are unavailable")
+        n_ios = len(byte_lens)
+        doorbell_ns = [
+            int(value)
+            for value in self._doorbell_timestamps[:n_ios].cpu().tolist()
+        ]
+        observed_ns = [
+            int(value) for value in self._cqe_timestamps[:n_ios].cpu().tolist()
+        ]
+        observed_cids = [
+            int(value) for value in self._observed_cids[:n_ios].cpu().tolist()
+        ]
+        expected_cids = list(range(n_ios))
+        if sorted(observed_cids) != expected_cids:
+            raise RuntimeError(
+                "Tutti CQE CID conservation failed: "
+                f"expected={expected_cids} observed={observed_cids}"
+            )
+        if any(value <= 0 for value in doorbell_ns + observed_ns):
+            raise RuntimeError("Tutti device timestamp output contains zero")
+        if any(
+            observed_ns[cid] < doorbell_ns[cid]
+            for cid in expected_cids
+        ):
+            raise RuntimeError("Tutti CQE timestamp precedes its doorbell")
+        if mode == "legacy" and any(
+            later < earlier
+            for earlier, later in zip(doorbell_ns, doorbell_ns[1:])
+        ):
+            raise RuntimeError("legacy Tutti doorbell timestamps are not ordered")
+        if mode == "indexed" and len(set(doorbell_ns)) != 1:
+            raise RuntimeError("indexed Tutti batch must have one doorbell time")
+        actual_byte_lens = [int(value) for value in byte_lens]
+        if any(
+            value <= 0 or value % _NVME_LBS != 0
+            for value in actual_byte_lens
+        ):
+            raise RuntimeError("Tutti profile saw a non-sector-aligned byte length")
+
+        upper_ns = max(observed_ns) - min(doorbell_ns)
+        drain_ns = max(observed_ns) - max(doorbell_ns)
+        total_bytes = sum(actual_byte_lens)
+        payload = {
+            "schema": "tutti_device_batch_v1",
+            "pid": os.getpid(),
+            "rank": int(os.getenv("LOCAL_RANK", os.getenv("RANK", "-1"))),
+            "device": self._cuda_device,
+            "qid": int(self._session.queue.qid),
+            "call": call_seq,
+            "batch": batch_seq,
+            "mode": mode,
+            "kind": profile_kind or "unknown",
+            "op": profile_operation_id or "unknown",
+            "source_layer": (
+                int(profile_source_layer)
+                if profile_source_layer is not None
+                else -1
+            ),
+            "target_layer": (
+                int(profile_layer_id) if profile_layer_id is not None else -1
+            ),
+            "n_ios": n_ios,
+            "bytes": total_bytes,
+            "byte_lens": actual_byte_lens,
+            "doorbell_pre_ns_by_cid": doorbell_ns,
+            "cqe_first_observed_ns_by_cid": observed_ns,
+            "cqe_arrival_cids": observed_cids,
+            "doorbell_to_cqe_observed_upper_ns": upper_ns,
+            "drain_after_last_doorbell_ns": drain_ns,
+            "effective_bw_lower_gbps_decimal": (
+                total_bytes / upper_ns if upper_ns > 0 else None
+            ),
+        }
+        logger.info(
+            "TUTTI_DEVICE_BATCH %s",
+            json.dumps(payload, separators=(",", ":"), sort_keys=True),
+        )
 
     def store_bytes_to_raw_lbas(
         self,
@@ -3555,6 +3850,10 @@ class TuttiDirectLoader:
         ] = None,
         clone_results: bool = True,
         on_raw_batch_loaded: Optional[_LocalRawBatchLoadedCallback] = None,
+        profile_layer_id: Optional[int] = None,
+        profile_kind: Optional[str] = None,
+        profile_operation_id: Optional[str] = None,
+        profile_source_layer: Optional[int] = None,
     ) -> list[Optional[MemoryObj]]:
         """Load one queue/staging-capacity-bounded batch into HBM staging."""
 
@@ -3727,6 +4026,11 @@ class TuttiDirectLoader:
             next_staging_offset += aligned_nbytes
 
         n_ios = len(io_to_key_index)
+        device_call_seq = (
+            self._next_device_profile_call()
+            if getattr(self, "_device_timestamp_profile", False)
+            else -1
+        )
         build_ms = _elapsed_ms(profile_start)
         if n_ios == 0:
             if any(meta is not None for meta in metas):
@@ -3775,7 +4079,9 @@ class TuttiDirectLoader:
             # reads use their narrower ``input_ready_event`` path instead.
             if io_stream is not None:
                 io_stream.wait_stream(torch.cuda.current_stream())
-            for wave_index in sorted(set(io_wave_indices)):
+            for device_batch_seq, wave_index in enumerate(
+                sorted(set(io_wave_indices))
+            ):
                 wave_ios = [
                     index
                     for index, value in enumerate(io_wave_indices)
@@ -3817,38 +4123,78 @@ class TuttiDirectLoader:
                     )
                 arg_ms += _elapsed_ms(arg_start)
 
-                submit_start = time.perf_counter()
-                _c_ops.tutti_submit_batch_sgl_read(
-                    sq_dev_ptr=sq_dev_ptr,
-                    cq_dev_ptr=cq_dev_ptr,
-                    sq_db_ptr=sq_db_ptr,
-                    cq_db_ptr=cq_db_ptr,
-                    sq_tail_ptr=self._sq_tail_ptr,
-                    q_depth=self._q_depth(),
-                    qid=q.qid,
-                    nsid=self._session.nsid,
-                    staging_iovas=staging_iovas_t,
-                    slbas=slbas_t,
-                    byte_lens=byte_lens_t,
-                    stream_ptr=io_stream_ptr,
+                batch_range = detailed_io_nvtx.start(
+                    CsaNvtxEvent.NVME_DEVICE_BATCH,
+                    layer_id=(
+                        int(profile_source_layer)
+                        if profile_source_layer is not None
+                        else int(profile_layer_id or -1)
+                    ),
+                    target_layer_id=profile_layer_id,
+                    operation_id=profile_operation_id,
+                    attributes={
+                        "kind": profile_kind or "unknown",
+                        "call": device_call_seq,
+                        "batch": device_batch_seq,
+                        "mode": "legacy",
+                        "qid": int(q.qid),
+                        "n_ios": wave_n_ios,
+                        "bytes": sum(wave_lengths),
+                    },
                 )
+                self._prepare_device_timestamp_batch(wave_n_ios, io_stream)
+
+                submit_start = time.perf_counter()
+                submit_op = (
+                    _c_ops.tutti_submit_batch_sgl_read_profiled
+                    if getattr(self, "_device_timestamp_profile", False)
+                    else _c_ops.tutti_submit_batch_sgl_read
+                )
+                submit_kwargs = {
+                    "sq_dev_ptr": sq_dev_ptr,
+                    "cq_dev_ptr": cq_dev_ptr,
+                    "sq_db_ptr": sq_db_ptr,
+                    "cq_db_ptr": cq_db_ptr,
+                    "sq_tail_ptr": self._sq_tail_ptr,
+                    "q_depth": self._q_depth(),
+                    "qid": q.qid,
+                    "nsid": self._session.nsid,
+                    "staging_iovas": staging_iovas_t,
+                    "slbas": slbas_t,
+                    "byte_lens": byte_lens_t,
+                    "stream_ptr": io_stream_ptr,
+                }
+                if getattr(self, "_device_timestamp_profile", False):
+                    submit_kwargs["doorbell_timestamps"] = (
+                        self._doorbell_timestamps
+                    )
+                submit_op(**submit_kwargs)
                 submit_launch_ms += _elapsed_ms(submit_start)
 
                 poll_start = time.perf_counter()
-                _c_ops.tutti_poll_batch(
-                    sq_dev_ptr=sq_dev_ptr,
-                    cq_dev_ptr=cq_dev_ptr,
-                    sq_db_ptr=sq_db_ptr,
-                    cq_db_ptr=cq_db_ptr,
-                    cq_head_ptr=self._cq_head_ptr,
-                    cq_phase_ptr=self._cq_phase_ptr,
-                    q_depth=self._q_depth(),
-                    n_ios=wave_n_ios,
-                    status_out=self._status_buf,
-                    timed_out_ptr=self._timed_out_ptr,
-                    max_iters=self.POLL_MAX_ITERS,
-                    stream_ptr=io_stream_ptr,
+                poll_op = (
+                    _c_ops.tutti_poll_batch_profiled
+                    if getattr(self, "_device_timestamp_profile", False)
+                    else _c_ops.tutti_poll_batch
                 )
+                poll_kwargs = {
+                    "sq_dev_ptr": sq_dev_ptr,
+                    "cq_dev_ptr": cq_dev_ptr,
+                    "sq_db_ptr": sq_db_ptr,
+                    "cq_db_ptr": cq_db_ptr,
+                    "cq_head_ptr": self._cq_head_ptr,
+                    "cq_phase_ptr": self._cq_phase_ptr,
+                    "q_depth": self._q_depth(),
+                    "n_ios": wave_n_ios,
+                    "status_out": self._status_buf,
+                    "timed_out_ptr": self._timed_out_ptr,
+                    "max_iters": self.POLL_MAX_ITERS,
+                    "stream_ptr": io_stream_ptr,
+                }
+                if getattr(self, "_device_timestamp_profile", False):
+                    poll_kwargs["cqe_timestamps"] = self._cqe_timestamps
+                    poll_kwargs["observed_cids"] = self._observed_cids
+                poll_op(**poll_kwargs)
                 status_has_error = self._enqueue_nvme_status_reduction(
                     wave_n_ios,
                     io_stream,
@@ -3858,6 +4204,7 @@ class TuttiDirectLoader:
                 else:
                     torch.cuda.synchronize(device=self._cuda_device)
                 poll_sync_ms += _elapsed_ms(poll_start)
+                detailed_io_nvtx.finish(batch_range)
 
                 if ctypes.c_int32.from_address(self._timed_out_ptr).value != 0:
                     cq_head = ctypes.c_uint16.from_address(self._cq_head_ptr).value
@@ -3909,6 +4256,16 @@ class TuttiDirectLoader:
                     n_ios=wave_n_ios,
                     path_for_io=_read_path_for_wave_io,
                     gpu_has_error=status_has_error,
+                )
+                self._finish_device_timestamp_batch(
+                    call_seq=device_call_seq,
+                    batch_seq=device_batch_seq,
+                    mode="legacy",
+                    byte_lens=wave_lengths,
+                    profile_layer_id=profile_layer_id,
+                    profile_source_layer=profile_source_layer,
+                    profile_kind=profile_kind,
+                    profile_operation_id=profile_operation_id,
                 )
                 status_ms += _elapsed_ms(status_start)
 
@@ -4065,24 +4422,59 @@ class TuttiDirectLoader:
 
     def close(self) -> None:
         """Release all GPU and NVMe resources."""
-        with self._cpu_raw_writer_lock:
-            cpu_raw_writer = self._cpu_raw_writer
-            self._cpu_raw_writer = None
-        if cpu_raw_writer is not None:
-            cpu_raw_writer.close()
-        self._session.close()
-        _cuda_free(self._sq_tail_ptr)
-        self._sq_tail_ptr = 0
-        _cuda_free(self._cq_head_ptr)
-        self._cq_head_ptr = 0
-        _cuda_free(self._cq_phase_ptr)
-        self._cq_phase_ptr = 0
-        _cuda_free(self._timed_out_ptr)
-        self._timed_out_ptr = 0
-        self._status_buf = torch.empty(0, dtype=torch.int32)
-        self._staging = torch.empty(0, dtype=torch.uint8)
-        _cuda_free(self._staging_raw_ptr)
-        self._staging_raw_ptr = 0
+        # Serialise teardown with the final submit/poll cycle. This lock is
+        # touched only during shutdown, so it adds no request-path overhead.
+        with self._io_lock:
+            if self._closed:
+                return
+            self._closed = True
+
+            # No producer should remain once LMCacheEngine.close reaches this
+            # method, but finish already-enqueued CUDA work before unmapping
+            # queue rings and the DATA staging pool from snvme.
+            for stream in (self._io_stream, self._host_pack_stream):
+                if stream is None:
+                    continue
+                try:
+                    stream.synchronize()
+                except Exception as exc:
+                    logger.warning("Tutti CUDA stream synchronization failed: %s", exc)
+
+            with self._cpu_raw_writer_lock:
+                cpu_raw_writer = self._cpu_raw_writer
+                self._cpu_raw_writer = None
+            if cpu_raw_writer is not None:
+                try:
+                    cpu_raw_writer.close()
+                except Exception as exc:
+                    logger.warning("Closing Tutti CPU raw writer failed: %s", exc)
+
+            # The kernel mapping must be released before cudaFree. Closing the
+            # device fd is also the crash-safe fallback that invokes
+            # snvm_dev_release for any mapping missed by the explicit ioctls.
+            self._session.close()
+            self._staging_page_iovas_gpu = None
+            self._doorbell_timestamps = None
+            self._cqe_timestamps = None
+            self._observed_cids = None
+            self._status_buf = torch.empty(0, dtype=torch.int32)
+            self._staging = torch.empty(0, dtype=torch.uint8)
+
+            _cuda_free(self._sq_tail_ptr)
+            self._sq_tail_ptr = 0
+            _cuda_free(self._cq_head_ptr)
+            self._cq_head_ptr = 0
+            _cuda_free(self._cq_phase_ptr)
+            self._cq_phase_ptr = 0
+            _cuda_free(self._timed_out_ptr)
+            self._timed_out_ptr = 0
+
+            # Free the 512-MiB raw staging allocation last, after snvme has
+            # dropped every nvidia_p2p_get_pages reference to it.
+            _cuda_free(self._staging_raw_ptr)
+            self._staging_raw_ptr = 0
+            self._io_stream = None
+            self._host_pack_stream = None
 
     def __enter__(self) -> "TuttiDirectLoader":
         return self

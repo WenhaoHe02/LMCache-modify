@@ -5,6 +5,7 @@
 from concurrent.futures import Future, ThreadPoolExecutor
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -445,6 +446,183 @@ def test_prediction_readiness_check_joins_running_work() -> None:
     assert manager._expired_proxy_layers == {2}
 
 
+def test_prediction_gate_drains_nested_io_and_finalizes_shard_work() -> None:
+    """An aligned gate consumes I/O appended by proxy completion."""
+    manager = object.__new__(IndexerSSDManager)
+    manager._lock = threading.Lock()
+    manager._prediction_gate_timeout_s = 1.0
+    shard_work = object()
+    finalized: list[object] = []
+    io_future: Future[object] = Future()
+    io_future.set_result(shard_work)
+
+    proxy_future: Future[None] = Future()
+    manager._proxy_futures = {2: [proxy_future]}
+    manager._expired_proxy_layers = set()
+    manager._last_proxy_blocks = {2: [7]}
+
+    def _finalize(work: object | None) -> bool:
+        if work is None:
+            return False
+        finalized.append(work)
+        return True
+
+    manager._csa_attention_kv_manager = SimpleNamespace(
+        uses_gate_aligned_shard_gather=lambda: True,
+        finalize_deferred_shard_gather=_finalize,
+    )
+    with manager._lock:
+        manager._proxy_futures[2].append(io_future)
+    proxy_future.set_result(None)
+
+    assert manager.wait_for_csa_attention_kv_prediction(2)
+    assert finalized == [shard_work]
+    assert manager._proxy_futures[2] == []
+    assert manager._expired_proxy_layers == set()
+
+
+def test_gate_aligned_prediction_waits_instead_of_cancelling() -> None:
+    """A running owner-shard read is joined before its gate collective."""
+    manager = object.__new__(IndexerSSDManager)
+    manager._lock = threading.Lock()
+    manager._prediction_gate_timeout_s = 1.0
+    manager._expired_proxy_layers = set()
+    manager._last_proxy_blocks = {2: [7]}
+    release = threading.Event()
+    finalized: list[object] = []
+    shard_work = object()
+    manager._csa_attention_kv_manager = SimpleNamespace(
+        uses_gate_aligned_shard_gather=lambda: True,
+        finalize_deferred_shard_gather=lambda work: finalized.append(work),
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            lambda: shard_work if release.wait(timeout=1.0) else None
+        )
+        manager._proxy_futures = {2: [future]}
+        timer = threading.Timer(0.01, release.set)
+        timer.start()
+        try:
+            assert manager.wait_for_csa_attention_kv_prediction(2)
+        finally:
+            timer.cancel()
+
+    assert not future.cancelled()
+    assert finalized == [shard_work]
+    assert manager._expired_proxy_layers == set()
+
+
+def test_deactivate_predictions_discards_unconsumed_shard_work() -> None:
+    """Request teardown retires a completed prediction missed by its gate."""
+    manager = object.__new__(IndexerSSDManager)
+    manager._lock = threading.Lock()
+    manager._csa_layer_ids = (2,)
+    manager._proxy_futures = {2: []}
+    manager._expired_proxy_layers = set()
+    shard_work = object()
+    future: Future[object] = Future()
+    future.set_result(shard_work)
+    manager._proxy_futures[2].append(future)
+    discarded: list[tuple[object, str]] = []
+    manager._csa_attention_kv_manager = SimpleNamespace(
+        discard_deferred_shard_gather=lambda work, *, status: discarded.append(
+            (work, status)
+        )
+    )
+
+    assert manager.deactivate_csa_predictions(timeout_s=0.1)
+    assert discarded == [(shard_work, "request_deactivated")]
+    assert manager._proxy_futures[2] == []
+    assert manager._expired_proxy_layers == {2}
+
+
+def test_deactivate_predictions_retains_running_future_after_timeout() -> None:
+    """A timed-out old prediction stays reachable for a later cleanup pass."""
+
+    class _Future:
+        done_now = False
+
+        def cancel(self) -> bool:
+            return False
+
+        def result(self, timeout: float) -> None:
+            del timeout
+            if not self.done_now:
+                raise TimeoutError
+
+        def done(self) -> bool:
+            return self.done_now
+
+    manager = object.__new__(IndexerSSDManager)
+    manager._lock = threading.Lock()
+    manager._csa_layer_ids = (2,)
+    future = _Future()
+    manager._proxy_futures = {2: [future]}
+    manager._expired_proxy_layers = set()
+    manager._csa_attention_kv_manager = SimpleNamespace()
+
+    assert not manager.deactivate_csa_predictions(timeout_s=0.0)
+    assert manager._proxy_futures[2] == [future]
+
+    future.done_now = True
+    assert manager.deactivate_csa_predictions(timeout_s=0.1)
+    assert manager._proxy_futures[2] == []
+
+
+def test_gate_aligned_missing_prediction_expires_late_arrival() -> None:
+    """A proxy arriving after its only TP-aligned gate cannot submit I/O."""
+    manager = object.__new__(IndexerSSDManager)
+    manager._lock = threading.Lock()
+    manager._proxy_futures = {2: []}
+    manager._expired_proxy_layers = set()
+    manager._last_proxy_blocks = {2: None}
+    fire_predicted = MagicMock()
+    manager._csa_attention_kv_manager = SimpleNamespace(
+        uses_gate_aligned_shard_gather=lambda: True,
+        fire_predicted_reads=fire_predicted,
+        active_request_id="request-a",
+        active_request_token=("request-a", 7),
+    )
+    manager._csa_fired_request_id = "request-old"
+    manager._csa_fired_request_generation = 6
+    manager._csa_fired_levels = set()
+    manager._csa_layer_ids = (2,)
+    manager._expired_proxy_targets = set()
+    manager._release_proxy_cpu_selection = MagicMock()
+    manager._log_timing = MagicMock()
+    manager._proxy_io_executor = SimpleNamespace(
+        submit=MagicMock(side_effect=AssertionError("late I/O submitted"))
+    )
+
+    assert not manager.wait_for_csa_attention_kv_prediction(2)
+    assert manager._expired_proxy_layers == {2}
+    assert manager._expired_proxy_targets == {("request-a", 7, 2)}
+
+    # The producer sees this request for the first time only after layer 2's
+    # target gate. Its request initialization must preserve the scoped expiry.
+    with manager._lock:
+        manager._begin_csa_proxy_request_locked("request-a", 7)
+    assert manager._expired_proxy_layers == {2}
+    assert manager._expired_proxy_targets == {("request-a", 7, 2)}
+
+    copy_done = SimpleNamespace(synchronize=lambda: None)
+    manager._finish_csa_attention_kv_proxy(
+        2,
+        [(torch.tensor([7]), None, None, copy_done, {})],
+        cursor=0,
+        selected_rows=1,
+        fire_start=time.perf_counter(),
+        prefetch_level=2,
+        request_id="request-a",
+        request_token=("request-a", 7),
+    )
+
+    fire_predicted.assert_not_called()
+    manager._proxy_io_executor.submit.assert_not_called()
+    assert manager._last_proxy_blocks[2] is None
+
+
 def test_prefill_cp_partitions_cover_k_once_and_bound_union_budget() -> None:
     """All K rows have one owner and default local quotas sum to global K."""
     partitions = [
@@ -557,12 +735,14 @@ def test_prefill_cp_query_ranges_reject_invalid_budget(
 
 def test_deterministic_hca_submission_is_exposed_to_target_gate() -> None:
     """The unified manager can join HCA I/O scheduled by a preceding FFN."""
-    submitted: list[int] = []
+    submitted: list[tuple[int, int | None]] = []
     tracked: dict[int, Any] = {}
     fake_csa_manager = SimpleNamespace(
         active_request_id="request-a",
         active_request_token=("request-a", 1),
-        fire_deterministic_layer=lambda layer_id, **_kwargs: submitted.append(layer_id),
+        fire_deterministic_layer=lambda layer_id, **kwargs: submitted.append(
+            (layer_id, kwargs.get("source_layer_id"))
+        ),
         track_layer_submission=lambda layer_id, future, **_kwargs: tracked.update(
             {layer_id: future}
         ),
@@ -579,12 +759,163 @@ def test_deterministic_hca_submission_is_exposed_to_target_gate() -> None:
         )
         manager.attach_csa_attention_kv_manager(fake_csa_manager)
         try:
-            manager.fire_async_for_layers([3])
+            manager.fire_async_for_layers([3], source_layer_id=1)
             tracked[3].result(timeout=2.0)
         finally:
             manager.close()
 
-    assert submitted == [3]
+    assert submitted == [(3, 1)]
+
+
+def test_prefire_all_hca_layers_preserves_consumer_order() -> None:
+    """Request-start HCA prefire cannot let a later layer win the I/O queue."""
+    submitted: list[int] = []
+    tracked: dict[int, Any] = {}
+    first_started = threading.Event()
+    release_first = threading.Event()
+
+    def fire(layer_id: int, **_kwargs: Any) -> None:
+        if layer_id == 3:
+            first_started.set()
+            assert release_first.wait(timeout=2.0)
+        submitted.append(layer_id)
+
+    fake_csa_manager = SimpleNamespace(
+        active_request_id="request-a",
+        active_request_token=("request-a", 1),
+        fire_deterministic_layer=fire,
+        track_layer_submission=lambda layer_id, future, **_kwargs: tracked.update(
+            {layer_id: future}
+        ),
+    )
+    with tempfile.TemporaryDirectory() as store_dir:
+        manager = IndexerSSDManager(
+            csa_layer_ids=[4],
+            store_dir=store_dir,
+            pool_size=8,
+            token_bytes=4,
+            max_seq_len=32,
+            io_workers=3,
+            device=torch.device("cpu"),
+        )
+        manager.attach_csa_attention_kv_manager(fake_csa_manager)
+        try:
+            with patch.dict(
+                indexer_manager_module.os.environ,
+                {"LMCACHE_HCA_PREFIRE_ALL_LAYERS": "1"},
+            ):
+                manager.fire_async_for_layers([3, 5, 7], source_layer_id=-1)
+            assert first_started.wait(timeout=2.0)
+            time.sleep(0.05)
+            assert submitted == []
+            release_first.set()
+            for layer_id in (3, 5, 7):
+                tracked[layer_id].result(timeout=2.0)
+        finally:
+            release_first.set()
+            manager.close()
+
+    assert submitted == [3, 5, 7]
+
+
+def test_proxy_coverage_model_switches_only_after_union_saturates() -> None:
+    """The Pro cost model distinguishes sparse and near-dense appends."""
+    sparse = indexer_manager_module._estimated_proxy_block_coverage(
+        196_608,
+        256,
+        512,
+        4,
+        2_048,
+    )
+    dense = indexer_manager_module._estimated_proxy_block_coverage(
+        196_608,
+        8_192,
+        512,
+        4,
+        2_048,
+    )
+
+    assert sparse < 0.8
+    assert dense > 0.99
+
+
+def test_adaptive_dense_prefetch_skips_redundant_proxy() -> None:
+    """A saturated predicted union uses exact dense lookahead without scoring."""
+    manager = object.__new__(IndexerSSDManager)
+    manager._prefetch_lookahead = {2: 2}
+    manager._decode_cursor = {2: 196_608}
+    manager._proxy_topk_tokens_by_layer = {}
+    manager._l1_proxy_topk_tokens = 2_048
+    manager.wait_for_seed = MagicMock(return_value=True)
+    manager.fire_dense_csa_layers = MagicMock()
+    manager.fire_async_for_layer = MagicMock()
+    manager._log_timing = MagicMock()
+    residual = torch.empty((8_192, 1), dtype=torch.float32)
+    positions = torch.arange(8_192, dtype=torch.int64)
+
+    with patch.dict(
+        indexer_manager_module.os.environ,
+        {
+            "LMCACHE_CSA_ADAPTIVE_DENSE_PREFETCH": "1",
+            "LMCACHE_CSA_ADAPTIVE_DENSE_THRESHOLD_PERCENT": "80",
+            "LMCACHE_CSA_PREFETCH_CP_QUERY_SAMPLE_STRIDE": "4",
+            "LMCACHE_CSA_PREFETCH_CP_SIZE": "8",
+            "LMCACHE_CSA_PREFETCH_CP_INTERLEAVE": "64",
+        },
+    ):
+        manager.fire_residual_prefetch_for_layer(
+            2,
+            residual,
+            positions,
+            lookahead=2,
+        )
+
+    manager.fire_dense_csa_layers.assert_called_once_with(
+        (2,),
+        source_layer_id=0,
+    )
+    manager.fire_async_for_layer.assert_not_called()
+
+
+def test_adaptive_dense_prefetch_retains_sparse_proxy() -> None:
+    """A short append keeps the sparse predictor and avoids dense I/O."""
+    manager = object.__new__(IndexerSSDManager)
+    manager._prefetch_lookahead = {2: 2}
+    manager._decode_cursor = {2: 196_608}
+    manager._proxy_topk_tokens_by_layer = {}
+    manager._l1_proxy_topk_tokens = 2_048
+    manager._csa_attention_kv_manager = SimpleNamespace(active_request_id="request-a")
+    manager.wait_for_seed = MagicMock(return_value=True)
+    manager.fire_dense_csa_layers = MagicMock()
+    manager.fire_async_for_layer = MagicMock()
+    manager._log_timing = MagicMock()
+    residual = torch.empty((256, 1), dtype=torch.float32)
+    positions = torch.arange(256, dtype=torch.int64)
+
+    with patch.dict(
+        indexer_manager_module.os.environ,
+        {
+            "LMCACHE_CSA_ADAPTIVE_DENSE_PREFETCH": "1",
+            "LMCACHE_CSA_ADAPTIVE_DENSE_THRESHOLD_PERCENT": "80",
+            "LMCACHE_CSA_PREFETCH_CP_QUERY_SAMPLE_STRIDE": "4",
+            "LMCACHE_CSA_PREFETCH_CP_SIZE": "8",
+            "LMCACHE_CSA_PREFETCH_CP_INTERLEAVE": "64",
+        },
+    ):
+        manager.fire_residual_prefetch_for_layer(
+            2,
+            residual,
+            positions,
+            lookahead=2,
+        )
+
+    manager.fire_dense_csa_layers.assert_not_called()
+    manager.fire_async_for_layer.assert_called_once_with(
+        2,
+        residual_f=residual,
+        positions=positions,
+        prefetch_level=2,
+    )
 
 
 def test_native_indexer_stream_orders_and_schedules_demanded_layer() -> None:
@@ -598,8 +929,9 @@ def test_native_indexer_stream_orders_and_schedules_demanded_layer() -> None:
         *,
         label: str,
         request_token: tuple[str, int] | None = None,
+        source_layer_id: int | None = None,
     ) -> bool:
-        del request_token
+        del request_token, source_layer_id
         submitted.append((layer_id, label))
         return True
 

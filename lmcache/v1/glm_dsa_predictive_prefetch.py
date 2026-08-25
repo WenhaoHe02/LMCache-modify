@@ -25,6 +25,7 @@ import torch
 
 # First Party
 from lmcache.logging import init_logger
+from lmcache.v1.csa_pipeline_nvtx import CsaNvtxEvent, csa_pipeline_nvtx
 from lmcache.v1.index_to_io_profile import ModelTopologyProfile
 
 logger = init_logger(__name__)
@@ -89,12 +90,14 @@ class GLMDSAPrefetchEvent:
         topk_indices: Predicted or true token indices, shaped ``[rows, topk]``.
         correction: ``False`` for speculative prefetch and ``True`` after the
             target Full indexer produces authoritative indices.
+        profile_operation_id: Optional profile-only correlation identifier.
     """
 
     request_id: str
     schedule: GLMDSAPredictionSchedule
     topk_indices: torch.Tensor
     correction: bool
+    profile_operation_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,11 +105,52 @@ class _StagedPrediction:
     """One Shared-consumer prediction waiting for a decoder progress gate."""
 
     request_id: str
+    source_layer: int
     target_layer: int
+    group_id: str
     consumer_layer: int
     blocks: torch.Tensor
     level: int
     request_token: Any
+    profile_operation_id: str | None = None
+
+
+def _glm_profile_operation_id(
+    event: GLMDSAPrefetchEvent,
+    phase: str,
+    consumer_layer: int,
+) -> str | None:
+    """Return one profile-only operation id without touching the disabled path."""
+    if not csa_pipeline_nvtx.enabled:
+        return None
+    base = event.profile_operation_id or (
+        f"glm-{phase}-{event.schedule.source_layer}-"
+        f"{event.schedule.target_layer}-{time.monotonic_ns()}"
+    )
+    if int(consumer_layer) == event.schedule.target_layer:
+        return base
+    return f"{base}-consumer-{int(consumer_layer)}"
+
+
+def _glm_io_profile_kwargs(
+    event: GLMDSAPrefetchEvent,
+    phase: str,
+    consumer_layer: int,
+) -> dict[str, object]:
+    """Build optional source/op metadata accepted by the Tutti manager."""
+    operation_id = _glm_profile_operation_id(event, phase, consumer_layer)
+    if operation_id is None:
+        return {}
+    source_layer = (
+        event.schedule.target_layer
+        if phase == "correction"
+        else event.schedule.source_layer
+    )
+    return {
+        "profile_source_layer": int(source_layer),
+        "profile_operation_id": operation_id,
+        "profile_kind": f"glm_dsa_{phase}",
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,6 +363,11 @@ class GLMDSAPhysicalPrefetchSink:
                         int(layer_id),
                         blocks,
                         request_token=request_token,
+                        **_glm_io_profile_kwargs(
+                            event,
+                            "correction",
+                            int(layer_id),
+                        ),
                     )
                     submit_ms = (time.perf_counter() - submit_start) * 1000.0
                     gate_start = time.perf_counter()
@@ -352,23 +401,30 @@ class GLMDSAPhysicalPrefetchSink:
                         int(layer_id),
                         None,
                     )
-                if self._shared_prediction_mode == "staged":
-                    shared_prediction_ready = (
-                        staged_future is None or staged_future.done()
-                    )
-                else:
-                    shared_prediction_ready = manager.wait_for_tracked_submission(
-                        int(layer_id)
-                    )
+                # Both modes must *join* the staged prediction through the
+                # manager, not merely observe that its future is done.  The
+                # manager tracks the same future and a sharded prediction
+                # returns deferred gather work that only
+                # ``wait_for_tracked_submission`` finalizes; polling ``done()``
+                # leaves that work booked against the layer's pending-read
+                # count and the consumer gate then blocks until it times out.
+                shared_prediction_ready = manager.wait_for_tracked_submission(
+                    int(layer_id)
+                )
                 shared_join_ms = (time.perf_counter() - shared_join_start) * 1000.0
                 shared_submit_start = time.perf_counter()
                 if self._shared_prediction_mode == "staged":
+                    # ``wait_for_tracked_submission`` already consumed the
+                    # tracked future above, so pass ``None`` rather than
+                    # re-awaiting the popped one.
+                    del staged_future
                     future = self._executor.submit(
                         self._submit_after_prediction,
-                        staged_future,
+                        None,
                         int(layer_id),
                         blocks,
                         request_token,
+                        event,
                     )
                 else:
                     future = self._executor.submit(
@@ -376,6 +432,11 @@ class GLMDSAPhysicalPrefetchSink:
                         int(layer_id),
                         blocks,
                         request_token=request_token,
+                        **_glm_io_profile_kwargs(
+                            event,
+                            "correction",
+                            int(layer_id),
+                        ),
                     )
                 manager.track_layer_submission(
                     int(layer_id),
@@ -418,6 +479,7 @@ class GLMDSAPhysicalPrefetchSink:
                 blocks,
                 level,
                 request_token,
+                event=event,
             )
         if self._shared_prediction_mode == "staged":
             self._stage_shared_predictions(
@@ -463,18 +525,32 @@ class GLMDSAPhysicalPrefetchSink:
             # the CUDA-to-CPU boundary.
             blocks = self._topk_to_blocks(true_topk, block_budget=None)
         for layer_id in consumers:
+            profile_kwargs = (
+                {
+                    "profile_source_layer": target,
+                    "profile_operation_id": (
+                        f"glm-authoritative-{target}-{int(layer_id)}-"
+                        f"{time.monotonic_ns()}"
+                    ),
+                    "profile_kind": "glm_dsa_correction",
+                }
+                if csa_pipeline_nvtx.enabled
+                else {}
+            )
             if int(layer_id) == target:
                 if callable(submit_topk_misses):
                     submit_topk_misses(
                         target,
                         true_topk,
                         request_token=request_token,
+                        **profile_kwargs,
                     )
                 else:
                     manager.submit_miss_reads(
                         target,
                         blocks,
                         request_token=request_token,
+                        **profile_kwargs,
                     )
                 if not manager.wait_for_layer(
                     target,
@@ -490,6 +566,7 @@ class GLMDSAPhysicalPrefetchSink:
                     int(layer_id),
                     true_topk,
                     request_token=request_token,
+                    **profile_kwargs,
                 )
             else:
                 future = self._executor.submit(
@@ -497,6 +574,7 @@ class GLMDSAPhysicalPrefetchSink:
                     int(layer_id),
                     blocks,
                     request_token=request_token,
+                    **profile_kwargs,
                 )
             manager.track_layer_submission(
                 int(layer_id),
@@ -513,13 +591,21 @@ class GLMDSAPhysicalPrefetchSink:
         Returns:
             Whether every tracked read completed before the timeout.
         """
-        self._release_prediction_stages(int(layer_id))
-        return bool(
-            self._attention_kv_manager.wait_for_layer(
-                int(layer_id),
-                timeout_s=self._gate_timeout_s(),
+        manager = self._attention_kv_manager
+        with csa_pipeline_nvtx.range(
+            CsaNvtxEvent.CONSUMER_WAIT,
+            layer_id=int(layer_id),
+            target_layer_id=int(layer_id),
+            request_id=str(getattr(manager, "active_request_id", "")) or None,
+            attributes={"kind": "glm_dsa"},
+        ):
+            self._release_prediction_stages(int(layer_id))
+            return bool(
+                manager.wait_for_layer(
+                    int(layer_id),
+                    timeout_s=self._gate_timeout_s(),
+                )
             )
-        )
 
     def finish_request(self, request_id: str) -> bool:
         """Drain physical I/O owned by a completed request.
@@ -581,11 +667,7 @@ class GLMDSAPhysicalPrefetchSink:
         predicted: torch.Tensor | None,
         actual: torch.Tensor,
     ) -> None:
-        if (
-            not _accuracy_profile_enabled()
-            or predicted is None
-            or actual.numel() == 0
-        ):
+        if not _accuracy_profile_enabled() or predicted is None or actual.numel() == 0:
             return
         predicted = predicted.to(device=actual.device, dtype=torch.int64)
         locations = torch.searchsorted(predicted, actual).clamp_max(
@@ -633,11 +715,18 @@ class GLMDSAPhysicalPrefetchSink:
                 self._pending_prediction_stages[release_layer].append(
                     _StagedPrediction(
                         request_id=event.request_id,
+                        source_layer=event.schedule.source_layer,
                         target_layer=event.schedule.target_layer,
+                        group_id=event.schedule.group_id,
                         consumer_layer=int(consumer_layer),
                         blocks=blocks,
                         level=level,
                         request_token=request_token,
+                        profile_operation_id=_glm_profile_operation_id(
+                            event,
+                            "prediction",
+                            int(consumer_layer),
+                        ),
                     )
                 )
                 release_layers.append(release_layer)
@@ -664,17 +753,32 @@ class GLMDSAPhysicalPrefetchSink:
                 if layer <= progress_layer
             )
             stages = [
-                stage
+                (release_layer, stage)
                 for release_layer in release_layers
                 for stage in self._pending_prediction_stages.pop(release_layer)
                 if stage.request_id == active_request_id
             ]
-        for stage in stages:
+        for release_layer, stage in stages:
+            csa_pipeline_nvtx.mark(
+                CsaNvtxEvent.GLM_DSA_STAGE_RELEASE,
+                layer_id=int(release_layer),
+                target_layer_id=stage.consumer_layer,
+                request_id=stage.request_id,
+                operation_id=stage.profile_operation_id,
+                attributes={
+                    "kind": "glm_dsa_prediction",
+                    "source": stage.source_layer,
+                    "full_target": stage.target_layer,
+                    "group": stage.group_id,
+                },
+            )
             future = self._submit_predicted_layer(
                 stage.consumer_layer,
                 stage.blocks,
                 stage.level,
                 stage.request_token,
+                profile_source_layer=stage.source_layer,
+                profile_operation_id=stage.profile_operation_id,
             )
             with self._lock:
                 self._staged_prediction_futures[stage.consumer_layer] = future
@@ -685,14 +789,40 @@ class GLMDSAPhysicalPrefetchSink:
         blocks: torch.Tensor,
         level: int,
         request_token: Any,
+        *,
+        event: GLMDSAPrefetchEvent | None = None,
+        profile_source_layer: int | None = None,
+        profile_operation_id: str | None = None,
     ) -> Future[Any]:
         manager = self._attention_kv_manager
+        profile_kwargs: dict[str, object] = {}
+        if csa_pipeline_nvtx.enabled:
+            source_layer = (
+                int(profile_source_layer)
+                if profile_source_layer is not None
+                else int(event.schedule.source_layer)
+                if event is not None
+                else int(layer_id) - int(level)
+            )
+            operation_id = profile_operation_id
+            if operation_id is None and event is not None:
+                operation_id = _glm_profile_operation_id(
+                    event,
+                    "prediction",
+                    int(layer_id),
+                )
+            profile_kwargs = {
+                "profile_source_layer": source_layer,
+                "profile_operation_id": operation_id,
+                "profile_kind": "glm_dsa_prediction",
+            }
         future = self._prediction_executor.submit(
             manager.fire_predicted_reads,
             layer_id,
             blocks,
             level,
             request_token=request_token,
+            **profile_kwargs,
         )
         manager.track_layer_submission(
             layer_id,
@@ -707,6 +837,7 @@ class GLMDSAPhysicalPrefetchSink:
         layer_id: int,
         blocks: torch.Tensor,
         request_token: Any,
+        event: GLMDSAPrefetchEvent,
     ) -> None:
         if prediction_future is not None:
             prediction_future.result()
@@ -714,6 +845,11 @@ class GLMDSAPhysicalPrefetchSink:
             layer_id,
             blocks,
             request_token=request_token,
+            **_glm_io_profile_kwargs(
+                event,
+                "correction",
+                int(layer_id),
+            ),
         )
 
     def _drop_pending_target_locked(self, target_layer: int) -> None:
@@ -1012,7 +1148,21 @@ class GLMDSAPredictivePrefetchManager:
 
         predicted_targets: list[int] = []
         for schedule in schedules:
-            topk = self._predictor(schedule, activation, positions)
+            operation_id = (
+                f"glm-prediction-{source_layer}-{schedule.target_layer}-"
+                f"{time.monotonic_ns()}"
+                if csa_pipeline_nvtx.enabled
+                else None
+            )
+            with csa_pipeline_nvtx.range(
+                CsaNvtxEvent.GLM_DSA_PREDICTION,
+                layer_id=int(source_layer),
+                target_layer_id=schedule.target_layer,
+                request_id=request_id,
+                operation_id=operation_id,
+                attributes={"kind": "glm_dsa", "group": schedule.group_id},
+            ):
+                topk = self._predictor(schedule, activation, positions)
             if topk.ndim != 2:
                 raise ValueError("predictor must return a two-dimensional tensor")
             topk = topk.detach()
@@ -1026,6 +1176,7 @@ class GLMDSAPredictivePrefetchManager:
                     schedule=schedule,
                     topk_indices=topk,
                     correction=False,
+                    profile_operation_id=operation_id,
                 )
             )
             predicted_targets.append(schedule.target_layer)
@@ -1081,14 +1232,33 @@ class GLMDSAPredictivePrefetchManager:
                 agreement.recall,
                 agreement.precision,
             )
-        self._submit(
-            GLMDSAPrefetchEvent(
-                request_id=request_id,
-                schedule=schedule,
-                topk_indices=true_topk.detach(),
-                correction=True,
-            )
+        operation_id = (
+            f"glm-correction-{schedule.source_layer}-{target_layer}-"
+            f"{time.monotonic_ns()}"
+            if csa_pipeline_nvtx.enabled
+            else None
         )
+        with csa_pipeline_nvtx.range(
+            CsaNvtxEvent.GLM_DSA_CORRECTION,
+            layer_id=int(target_layer),
+            target_layer_id=int(target_layer),
+            request_id=request_id,
+            operation_id=operation_id,
+            attributes={
+                "kind": "glm_dsa",
+                "source": schedule.source_layer,
+                "group": schedule.group_id,
+            },
+        ):
+            self._submit(
+                GLMDSAPrefetchEvent(
+                    request_id=request_id,
+                    schedule=schedule,
+                    topk_indices=true_topk.detach(),
+                    correction=True,
+                    profile_operation_id=operation_id,
+                )
+            )
         return agreement
 
     def stats_snapshot(self) -> Mapping[int, GLMDSALayerStats]:

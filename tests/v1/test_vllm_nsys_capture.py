@@ -68,6 +68,31 @@ def test_generic_full_capture_is_disabled_when_prefetch_is_enabled(
     assert not controller.active
 
 
+def test_glm_layer_major_skips_legacy_deepseek_indexer_attach(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LMCACHE_GLM_DSA_LAYER_MAJOR", "1")
+    monkeypatch.setenv("LMCACHE_INDEXER_ENABLE_PREFETCH", "1")
+    attach_calls: list[object] = []
+    scan_calls: list[bool] = []
+    monkeypatch.setattr(
+        adapter,
+        "_deepseek_decoder_layers",
+        lambda: scan_calls.append(True) or [],
+    )
+
+    adapter._attach_indexer_prefetch(tutti_loader=object())
+    monkeypatch.setattr(
+        adapter,
+        "_attach_indexer_prefetch",
+        lambda tutti_loader=None: attach_calls.append(tutti_loader),
+    )
+    adapter._maybe_lazy_attach_indexer_prefetch(object())
+
+    assert scan_calls == []
+    assert attach_calls == []
+
+
 def test_decoder_forward_waits_for_registered_hca_layer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

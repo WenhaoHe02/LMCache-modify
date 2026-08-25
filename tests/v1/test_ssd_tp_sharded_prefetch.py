@@ -284,6 +284,10 @@ def test_central_config_parses_ranges_and_engine_fields(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Environment and engine configuration share one validated schema."""
+    monkeypatch.delenv("LMCACHE_SSD_TP_DENSE_LAYERS", raising=False)
+    assert SSDTPShardedPrefetchConfig.from_env().dense_layers == frozenset()
+    assert LMCacheEngineConfig.from_defaults().ssd_tp_dense_layers == ""
+
     monkeypatch.setenv("LMCACHE_SSD_TP_SHARDED_PREFETCH", "1")
     monkeypatch.setenv("LMCACHE_SSD_TP_DENSE_LAYERS", "2-4,8")
     env_config = SSDTPShardedPrefetchConfig.from_env()

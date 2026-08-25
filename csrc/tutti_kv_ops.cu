@@ -87,6 +87,13 @@ __device__ __forceinline__ uint16_t load_cq_status_cv(const nvme_cqe* slot) {
   return status;
 }
 
+__device__ __forceinline__ uint16_t load_cq_cid_cv(const nvme_cqe* slot) {
+  uint16_t cid;
+  const void* address = reinterpret_cast<const char*>(slot) + 12;
+  asm volatile("ld.global.cv.u16 %0, [%1];" : "=h"(cid) : "l"(address));
+  return cid;
+}
+
 // Per-queue device-side state passed by value into kernels.
 struct tutti_queue_dev {
     nvme_sqe*          sq;      // device VA: SQ ring base
@@ -101,9 +108,18 @@ struct tutti_queue_dev {
 // GPU kernels
 // ---------------------------------------------------------------------------
 
+// `%globaltimer` is comparable across kernels on one GPU and is reported in
+// nanoseconds on Hopper. Absolute values must never be compared across GPUs.
+__device__ __forceinline__ uint64_t tutti_globaltimer_ns() {
+    uint64_t value;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(value));
+    return value;
+}
+
 // Submit n_ios NVMe SGL READ/WRITE commands from a single GPU thread.
 // Rings the SQ doorbell after every SQE so the controller can begin DMA
 // for earlier I/Os while the kernel is still building later SQEs.
+template <bool Profiled>
 __global__ void k_submit_batch_sgl_rw(
     tutti_queue_dev   qd,
     uint16_t*         sq_tail_io,
@@ -112,7 +128,8 @@ __global__ void k_submit_batch_sgl_rw(
     const uint64_t*   staging_iovas,
     const uint64_t*   slbas,
     const uint32_t*   byte_lens,
-    int               n_ios)
+    int               n_ios,
+    uint64_t*          doorbell_timestamps)
 {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
@@ -151,6 +168,11 @@ __global__ void k_submit_batch_sgl_rw(
         __threadfence_system();
 
         uint16_t new_tail = static_cast<uint16_t>((tail + 1) % qd.q_depth);
+        if constexpr (Profiled) {
+            // A pre-doorbell timestamp makes CQE-observed - doorbell_ts a
+            // conservative upper envelope for controller-visible latency.
+            doorbell_timestamps[i] = tutti_globaltimer_ns();
+        }
         *qd.sq_db = new_tail;
         tail = new_tail;
     }
@@ -163,6 +185,7 @@ __global__ void k_submit_batch_sgl_rw(
 // byte_lens lists for every layer. Each object occupies one 64-KiB-aligned
 // staging row, so its IOVA can be resolved through the registered GPU-page
 // IOVA table without assuming that adjacent pages have contiguous IOVAs.
+template <bool Profiled>
 __global__ void k_submit_indexed_sgl_read(
     tutti_queue_dev qd,
     uint16_t* sq_tail_io,
@@ -172,7 +195,8 @@ __global__ void k_submit_indexed_sgl_read(
     const uint64_t* slba_table,
     const int64_t* selected_ids,
     uint32_t byte_len,
-    int n_ios)
+    int n_ios,
+    uint64_t* doorbell_timestamps)
 {
     __shared__ uint16_t base_tail;
     if (threadIdx.x == 0) base_tail = *sq_tail_io;
@@ -222,6 +246,12 @@ __global__ void k_submit_indexed_sgl_read(
           (static_cast<uint32_t>(base_tail) + static_cast<uint32_t>(n_ios)) %
           qd.q_depth);
       *sq_tail_io = new_tail;
+      if constexpr (Profiled) {
+        const uint64_t timestamp = tutti_globaltimer_ns();
+        for (int i = 0; i < n_ios; ++i) {
+          doorbell_timestamps[i] = timestamp;
+        }
+      }
       *qd.sq_db = new_tail;
     }
 }
@@ -235,10 +265,13 @@ __global__ void k_submit_indexed_sgl_read(
 // later completions time out almost immediately when all slots are polled in
 // parallel. Use it as a coarse wall-clock budget instead, and back off between
 // MMIO reads to avoid flooding the PCIe BAR while the device is working.
+template <bool Profiled>
 __global__ void k_poll_batch(tutti_queue_dev qd, uint16_t* cq_head_io,
                              uint8_t* cq_phase_io, int n_ios,
                              uint32_t* status_out, int* timed_out,
-                             uint64_t max_iters) {
+                             uint64_t max_iters,
+                             uint64_t* cqe_timestamps,
+                             int32_t* observed_cids) {
   if (blockIdx.x != 0) return;
 
   const uint16_t head = *cq_head_io;
@@ -266,7 +299,18 @@ __global__ void k_poll_batch(tutti_queue_dev qd, uint16_t* cq_head_io,
     uint16_t status = 0;
     for (;;) {
       status = load_cq_status_cv(slot);
-      if (static_cast<uint8_t>(status & 0x1u) == expected_phase) break;
+      if (static_cast<uint8_t>(status & 0x1u) == expected_phase) {
+        if constexpr (Profiled) {
+          // CQ slots are arrival ordered, not CID ordered. Preserve both the
+          // observed slot order and a CID-indexed first-observed timestamp.
+          const uint16_t cid = load_cq_cid_cv(slot);
+          observed_cids[i] = static_cast<int32_t>(cid);
+          if (cid < static_cast<uint16_t>(n_ios)) {
+            cqe_timestamps[cid] = tutti_globaltimer_ns();
+          }
+        }
+        break;
+      }
       if (clock64() - start_clock >= timeout_cycles) {
         atomicExch(timed_out, 1);
         break;
@@ -326,6 +370,7 @@ static void tutti_submit_batch_sgl_rw(
     at::Tensor slbas,
     at::Tensor byte_lens,
     uint8_t    opcode,
+    at::Tensor* doorbell_timestamps,
     int64_t   stream_ptr)
 {
     TORCH_CHECK(staging_iovas.dtype() == at::kLong,
@@ -348,15 +393,32 @@ static void tutti_submit_batch_sgl_rw(
         sq_dev_ptr, cq_dev_ptr, sq_db_ptr, cq_db_ptr, q_depth, qid);
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
-    k_submit_batch_sgl_rw<<<1, 1, 0, stream>>>(
-        qd,
-        reinterpret_cast<uint16_t*>(sq_tail_ptr),
-        static_cast<uint32_t>(nsid),
-        opcode,
-        reinterpret_cast<const uint64_t*>(staging_iovas.data_ptr<int64_t>()),
-        reinterpret_cast<const uint64_t*>(slbas.data_ptr<int64_t>()),
-        reinterpret_cast<const uint32_t*>(byte_lens.data_ptr<int32_t>()),
-        n_ios);
+    if (doorbell_timestamps != nullptr) {
+      TORCH_CHECK(doorbell_timestamps->is_cuda(),
+                  "doorbell_timestamps must be a CUDA tensor");
+      TORCH_CHECK(doorbell_timestamps->dtype() == at::kLong,
+                  "doorbell_timestamps must be int64");
+      TORCH_CHECK(doorbell_timestamps->is_contiguous(),
+                  "doorbell_timestamps must be contiguous");
+      TORCH_CHECK(doorbell_timestamps->numel() >= n_ios,
+                  "doorbell_timestamps is too small");
+      k_submit_batch_sgl_rw<true><<<1, 1, 0, stream>>>(
+          qd, reinterpret_cast<uint16_t*>(sq_tail_ptr),
+          static_cast<uint32_t>(nsid), opcode,
+          reinterpret_cast<const uint64_t*>(staging_iovas.data_ptr<int64_t>()),
+          reinterpret_cast<const uint64_t*>(slbas.data_ptr<int64_t>()),
+          reinterpret_cast<const uint32_t*>(byte_lens.data_ptr<int32_t>()),
+          n_ios, reinterpret_cast<uint64_t*>(
+                     doorbell_timestamps->data_ptr<int64_t>()));
+    } else {
+      k_submit_batch_sgl_rw<false><<<1, 1, 0, stream>>>(
+          qd, reinterpret_cast<uint16_t*>(sq_tail_ptr),
+          static_cast<uint32_t>(nsid), opcode,
+          reinterpret_cast<const uint64_t*>(staging_iovas.data_ptr<int64_t>()),
+          reinterpret_cast<const uint64_t*>(slbas.data_ptr<int64_t>()),
+          reinterpret_cast<const uint32_t*>(byte_lens.data_ptr<int32_t>()),
+          n_ios, nullptr);
+    }
 }
 
 void tutti_submit_batch_sgl_read(
@@ -376,7 +438,19 @@ void tutti_submit_batch_sgl_read(
     tutti_submit_batch_sgl_rw(
         sq_dev_ptr, cq_dev_ptr, sq_db_ptr, cq_db_ptr, sq_tail_ptr,
         q_depth, qid, nsid, staging_iovas, slbas, byte_lens,
-        NVME_OPC_READ, stream_ptr);
+        NVME_OPC_READ, nullptr, stream_ptr);
+}
+
+void tutti_submit_batch_sgl_read_profiled(
+    int64_t sq_dev_ptr, int64_t cq_dev_ptr, int64_t sq_db_ptr,
+    int64_t cq_db_ptr, int64_t sq_tail_ptr, int q_depth, int qid,
+    int64_t nsid, at::Tensor staging_iovas, at::Tensor slbas,
+    at::Tensor byte_lens, at::Tensor doorbell_timestamps,
+    int64_t stream_ptr) {
+  tutti_submit_batch_sgl_rw(
+      sq_dev_ptr, cq_dev_ptr, sq_db_ptr, cq_db_ptr, sq_tail_ptr, q_depth,
+      qid, nsid, staging_iovas, slbas, byte_lens, NVME_OPC_READ,
+      &doorbell_timestamps, stream_ptr);
 }
 
 void tutti_submit_indexed_sgl_read(
@@ -431,7 +505,7 @@ void tutti_submit_indexed_sgl_read(
         sq_dev_ptr, cq_dev_ptr, sq_db_ptr, cq_db_ptr, q_depth, qid);
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     constexpr int kSubmitThreads = 256;
-    k_submit_indexed_sgl_read<<<1, kSubmitThreads, 0, stream>>>(
+    k_submit_indexed_sgl_read<false><<<1, kSubmitThreads, 0, stream>>>(
         qd,
         reinterpret_cast<uint16_t*>(sq_tail_ptr),
         static_cast<uint32_t>(nsid),
@@ -441,7 +515,64 @@ void tutti_submit_indexed_sgl_read(
         reinterpret_cast<const uint64_t*>(slba_table.data_ptr<int64_t>()),
         selected_ids.data_ptr<int64_t>(),
         static_cast<uint32_t>(byte_len),
-        n_ios);
+        n_ios,
+        nullptr);
+}
+
+void tutti_submit_indexed_sgl_read_profiled(
+    int64_t sq_dev_ptr, int64_t cq_dev_ptr, int64_t sq_db_ptr,
+    int64_t cq_db_ptr, int64_t sq_tail_ptr, int q_depth, int qid,
+    int64_t nsid, at::Tensor staging_page_iovas, int64_t staging_stride,
+    at::Tensor slba_table, at::Tensor selected_ids, int byte_len,
+    at::Tensor doorbell_timestamps, int64_t stream_ptr) {
+  TORCH_CHECK(doorbell_timestamps.is_cuda(),
+              "doorbell_timestamps must be a CUDA tensor");
+  TORCH_CHECK(doorbell_timestamps.dtype() == at::kLong,
+              "doorbell_timestamps must be int64");
+  TORCH_CHECK(doorbell_timestamps.is_contiguous(),
+              "doorbell_timestamps must be contiguous");
+  const int n_ios = static_cast<int>(selected_ids.numel());
+  TORCH_CHECK(doorbell_timestamps.numel() >= n_ios,
+              "doorbell_timestamps is too small");
+
+  // Reuse the production wrapper's input validation before launching the
+  // profiled specialization. The duplicate launch is avoided by keeping the
+  // validation below explicit rather than calling that wrapper.
+  TORCH_CHECK(staging_page_iovas.dtype() == at::kLong &&
+                  slba_table.dtype() == at::kLong &&
+                  selected_ids.dtype() == at::kLong,
+              "indexed descriptor tensors must be int64");
+  TORCH_CHECK(staging_page_iovas.is_cuda() && slba_table.is_cuda() &&
+                  selected_ids.is_cuda(),
+              "indexed descriptor tensors must be CUDA tensors");
+  TORCH_CHECK(staging_page_iovas.is_contiguous() &&
+                  slba_table.is_contiguous() && selected_ids.is_contiguous(),
+              "indexed descriptor tensors must be contiguous");
+  TORCH_CHECK(n_ios > 0 && n_ios < q_depth,
+              "n_ios must be positive and smaller than q_depth");
+  TORCH_CHECK(staging_stride > 0 && staging_stride % 65536 == 0,
+              "staging_stride must be a positive multiple of 65536");
+  TORCH_CHECK(byte_len > 0 && byte_len % NVME_LBS == 0 &&
+                  byte_len <= staging_stride,
+              "invalid indexed byte_len");
+  TORCH_CHECK(static_cast<int64_t>(n_ios) * staging_stride <=
+                  staging_page_iovas.numel() * 65536,
+              "indexed staging plan exceeds registered staging pages");
+
+  tutti_queue_dev qd = make_qd(
+      sq_dev_ptr, cq_dev_ptr, sq_db_ptr, cq_db_ptr, q_depth, qid);
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+  constexpr int kSubmitThreads = 256;
+  k_submit_indexed_sgl_read<true><<<1, kSubmitThreads, 0, stream>>>(
+      qd, reinterpret_cast<uint16_t*>(sq_tail_ptr),
+      static_cast<uint32_t>(nsid),
+      reinterpret_cast<const uint64_t*>(
+          staging_page_iovas.data_ptr<int64_t>()),
+      static_cast<uint64_t>(staging_stride),
+      reinterpret_cast<const uint64_t*>(slba_table.data_ptr<int64_t>()),
+      selected_ids.data_ptr<int64_t>(), static_cast<uint32_t>(byte_len),
+      n_ios,
+      reinterpret_cast<uint64_t*>(doorbell_timestamps.data_ptr<int64_t>()));
 }
 
 void tutti_submit_batch_sgl_write(
@@ -460,7 +591,8 @@ void tutti_submit_batch_sgl_write(
 {
   tutti_submit_batch_sgl_rw(sq_dev_ptr, cq_dev_ptr, sq_db_ptr, cq_db_ptr,
                             sq_tail_ptr, q_depth, qid, nsid, staging_iovas,
-                            slbas, byte_lens, NVME_OPC_WRITE, stream_ptr);
+                            slbas, byte_lens, NVME_OPC_WRITE, nullptr,
+                            stream_ptr);
 }
 
 void tutti_poll_batch(int64_t sq_dev_ptr, int64_t cq_dev_ptr, int64_t sq_db_ptr,
@@ -479,9 +611,45 @@ void tutti_poll_batch(int64_t sq_dev_ptr, int64_t cq_dev_ptr, int64_t sq_db_ptr,
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
   constexpr int kPollThreads = 256;
-  k_poll_batch<<<1, kPollThreads, 0, stream>>>(
+  k_poll_batch<false><<<1, kPollThreads, 0, stream>>>(
       qd, reinterpret_cast<uint16_t*>(cq_head_ptr),
       reinterpret_cast<uint8_t*>(cq_phase_ptr), n_ios,
       reinterpret_cast<uint32_t*>(status_out.data_ptr<int32_t>()),
-      reinterpret_cast<int*>(timed_out_ptr), static_cast<uint64_t>(max_iters));
+      reinterpret_cast<int*>(timed_out_ptr), static_cast<uint64_t>(max_iters),
+      nullptr, nullptr);
+}
+
+
+void tutti_poll_batch_profiled(
+    int64_t sq_dev_ptr, int64_t cq_dev_ptr, int64_t sq_db_ptr,
+    int64_t cq_db_ptr, int64_t cq_head_ptr, int64_t cq_phase_ptr,
+    int q_depth, int n_ios, at::Tensor status_out, int64_t timed_out_ptr,
+    int64_t max_iters, at::Tensor cqe_timestamps, at::Tensor observed_cids,
+    int64_t stream_ptr) {
+  TORCH_CHECK(status_out.dtype() == at::kInt && status_out.is_contiguous(),
+              "status_out must be contiguous int32");
+  TORCH_CHECK(cqe_timestamps.is_cuda() &&
+                  cqe_timestamps.dtype() == at::kLong &&
+                  cqe_timestamps.is_contiguous(),
+              "cqe_timestamps must be contiguous CUDA int64");
+  TORCH_CHECK(observed_cids.is_cuda() && observed_cids.dtype() == at::kInt &&
+                  observed_cids.is_contiguous(),
+              "observed_cids must be contiguous CUDA int32");
+  TORCH_CHECK(status_out.numel() >= n_ios &&
+                  cqe_timestamps.numel() >= n_ios &&
+                  observed_cids.numel() >= n_ios,
+              "profile output tensor is too small");
+  TORCH_CHECK(max_iters > 0, "max_iters must be positive");
+
+  tutti_queue_dev qd =
+      make_qd(sq_dev_ptr, cq_dev_ptr, sq_db_ptr, cq_db_ptr, q_depth, 0);
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+  constexpr int kPollThreads = 256;
+  k_poll_batch<true><<<1, kPollThreads, 0, stream>>>(
+      qd, reinterpret_cast<uint16_t*>(cq_head_ptr),
+      reinterpret_cast<uint8_t*>(cq_phase_ptr), n_ios,
+      reinterpret_cast<uint32_t*>(status_out.data_ptr<int32_t>()),
+      reinterpret_cast<int*>(timed_out_ptr), static_cast<uint64_t>(max_iters),
+      reinterpret_cast<uint64_t*>(cqe_timestamps.data_ptr<int64_t>()),
+      observed_cids.data_ptr<int32_t>());
 }

@@ -1718,7 +1718,11 @@ def _fire_decoder_ffn_overlap(
             )
             if positions is not None and callable(fire_layers):
                 if pending_targets:
-                    fire_layers(pending_targets, positions)
+                    fire_layers(
+                        pending_targets,
+                        positions,
+                        source_layer_id=int(layer_id),
+                    )
             elif positions is not None:
                 for next_hca in pending_targets:
                     hca_manager.fire_async_for_layer(next_hca, positions)
@@ -2399,7 +2403,7 @@ def _attach_indexer_prefetch(tutti_loader: Optional[Any] = None) -> None:
         from lmcache.v1.ssd_tp_sharded_prefetch import parse_layer_ranges
 
         dense_prediction_exclusions = parse_layer_ranges(
-            os.getenv("LMCACHE_SSD_TP_DENSE_LAYERS", "2-24")
+            os.getenv("LMCACHE_SSD_TP_DENSE_LAYERS", "")
         )
     source_prefetch = build_residual_prefetch_sources(
         csa_layer_ids,
@@ -3852,10 +3856,17 @@ class LMCacheConnectorV1Impl:
         # chunked prefill (currently the 256-token matrix row) may be routed
         # through the decode-shaped sparse-attention kernel.  Treating that as
         # real decode silently disables the external-KV consumers after the
-        # streaming-only path has already skipped generic retrieval.  A
-        # loadable connector request is the authoritative signal that this
-        # forward must consume externally cached KV.
-        _set_dsv4_prefetch_forward_active(bool(loadable_requests))
+        # streaming-only path has already skipped generic retrieval.  The
+        # scheduler also sets ``can_load`` on a cold miss, so require a strict
+        # LMCache-over-vLLM token advantage before enabling physical prefetch
+        # consumers and their per-layer completion gates.
+        has_external_kv = any(
+            request.load_spec is not None
+            and request.load_spec.lmcache_cached_tokens
+            > request.load_spec.vllm_cached_tokens
+            for request in loadable_requests
+        )
+        _set_dsv4_prefetch_forward_active(has_external_kv)
 
         # Attach the CSA attention-KV prefetch manager if the Tutti loader
         # became ready after register_kv_caches. Runs on the main thread before

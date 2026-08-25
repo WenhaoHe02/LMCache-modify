@@ -71,20 +71,169 @@ def _patch_connector(source: str) -> str:
 
 def _patch_api_server(source: str) -> str:
     marker = 'if __name__ == "__main__":\n'
-    hook = f'''# {_MARKER}
+    hook = f"""# {_MARKER}
 from lmcache.integration.vllm.tool_slack_hook import (
     install_vllm_tool_slack_hook,
 )
 
 install_vllm_tool_slack_hook()
 
-'''
+"""
     return _replace_once(
         source,
         marker,
         hook + marker,
         "OpenAI API server tool-slack bootstrap",
     )
+
+
+def _patch_deepseek_v2_profile_nvtx(source: str) -> str:
+    """Install profile-only GLM decoder and MoE NVTX wrappers.
+
+    GLM-5.2 uses ``DeepseekV2DecoderLayer`` in vLLM 0.26.0.  The connector is
+    constructed after the model, so these wrappers must be installed in the
+    model module before decoder instances are created.  They are completely
+    absent from the call path unless ``LMCACHE_CSA_PIPELINE_NVTX=1``.
+    """
+    if "class DeepseekV2DecoderLayer(" not in source:
+        raise PatchError("vLLM 0.26.0 DeepSeek V2 decoder class not found")
+    profile_hooks = f"""
+
+# {_MARKER}: profile-only GLM decoder and MoE stage ranges.
+_LMCACHE_GLM_PIPELINE_NVTX_ENABLED = __import__("os").environ.get(
+    "LMCACHE_CSA_PIPELINE_NVTX", "0"
+).lower() in {{"1", "on", "true", "yes"}}
+
+if _LMCACHE_GLM_PIPELINE_NVTX_ENABLED:
+    from functools import wraps as _lmcache_glm_wraps
+
+    def _lmcache_glm_layer_id(owner):
+        layer_id = getattr(owner, "layer_idx", None)
+        if isinstance(layer_id, int):
+            return layer_id
+        layer_id = getattr(owner, "_lmcache_profile_layer_idx", None)
+        return layer_id if isinstance(layer_id, int) else -1
+
+    def _lmcache_glm_wrap_component(owner, module, event):
+        if module is None:
+            return
+        original = getattr(module, "forward", None)
+        if not callable(original) or getattr(original, "_lmcache_glm_nvtx", False):
+            return
+
+        @_lmcache_glm_wraps(original)
+        def profiled(*args, **kwargs):
+            layer_id = _lmcache_glm_layer_id(owner)
+            torch.cuda.nvtx.range_push(f"event={{event}}|layer={{layer_id}}")
+            try:
+                return original(*args, **kwargs)
+            finally:
+                torch.cuda.nvtx.range_pop()
+
+        profiled._lmcache_glm_nvtx = True
+        module.forward = profiled
+
+    _lmcache_glm_original_init = DeepseekV2DecoderLayer.__init__
+
+    @_lmcache_glm_wraps(_lmcache_glm_original_init)
+    def _lmcache_glm_profiled_init(self, *args, **kwargs):
+        _lmcache_glm_original_init(self, *args, **kwargs)
+        prefix = kwargs.get("prefix")
+        if not isinstance(prefix, str):
+            prefix = next(
+                (
+                    value
+                    for value in reversed(args)
+                    if isinstance(value, str) and ".layers." in value
+                ),
+                "",
+            )
+        if ".layers." in prefix:
+            try:
+                self._lmcache_profile_layer_idx = int(
+                    prefix.rsplit(".layers.", 1)[1].split(".", 1)[0]
+                )
+            except (IndexError, ValueError):
+                self._lmcache_profile_layer_idx = -1
+        _lmcache_glm_wrap_component(
+            self,
+            getattr(self, "self_attn", None),
+            "attention",
+        )
+        _lmcache_glm_wrap_component(
+            self,
+            getattr(self, "mlp", None),
+            "ffn_total",
+        )
+
+    DeepseekV2DecoderLayer.__init__ = _lmcache_glm_profiled_init
+
+    try:
+        from vllm.model_executor.layers.fused_moe.routed_experts import (
+            RoutedExperts as _LMCacheGLMRoutedExperts,
+        )
+        from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
+            FusedMoERouter as _LMCacheGLMFusedMoERouter,
+        )
+        from vllm.model_executor.layers.fused_moe.router.gate_linear import (
+            GateLinear as _LMCacheGLMGateLinear,
+        )
+        from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
+            MoERunner as _LMCacheGLMMoERunner,
+        )
+        from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+            SharedExperts as _LMCacheGLMSharedExperts,
+        )
+    except ImportError:
+        pass
+    else:
+        def _lmcache_glm_install_moe_nvtx(cls, method_name, event):
+            original = getattr(cls, method_name)
+            if getattr(original, "_lmcache_moe_nvtx", False):
+                return
+
+            @_lmcache_glm_wraps(original)
+            def profiled(self, *args, **kwargs):
+                layer_name = getattr(self, "layer_name", type(self).__name__)
+                torch.cuda.nvtx.range_push(
+                    f"event={{event}}|layer_name={{layer_name}}|method={{method_name}}"
+                )
+                try:
+                    return original(self, *args, **kwargs)
+                finally:
+                    torch.cuda.nvtx.range_pop()
+
+            profiled._lmcache_moe_nvtx = True
+            setattr(cls, method_name, profiled)
+
+        _lmcache_glm_install_moe_nvtx(
+            _LMCacheGLMGateLinear, "forward", "moe_gate"
+        )
+        _lmcache_glm_install_moe_nvtx(
+            _LMCacheGLMFusedMoERouter, "select_experts", "moe_router"
+        )
+        _lmcache_glm_install_moe_nvtx(
+            _LMCacheGLMRoutedExperts, "forward_modular", "moe_routed_experts"
+        )
+        _lmcache_glm_install_moe_nvtx(
+            _LMCacheGLMRoutedExperts, "forward_monolithic", "moe_routed_experts"
+        )
+        _lmcache_glm_install_moe_nvtx(
+            _LMCacheGLMSharedExperts, "forward", "moe_shared_experts"
+        )
+        _lmcache_glm_install_moe_nvtx(
+            _LMCacheGLMMoERunner, "_maybe_dispatch", "moe_ep_dispatch"
+        )
+        _lmcache_glm_install_moe_nvtx(
+            _LMCacheGLMMoERunner, "_maybe_combine", "moe_ep_combine"
+        )
+        _lmcache_glm_install_moe_nvtx(
+            _LMCacheGLMMoERunner,
+            "_maybe_reduce_final_output",
+            "moe_ep_final_reduce",
+        )
+"""
+    return source + profile_hooks
 
 
 def _patch_dsv4_model(source: str) -> str:
@@ -96,7 +245,7 @@ def _patch_dsv4_model(source: str) -> str:
         "        super().__init__()\n\n"
         "        config = vllm_config.model_config.hf_config\n"
     )
-    init_hook = '''        super().__init__()
+    init_hook = """        super().__init__()
 
         # LMCache's connector is constructed after the vLLM model, so its
         # registry hook cannot observe decoder construction on vLLM 0.26.0.
@@ -106,7 +255,7 @@ def _patch_dsv4_model(source: str) -> str:
         _DEEPSEEK_V4_DECODER_LAYER_REGISTRY.append(self)
 
         config = vllm_config.model_config.hf_config
-'''
+"""
     forward_marker = "    def forward(\n        self,\n        x: torch.Tensor,\n"
     forward_start = source.find(forward_marker, class_start)
     if forward_start < 0:
@@ -118,16 +267,19 @@ def _patch_dsv4_model(source: str) -> str:
         "DeepSeek V4 decoder layer id",
     )
     source = source[:class_start] + decoder_init + source[forward_start:]
-    registry = '''\
+    registry = """\
 # Decoder instances are created before LMCache's worker connector on vLLM
 # 0.26.0. Keep a module-owned strong registry so the deferred Tutti attach can
 # deterministically recover the live layer objects without a GC-order guess.
 _DEEPSEEK_V4_DECODER_LAYER_REGISTRY = []
 _LMCACHE_DSV4_PREFETCH_ACTIVE = False
+_LMCACHE_CSA_PIPELINE_NVTX_ENABLED = __import__("os").environ.get(
+    "LMCACHE_CSA_PIPELINE_NVTX", "0"
+).lower() in {"1", "on", "true", "yes"}
 
 
 class DeepseekV4DecoderLayer(nn.Module):
-'''
+"""
     source = _replace_once(
         source,
         "class DeepseekV4DecoderLayer(nn.Module):\n",
@@ -159,7 +311,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         "DeepSeek V4 native pre-FFN method",
     )
     ffn_marker = "\n        x = self.ffn(x, input_ids)\n"
-    ffn_hook = '''
+    ffn_hook = """
         # This is the earliest point at which the post-attention residual is
         # available and the MoE has not started. Decode bypasses the Python
         # dispatcher entirely; the connector toggles this module-owned flag
@@ -169,8 +321,17 @@ class DeepseekV4DecoderLayer(nn.Module):
             self._lmcache_python_pre_ffn_overlap_fired = False
             self._lmcache_fire_pre_ffn_overlap(residual, positions)
 
-        x = self.ffn(x, input_ids)
-'''
+        if _LMCACHE_CSA_PIPELINE_NVTX_ENABLED:
+            torch.cuda.nvtx.range_push(
+                f"event=ffn_total|layer={self.layer_idx}"
+            )
+            try:
+                x = self.ffn(x, input_ids)
+            finally:
+                torch.cuda.nvtx.range_pop()
+        else:
+            x = self.ffn(x, input_ids)
+"""
     source = _replace_once(
         source,
         ffn_marker,
@@ -178,7 +339,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         "DeepSeek V4 pre-FFN call",
     )
     attention_marker = "\n        x = self.attn(positions, x, None)\n"
-    attention_gate = '''
+    attention_gate = """
         if _LMCACHE_DSV4_PREFETCH_ACTIVE:
             from lmcache.integration.vllm.vllm_v1_adapter import (
                 wait_dsv4_attention_kv_from_decoder_boundary,
@@ -186,21 +347,111 @@ class DeepseekV4DecoderLayer(nn.Module):
 
             wait_dsv4_attention_kv_from_decoder_boundary(self)
 
-        x = self.attn(positions, x, None)
-'''
-    return _replace_once(
+        if _LMCACHE_CSA_PIPELINE_NVTX_ENABLED:
+            torch.cuda.nvtx.range_push(
+                f"event=attention|layer={self.layer_idx}"
+            )
+            try:
+                x = self.attn(positions, x, None)
+            finally:
+                torch.cuda.nvtx.range_pop()
+        else:
+            x = self.attn(positions, x, None)
+"""
+    source = _replace_once(
         source,
         attention_marker,
         attention_gate,
         "DeepSeek V4 pre-attention HCA gate",
     )
+    moe_profile_hooks = """
+
+# Profile-only DeepSeek-V4 MoE stage hooks. Installing wrappers only when the
+# NVTX switch is enabled keeps the production call path byte-for-byte original.
+if _LMCACHE_CSA_PIPELINE_NVTX_ENABLED:
+    from functools import wraps as _lmcache_wraps
+
+    from vllm.model_executor.layers.fused_moe.routed_experts import (
+        RoutedExperts as _LMCacheRoutedExperts,
+    )
+    from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
+        FusedMoERouter as _LMCacheFusedMoERouter,
+    )
+    from vllm.model_executor.layers.fused_moe.router.gate_linear import (
+        GateLinear as _LMCacheGateLinear,
+    )
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
+        MoERunner as _LMCacheMoERunner,
+    )
+    from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
+        SharedExperts as _LMCacheSharedExperts,
+    )
+
+    def _lmcache_install_moe_nvtx(cls, method_name, event):
+        original = getattr(cls, method_name)
+        if getattr(original, "_lmcache_moe_nvtx", False):
+            return
+
+        @_lmcache_wraps(original)
+        def profiled(self, *args, **kwargs):
+            layer_name = getattr(self, "layer_name", type(self).__name__)
+            torch.cuda.nvtx.range_push(
+                f"event={event}|layer_name={layer_name}|method={method_name}"
+            )
+            try:
+                return original(self, *args, **kwargs)
+            finally:
+                torch.cuda.nvtx.range_pop()
+
+        profiled._lmcache_moe_nvtx = True
+        setattr(cls, method_name, profiled)
+
+    _lmcache_install_moe_nvtx(_LMCacheGateLinear, "forward", "moe_gate")
+    _lmcache_install_moe_nvtx(
+        _LMCacheFusedMoERouter,
+        "select_experts",
+        "moe_router",
+    )
+    _lmcache_install_moe_nvtx(
+        _LMCacheRoutedExperts,
+        "forward_modular",
+        "moe_routed_experts",
+    )
+    _lmcache_install_moe_nvtx(
+        _LMCacheRoutedExperts,
+        "forward_monolithic",
+        "moe_routed_experts",
+    )
+    _lmcache_install_moe_nvtx(
+        _LMCacheSharedExperts,
+        "forward",
+        "moe_shared_experts",
+    )
+    _lmcache_install_moe_nvtx(
+        _LMCacheMoERunner,
+        "_maybe_dispatch",
+        "moe_ep_dispatch",
+    )
+    _lmcache_install_moe_nvtx(
+        _LMCacheMoERunner,
+        "_maybe_combine",
+        "moe_ep_combine",
+    )
+    _lmcache_install_moe_nvtx(
+        _LMCacheMoERunner,
+        "_maybe_reduce_final_output",
+        "moe_ep_final_reduce",
+    )
+"""
+    return source + moe_profile_hooks
 
 
 def _patch_sparse_indexer(source: str) -> str:
     source = _replace_once(
         source,
         "import torch\n",
-        "import os\n\nfrom collections.abc import Callable\n\nimport torch\n",
+        "import os\nimport re\n\nfrom collections.abc import Callable\n"
+        "from contextlib import nullcontext\n\nimport torch\n",
         "sparse indexer callback import",
     )
     registry_marker = "MXFP4_BLOCK_SIZE = 32\n\n"
@@ -229,6 +480,27 @@ _LMCACHE_TRUE_INDEXER_CP_WORKSPACES: dict[
     tuple[str, int | None, torch.dtype, int, int],
     tuple[int, torch.Tensor],
 ] = {{}}
+
+
+def _lmcache_true_indexer_nvtx_context(k_cache_prefix: object):
+    """Return the opt-in detailed true-indexer NVTX context."""
+    enabled = os.getenv("LMCACHE_CSA_DETAILED_IO_NVTX", "0").lower() in {{
+        "1",
+        "true",
+        "yes",
+        "on",
+    }}
+    if not enabled:
+        return nullcontext()
+    match = re.search(
+        r"(?:^|\\.)layers\\.(\\d+)(?:\\.|$)",
+        str(k_cache_prefix),
+    )
+    layer_id = int(match.group(1)) if match is not None else -1
+    return torch.cuda.nvtx.range(
+        f"event=true_indexer_compute|layer={{layer_id}}|target={{layer_id}}|"
+        "kind=dsa_indexer"
+    )
 
 
 def _lmcache_true_indexer_cp_context(
@@ -337,12 +609,12 @@ def _lmcache_true_indexer_cp_workspace(
         "        for chunk_index, chunk in enumerate(prefill_metadata.chunks):\n",
         "sparse indexer chunk enumeration",
     )
-    chunk_header = '''\
+    chunk_header = """\
         for chunk_index, chunk in enumerate(prefill_metadata.chunks):
             cu_seqlen_ks = chunk.cu_seqlen_ks
             cu_seqlen_ke = chunk.cu_seqlen_ke
-'''
-    cp_chunk_header = '''\
+"""
+    cp_chunk_header = """\
         for chunk_index, chunk in enumerate(prefill_metadata.chunks):
             chunk_start = int(chunk.token_start)
             chunk_end = int(chunk.token_end)
@@ -368,14 +640,14 @@ def _lmcache_true_indexer_cp_workspace(
             relative_end = score_end - chunk_start
             cu_seqlen_ks = chunk.cu_seqlen_ks[relative_start:relative_end]
             cu_seqlen_ke = chunk.cu_seqlen_ke[relative_start:relative_end]
-'''
+"""
     source = _replace_once(
         source,
         chunk_header,
         cp_chunk_header,
         "sparse indexer query CP chunk bounds",
     )
-    query_output = '''            q_slice = q_quant[chunk.token_start : chunk.token_end]
+    query_output = """            q_slice = q_quant[chunk.token_start : chunk.token_end]
             q_scale_slice = (
                 q_scale[chunk.token_start : chunk.token_end]
                 if q_scale is not None
@@ -384,8 +656,8 @@ def _lmcache_true_indexer_cp_workspace(
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
-'''
-    cp_query_output = '''            q_slice = q_quant[score_start:score_end]
+"""
+    cp_query_output = """            q_slice = q_quant[score_start:score_end]
             q_scale_slice = (
                 q_scale[score_start:score_end]
                 if q_scale is not None
@@ -407,7 +679,7 @@ def _lmcache_true_indexer_cp_workspace(
                 local_rows = score_end - score_start
                 if local_rows < padded_rows:
                     topk_indices[local_rows:].fill_(-1)
-'''
+"""
     source = _replace_once(
         source,
         query_output,
@@ -420,7 +692,7 @@ def _lmcache_true_indexer_cp_workspace(
             "vLLM 0.26.0 marker count changed for sparse indexer weight slices"
         )
     source = source.replace(weight_slice, "weights[score_start:score_end]", 2)
-    merge_marker = '''            _merge_dcp_topk_global(
+    merge_marker = """            _merge_dcp_topk_global(
                 logits,
                 topk_indices,
                 topk_tokens,
@@ -429,8 +701,8 @@ def _lmcache_true_indexer_cp_workspace(
                 cp_kv_cache_interleave_size,
                 row_starts=chunk.cu_seqlen_ks,
             )
-'''
-    cp_merge = '''            _merge_dcp_topk_global(
+"""
+    cp_merge = """            _merge_dcp_topk_global(
                 logits,
                 topk_indices,
                 topk_tokens,
@@ -484,14 +756,14 @@ def _lmcache_true_indexer_cp_workspace(
                             ]
                         )
                 topk_indices = complete_topk
-'''
+"""
     source = _replace_once(
         source,
         merge_marker,
         cp_merge,
         "sparse indexer exact query CP gather",
     )
-    return _replace_once(
+    source = _replace_once(
         source,
         cp_merge,
         cp_merge
@@ -499,11 +771,18 @@ def _lmcache_true_indexer_cp_workspace(
         + "                chunk_callback(topk_indices, chunk_index)\n",
         "sparse indexer completed-chunk callback",
     )
+    return _replace_once(
+        source,
+        "        return torch.ops.vllm.sparse_attn_indexer(\n",
+        "        with _lmcache_true_indexer_nvtx_context(self.k_cache.prefix):\n"
+        "            return torch.ops.vllm.sparse_attn_indexer(\n",
+        "sparse indexer detailed true-indexer range",
+    )
 
 
 def _patch_cache_utils(source: str) -> str:
     """Fuse compact-page translation into the existing sparse-index combiner."""
-    signature = '''def combine_topk_swa_indices(
+    signature = """def combine_topk_swa_indices(
     topk_indices: torch.Tensor,
     query_start_loc: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -514,11 +793,11 @@ def _patch_cache_utils(source: str) -> str:
     M: int,
     N: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-'''
+"""
     source = _replace_once(
         source,
         signature,
-        '''def combine_topk_swa_indices(
+        """def combine_topk_swa_indices(
     topk_indices: torch.Tensor,
     query_start_loc: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -531,10 +810,10 @@ def _patch_cache_utils(source: str) -> str:
     page_to_compact: torch.Tensor | None = None,
     compact_block_size: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-''',
+""",
         "compact-page combiner signature",
     )
-    launch_marker = '''    NUM_WORKERS = 128
+    launch_marker = """    NUM_WORKERS = 128
     _combine_topk_swa_indices_kernel[(num_reqs, NUM_WORKERS)](
         combined_indices,
         combined_indices.stride(0),
@@ -542,11 +821,11 @@ def _patch_cache_utils(source: str) -> str:
         topk_indices,
         topk_indices.stride(0),
         query_start_loc,
-'''
+"""
     source = _replace_once(
         source,
         launch_marker,
-        '''    use_compact_page_map = page_to_compact is not None
+        """    use_compact_page_map = page_to_compact is not None
     if use_compact_page_map:
         assert page_to_compact is not None
         if page_to_compact.dtype != torch.int32 or page_to_compact.ndim != 2:
@@ -569,58 +848,58 @@ def _patch_cache_utils(source: str) -> str:
         compact_page_map,
         compact_page_map.stride(0),
         query_start_loc,
-''',
+""",
         "compact-page combiner launch",
     )
     source = _replace_once(
         source,
-        '''        PADDED_TOP_K=triton.next_power_of_2(topk_indices.shape[-1]),
+        """        PADDED_TOP_K=triton.next_power_of_2(topk_indices.shape[-1]),
     )
-''',
-        '''        PADDED_TOP_K=triton.next_power_of_2(topk_indices.shape[-1]),
+""",
+        """        PADDED_TOP_K=triton.next_power_of_2(topk_indices.shape[-1]),
         PAGE_MAP_WIDTH=compact_page_map.shape[1],
         COMPACT_BLOCK_SIZE=compact_block_size,
         USE_COMPACT_PAGE_MAP=use_compact_page_map,
     )
-''',
+""",
         "compact-page combiner constexprs",
     )
     source = _replace_once(
         source,
-        '''    topk_indices_ptr,
+        """    topk_indices_ptr,
     topk_indices_stride,
     query_start_loc_ptr,
-''',
-        '''    topk_indices_ptr,
+""",
+        """    topk_indices_ptr,
     topk_indices_stride,
     page_to_compact_ptr,
     page_to_compact_stride,
     query_start_loc_ptr,
-''',
+""",
         "compact-page combiner kernel arguments",
     )
     source = _replace_once(
         source,
-        '''    PADDED_TOP_K: tl.constexpr,
+        """    PADDED_TOP_K: tl.constexpr,
 ):
-''',
-        '''    PADDED_TOP_K: tl.constexpr,
+""",
+        """    PADDED_TOP_K: tl.constexpr,
     PAGE_MAP_WIDTH: tl.constexpr,
     COMPACT_BLOCK_SIZE: tl.constexpr,
     USE_COMPACT_PAGE_MAP: tl.constexpr,
 ):
-''',
+""",
         "compact-page combiner kernel constexprs",
     )
     return _replace_once(
         source,
-        '''        topk_indices = tl.load(
+        """        topk_indices = tl.load(
             topk_indices_ptr + token_idx * topk_indices_stride + offset,
             mask=mask,
         )
         tl.store(
-''',
-        '''        topk_indices = tl.load(
+""",
+        """        topk_indices = tl.load(
             topk_indices_ptr + token_idx * topk_indices_stride + offset,
             mask=mask,
         )
@@ -646,15 +925,15 @@ def _patch_cache_utils(source: str) -> str:
             )
             topk_indices = compact_page * COMPACT_BLOCK_SIZE + page_offset
         tl.store(
-''',
+""",
         "compact-page translation in sparse-index consumer",
     )
 
 
 def _patch_flashmla(source: str) -> str:
-    import_marker = '''from vllm.v1.worker.workspace import current_workspace_manager
+    import_marker = """from vllm.v1.worker.workspace import current_workspace_manager
 
-'''
+"""
     helpers = f'''from vllm.v1.worker.workspace import current_workspace_manager
 
 from lmcache.integration.vllm.dsv4_compact_prefill import (
@@ -735,23 +1014,23 @@ def _lmcache_compact_csa_gather_plan(
         helpers,
         "FlashMLA compact-gather helpers",
     )
-    loop_marker = '''        workspace_manager = current_workspace_manager()
+    loop_marker = """        workspace_manager = current_workspace_manager()
         for chunk_start, chunk_end, chunk_N, chunk_M in chunk_plan:
-'''
+"""
     source = _replace_once(
         source,
         loop_marker,
-        '''        workspace_manager = current_workspace_manager()
+        """        workspace_manager = current_workspace_manager()
         compact_csa_gather = (
             not swa_only
             and self.compress_ratio == 4
             and _lmcache_compact_csa_gather_enabled(compressed_k_cache)
         )
         for chunk_start, chunk_end, chunk_N, chunk_M in chunk_plan:
-''',
+""",
         "FlashMLA compact-gather mode",
     )
-    gather_marker = '''            if not swa_only:
+    gather_marker = """            if not swa_only:
                 # Gather compressed KV
                 assert attn_metadata is not None
                 block_table = attn_metadata.block_table[num_decodes:]
@@ -764,8 +1043,8 @@ def _lmcache_compact_csa_gather_plan(
                     block_size=attn_metadata.block_size // self.compress_ratio,
                     offset=0,
                 )
-'''
-    gather_replacement = '''            query_start = (
+"""
+    gather_replacement = """            query_start = (
                 query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
             )
             query_end = (
@@ -821,14 +1100,14 @@ def _lmcache_compact_csa_gather_plan(
                     block_size=attn_metadata.block_size // self.compress_ratio,
                     offset=0,
                 )
-'''
+"""
     source = _replace_once(
         source,
         gather_marker,
         gather_replacement,
         "FlashMLA compact gather",
     )
-    old_query = '''\
+    old_query = """\
             # Combine the topk indices and SWA indices for gathered KV cache
             query_start = (
                 query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
@@ -839,26 +1118,26 @@ def _lmcache_compact_csa_gather_plan(
 
             combined_indices, combined_lens = combine_topk_swa_indices(
                 topk_indices[query_start:query_end],
-'''
-    new_query = '''\
+"""
+    new_query = """\
             # Combine indices and translate compact CSA pages in one pass.
             combined_indices, combined_lens = combine_topk_swa_indices(
                 chunk_topk_indices,
-'''
+"""
     source = _replace_once(
         source,
         old_query,
         new_query,
         "FlashMLA compact top-K input",
     )
-    combine_tail = '''                chunk_M,
+    combine_tail = """                chunk_M,
                 chunk_N,
             )
-'''
+"""
     return _replace_once(
         source,
         combine_tail,
-        '''                chunk_M,
+        """                chunk_M,
                 chunk_N,
                 page_to_compact=compact_page_to_compact,
                 compact_block_size=(
@@ -867,13 +1146,13 @@ def _lmcache_compact_csa_gather_plan(
                     else 0
                 ),
             )
-''',
+""",
         "FlashMLA fused compact-page translation",
     )
 
 
 def _patch_kv_cache_admission(source: str) -> str:
-    admission_check = '''    # Check if the available memory is enough per worker.
+    admission_check = """    # Check if the available memory is enough per worker.
     for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
         if not groups:
             continue
@@ -883,8 +1162,8 @@ def _patch_kv_cache_admission(source: str) -> str:
             vllm_config.model_config.max_model_len,
             partial(_estimate_max_model_len_from_groups, vllm_config, groups),
         )
-'''
-    external_cache_check = f'''    # Check if the available memory is enough per worker.
+"""
+    external_cache_check = f"""    # Check if the available memory is enough per worker.
     # {_MARKER}: the DSV4 SSD path intentionally keeps only a bounded working
     # set in vLLM's GPU cache while LMCache owns the complete logical sequence.
     # vLLM 0.26 otherwise rejects the old, proven 530K configuration before
@@ -909,7 +1188,7 @@ def _patch_kv_cache_admission(source: str) -> str:
             vllm_config.model_config.max_model_len,
             partial(_estimate_max_model_len_from_groups, vllm_config, groups),
         )
-'''
+"""
     return _replace_once(
         source,
         admission_check,
@@ -926,7 +1205,7 @@ def _patch_scheduler_oversized_prefill(source: str) -> str:
         "scheduler LMCache environment import",
     )
     logger_marker = "logger = init_logger(__name__)\n"
-    opt_in = f'''logger = init_logger(__name__)
+    opt_in = f"""logger = init_logger(__name__)
 
 # {_MARKER}: vLLM 0.26 can schedule the next prefill chunk before the
 # preceding GPU step has settled. An oversized hybrid request may then fail
@@ -936,20 +1215,20 @@ def _patch_scheduler_oversized_prefill(source: str) -> str:
 _LMCACHE_SERIALIZE_OVERSIZED_PREFILL = os.getenv(
     "LMCACHE_ALLOW_OVERSIZED_KV_CACHE", "0"
 ).lower() in {{"1", "on", "true", "yes"}}
-'''
+"""
     source = _replace_once(
         source,
         logger_marker,
         opt_in,
         "scheduler LMCache oversized-prefill flag",
     )
-    running_marker = '''\
+    running_marker = """\
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
             if (
-'''
-    serialized = '''        while req_index < len(self.running) and token_budget > 0:
+"""
+    serialized = """        while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
             if (
@@ -964,7 +1243,7 @@ _LMCACHE_SERIALIZE_OVERSIZED_PREFILL = os.getenv(
                 continue
 
             if (
-'''
+"""
     return _replace_once(
         source,
         running_marker,
@@ -989,11 +1268,14 @@ def patch_vllm_0260(vllm_root: Path) -> tuple[Path, ...]:
     """
     targets = (
         (
-            vllm_root
-            / "distributed/kv_transfer/kv_connector/v1/lmcache_connector.py",
+            vllm_root / "distributed/kv_transfer/kv_connector/v1/lmcache_connector.py",
             _patch_connector,
         ),
         (vllm_root / "entrypoints/openai/api_server.py", _patch_api_server),
+        (
+            vllm_root / "model_executor/models/deepseek_v2.py",
+            _patch_deepseek_v2_profile_nvtx,
+        ),
         (vllm_root / "models/deepseek_v4/nvidia/model.py", _patch_dsv4_model),
         (
             vllm_root / "model_executor/layers/sparse_attn_indexer.py",

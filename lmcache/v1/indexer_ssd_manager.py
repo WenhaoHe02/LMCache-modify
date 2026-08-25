@@ -106,6 +106,35 @@ def _proxy_num_rows(proxy_state: Optional[torch.Tensor]) -> int:
     return int(proxy_state.shape[0])
 
 
+def _estimated_proxy_block_coverage(
+    history_tokens: int,
+    append_rows: int,
+    topk_tokens: int,
+    query_sample_stride: int,
+    minimum_sample_span: int,
+) -> float:
+    """Estimate the fraction of historical blocks selected by a proxy union."""
+    history_blocks = max(
+        1,
+        (int(history_tokens) + DEEPGEMM_PAGED_BLOCK_SIZE - 1)
+        // DEEPGEMM_PAGED_BLOCK_SIZE,
+    )
+    # Below one complete CP sampling cycle every rank scores the full suffix;
+    # otherwise the exchanged union represents one in ``stride`` query rows.
+    sampled_queries = int(append_rows)
+    if sampled_queries >= int(minimum_sample_span):
+        sampled_queries = (
+            sampled_queries + int(query_sample_stride) - 1
+        ) // int(query_sample_stride)
+    topk_blocks = max(
+        1,
+        (int(topk_tokens) + DEEPGEMM_PAGED_BLOCK_SIZE - 1)
+        // DEEPGEMM_PAGED_BLOCK_SIZE,
+    )
+    draws = max(0, sampled_queries) * topk_blocks
+    return 1.0 - math.exp(-float(draws) / float(history_blocks))
+
+
 def _flatten_proxy_state_for_positions(
     proxy_state: torch.Tensor,
     positions: torch.Tensor,
@@ -1163,6 +1192,7 @@ class IndexerSSDManager:
             lid: [] for lid in csa_layer_ids
         }
         self._expired_proxy_layers: Set[int] = set()
+        self._expired_proxy_targets: Set[Tuple[str, int, int]] = set()
         self._proxy_block_budget = max(
             1,
             _env_int("LMCACHE_CSA_PREFETCH_BLOCK_BUDGET", 256),
@@ -1210,6 +1240,7 @@ class IndexerSSDManager:
         # memory on the second request).  True-topK miss correction remains
         # the correctness net for any blocks the single fire missed.
         self._csa_fired_request_id: str = ""
+        self._csa_fired_request_generation: int = -1
         self._csa_fired_levels: Set[Tuple[int, int]] = set()
         self._prefetch_lookahead: Dict[int, int] = {lid: 0 for lid in csa_layer_ids}
         self._cp_proxy_fallback_logged: Set[Tuple[int, str]] = set()
@@ -1833,15 +1864,21 @@ class IndexerSSDManager:
             wait_ms=f"{native_wait_ms:.3f}",
         )
         request_id = str(getattr(manager, "active_request_id", ""))
+        active_request_token = getattr(
+            manager,
+            "active_request_token",
+            (request_id, -1),
+        )
+        request_generation = (
+            int(active_request_token[1])
+            if isinstance(active_request_token, tuple)
+            and len(active_request_token) >= 2
+            else -1
+        )
         self.start_nsys_capture_for_layer(layer_id, request_id)
         fire_key = (int(layer_id), int(prefetch_level))
         with self._lock:
-            if request_id != self._csa_fired_request_id:
-                self._csa_fired_request_id = request_id
-                self._csa_fired_levels.clear()
-                self._expired_proxy_layers.clear()
-                for target_layer_id in self._csa_layer_ids:
-                    self._last_proxy_blocks[target_layer_id] = None
+            self._begin_csa_proxy_request_locked(request_id, request_generation)
             if request_id and fire_key in self._csa_fired_levels:
                 return
             # Reserve before launching so duplicate decoder hooks cannot race
@@ -2156,6 +2193,81 @@ class IndexerSSDManager:
         self._native_indexer_stream_cleanup_failed = not drained
         return drained
 
+    def deactivate_csa_predictions(self, timeout_s: float = 30.0) -> bool:
+        """Cancel or retire proxy work whose target gate was not consumed.
+
+        Args:
+            timeout_s: Total time allowed for already-running proxy/I/O work.
+
+        Returns:
+            ``True`` when no old-request prediction can still submit or retain
+            CSA KV state, otherwise ``False`` with unresolved futures retained
+            for a later cleanup attempt.
+
+        Notes:
+            This is a request-lifecycle operation. It never launches the TP
+            gather collective: completed rank-local shard work is discarded
+            through the CSA manager after its already-enqueued CUDA event.
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        csa_manager = getattr(self, "_csa_attention_kv_manager", None)
+        active_request_token = getattr(
+            csa_manager,
+            "active_request_token",
+            (str(getattr(csa_manager, "active_request_id", "") or ""), -1),
+        )
+        active_request_id = str(active_request_token[0] or "")
+        active_request_generation = int(active_request_token[1])
+        with self._lock:
+            # Close every old target gate before taking the first snapshot.
+            # A running score callback checks this set before it can append its
+            # nested I/O Future.
+            self._expired_proxy_layers.update(self._csa_layer_ids)
+            if active_request_id:
+                expired_targets = getattr(self, "_expired_proxy_targets", set())
+                expired_targets.update(
+                    (
+                        active_request_id,
+                        active_request_generation,
+                        int(layer_id),
+                    )
+                    for layer_id in self._csa_layer_ids
+                )
+                self._expired_proxy_targets = expired_targets
+        discard = getattr(csa_manager, "discard_deferred_shard_gather", None)
+        while True:
+            with self._lock:
+                current = [
+                    (int(layer_id), future)
+                    for layer_id in self._csa_layer_ids
+                    for future in self._proxy_futures.get(int(layer_id), ())
+                ]
+                for layer_id in self._csa_layer_ids:
+                    self._proxy_futures[int(layer_id)] = []
+            if not current:
+                return True
+            for _layer_id, future in current:
+                future.cancel()
+            for layer_id, future in current:
+                try:
+                    work = future.result(
+                        timeout=max(0.0, deadline - time.monotonic())
+                    )
+                    if callable(discard):
+                        discard(work, status="request_deactivated")
+                except CancelledError:
+                    continue
+                except TimeoutError:
+                    if not future.done():
+                        with self._lock:
+                            self._proxy_futures[layer_id].append(future)
+                        return False
+                except Exception:
+                    logger.exception(
+                        "IndexerSSDManager: old-request CSA prediction failed "
+                        "while deactivating"
+                    )
+
     def wait_for_native_indexer_layer(self, layer_id: int) -> bool:
         """Wait until one streamed native indexer layer is safe to consume.
 
@@ -2209,6 +2321,45 @@ class IndexerSSDManager:
                 request_token=request_token,
             )
 
+    def _begin_csa_proxy_request_locked(
+        self,
+        request_id: str,
+        request_generation: int,
+    ) -> None:
+        """Initialize producer state without dropping current-request expiry."""
+        if (
+            request_id == self._csa_fired_request_id
+            and request_generation == self._csa_fired_request_generation
+        ):
+            return
+        self._csa_fired_request_id = request_id
+        self._csa_fired_request_generation = int(request_generation)
+        self._csa_fired_levels.clear()
+        self._expired_proxy_targets = {
+            (expired_request, expired_generation, expired_layer)
+            for expired_request, expired_generation, expired_layer in getattr(
+                self,
+                "_expired_proxy_targets",
+                set(),
+            )
+            if (
+                expired_request == request_id
+                and expired_generation == request_generation
+            )
+        }
+        self._expired_proxy_layers = {
+            expired_layer
+            for expired_request, expired_generation, expired_layer in (
+                self._expired_proxy_targets
+            )
+            if (
+                expired_request == request_id
+                and expired_generation == request_generation
+            )
+        }
+        for target_layer_id in self._csa_layer_ids:
+            self._last_proxy_blocks[target_layer_id] = None
+
     def fire_residual_prefetch_for_layer(
         self,
         layer_id: int,
@@ -2245,10 +2396,54 @@ class IndexerSSDManager:
             )
             return
         self.wait_for_seed(layer_id)
+        append_rows = _proxy_num_rows(residual_f)
+        if _env_flag("LMCACHE_CSA_ADAPTIVE_DENSE_PREFETCH"):
+            history_tokens = self._decode_cursor.get(int(layer_id), 0)
+            query_sample_stride = max(
+                1,
+                _env_int("LMCACHE_CSA_PREFETCH_CP_QUERY_SAMPLE_STRIDE", 1),
+            )
+            cp_size = max(1, _env_int("LMCACHE_CSA_PREFETCH_CP_SIZE", 1))
+            cp_interleave = max(
+                1,
+                _env_int("LMCACHE_CSA_PREFETCH_CP_INTERLEAVE", 64),
+            )
+            topk_tokens = self._proxy_topk_tokens_by_layer.get(
+                int(layer_id),
+                self._l1_proxy_topk_tokens if lookahead == 1 else 512,
+            )
+            estimated_coverage = _estimated_proxy_block_coverage(
+                history_tokens,
+                append_rows,
+                topk_tokens,
+                query_sample_stride,
+                cp_size * cp_interleave * query_sample_stride,
+            )
+            dense_threshold = max(
+                0,
+                min(
+                    100,
+                    _env_int("LMCACHE_CSA_ADAPTIVE_DENSE_THRESHOLD_PERCENT", 80),
+                ),
+            )
+            if estimated_coverage * 100.0 >= float(dense_threshold):
+                self.fire_dense_csa_layers(
+                    (int(layer_id),),
+                    source_layer_id=int(layer_id) - int(lookahead),
+                )
+                self._log_timing(
+                    "adaptive_dense_submit",
+                    int(layer_id),
+                    history_tokens=history_tokens,
+                    append_rows=append_rows,
+                    estimated_coverage=f"{estimated_coverage:.4f}",
+                    threshold_percent=dense_threshold,
+                )
+                return
         self._log_timing(
             f"l{lookahead}_submit",
             layer_id,
-            rows=_proxy_num_rows(residual_f),
+            rows=append_rows,
         )
         with csa_pipeline_nvtx.range(
             CsaNvtxEvent.PROXY,
@@ -2280,12 +2475,15 @@ class IndexerSSDManager:
         self,
         layer_ids: Sequence[int],
         positions: Optional[torch.Tensor] = None,
+        *,
+        source_layer_id: Optional[int] = None,
     ) -> None:
         """Schedule deterministic HCA attention-KV reads in the FFN window.
 
         Args:
             layer_ids: Upcoming registered HCA transformer layer ids.
             positions: Unused compatibility argument for decoder hooks.
+            source_layer_id: Decoder layer whose FFN boundary schedules reads.
         """
         del positions
         manager = getattr(self, "_csa_attention_kv_manager", None)
@@ -2295,6 +2493,7 @@ class IndexerSSDManager:
             return
         request_id = str(getattr(manager, "active_request_id", ""))
         request_token = getattr(manager, "active_request_token", (request_id, -1))
+        pending_layer_ids: list[int] = []
         for raw_layer_id in layer_ids:
             layer_id = int(raw_layer_id)
             with self._lock:
@@ -2304,12 +2503,65 @@ class IndexerSSDManager:
                 if layer_id in self._hca_fired_layers:
                     continue
                 self._hca_fired_layers.add(layer_id)
+            pending_layer_ids.append(layer_id)
 
+        if not pending_layer_ids:
+            return
+
+        if _env_flag("LMCACHE_HCA_PREFIRE_ALL_LAYERS") and len(pending_layer_ids) > 1:
+            # One ordered producer prevents later HCA layers from winning the
+            # shared Tutti queue ahead of earlier consumers.  A completion per
+            # layer still releases each gate as soon as its own read finishes.
+            completions: Dict[int, Future[Any]] = {
+                layer_id: Future() for layer_id in pending_layer_ids
+            }
+
+            def _fire_ordered(
+                targets: Tuple[int, ...] = tuple(pending_layer_ids),
+                token: Tuple[str, int] = request_token,
+                source: Optional[int] = source_layer_id,
+            ) -> None:
+                for index, target_layer_id in enumerate(targets):
+                    try:
+                        fire_layer(
+                            target_layer_id,
+                            request_token=token,
+                            source_layer_id=source,
+                        )
+                    except Exception as exc:
+                        for remaining_layer_id in targets[index:]:
+                            completion = completions[remaining_layer_id]
+                            if not completion.done():
+                                completion.set_exception(exc)
+                        return
+                    completions[target_layer_id].set_result(None)
+
+            self._executor.submit(_fire_ordered)
+            for layer_id in pending_layer_ids:
+                if callable(track):
+                    track(
+                        layer_id,
+                        completions[layer_id],
+                        request_token=request_token,
+                    )
+                self._log_timing(
+                    "hca_deterministic_ordered_submit",
+                    layer_id,
+                    request_id=request_id,
+                )
+            return
+
+        for layer_id in pending_layer_ids:
             def _fire(
                 target_layer_id: int = layer_id,
                 token: Tuple[str, int] = request_token,
+                source: Optional[int] = source_layer_id,
             ) -> None:
-                fire_layer(target_layer_id, request_token=token)
+                fire_layer(
+                    target_layer_id,
+                    request_token=token,
+                    source_layer_id=source,
+                )
 
             future = self._executor.submit(_fire)
             if callable(track):
@@ -2387,7 +2639,11 @@ class IndexerSSDManager:
                 # collective between ranks.
                 try:
                     for target_layer_id in target_layer_ids:
-                        prepared = fire_layer(target_layer_id, request_token=token)
+                        prepared = fire_layer(
+                            target_layer_id,
+                            request_token=token,
+                            source_layer_id=source_layer_id,
+                        )
                         if not prepared:
                             raise RuntimeError(
                                 "dense CSA shard preparation rejected layer "
@@ -2424,8 +2680,13 @@ class IndexerSSDManager:
             def _fire(
                 target_layer_id: int = layer_id,
                 token: Tuple[str, int] = request_token,
+                source: Optional[int] = source_layer_id,
             ) -> Any:
-                return fire_layer(target_layer_id, request_token=token)
+                return fire_layer(
+                    target_layer_id,
+                    request_token=token,
+                    source_layer_id=source,
+                )
 
             future = self._dense_shard_executor.submit(_fire)
             if callable(track):
@@ -2826,7 +3087,10 @@ class IndexerSSDManager:
         with self._lock:
             expired = (
                 int(layer_id) in self._expired_proxy_layers
+                or (request_token[0], int(request_token[1]), int(layer_id))
+                in getattr(self, "_expired_proxy_targets", set())
                 or request_id != self._csa_fired_request_id
+                or int(request_token[1]) != self._csa_fired_request_generation
             )
             self._last_proxy_blocks[int(layer_id)] = (
                 [int(block_id) for block_id in block_ids_tensor.tolist()]
@@ -3538,12 +3802,36 @@ class IndexerSSDManager:
         gate_start = time.perf_counter()
         layer_id = int(layer_id)
         with self._lock:
-            futures = tuple(self._proxy_futures.get(layer_id, ()))
-            prediction_submitted = bool(futures) or bool(
-                self._last_proxy_blocks.get(layer_id)
+            manager = getattr(self, "_csa_attention_kv_manager", None)
+            active_request_token = getattr(
+                manager,
+                "active_request_token",
+                (str(getattr(manager, "active_request_id", "") or ""), -1),
+            )
+            active_request_id = str(active_request_token[0] or "")
+            active_request_generation = int(active_request_token[1])
+            producer_request_id = str(
+                getattr(self, "_csa_fired_request_id", "") or ""
+            )
+            producer_request_generation = int(
+                getattr(self, "_csa_fired_request_generation", -1)
+            )
+            same_request = (
+                not active_request_id
+                or (
+                    active_request_id == producer_request_id
+                    and active_request_generation == producer_request_generation
+                )
+            )
+            futures = (
+                tuple(self._proxy_futures.get(layer_id, ()))
+                if same_request
+                else ()
+            )
+            prediction_submitted = same_request and (
+                bool(futures) or bool(self._last_proxy_blocks.get(layer_id))
             )
             ready = prediction_submitted and all(future.done() for future in futures)
-            manager = getattr(self, "_csa_attention_kv_manager", None)
             gate_aligned = bool(
                 callable(
                     uses_gate_aligned := getattr(
@@ -3554,8 +3842,26 @@ class IndexerSSDManager:
                 )
                 and uses_gate_aligned()
             )
-            if not ready and not gate_aligned:
+            # A target with no submitted prediction has already passed its
+            # only consumption gate. Expire it even in gate-aligned mode so a
+            # late proxy callback cannot enqueue rank-local shard work that no
+            # future model layer will finalize.
+            if not prediction_submitted or (not ready and not gate_aligned):
                 self._expired_proxy_layers.add(layer_id)
+                if active_request_id:
+                    expired_targets = getattr(
+                        self,
+                        "_expired_proxy_targets",
+                        set(),
+                    )
+                    expired_targets.add(
+                        (
+                            active_request_id,
+                            active_request_generation,
+                            layer_id,
+                        )
+                    )
+                    self._expired_proxy_targets = expired_targets
         if not prediction_submitted:
             if _profile_accuracy_enabled():
                 logger.info(
@@ -4556,6 +4862,8 @@ class IndexerSSDManager:
         Call between benchmark runs or when starting a new sequence.
         """
         with self._lock:
+            self._expired_proxy_layers.clear()
+            self._expired_proxy_targets.clear()
             for lid in self._csa_layer_ids:
                 self._prev_topk[lid] = None
                 self._pending[lid] = []

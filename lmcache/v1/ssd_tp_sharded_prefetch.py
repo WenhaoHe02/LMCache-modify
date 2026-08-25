@@ -353,7 +353,7 @@ class SSDTPShardedPrefetchConfig:
             indexer_enabled=_flag("LMCACHE_SSD_TP_SHARD_INDEXER", True),
             csa_enabled=_flag("LMCACHE_SSD_TP_SHARD_CSA", True),
             dense_layers=parse_layer_ranges(
-                os.getenv("LMCACHE_SSD_TP_DENSE_LAYERS", "2-24")
+                os.getenv("LMCACHE_SSD_TP_DENSE_LAYERS", "")
             ),
             disabled_layers=parse_layer_ranges(
                 os.getenv("LMCACHE_SSD_TP_DISABLED_LAYERS", "")

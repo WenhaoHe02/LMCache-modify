@@ -39,8 +39,20 @@ class CsaNvtxEvent(str, Enum):
     IO_IN_FLIGHT = "io_in_flight"
     IO_SUBMIT = "io_submit"
     IO_DONE = "io_done"
+    IO_SCATTER = "io_scatter"
     TARGET_GATE_WAIT = "target_gate_wait"
     TRUE_INDEXER = "true_indexer"
+    TRUE_INDEXER_COMPUTE = "true_indexer_compute"
+    IO_LOADER_CALL = "io_loader_call"
+    IO_MATERIALIZE = "io_materialize"
+    NVME_DEVICE_BATCH = "nvme_device_batch"
+    CONSUMER_WAIT = "consumer_wait"
+    FUTURE_WAIT = "future_wait"
+    CONDITION_WAIT = "condition_wait"
+    CUDA_EVENT_WAIT = "cuda_event_wait"
+    GLM_DSA_PREDICTION = "glm_dsa_prediction"
+    GLM_DSA_CORRECTION = "glm_dsa_correction"
+    GLM_DSA_STAGE_RELEASE = "glm_dsa_stage_release"
 
 
 class CsaNvtxBackend(Protocol):
@@ -78,8 +90,20 @@ _EVENT_COLORS = {
     CsaNvtxEvent.IO_IN_FLIGHT: "purple",
     CsaNvtxEvent.IO_SUBMIT: "purple",
     CsaNvtxEvent.IO_DONE: "green",
+    CsaNvtxEvent.IO_SCATTER: "yellow",
     CsaNvtxEvent.TARGET_GATE_WAIT: "red",
     CsaNvtxEvent.TRUE_INDEXER: "rapids",
+    CsaNvtxEvent.TRUE_INDEXER_COMPUTE: "rapids",
+    CsaNvtxEvent.IO_LOADER_CALL: "purple",
+    CsaNvtxEvent.IO_MATERIALIZE: "yellow",
+    CsaNvtxEvent.NVME_DEVICE_BATCH: "purple",
+    CsaNvtxEvent.CONSUMER_WAIT: "red",
+    CsaNvtxEvent.FUTURE_WAIT: "red",
+    CsaNvtxEvent.CONDITION_WAIT: "red",
+    CsaNvtxEvent.CUDA_EVENT_WAIT: "red",
+    CsaNvtxEvent.GLM_DSA_PREDICTION: "orange",
+    CsaNvtxEvent.GLM_DSA_CORRECTION: "yellow",
+    CsaNvtxEvent.GLM_DSA_STAGE_RELEASE: "blue",
 }
 
 
@@ -135,9 +159,10 @@ class CsaPipelineNvtx:
 
     Args:
         enabled: Whether event emission is enabled. If omitted, the value is
-            read from ``LMCACHE_CSA_PIPELINE_NVTX``.
+            read from ``env_name``.
         backend: Optional backend, primarily useful for tests. The installed
             Python ``nvtx`` package is used when omitted.
+        env_name: Environment variable used when ``enabled`` is omitted.
 
     Notes:
         Explicit start/end ranges are used so an I/O range may begin on the
@@ -148,9 +173,10 @@ class CsaPipelineNvtx:
         self,
         enabled: bool | None = None,
         backend: CsaNvtxBackend | None = None,
+        env_name: str = "LMCACHE_CSA_PIPELINE_NVTX",
     ) -> None:
         requested = (
-            os.getenv("LMCACHE_CSA_PIPELINE_NVTX", "0").lower() in _TRUE_VALUES
+            os.getenv(env_name, "0").lower() in _TRUE_VALUES
             if enabled is None
             else enabled
         )
@@ -354,3 +380,6 @@ class CsaPipelineNvtx:
 
 csa_pipeline_nvtx = CsaPipelineNvtx()
 """Process-wide pipeline tracer used by CSA/HCA integration points."""
+
+detailed_io_nvtx = CsaPipelineNvtx(env_name="LMCACHE_CSA_DETAILED_IO_NVTX")
+"""Opt-in detailed I/O tracer; disabled independently by default."""

@@ -451,57 +451,57 @@ def _make_loader(n_slots: int = 4, slot_mb: int = 32, q_depth: Optional[int] = N
 
 
 class TestRawStoreStreamIsolation:
-    """Keep background cold-store CUDA work off the model default stream."""
+    """Keep background cold-store writes completely off the GPU."""
 
-    def test_raw_store_uses_only_dedicated_stream(self) -> None:
+    def test_public_raw_store_uses_cpu_writer_only(self) -> None:
         loader, _ctrl = _make_loader(n_slots=2, q_depth=2)
-        io_stream = MagicMock()
-        io_stream.cuda_stream = 123
-        loader._io_stream = io_stream
-        original_tensor = torch.tensor
-
-        @contextmanager
-        def fake_stream_context(_stream: Any) -> Iterator[None]:
-            yield
-
-        def tensor_on_cpu(*args: Any, **kwargs: Any) -> torch.Tensor:
-            kwargs.pop("device", None)
-            return original_tensor(*args, **kwargs)
-
+        cpu_writer = MagicMock()
+        cpu_writer.write.return_value = (((0, 100, 1),), 0.5)
         with (
-            patch("torch.cuda.device"),
-            patch("torch.cuda.stream", side_effect=fake_stream_context) as use_stream,
-            patch("torch.cuda.current_stream") as current_stream,
-            patch("torch.cuda.synchronize") as device_synchronize,
+            patch.object(loader, "_ensure_cpu_raw_writer", return_value=cpu_writer),
+            patch.object(loader, "queue_background_write") as queue_wave,
+            patch.object(loader, "start_background_write") as start_wave,
+            patch.object(loader, "finish_background_write") as finish_wave,
             patch.object(_tdl, "_c_ops") as c_ops,
-            patch.object(
-                loader,
-                "_enqueue_nvme_status_reduction",
-                return_value=False,
-            ),
-            patch.object(loader, "_check_nvme_status"),
-            patch("torch.tensor", side_effect=tensor_on_cpu),
         ):
-            c_ops.tutti_submit_batch_sgl_write = MagicMock()
-            c_ops.tutti_poll_batch = MagicMock()
-            records = loader._store_bytes_to_raw_extents_locked(
-                payload_view=memoryview(b"x" * 512),
-                payload_nbytes=512,
-                dma_nbytes=512,
-                aligned_nbytes=1 << 16,
+            records = loader.store_bytes_to_raw_extents(
+                b"x" * 512,
                 raw_extents=[
-                    LbaRecord(file_offset=0, slba=0, n_sectors=1),
+                    LbaRecord(file_offset=0, slba=100, n_sectors=1),
                 ],
                 base_file_offset=0,
-                profile_start=time.perf_counter(),
             )
 
-        assert records == [LbaRecord(file_offset=0, slba=0, n_sectors=1)]
-        assert use_stream.call_count == 2
-        current_stream.assert_not_called()
-        device_synchronize.assert_not_called()
-        io_stream.wait_stream.assert_not_called()
-        assert io_stream.synchronize.call_count == 2
+        assert records == [LbaRecord(file_offset=0, slba=100, n_sectors=1)]
+        queue_wave.assert_called_once_with(512)
+        start_wave.assert_called_once_with()
+        finish_wave.assert_called_once()
+        cpu_writer.write.assert_called_once()
+        c_ops.tutti_submit_batch_sgl_write.assert_not_called()
+
+    def test_cpu_write_failure_never_falls_back_to_gpu(self) -> None:
+        loader, _ctrl = _make_loader(n_slots=2, q_depth=2)
+        cpu_writer = MagicMock()
+        cpu_writer.write.side_effect = OSError("injected CPU write failure")
+        with (
+            patch.object(loader, "_ensure_cpu_raw_writer", return_value=cpu_writer),
+            patch.object(loader, "queue_background_write"),
+            patch.object(loader, "start_background_write"),
+            patch.object(loader, "finish_background_write") as finish_wave,
+            patch.object(_tdl, "_c_ops") as c_ops,
+            pytest.raises(OSError, match="injected CPU write failure"),
+        ):
+            loader.store_bytes_to_raw_extents(
+                b"x" * 512,
+                raw_extents=[
+                    LbaRecord(file_offset=0, slba=100, n_sectors=1),
+                ],
+                base_file_offset=0,
+            )
+
+        finish_wave.assert_called_once()
+        assert finish_wave.call_args.args[-1] is False
+        c_ops.tutti_submit_batch_sgl_write.assert_not_called()
 
 
 class _FakeCudaInt64Tensor:
@@ -942,15 +942,36 @@ class TestTuttiDirectLoaderLoadChunksToHbm:
 
     def test_before_batch_runs_under_whole_call_lock(self) -> None:
         loader, _ctrl = _make_loader()
-        callback_lock_states: list[bool] = []
+        registration_started = threading.Event()
+        registration_done = threading.Event()
+        registration_thread: list[threading.Thread] = []
 
         def before_batch() -> None:
-            callback_lock_states.append(loader._io_lock.locked())
+            def register_competing_table() -> None:
+                registration_started.set()
+                loader.register_lba_cache(
+                    {
+                        "tutti://competing": [
+                            LbaRecord(slba=1, n_sectors=1, file_offset=0)
+                        ]
+                    }
+                )
+                registration_done.set()
+
+            thread = threading.Thread(target=register_competing_table)
+            registration_thread.append(thread)
+            thread.start()
+            assert registration_started.wait(timeout=5.0)
+            assert not registration_done.wait(timeout=0.05)
+
+        def load_locked(*_args: Any, **_kwargs: Any) -> list[None]:
+            assert not registration_done.is_set()
+            return [None]
 
         with patch.object(
             loader,
             "_load_chunks_to_hbm_locked",
-            return_value=[None],
+            side_effect=load_locked,
         ) as load_locked:
             results = loader.load_chunks_to_hbm(
                 [_fake_key(0)],
@@ -959,7 +980,10 @@ class TestTuttiDirectLoaderLoadChunksToHbm:
             )
 
         assert results == [None]
-        assert callback_lock_states == [True]
+        assert len(registration_thread) == 1
+        registration_thread[0].join(timeout=5.0)
+        assert not registration_thread[0].is_alive()
+        assert registration_done.is_set()
         load_locked.assert_called_once()
 
     def test_raw_callback_reports_global_batch_start(self) -> None:
@@ -1118,52 +1142,6 @@ class TestTuttiDirectLoaderLoadChunksToHbm:
         assert not speculative_thread.is_alive()
         assert speculative_submitted.is_set()
         assert errors == []
-
-    def test_speculative_read_yields_to_store_writer(self, monkeypatch) -> None:
-        monkeypatch.setenv("LMCACHE_TUTTI_WRITE_SLACK_SEC", "60")
-        monkeypatch.setenv("LMCACHE_TUTTI_WRITE_MAX_DELAY_SEC", "60")
-        loader, _ctrl = _make_loader(n_slots=2, q_depth=2)
-        store_started = threading.Event()
-        release_store = threading.Event()
-        store_error: list[BaseException] = []
-
-        def fake_store(**_kwargs: Any) -> list[LbaRecord]:
-            store_started.set()
-            assert release_store.wait(timeout=5.0)
-            return [LbaRecord(slba=0, n_sectors=1)]
-
-        def run_store() -> None:
-            try:
-                loader.store_bytes_to_raw_extents(
-                    b"x" * 512,
-                    raw_extents=[LbaRecord(slba=0, n_sectors=1)],
-                    base_file_offset=0,
-                )
-            except BaseException as exc:
-                store_error.append(exc)
-
-        with patch.object(_tdl, "_HAS_WRITE_C_OPS", True):
-            with patch.object(
-                loader,
-                "_store_bytes_to_raw_extents_locked",
-                side_effect=fake_store,
-            ):
-                store_thread = threading.Thread(target=run_store)
-                store_thread.start()
-                assert store_started.wait(timeout=5.0)
-                results = loader.load_chunks_to_hbm(
-                    [_fake_key(0)],
-                    [_disk_meta_for(512 * 4)],
-                    lock_per_batch=True,
-                    on_raw_batch_loaded=lambda *_args: None,
-                    io_priority="speculative",
-                )
-                release_store.set()
-                store_thread.join(timeout=5.0)
-
-        assert not store_thread.is_alive()
-        assert store_error == []
-        assert results == [None]
 
     def test_parked_store_writer_does_not_cancel_speculative_read(self) -> None:
         """A writer waiting for idle time cannot suppress CSA prefetch."""
@@ -1632,6 +1610,22 @@ class TestTuttiDirectLoaderClose:
             loader.close()
 
         assert len(freed) == 5  # control scalars plus raw staging allocation
+        loader._session.close.assert_called_once()
+
+    def test_close_is_idempotent_and_unmaps_before_cuda_free(self) -> None:
+        loader, _ctrl = _make_loader()
+        calls: list[str] = []
+
+        loader._session.close.side_effect = lambda: calls.append("session")
+
+        def spy_free(_ptr: int) -> None:
+            calls.append("cuda_free")
+
+        with patch.object(_tdl, "_cuda_free", side_effect=spy_free):
+            loader.close()
+            loader.close()
+
+        assert calls == ["session", *("cuda_free" for _ in range(5))]
         loader._session.close.assert_called_once()
 
     def test_context_manager(self) -> None:

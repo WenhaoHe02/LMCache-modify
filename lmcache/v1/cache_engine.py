@@ -3730,6 +3730,13 @@ class LMCacheEngine:
         indexer_manager: Any,
     ) -> None:
         """Ensure no previous split-layout plan can write the next request."""
+        deactivate_predictions = getattr(
+            indexer_manager,
+            "deactivate_csa_predictions",
+            None,
+        )
+        if callable(deactivate_predictions) and not deactivate_predictions():
+            raise RuntimeError("CSA prediction stream did not deactivate")
         deactivate_indexer = getattr(
             indexer_manager,
             "deactivate_native_indexer_stream",
@@ -3977,6 +3984,17 @@ class LMCacheEngine:
                 )
                 return False, False, False
 
+        # Retire the previous request before either producer installs the new
+        # plan.  In particular, proxy-owned deferred TP shard work must be
+        # discarded while its old CSA/HCA plan is still available; letting
+        # ``register_request_chunks`` deactivate the CSA manager by itself
+        # leaves that work orphaned with pending blocks and no consumer gate.
+        if str(getattr(manager, "active_request_id", "")) != str(req_id):
+            self._dsv4_deactivate_streaming_consumers(
+                manager,
+                indexer_manager,
+            )
+
         # The request-level capture owner is the canonical CSA/HCA manager,
         # but compact indexer Stage0 starts first to maximize its overlap with
         # request setup and layers 0-1. Destination-row tables are prewarmed at
@@ -4035,6 +4053,23 @@ class LMCacheEngine:
             raise RuntimeError(
                 "CSA attention KV read-plan registration failed"
             ) from exc
+        if hca_requested and _env_flag("LMCACHE_HCA_PREFIRE_FIRST_LAYER"):
+            hca_layer_ids = tuple(int(value) for value in manager.hca_layer_ids)
+            prefire_hca = getattr(indexer_manager, "fire_async_for_layers", None)
+            if hca_layer_ids and callable(prefire_hca):
+                # Some model variants consume HCA at layer 1.  Waiting until
+                # layer 0's FFN boundary leaves too little time to submit the
+                # deterministic read, especially for long prefixes.  Pro can
+                # optionally prefire every deterministic HCA layer once the
+                # complete request plan is registered.  The per-request fired
+                # bitmap makes all later FFN hooks idempotent, while moving the
+                # small, known HCA working set out of 30 consumer gates.
+                prefire_targets = (
+                    hca_layer_ids
+                    if _env_flag("LMCACHE_HCA_PREFIRE_ALL_LAYERS")
+                    else (hca_layer_ids[0],)
+                )
+                prefire_hca(prefire_targets, source_layer_id=-1)
         if _env_flag("LMCACHE_TUTTI_PROFILE"):
             logger.info(
                 "TUTTI_PROFILE streaming_register request=%s "
@@ -7590,44 +7625,48 @@ class LMCacheEngine:
     def close(self) -> None:
         """Close the cache engine and free all the resources"""
         logger.info("Closing LMCacheEngine...")
-        self._discard_dsv4_layer_major_snapshot()
-
-        # Deferred admissions access both the object store and the Tutti writer,
-        # so drain them before either backend is closed.
-        self._dsv4_admission_executor.shutdown(wait=True, cancel_futures=False)
-
         try:
-            from lmcache.integration.vllm.vllm_v1_adapter import (
-                close_vllm_prefetch_managers,
-            )
+            self._discard_dsv4_layer_major_snapshot()
 
-            close_vllm_prefetch_managers()
-        except ImportError:
-            pass
+            # Shutdown order matters: first quiesce every producer that can
+            # submit Tutti reads or writes, then close storage, and only then
+            # unmap/free the loader's NVMe and GPU resources.
+            self._dsv4_admission_executor.shutdown(wait=True, cancel_futures=False)
 
-        if self.lmcache_worker is not None:
             try:
-                logger.info("Closing lmcache_worker...")
-                self.lmcache_worker.close()
-                logger.info("lmcache_worker closed successfully")
+                from lmcache.integration.vllm.vllm_v1_adapter import (
+                    close_vllm_prefetch_managers,
+                )
+
+                close_vllm_prefetch_managers()
+            except ImportError:
+                pass
+
+            if self.lmcache_worker is not None:
+                try:
+                    logger.info("Closing lmcache_worker...")
+                    self.lmcache_worker.close()
+                    logger.info("lmcache_worker closed successfully")
+                except Exception as e:
+                    logger.error(f"Error closing lmcache_worker: {e}")
+
+            try:
+                logger.info("Closing storage_manager...")
+                if self.storage_manager is not None:
+                    self.storage_manager.close()
+                logger.info("storage_manager closed successfully")
             except Exception as e:
-                logger.error(f"Error closing lmcache_worker: {e}")
-
-        try:
-            logger.info("Closing storage_manager...")
-            if self.storage_manager is not None:
-                self.storage_manager.close()
-            logger.info("storage_manager closed successfully")
-        except Exception as e:
-            logger.error(f"Error closing storage_manager: {e}")
-
-
-        if self._tutti_loader is not None:
-            try:
-                self._tutti_loader.close()
-            except Exception as exc:
-                logger.error("Error closing TuttiDirectLoader: %s", exc)
+                logger.error(f"Error closing storage_manager: {e}")
+        finally:
+            # Never let an earlier shutdown error skip the P2P unmap. Clear the
+            # reference first so repeated close calls cannot race or double-free.
+            tutti_loader = self._tutti_loader
             self._tutti_loader = None
+            if tutti_loader is not None:
+                try:
+                    tutti_loader.close()
+                except Exception as exc:
+                    logger.error("Error closing TuttiDirectLoader: %s", exc)
 
         logger.info("LMCacheEngine closed.")
 

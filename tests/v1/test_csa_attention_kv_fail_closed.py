@@ -19,6 +19,12 @@ from lmcache.v1.csa_attention_kv_prefetch_manager import (
 from lmcache.v1.csa_pipeline_nvtx import csa_pipeline_nvtx
 
 
+def test_dsa_native_indexer_load_has_a_distinct_timeline_kind() -> None:
+    assert csa_manager._io_profile_kind("indexer_native_stream") == "dsa_indexer"
+    assert csa_manager._io_profile_kind("predicted_l2") == "csa_predicted"
+    assert csa_manager._io_profile_kind("hca_deterministic") == "hca_deterministic"
+
+
 def _init_active_request_state(
     manager: CSAAttentionKVPrefetchManager,
 ) -> None:
@@ -34,6 +40,7 @@ def _init_active_request_state(
 def _minimal_manager_with_partial_issue() -> CSAAttentionKVPrefetchManager:
     manager = object.__new__(CSAAttentionKVPrefetchManager)
     _init_active_request_state(manager)
+    manager._shard_transport = None
     manager._layers = {
         2: SimpleNamespace(
             chunks=[SimpleNamespace(end_compressed_block=4)],
@@ -546,6 +553,158 @@ def test_deactivate_timeout_retains_unresolved_future() -> None:
     assert manager.request_stream_available()
 
 
+def test_deactivate_discards_completed_unconsumed_submission() -> None:
+    """A completed producer result cannot disappear during request teardown."""
+
+    class _Future:
+        def cancel(self) -> bool:
+            return False
+
+        def result(self, timeout: float) -> object:
+            del timeout
+            return deferred_work
+
+        def cancelled(self) -> bool:
+            return False
+
+        def done(self) -> bool:
+            return True
+
+    manager = _minimal_lifecycle_manager()
+    deferred_work = object()
+    discarded: list[tuple[object, str]] = []
+
+    def _discard(
+        _self: CSAAttentionKVPrefetchManager,
+        work: object,
+        *,
+        status: str,
+    ) -> bool:
+        discarded.append((work, status))
+        return True
+
+    manager.discard_deferred_shard_gather = MethodType(_discard, manager)
+    manager._scheduled_layer_futures[26] = _Future()
+
+    assert manager.deactivate_request(timeout_s=0.1)
+    assert discarded == [(deferred_work, "request_deactivated")]
+    assert manager._scheduled_layer_futures == {}
+
+
+def test_wait_for_layer_finalizes_gate_aligned_shard_gather() -> None:
+    """The consumer gate must finalize deferred work, not merely join it.
+
+    A gate-aligned shard gather books ``pending_read_count`` when it is
+    prepared and releases it only when finalized.  If ``wait_for_layer``
+    joins the producer future and drops its result, the booking stays
+    outstanding and the gate blocks for the full timeout on I/O that has
+    already landed.
+    """
+
+    class _Future:
+        def result(self, timeout: float) -> object:
+            del timeout
+            return deferred_work
+
+    state = SimpleNamespace(
+        layer_id=2,
+        pending_reads_lock=threading.Condition(),
+        pending_read_count=1,
+    )
+    deferred_work = csa_manager._DeferredShardGather(
+        state=state,
+        descriptor=SimpleNamespace(),
+        selected=torch.tensor([0]),
+        owned=torch.tensor([0]),
+        local_ready_event=None,
+        local_objects=[],
+        local_complete=True,
+        local_capability=True,
+        pending_ids=torch.tensor([0]),
+        io_range=None,  # type: ignore[arg-type]
+        operation_id="prediction-1",
+        request_id="request-a",
+    )
+    manager = _minimal_lifecycle_manager()
+    manager._layers = {2: state}
+    manager._scheduled_layer_futures[2] = _Future()
+    finalized: list[object] = []
+
+    def _finalize(
+        _self: CSAAttentionKVPrefetchManager,
+        work: object,
+    ) -> bool:
+        finalized.append(work)
+        with state.pending_reads_lock:
+            state.pending_read_count = 0
+            state.pending_reads_lock.notify_all()
+        return True
+
+    manager.finalize_deferred_shard_gather = MethodType(_finalize, manager)
+    manager.drain_for_layer = MethodType(lambda _self, _layer_id: None, manager)
+
+    assert manager.wait_for_layer(2, timeout_s=0.5)
+    assert finalized == [deferred_work]
+    assert state.pending_read_count == 0
+
+
+def test_discard_deferred_shard_work_is_idempotent(monkeypatch) -> None:
+    """An unconsumed prediction releases its pending bit and staging once."""
+
+    class _Event:
+        synchronizations = 0
+
+        def synchronize(self) -> None:
+            self.synchronizations += 1
+
+    class _Memory:
+        releases = 0
+
+        def ref_count_down(self) -> None:
+            self.releases += 1
+
+    state = SimpleNamespace(
+        layer_id=26,
+        pending_reads_bitmap=torch.tensor([True]),
+        pending_reads_lock=threading.Condition(),
+        pending_read_count=1,
+    )
+    event = _Event()
+    memory = _Memory()
+    io_range = object()
+    finished: list[tuple[object, str, str | None]] = []
+    monkeypatch.setattr(
+        csa_pipeline_nvtx,
+        "finish_io",
+        lambda handle, **kwargs: finished.append(
+            (handle, kwargs["status"], kwargs["request_id"])
+        ),
+    )
+    work = csa_manager._DeferredShardGather(
+        state=state,
+        descriptor=SimpleNamespace(),
+        selected=torch.tensor([0]),
+        owned=torch.tensor([0]),
+        local_ready_event=event,
+        local_objects=[memory],
+        local_complete=True,
+        local_capability=True,
+        pending_ids=torch.tensor([0]),
+        io_range=io_range,  # type: ignore[arg-type]
+        operation_id="prediction-1",
+        request_id="request-a",
+    )
+    manager = object.__new__(CSAAttentionKVPrefetchManager)
+
+    assert manager.discard_deferred_shard_gather(work)
+    assert manager.discard_deferred_shard_gather(work)
+    assert state.pending_read_count == 0
+    assert not bool(state.pending_reads_bitmap[0])
+    assert event.synchronizations == 1
+    assert memory.releases == 1
+    assert finished == [(io_range, "cancelled", "request-a")]
+
+
 def test_stale_request_generation_cannot_submit_reads() -> None:
     """Delayed work from an older plan cannot enter a reused request id."""
     manager = _minimal_manager_with_partial_issue()
@@ -655,6 +814,25 @@ def test_late_prediction_falls_back_to_true_topk_without_blocking() -> None:
     assert indexer.forward().tolist() == [1, 2]
 
 
+def test_decode_bypasses_csa_indexer_correction() -> None:
+    """An inactive external-KV phase calls only the official indexer."""
+    manager = object.__new__(CSAAttentionKVPrefetchManager)
+    manager._patch_lock = threading.Lock()
+    manager._patched_modules = []
+    manager.set_external_kv_forward_active(False)
+    calls: list[str] = []
+
+    def _true_indexer() -> torch.Tensor:
+        calls.append("true_indexer")
+        return torch.tensor([1, 2])
+
+    indexer = SimpleNamespace(forward=_true_indexer)
+    manager.patch_indexer_forward(indexer, 2)
+
+    assert indexer.forward().tolist() == [1, 2]
+    assert calls == ["true_indexer"]
+
+
 def test_true_indexer_waits_for_native_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -692,6 +870,15 @@ def test_true_indexer_waits_for_native_cache(
     )
     manager.drain_for_layer = MethodType(lambda _self, _layer_id: None, manager)
 
+    class _DenseFuture:
+        def result(self, timeout: float) -> None:
+            assert timeout == 30.0
+            calls.append("dense_gate")
+
+    manager._scheduled_layer_futures = {}
+    manager._scheduled_layer_futures_lock = threading.Lock()
+    manager._scheduled_layer_futures[2] = _DenseFuture()
+
     def _true_indexer() -> torch.Tensor:
         calls.append("true_indexer")
         return torch.tensor([1, 2])
@@ -700,7 +887,7 @@ def test_true_indexer_waits_for_native_cache(
     manager.patch_indexer_forward(indexer, 2)
 
     assert indexer.forward().tolist() == [1, 2]
-    assert calls == ["native_gate", "true_indexer"]
+    assert calls == ["native_gate", "dense_gate", "true_indexer"]
 
 
 def test_demand_only_layer_reads_true_indexer_misses() -> None:
@@ -853,3 +1040,59 @@ def test_layer_major_full_read_is_split_into_bounded_segments() -> None:
     ]
     assert captured["max_batch_ios"] == 256
     assert captured["max_batch_bytes"] == 128 * 1024**2
+
+
+def test_layer_major_sparse_indexer_reads_are_sector_aligned() -> None:
+    """Compact-indexer block runs use aligned I/O plus a payload skip."""
+    captured: dict[str, object] = {}
+
+    class _Loader:
+        def ensure_lba_cache(self, _records: object) -> None:
+            return
+
+        def load_chunks_to_hbm(
+            self,
+            keys: list[object],
+            disk_metas: list[object],
+            **kwargs: object,
+        ) -> list[None]:
+            captured.update(keys=keys, disk_metas=disk_metas, **kwargs)
+            return [None] * len(keys)
+
+    manager = object.__new__(CSAAttentionKVPrefetchManager)
+    manager._tutti_loader = _Loader()
+    manager._pending_raw_lba_cache = {}
+    manager._scatter_stream_for = MethodType(
+        lambda _self, _device: None,
+        manager,
+    )
+    state = SimpleNamespace(
+        chunks=[
+            SimpleNamespace(
+                key="indexer-layer-object",
+                disk_meta="metadata",
+                n_compressed_blocks=16,
+                bytes_per_block=64 * 132,
+                read_length=16 * 64 * 132,
+                layer_byte_offset=4096,
+            )
+        ],
+        layer_major_dst_rows_table=torch.arange(16, dtype=torch.int64),
+        block_slot_scatter=False,
+        k_cache_tensor=torch.zeros((16, 64 * 132), dtype=torch.uint8),
+        in_pool_bitmap=torch.zeros(16, dtype=torch.bool),
+    )
+
+    manager._issue_layer_major_read(
+        state,
+        torch.tensor([1, 2, 5, 6, 7], dtype=torch.int64),
+        io_priority="demand",
+    )
+
+    assert captured["keys"] == ["indexer-layer-object"] * 2
+    ranges = captured["read_ranges_per_key"]
+    assert isinstance(ranges, list)
+    assert [entry[0].offset for entry in ranges] == [12288, 46080]
+    assert [entry[0].length for entry in ranges] == [17408, 25600]
+    assert all(entry[0].offset % 512 == 0 for entry in ranges)
+    assert all(entry[0].length % 512 == 0 for entry in ranges)

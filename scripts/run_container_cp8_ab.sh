@@ -67,7 +67,10 @@ for cache_mount in "${cache_mounts[@]}"; do
   )
 done
 
-sudo docker rm -f "$name" >/dev/null 2>&1 || true
+# Let vLLM/LMCache run Tutti teardown before removing the stopped container.
+sudo docker stop -t "${LMCACHE_DOCKER_STOP_TIMEOUT_SEC:-60}" "$name" \
+  >/dev/null 2>&1 || true
+sudo docker rm "$name" >/dev/null 2>&1 || true
 
 tutti_device_args=()
 if [ -e /dev/snvm_control ]; then
@@ -160,7 +163,7 @@ if [ "$filter" = "1" ] || [ "$glm_dsa_layer_major_enabled" = "1" ]; then
     -e LMCACHE_SSD_TP_INDEXER_CP_VERIFIED="${LMCACHE_SSD_TP_INDEXER_CP_VERIFIED:-0}"
     -e LMCACHE_SSD_TP_CP_SIZE="${LMCACHE_SSD_TP_CP_SIZE:-8}"
     -e LMCACHE_SSD_TP_CP_INTERLEAVE="${LMCACHE_SSD_TP_CP_INTERLEAVE:-64}"
-    -e LMCACHE_SSD_TP_DENSE_LAYERS="${LMCACHE_SSD_TP_DENSE_LAYERS:-2-24}"
+    -e LMCACHE_SSD_TP_DENSE_LAYERS="${LMCACHE_SSD_TP_DENSE_LAYERS-}"
     -e LMCACHE_SSD_TP_DENSE_EAGER_GROUP_SIZE="${LMCACHE_SSD_TP_DENSE_EAGER_GROUP_SIZE:-1}"
     -e LMCACHE_SSD_TP_MIN_UNION_BLOCKS="${LMCACHE_SSD_TP_MIN_UNION_BLOCKS:-128}"
     -e LMCACHE_SSD_TP_LOCAL_DIRECT_COVERAGE_RATIO="${LMCACHE_SSD_TP_LOCAL_DIRECT_COVERAGE_RATIO:-0}"
@@ -206,6 +209,7 @@ sudo docker run -d \
   -e LMCACHE_ABLATION_MAX_MODEL_LEN="${LMCACHE_ABLATION_MAX_MODEL_LEN:-32768}" \
   -e LMCACHE_ABLATION_MAX_BATCHED_TOKENS="${LMCACHE_ABLATION_MAX_BATCHED_TOKENS:-1024}" \
   -e LMCACHE_ABLATION_GPU_UTIL="${LMCACHE_ABLATION_GPU_UTIL:-0.75}" \
+  -e VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS="${VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS:-300}" \
   -e LMCACHE_ABLATION_KV_OBJECT_STORE_SLOT_MB="${LMCACHE_ABLATION_KV_OBJECT_STORE_SLOT_MB:-8}" \
   -e LMCACHE_ABLATION_KV_OBJECT_STORE_CAPACITY="${LMCACHE_ABLATION_KV_OBJECT_STORE_CAPACITY:-48000}" \
   -e LMCACHE_TUTTI_RAW_REGION_BYTES="${LMCACHE_TUTTI_RAW_REGION_BYTES:-25769803776}" \
@@ -216,6 +220,10 @@ sudo docker run -d \
   -e LMCACHE_ABLATION_TUTTI_AFTER_STORE_DELAY="${LMCACHE_ABLATION_TUTTI_AFTER_STORE_DELAY:-10}" \
   -e LMCACHE_ABLATION_KV_CACHE_MEMORY_BYTES="${LMCACHE_ABLATION_KV_CACHE_MEMORY_BYTES:-}" \
   -e LMCACHE_DSV4_HCA_WALKER="$hca_walker" \
+  -e LMCACHE_HCA_PREFIRE_FIRST_LAYER="${LMCACHE_HCA_PREFIRE_FIRST_LAYER:-0}" \
+  -e LMCACHE_HCA_PREFIRE_ALL_LAYERS="${LMCACHE_HCA_PREFIRE_ALL_LAYERS:-0}" \
+  -e LMCACHE_CSA_ADAPTIVE_DENSE_PREFETCH="${LMCACHE_CSA_ADAPTIVE_DENSE_PREFETCH:-0}" \
+  -e LMCACHE_CSA_ADAPTIVE_DENSE_THRESHOLD_PERCENT="${LMCACHE_CSA_ADAPTIVE_DENSE_THRESHOLD_PERCENT:-80}" \
   -e LMCACHE_CSA_VALIDATE_AGAINST_GENERIC="${LMCACHE_CSA_VALIDATE_AGAINST_GENERIC:-0}" \
   -e LMCACHE_CSA_DEBUG_TOPK="${LMCACHE_CSA_DEBUG_TOPK:-0}" \
   -e LMCACHE_CSA_VALIDATE_BYTES="${LMCACHE_CSA_VALIDATE_BYTES:-0}" \
@@ -292,7 +300,7 @@ pin_tp_workers_by_numa() {
   for rank in $(seq 0 7); do
     pid=$(sudo docker top "$name" -eo pid,args 2>/dev/null \
       | awk -v marker="VLLM::Worker_TP${rank}_EP${rank}" \
-          'index($0, marker) { print $1; exit }')
+          'index($0, marker) && !found { print $1; found = 1 }')
     if [ -z "$pid" ]; then
       echo "warning: unable to locate TP worker rank ${rank} for NUMA pinning" >&2
       continue

@@ -10,6 +10,7 @@ from scripts.apply_vllm_0260_lmcache import (
     _patch_api_server,
     _patch_cache_utils,
     _patch_connector,
+    _patch_deepseek_v2_profile_nvtx,
     _patch_dsv4_model,
     _patch_file,
     _patch_flashmla,
@@ -33,14 +34,14 @@ def test_connector_overlay_adds_hma_contract_and_is_idempotent(
 ) -> None:
     path = tmp_path / "lmcache_connector.py"
     path.write_text(
-        '''from base import (
+        """from base import (
     KVConnectorRole,
 )
 class LMCacheConnectorV1(KVConnectorBase_V1):
     def request_finished(
         self,
     ): ...
-''',
+""",
         encoding="utf-8",
     )
 
@@ -52,7 +53,7 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
 
 
 def test_dsv4_overlay_fires_post_attention_residual_before_ffn() -> None:
-    source = '''class DeepseekV4DecoderLayer(nn.Module):
+    source = """class DeepseekV4DecoderLayer(nn.Module):
     def __init__(self, vllm_config, prefix):
         super().__init__()
 
@@ -68,13 +69,31 @@ def test_dsv4_overlay_fires_post_attention_residual_before_ffn() -> None:
         x = self.attn(positions, x, None)
 
         x = self.ffn(x, input_ids)
-'''
+"""
 
     patched = _patch_dsv4_model(source)
 
     assert _MARKER in patched
     assert "_DEEPSEEK_V4_DECODER_LAYER_REGISTRY = []" in patched
     assert "_LMCACHE_DSV4_PREFETCH_ACTIVE = False" in patched
+    assert "_LMCACHE_CSA_PIPELINE_NVTX_ENABLED" in patched
+    assert 'f"event=attention|layer={self.layer_idx}"' in patched
+    assert 'f"event=ffn_total|layer={self.layer_idx}"' in patched
+    # Decoder attention/FFN use two direct ranges; the profile-only MoE
+    # wrapper helper contributes the third range-push call site.
+    assert patched.count("torch.cuda.nvtx.range_push(") == 3
+    assert patched.count("torch.cuda.nvtx.range_pop()") == 3
+    for event in (
+        "moe_gate",
+        "moe_router",
+        "moe_routed_experts",
+        "moe_shared_experts",
+        "moe_ep_dispatch",
+        "moe_ep_combine",
+        "moe_ep_final_reduce",
+    ):
+        assert f'"{event}"' in patched
+    assert "_lmcache_install_moe_nvtx" in patched
     assert "_DEEPSEEK_V4_DECODER_LAYER_REGISTRY.append(self)" in patched
     assert 'self.layer_idx = int(prefix.rsplit(".layers.", 1)' in patched
     assert "fire_dsv4_prefetch_from_ffn_boundary" in patched
@@ -85,8 +104,35 @@ def test_dsv4_overlay_fires_post_attention_residual_before_ffn() -> None:
     )
 
 
+def test_deepseek_v2_overlay_installs_profile_only_glm_ranges() -> None:
+    source = """import torch
+
+class DeepseekV2DecoderLayer(nn.Module):
+    def __init__(self, prefix):
+        self.self_attn = Attention()
+        self.mlp = MLP()
+"""
+
+    patched = _patch_deepseek_v2_profile_nvtx(source)
+
+    assert _MARKER in patched
+    assert '"LMCACHE_CSA_PIPELINE_NVTX", "0"' in patched
+    assert '"attention"' in patched
+    assert '"ffn_total"' in patched
+    for event in (
+        "moe_gate",
+        "moe_router",
+        "moe_routed_experts",
+        "moe_shared_experts",
+        "moe_ep_dispatch",
+        "moe_ep_combine",
+        "moe_ep_final_reduce",
+    ):
+        assert f'"{event}"' in patched
+
+
 def test_sparse_indexer_overlay_observes_chunks_after_global_merge() -> None:
-    source = '''import torch
+    source = """import torch
 MXFP4_BLOCK_SIZE = 32
 
 def score():
@@ -117,7 +163,12 @@ def score():
                 cp_kv_cache_interleave_size,
                 row_starts=chunk.cu_seqlen_ks,
             )
-'''
+
+def forward_cuda():
+        return torch.ops.vllm.sparse_attn_indexer(
+            hidden_states,
+        )
+"""
 
     patched = _patch_sparse_indexer(source)
 
@@ -128,13 +179,15 @@ def score():
     assert patched.count("weights[score_start:score_end]") == 2
     assert "dist.all_gather_into_tensor(" in patched
     assert "row_starts=cu_seqlen_ks" in patched
+    assert "event=true_indexer_compute" in patched
+    assert "with _lmcache_true_indexer_nvtx_context(self.k_cache.prefix):" in patched
     assert patched.index("_merge_dcp_topk_global(") < patched.index(
         "chunk_callback(topk_indices, chunk_index)"
     )
 
 
 def test_flashmla_overlay_remaps_only_compact_csa_rows() -> None:
-    source = '''from vllm.v1.worker.workspace import current_workspace_manager
+    source = """from vllm.v1.worker.workspace import current_workspace_manager
 
 def prefill():
         workspace_manager = current_workspace_manager()
@@ -173,7 +226,7 @@ def prefill():
                 chunk_M,
                 chunk_N,
             )
-'''
+"""
 
     patched = _patch_flashmla(source)
 
@@ -185,7 +238,7 @@ def prefill():
 
 
 def test_cache_utils_fuses_bounded_compact_page_translation() -> None:
-    source = '''def combine_topk_swa_indices(
+    source = """def combine_topk_swa_indices(
     topk_indices: torch.Tensor,
     query_start_loc: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -247,7 +300,7 @@ def _combine_topk_swa_indices_kernel(
             topk_indices + M * batch_idx,
             mask=mask,
         )
-'''
+"""
 
     patched = _patch_cache_utils(source)
 
@@ -259,7 +312,7 @@ def _combine_topk_swa_indices_kernel(
 
 
 def test_kv_admission_overlay_is_explicit_and_preserves_zero_memory_error() -> None:
-    source = '''    # Check if the available memory is enough per worker.
+    source = """    # Check if the available memory is enough per worker.
     for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
         if not groups:
             continue
@@ -269,7 +322,7 @@ def test_kv_admission_overlay_is_explicit_and_preserves_zero_memory_error() -> N
             vllm_config.model_config.max_model_len,
             partial(_estimate_max_model_len_from_groups, vllm_config, groups),
         )
-'''
+"""
 
     patched = _patch_kv_cache_admission(source)
 
@@ -280,7 +333,7 @@ def test_kv_admission_overlay_is_explicit_and_preserves_zero_memory_error() -> N
 
 
 def test_scheduler_serializes_only_opt_in_oversized_prefill_chunks() -> None:
-    source = '''import itertools
+    source = """import itertools
 import time
 
 logger = init_logger(__name__)
@@ -293,7 +346,7 @@ def schedule(self):
                 request.num_output_placeholders > 0
             ):
                 pass
-'''
+"""
 
     patched = _patch_scheduler_oversized_prefill(source)
 

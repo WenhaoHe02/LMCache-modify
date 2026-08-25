@@ -35,6 +35,32 @@ def test_disabled_tracer_is_noop() -> None:
     assert backend.calls == []
 
 
+def test_detailed_tracer_uses_independent_environment(
+    monkeypatch,
+) -> None:
+    backend = RecordingBackend()
+    monkeypatch.setenv("LMCACHE_CSA_PIPELINE_NVTX", "0")
+    monkeypatch.setenv("LMCACHE_CSA_DETAILED_IO_NVTX", "1")
+
+    tracer = CsaPipelineNvtx(
+        backend=backend,
+        env_name="LMCACHE_CSA_DETAILED_IO_NVTX",
+    )
+    with tracer.range(
+        CsaNvtxEvent.IO_LOADER_CALL,
+        layer_id=4,
+        target_layer_id=6,
+        operation_id="op-1",
+        attributes={"kind": "csa_predicted"},
+    ):
+        pass
+
+    assert tracer.enabled is True
+    assert "event=io_loader_call|layer=4|target=6|op=op-1" in str(
+        backend.calls[0][2]
+    )
+
+
 def test_sync_range_emits_machine_readable_label() -> None:
     backend = RecordingBackend()
     tracer = CsaPipelineNvtx(enabled=True, backend=backend)
@@ -94,3 +120,22 @@ def test_range_close_is_idempotent() -> None:
     handle.close()
 
     assert backend.calls == [("end", "id")]
+
+
+def test_scatter_range_keeps_hca_csa_kind_and_layer_mapping() -> None:
+    backend = RecordingBackend()
+    tracer = CsaPipelineNvtx(enabled=True, backend=backend)
+
+    with tracer.range(
+        CsaNvtxEvent.IO_SCATTER,
+        layer_id=3,
+        target_layer_id=5,
+        request_id="r2",
+        attributes={"kind": "csa_predicted", "blocks": 17},
+    ):
+        pass
+
+    assert (
+        "event=io_scatter|layer=3|target=5|request=r2|blocks=17|"
+        "kind=csa_predicted"
+    ) in backend.calls[0]

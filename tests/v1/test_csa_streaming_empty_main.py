@@ -15,6 +15,25 @@ from lmcache.v1.cache_engine import LMCacheEngine
 from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
 
 
+def test_streaming_deactivation_expires_predictions_before_cache_plans() -> None:
+    """Late proxy work is closed before either split-layout plan is cleared."""
+    calls: list[str] = []
+    csa_manager = SimpleNamespace(
+        deactivate_request=lambda: calls.append("csa") or True,
+    )
+    indexer_manager = SimpleNamespace(
+        deactivate_csa_predictions=lambda: calls.append("predictions") or True,
+        deactivate_native_indexer_stream=lambda: calls.append("indexer") or True,
+    )
+
+    LMCacheEngine._dsv4_deactivate_streaming_consumers(
+        csa_manager,
+        indexer_manager,
+    )
+
+    assert calls == ["predictions", "indexer", "csa"]
+
+
 class _RefCountedMemoryObj:
     def __init__(self) -> None:
         self.refs = 1
@@ -29,10 +48,7 @@ class _RefCountedMemoryObj:
 def _snapshot_engine() -> LMCacheEngine:
     engine = object.__new__(LMCacheEngine)
     engine._dsv4_snapshot_lock = threading.Lock()
-    engine._dsv4_snapshot_req_id = None
-    engine._dsv4_snapshot_keys = []
-    engine._dsv4_snapshot_memory_objs = []
-    engine._dsv4_snapshot_tokens = 0
+    engine._dsv4_snapshots = {}
     return engine
 
 
@@ -63,42 +79,85 @@ def test_layer_major_snapshot_is_emitted_only_for_final_batch() -> None:
     )
 
     assert result is not None
-    keys, memory_objs, tokens = result
+    keys, memory_objs, tokens, base_key, base_tokens = result
     assert keys == [first_key, final_key]
     assert memory_objs == [first_obj, final_obj]
     assert tokens == 384
+    assert base_key is None
+    assert base_tokens == 0
     assert first_obj.refs == final_obj.refs == 2
     for memory_obj in memory_objs:
         memory_obj.ref_count_down()
     assert first_obj.refs == final_obj.refs == 1
 
 
-def test_new_request_releases_incomplete_snapshot() -> None:
-    """An aborted prefill cannot leak retained host cache objects."""
+def test_interleaved_requests_keep_independent_snapshots() -> None:
+    """Interleaved chunked prefills retain one snapshot per request."""
     engine = _snapshot_engine()
-    stale_obj = _RefCountedMemoryObj()
-    next_obj = _RefCountedMemoryObj()
+    first_a = _RefCountedMemoryObj()
+    first_b = _RefCountedMemoryObj()
+    final_a = _RefCountedMemoryObj()
+    final_b = _RefCountedMemoryObj()
+    keys = [Mock() for _ in range(4)]
 
     engine._stage_dsv4_layer_major_snapshot(
-        "stale",
-        [Mock()],
-        [stale_obj],  # type: ignore[list-item]
+        "request-a",
+        [keys[0]],
+        [first_a],  # type: ignore[list-item]
         256,
         is_last_prefill=False,
     )
-    result = engine._stage_dsv4_layer_major_snapshot(
-        "next",
-        [Mock()],
-        [next_obj],  # type: ignore[list-item]
+    engine._stage_dsv4_layer_major_snapshot(
+        "request-b",
+        [keys[1]],
+        [first_b],  # type: ignore[list-item]
+        256,
+        is_last_prefill=False,
+    )
+    result_a = engine._stage_dsv4_layer_major_snapshot(
+        "request-a",
+        [keys[2]],
+        [final_a],  # type: ignore[list-item]
+        256,
+        is_last_prefill=True,
+    )
+    result_b = engine._stage_dsv4_layer_major_snapshot(
+        "request-b",
+        [keys[3]],
+        [final_b],  # type: ignore[list-item]
         256,
         is_last_prefill=True,
     )
 
-    assert result is not None
-    assert stale_obj.refs == 1
-    for memory_obj in result[1]:
+    assert result_a is not None
+    assert result_b is not None
+    assert result_a[0] == [keys[0], keys[2]]
+    assert result_b[0] == [keys[1], keys[3]]
+    assert result_a[1] == [first_a, final_a]
+    assert result_b[1] == [first_b, final_b]
+    assert not engine._dsv4_snapshots
+    for memory_obj in [*result_a[1], *result_b[1]]:
         memory_obj.ref_count_down()
-    assert next_obj.refs == 1
+    assert all(obj.refs == 1 for obj in [first_a, first_b, final_a, final_b])
+
+
+def test_discard_releases_every_incomplete_snapshot() -> None:
+    """A full clear releases retained objects for all aborted prefills."""
+    engine = _snapshot_engine()
+    objects = [_RefCountedMemoryObj(), _RefCountedMemoryObj()]
+    for request_id, memory_obj in zip(["request-a", "request-b"], objects, strict=True):
+        engine._stage_dsv4_layer_major_snapshot(
+            request_id,
+            [Mock()],
+            [memory_obj],  # type: ignore[list-item]
+            256,
+            is_last_prefill=False,
+        )
+
+    engine._discard_dsv4_layer_major_snapshot()
+
+    assert not engine._dsv4_snapshots
+    assert all(memory_obj.refs == 1 for memory_obj in objects)
 
 
 @pytest.mark.parametrize("admission_mode", ["deferred_cold", "deferred_hit"])
@@ -658,9 +717,7 @@ def test_streaming_only_hit_composes_deferred_suffix_generations() -> None:
     )
     prefix_metadata = object()
     terminal_metadata = object()
-    engine.lookup_pins = {
-        "request": {"LocalDiskBackend": [prefix_key, terminal_key]}
-    }
+    engine.lookup_pins = {"request": {"LocalDiskBackend": [prefix_key, terminal_key]}}
     engine.token_database = SimpleNamespace(
         process_tokens=Mock(
             return_value=[
@@ -884,25 +941,40 @@ def test_unified_registration_reports_all_streams_ready() -> None:
     engine._dsv4_streaming_expected_layer_coverage = Mock(side_effect=[4, 8])
 
     manager = SimpleNamespace(
+        active_request_id="old-request",
         csa_layer_ids=(10,),
         hca_layer_ids=(20,),
+        deactivate_request=Mock(
+            side_effect=lambda: commit_order.append("deactivate_csa") or True
+        ),
         start_full_nsys_capture_for_request=Mock(),
         register_request_chunks=Mock(
             side_effect=lambda *_args, **_kwargs: commit_order.append("manager")
         ),
     )
     indexer_manager = SimpleNamespace(
+        deactivate_csa_predictions=Mock(
+            side_effect=lambda: commit_order.append("deactivate_predictions")
+            or True
+        ),
+        deactivate_native_indexer_stream=Mock(
+            side_effect=lambda: commit_order.append("deactivate_indexer") or True
+        ),
         register_native_indexer_stream=Mock(
-            side_effect=lambda *_args, **_kwargs: (
-                commit_order.append("indexer") or True
-            )
-        )
+            side_effect=lambda *_args, **_kwargs: commit_order.append("indexer") or True
+        ),
+        fire_async_for_layers=Mock(
+            side_effect=lambda *_args, **_kwargs: commit_order.append("prefire_hca")
+        ),
     )
 
     with (
         patch.dict(
             os.environ,
-            {"LMCACHE_DSV4_HCA_WALKER": "1"},
+            {
+                "LMCACHE_DSV4_HCA_WALKER": "1",
+                "LMCACHE_HCA_PREFIRE_FIRST_LAYER": "1",
+            },
         ),
         patch(
             "lmcache.v1.csa_attention_kv_prefetch_manager."
@@ -931,7 +1003,17 @@ def test_unified_registration_reports_all_streams_ready() -> None:
         manager_call.kwargs["shared_raw_lba_cache"]
         is indexer_call.kwargs["shared_raw_lba_cache"]
     )
-    assert commit_order == ["indexer", "manager"]
+    assert commit_order == [
+        "deactivate_predictions",
+        "deactivate_indexer",
+        "deactivate_csa",
+        "indexer",
+        "manager",
+        "prefire_hca",
+    ]
+    indexer_manager.fire_async_for_layers.assert_called_once_with(
+        (20,), source_layer_id=-1
+    )
 
 
 def test_unified_registration_does_not_start_partial_plan() -> None:

@@ -40,6 +40,24 @@ void tutti_submit_batch_sgl_read(
     at::Tensor byte_lens,
     int64_t stream_ptr);
 
+// Profile-only variant. ``doorbell_timestamps`` is a CUDA int64 tensor with
+// at least ``n_ios`` entries. Entry i receives the device-global timestamp
+// immediately after command i's SQ doorbell write.
+void tutti_submit_batch_sgl_read_profiled(
+    int64_t sq_dev_ptr,
+    int64_t cq_dev_ptr,
+    int64_t sq_db_ptr,
+    int64_t cq_db_ptr,
+    int64_t sq_tail_ptr,
+    int q_depth,
+    int qid,
+    int64_t nsid,
+    at::Tensor staging_iovas,
+    at::Tensor slbas,
+    at::Tensor byte_lens,
+    at::Tensor doorbell_timestamps,
+    int64_t stream_ptr);
+
 // Submit indexed fixed-size READs without materialising per-I/O descriptor
 // tensors on the host. selected_ids indexes slba_table; staging IOVAs are
 // derived from a persistent GPU-page IOVA table and a fixed staging stride.
@@ -57,6 +75,25 @@ void tutti_submit_indexed_sgl_read(
     at::Tensor slba_table,
     at::Tensor selected_ids,
     int byte_len,
+    int64_t stream_ptr);
+
+// Profile-only indexed variant. One batched doorbell makes all commands
+// visible together, so every used output entry receives the same timestamp.
+void tutti_submit_indexed_sgl_read_profiled(
+    int64_t sq_dev_ptr,
+    int64_t cq_dev_ptr,
+    int64_t sq_db_ptr,
+    int64_t cq_db_ptr,
+    int64_t sq_tail_ptr,
+    int q_depth,
+    int qid,
+    int64_t nsid,
+    at::Tensor staging_page_iovas,
+    int64_t staging_stride,
+    at::Tensor slba_table,
+    at::Tensor selected_ids,
+    int byte_len,
+    at::Tensor doorbell_timestamps,
     int64_t stream_ptr);
 
 // Batch-submit N NVMe SGL WRITE commands from a single GPU thread.
@@ -97,3 +134,12 @@ void tutti_poll_batch(int64_t sq_dev_ptr, int64_t cq_dev_ptr, int64_t sq_db_ptr,
                       int64_t cq_phase_ptr, int q_depth, int n_ios,
                       at::Tensor status_out, int64_t timed_out_ptr,
                       int64_t max_iters, int64_t stream_ptr);
+
+// Profile-only poll variant. ``cqe_timestamps[i]`` is the device-global time
+// at which the polling thread first observes command i's expected phase bit.
+void tutti_poll_batch_profiled(
+    int64_t sq_dev_ptr, int64_t cq_dev_ptr, int64_t sq_db_ptr,
+    int64_t cq_db_ptr, int64_t cq_head_ptr, int64_t cq_phase_ptr,
+    int q_depth, int n_ios, at::Tensor status_out, int64_t timed_out_ptr,
+    int64_t max_iters, at::Tensor cqe_timestamps, at::Tensor observed_cids,
+    int64_t stream_ptr);

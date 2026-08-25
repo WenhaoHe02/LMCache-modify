@@ -123,7 +123,7 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
     },
     "ssd_tp_dense_layers": {
         "type": str,
-        "default": "2-24",
+        "default": "",
         "env_converter": str,
     },
     "ssd_tp_disabled_layers": {

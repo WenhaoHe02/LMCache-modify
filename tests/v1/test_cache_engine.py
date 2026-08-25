@@ -2,12 +2,15 @@
 # Standard
 from collections import OrderedDict
 from copy import deepcopy
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 import os
 import random
 import shlex
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 
 # Third Party
@@ -86,6 +89,213 @@ def test_streaming_terminal_lookup_allows_default_retrieve_locations(
     assert engine.storage_manager.contains_streaming_terminal.call_args.kwargs[
         "search_range"
     ] == ["LocalDiskBackend"]
+
+
+@pytest.mark.parametrize("streaming_generation", [False, True])
+def test_tutti_reuse_status_checks_the_registered_publication_type(
+    streaming_generation: bool,
+) -> None:
+    """Reuse readiness must support ordinary and layer-major disk objects."""
+    engine = LMCacheEngine.__new__(LMCacheEngine)
+    engine._tutti_reuse_ticket_lock = threading.Lock()
+    engine._tutti_reuse_tickets = {}
+    engine._tutti_reuse_pending_keys = {}
+    engine._tutti_reuse_ticket_limit = 8
+    engine.storage_manager = MagicMock()
+    engine.storage_manager.batched_contains.return_value = (1, {})
+    engine.storage_manager.batched_contains_tutti_raw.return_value = 1
+    engine.storage_manager.kv_object_raw_region_full_since.return_value = False
+    engine.storage_manager.contains_streaming_terminal.return_value = "LocalDiskBackend"
+    terminal_key = MagicMock(spec=CacheEngineKey)
+
+    engine._register_tutti_reuse_ticket(
+        "cmpl-public-0-worker",
+        terminal_key,
+        488_192,
+        streaming_generation=streaming_generation,
+    )
+    status = engine.get_tutti_reuse_write_status("cmpl-public")
+
+    assert status["state"] == "ready"
+    assert status["matched_request_id"] == "cmpl-public-0-worker"
+    assert status["token_count"] == 488_192
+    if streaming_generation:
+        engine.storage_manager.contains_streaming_terminal.assert_called_once_with(
+            terminal_key,
+            488_192,
+            search_range=["LocalDiskBackend"],
+            pin=False,
+        )
+        engine.storage_manager.batched_contains.assert_not_called()
+        engine.storage_manager.batched_contains_tutti_raw.assert_not_called()
+    else:
+        engine.storage_manager.batched_contains.assert_called_once_with(
+            [terminal_key],
+            search_range=["LocalDiskBackend"],
+            pin=False,
+        )
+        engine.storage_manager.batched_contains_tutti_raw.assert_called_once_with(
+            [terminal_key],
+            search_range=["LocalDiskBackend"],
+        )
+        engine.storage_manager.contains_streaming_terminal.assert_not_called()
+
+
+def test_tutti_generic_reuse_ticket_waits_for_every_prefill_batch() -> None:
+    """A generic ticket must cover all chunks from a chunked prefill."""
+    engine = LMCacheEngine.__new__(LMCacheEngine)
+    engine._tutti_reuse_ticket_lock = threading.Lock()
+    engine._tutti_reuse_tickets = {}
+    engine._tutti_reuse_pending_keys = {}
+    engine._tutti_reuse_ticket_limit = 8
+    engine.storage_manager = MagicMock()
+    engine.storage_manager.kv_object_raw_region_full_since.return_value = False
+    first_keys = [MagicMock(spec=CacheEngineKey) for _ in range(2)]
+    final_key = MagicMock(spec=CacheEngineKey)
+
+    engine._stage_tutti_generic_reuse_ticket(
+        "cmpl-chunked-0-worker",
+        first_keys,
+        512,
+        is_last_prefill=False,
+    )
+    assert engine.get_tutti_reuse_write_status("cmpl-chunked")["state"] == ("not_found")
+
+    engine._stage_tutti_generic_reuse_ticket(
+        "cmpl-chunked-0-worker",
+        [final_key],
+        768,
+        is_last_prefill=True,
+    )
+    engine.storage_manager.batched_contains.return_value = (3, {})
+    engine.storage_manager.batched_contains_tutti_raw.return_value = 2
+    pending = engine.get_tutti_reuse_write_status("cmpl-chunked")
+    assert pending["state"] == "pending"
+    assert pending["key_count"] == 3
+    assert pending["ready_key_count"] == 2
+
+    engine.storage_manager.batched_contains_tutti_raw.return_value = 3
+    ready = engine.get_tutti_reuse_write_status("cmpl-chunked")
+    assert ready["state"] == "ready"
+    assert ready["token_count"] == 768
+    engine.storage_manager.batched_contains.assert_called_with(
+        [*first_keys, final_key],
+        search_range=["LocalDiskBackend"],
+        pin=False,
+    )
+    engine.storage_manager.batched_contains_tutti_raw.assert_called_with(
+        [*first_keys, final_key],
+        search_range=["LocalDiskBackend"],
+    )
+
+
+def test_tutti_generic_reuse_ticket_revalidates_the_complete_hit_prefix() -> None:
+    """A continuation ticket must include inherited and newly written keys."""
+    engine = LMCacheEngine.__new__(LMCacheEngine)
+    engine._tutti_reuse_ticket_lock = threading.Lock()
+    engine._tutti_reuse_tickets = {}
+    engine._tutti_reuse_pending_keys = {}
+    engine._tutti_reuse_ticket_limit = 8
+    engine.storage_manager = MagicMock()
+    engine.storage_manager.kv_object_raw_region_full_since.return_value = False
+    inherited_keys = [MagicMock(spec=CacheEngineKey) for _ in range(508)]
+    suffix_keys = [MagicMock(spec=CacheEngineKey) for _ in range(3)]
+    complete_prefix = [*inherited_keys, *suffix_keys]
+
+    engine._stage_tutti_generic_reuse_ticket(
+        "cmpl-continuation-0-worker",
+        complete_prefix,
+        130_907,
+        is_last_prefill=True,
+    )
+    engine.storage_manager.batched_contains.return_value = (511, {})
+    engine.storage_manager.batched_contains_tutti_raw.return_value = 510
+
+    pending = engine.get_tutti_reuse_write_status("cmpl-continuation")
+
+    assert pending["state"] == "pending"
+    assert pending["key_count"] == 511
+    assert pending["ordinary_key_count"] == 511
+    assert pending["raw_key_count"] == 510
+    engine.storage_manager.batched_contains.assert_called_once_with(
+        complete_prefix,
+        search_range=["LocalDiskBackend"],
+        pin=False,
+    )
+    engine.storage_manager.batched_contains_tutti_raw.assert_called_once_with(
+        complete_prefix,
+        search_range=["LocalDiskBackend"],
+    )
+
+
+def test_tutti_reuse_status_fails_fast_when_raw_region_is_full() -> None:
+    """Raw exhaustion must fail a session barrier without a long timeout."""
+    engine = LMCacheEngine.__new__(LMCacheEngine)
+    engine._tutti_reuse_ticket_lock = threading.Lock()
+    engine._tutti_reuse_tickets = {}
+    engine._tutti_reuse_pending_keys = {}
+    engine._tutti_reuse_ticket_limit = 8
+    engine.storage_manager = MagicMock()
+    engine.storage_manager.batched_contains.return_value = (1, {})
+    engine.storage_manager.batched_contains_tutti_raw.return_value = 0
+    engine.storage_manager.kv_object_raw_region_full_since.return_value = True
+    key = MagicMock(spec=CacheEngineKey)
+    engine._register_tutti_reuse_ticket(
+        "cmpl-full-0-worker",
+        key,
+        256,
+        streaming_generation=False,
+    )
+
+    status = engine.get_tutti_reuse_write_status("cmpl-full")
+
+    assert status["state"] == "failed"
+    assert status["failure_reason"] == "raw_region_full"
+
+
+def test_deferred_admission_gates_sidecar_before_storage_put() -> None:
+    """Deferred sidecar work must obey the Tutti write admission gate."""
+    order: list[str] = []
+
+    class FakeLoader:
+        def wait_for_background_write_slot(
+            self,
+            nbytes: int,
+            writer_wait_started_s: float,
+        ) -> None:
+            assert nbytes == 0
+            assert writer_wait_started_s > 0
+            order.append("gate")
+
+    class FakeStorageManager:
+        def batched_put(self, *args: object, **kwargs: object) -> None:
+            order.append("put")
+
+    def record_sidecar(*args: object, **kwargs: object) -> None:
+        order.append("sidecar")
+
+    def no_warmup_callback(*args: object, **kwargs: object) -> None:
+        return None
+
+    engine = LMCacheEngine.__new__(LMCacheEngine)
+    engine._tutti_loader = FakeLoader()
+    engine.metadata = SimpleNamespace(worker_id=1)
+    engine.storage_manager = FakeStorageManager()
+    engine.store_location = None
+    engine._store_dsv4_layer_major_snapshot = record_sidecar
+    engine._make_tutti_store_warmup_callback = no_warmup_callback
+
+    engine._commit_dsv4_admission(
+        [MagicMock()],
+        [],
+        256,
+        admission_mode="deferred_hit",
+        req_id="request-1",
+        is_last_prefill=True,
+        transfer_spec=None,
+    )
+
+    assert order == ["gate", "sidecar", "put"]
 
 
 @pytest.mark.parametrize("save_unfull_chunk", [False, True])
@@ -1381,6 +1591,61 @@ def test_builder_destroy(autorelease_v1):
     LMCacheEngineBuilder.destroy("non_existent_id")  # Should not raise
 
 
+def test_close_quiesces_producers_before_releasing_tutti(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Engine shutdown must stop producers before releasing Tutti mappings."""
+    engine = LMCacheEngine.__new__(LMCacheEngine)
+    calls: list[str] = []
+    engine._discard_dsv4_layer_major_snapshot = lambda: calls.append("snapshot")
+    engine._dsv4_admission_executor = MagicMock()
+    engine._dsv4_admission_executor.shutdown.side_effect = (
+        lambda **_kwargs: calls.append("admission")
+    )
+    engine.lmcache_worker = MagicMock()
+    engine.lmcache_worker.close.side_effect = lambda: calls.append("worker")
+    engine.storage_manager = MagicMock()
+    engine.storage_manager.close.side_effect = lambda: calls.append("storage")
+    engine._tutti_loader = MagicMock()
+    engine._tutti_loader.close.side_effect = lambda: calls.append("tutti")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "lmcache.integration.vllm.vllm_v1_adapter",
+        SimpleNamespace(
+            close_vllm_prefetch_managers=lambda: calls.append("prefetch")
+        ),
+    )
+
+    engine.close()
+
+    assert calls == [
+        "snapshot",
+        "admission",
+        "prefetch",
+        "worker",
+        "storage",
+        "tutti",
+    ]
+    assert engine._tutti_loader is None
+
+
+def test_close_releases_tutti_when_quiesce_raises() -> None:
+    """A producer shutdown error must not skip the P2P unmap."""
+    engine = LMCacheEngine.__new__(LMCacheEngine)
+    engine._discard_dsv4_layer_major_snapshot = MagicMock()
+    engine._dsv4_admission_executor = MagicMock()
+    engine._dsv4_admission_executor.shutdown.side_effect = RuntimeError("failed")
+    engine._tutti_loader = MagicMock()
+    tutti_loader = engine._tutti_loader
+
+    with pytest.raises(RuntimeError, match="failed"):
+        engine.close()
+
+    tutti_loader.close.assert_called_once()
+    assert engine._tutti_loader is None
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available(),
     reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
@@ -1594,9 +1859,7 @@ def test_process_tokens_worker_uses_exact_streaming_terminal() -> None:
     engine.dsv4_optimized_kv = True
     engine._tutti_config = None
     engine._dsv4_csa_attention_kv_prefetch_active.return_value = False
-    engine.storage_manager.contains_streaming_terminal.return_value = (
-        "LocalDiskBackend"
-    )
+    engine.storage_manager.contains_streaming_terminal.return_value = "LocalDiskBackend"
     engine._dsv4_retrieve_shapes_for_range.return_value = []
 
     ret_mask = torch.zeros(20, dtype=torch.bool)

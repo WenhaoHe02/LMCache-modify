@@ -52,7 +52,7 @@ import threading
 import time
 from contextlib import nullcontext
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -80,6 +80,7 @@ from lmcache.v1.csa_pipeline_nvtx import (
     CsaNvtxEvent,
     CsaNvtxRange,
     csa_pipeline_nvtx,
+    detailed_io_nvtx,
 )
 from lmcache.v1.kv_object_store import KVObjectByteRange
 from lmcache.v1.ssd_tp_sharded_prefetch import (
@@ -120,6 +121,22 @@ def _timing_enabled() -> bool:
     """Return True when CSA attention KV prefetch timing logs are enabled."""
     value = os.environ.get("LMCACHE_CSA_ATTENTION_KV_TIMING", "")
     return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _io_profile_kind(label: str) -> str:
+    """Return a stable HCA/CSA timeline kind for an internal read label."""
+
+    if label.startswith("hca_deterministic"):
+        return "hca_deterministic"
+    if label == "indexer_native_stream":
+        return "dsa_indexer"
+    if label.startswith("predicted_"):
+        return "csa_predicted"
+    if label == "miss" or label.startswith("exact_chunk_"):
+        return "csa_correction"
+    if label == "dense":
+        return "csa_dense"
+    return label
 
 
 def _exact_chunk_prefetch_enabled() -> bool:
@@ -451,6 +468,11 @@ class _DeferredShardGather:
     pending_ids: Optional[torch.Tensor] = None
     io_range: Optional[CsaNvtxRange] = None
     operation_id: str = ""
+    profile_kind: str = "unknown"
+    profile_source_layer: Optional[int] = None
+    request_id: Optional[str] = None
+    lifecycle_lock: threading.Lock = field(default_factory=threading.Lock)
+    lifecycle_claimed: bool = False
 
 
 class CSAAttentionKVPrefetchManager:
@@ -835,7 +857,11 @@ class CSAAttentionKVPrefetchManager:
             try:
                 if not callable(result):
                     raise RuntimeError("tracked submission has no result method")
-                result(timeout=max(0.0, deadline - time.monotonic()))
+                completed_work = result(timeout=max(0.0, deadline - time.monotonic()))
+                self.discard_deferred_shard_gather(
+                    completed_work,
+                    status="request_deactivated",
+                )
             except Exception:
                 cancelled = bool(getattr(future, "cancelled", lambda: False)())
                 done = bool(getattr(future, "done", lambda: False)())
@@ -1338,6 +1364,13 @@ class CSAAttentionKVPrefetchManager:
             requests registered by this manager, allowing warmup hits to be
             skipped without tracing cold-store model execution.
         """
+        if detailed_io_nvtx.enabled:
+            logger.info(
+                "LMCACHE_CSA_DETAILED_IO_NVTX requires one externally "
+                "coordinated Nsys window spanning HTTP send through first "
+                "token; per-rank cudaProfilerApi capture is disabled"
+            )
+            return
         enabled = os.getenv("LMCACHE_NSYS_FULL_CAPTURE", "0").lower() in {
             "1",
             "on",
@@ -1575,6 +1608,9 @@ class CSAAttentionKVPrefetchManager:
         prefetch_level: int = 2,
         *,
         request_token: Optional[Tuple[str, int]] = None,
+        profile_source_layer: Optional[int] = None,
+        profile_operation_id: Optional[str] = None,
+        profile_kind: Optional[str] = None,
     ) -> bool | _DeferredShardGather:
         """Submit Tutti reads for the predicted ``top-K`` of one CSA layer.
 
@@ -1587,6 +1623,9 @@ class CSAAttentionKVPrefetchManager:
             compressed_block_ids: Predicted compressed block ids.
             prefetch_level: Source-to-target distance, either one or two.
             request_token: Request generation captured when work was queued.
+            profile_source_layer: Optional true prediction source layer.
+            profile_operation_id: Optional parent operation correlation id.
+            profile_kind: Optional profile-only I/O classification.
 
         Raises:
             ValueError: If ``prefetch_level`` is unsupported.
@@ -1606,6 +1645,9 @@ class CSAAttentionKVPrefetchManager:
                 compressed_block_ids,
                 label=f"predicted_l{prefetch_level}",
                 request_token=request_token,
+                profile_source_layer=profile_source_layer,
+                profile_operation_id=profile_operation_id,
+                profile_kind=profile_kind,
             )
         return self._submit_reads(
             layer_id,
@@ -1613,6 +1655,13 @@ class CSAAttentionKVPrefetchManager:
             label=f"predicted_l{prefetch_level}",
             io_priority="lookahead",
             request_token=request_token,
+            source_layer_id=(
+                int(profile_source_layer)
+                if profile_source_layer is not None
+                else int(layer_id) - int(prefetch_level)
+            ),
+            profile_operation_id=profile_operation_id,
+            profile_kind=profile_kind,
         )
 
     def set_prediction_waiter(
@@ -1639,6 +1688,7 @@ class CSAAttentionKVPrefetchManager:
         *,
         label: str = "hca_deterministic",
         request_token: Optional[Tuple[str, int]] = None,
+        source_layer_id: Optional[int] = None,
     ) -> bool:
         """Submit every covered block for a deterministic HCA layer.
 
@@ -1670,6 +1720,7 @@ class CSAAttentionKVPrefetchManager:
             label=label,
             raise_on_error=True,
             request_token=request_token,
+            source_layer_id=source_layer_id,
         )
         return True
 
@@ -1678,6 +1729,7 @@ class CSAAttentionKVPrefetchManager:
         layer_id: int,
         *,
         request_token: Optional[Tuple[str, int]] = None,
+        source_layer_id: Optional[int] = None,
     ) -> bool | _DeferredShardGather:
         """Prepare a complete CSA layer for dense shard-gather.
 
@@ -1709,6 +1761,8 @@ class CSAAttentionKVPrefetchManager:
                 mode=SSDReadMode.SHARD_GATHER_DENSE,
                 io_priority="lookahead",
                 request_token=request_token,
+                profile_kind="csa_dense",
+                profile_source_layer=source_layer_id,
             )
         self._submit_reads(
             int(layer_id),
@@ -1717,6 +1771,7 @@ class CSAAttentionKVPrefetchManager:
             io_priority="lookahead",
             raise_on_error=True,
             request_token=request_token,
+            source_layer_id=source_layer_id,
         )
         return True
 
@@ -1801,6 +1856,34 @@ class CSAAttentionKVPrefetchManager:
         self._finalize_shard_gather(work)
         return True
 
+    def discard_deferred_shard_gather(
+        self,
+        work: Any,
+        *,
+        status: str = "cancelled",
+    ) -> bool:
+        """Release unconsumed rank-local prediction work without a collective.
+
+        Args:
+            work: Value returned by a deferred dense or predicted submission.
+            status: Completion status written to the associated profile range.
+
+        Returns:
+            ``True`` when ``work`` was deferred shard work. Repeated finalize
+            or discard calls are harmless.
+
+        Notes:
+            Request teardown uses this path for predictions whose target layer
+            was never consumed. It waits only for already-enqueued local CUDA
+            writes before releasing staging references; no TP collective is
+            introduced on the teardown path.
+        """
+        if not isinstance(work, _DeferredShardGather):
+            return False
+        if self._claim_deferred_shard_gather(work):
+            self._release_deferred_shard_gather(work, status=status)
+        return True
+
     def uses_gate_aligned_shard_gather(self) -> bool:
         """Return whether predicted TP collectives must run at model gates."""
         return bool(
@@ -1815,6 +1898,9 @@ class CSAAttentionKVPrefetchManager:
         compressed_block_ids: Sequence[int] | torch.Tensor,
         *,
         request_token: Optional[Tuple[str, int]] = None,
+        profile_source_layer: Optional[int] = None,
+        profile_operation_id: Optional[str] = None,
+        profile_kind: Optional[str] = None,
     ) -> None:
         """Submit Tutti reads for blocks not covered by the prediction.
 
@@ -1826,6 +1912,9 @@ class CSAAttentionKVPrefetchManager:
             compressed_block_ids: ``true_topk`` block ids whose K cache
                 slots are not yet populated.
             request_token: Request generation captured before true-indexer work.
+            profile_source_layer: Optional authoritative indexer source layer.
+            profile_operation_id: Optional parent operation correlation id.
+            profile_kind: Optional profile-only I/O classification.
         """
         self._submit_reads(
             layer_id,
@@ -1833,6 +1922,13 @@ class CSAAttentionKVPrefetchManager:
             label="miss",
             raise_on_error=True,
             request_token=request_token,
+            source_layer_id=(
+                int(profile_source_layer)
+                if profile_source_layer is not None
+                else int(layer_id)
+            ),
+            profile_operation_id=profile_operation_id,
+            profile_kind=profile_kind,
         )
 
     def submit_topk_miss_reads(
@@ -1841,6 +1937,9 @@ class CSAAttentionKVPrefetchManager:
         true_topk: torch.Tensor,
         *,
         request_token: Optional[Tuple[str, int]] = None,
+        profile_source_layer: Optional[int] = None,
+        profile_operation_id: Optional[str] = None,
+        profile_kind: Optional[str] = None,
     ) -> None:
         """Submit only non-resident blocks selected by an indexer result.
 
@@ -1851,6 +1950,9 @@ class CSAAttentionKVPrefetchManager:
             request_token: Optional request generation captured before the
                 indexer ran. A stale generation is rejected by the normal
                 submission path.
+            profile_source_layer: Optional authoritative indexer source layer.
+            profile_operation_id: Optional parent operation correlation id.
+            profile_kind: Optional profile-only I/O classification.
 
         Notes:
             Miss selection stays on the GPU and copies only the compact miss
@@ -1864,6 +1966,9 @@ class CSAAttentionKVPrefetchManager:
             layer_id,
             missing_ids,
             request_token=request_token,
+            profile_source_layer=profile_source_layer,
+            profile_operation_id=profile_operation_id,
+            profile_kind=profile_kind,
         )
 
     def wait_for_layer(self, layer_id: int, timeout_s: float = 2.0) -> bool:
@@ -1883,6 +1988,29 @@ class CSAAttentionKVPrefetchManager:
             ``True`` when the layer has no pending reads (fully landed or
             never registered), ``False`` on timeout.
         """
+        if not detailed_io_nvtx.enabled:
+            return self._wait_for_layer_impl(layer_id, timeout_s, "disabled")
+        kind = (
+            "dsa_indexer"
+            if self._data_group == "indexer"
+            else ("hca_deterministic" if int(layer_id) in self.hca_layer_ids else "csa")
+        )
+        with detailed_io_nvtx.range(
+            CsaNvtxEvent.CONSUMER_WAIT,
+            layer_id=int(layer_id),
+            target_layer_id=int(layer_id),
+            request_id=self.active_request_id,
+            attributes={"kind": kind},
+        ):
+            return self._wait_for_layer_impl(layer_id, timeout_s, kind)
+
+    def _wait_for_layer_impl(
+        self,
+        layer_id: int,
+        timeout_s: float,
+        profile_kind: str,
+    ) -> bool:
+        """Implement :meth:`wait_for_layer` under its detailed NVTX range."""
         profile = _timing_enabled()
         wait_start = time.perf_counter()
         deadline = time.monotonic() + max(0.0, timeout_s)
@@ -1892,7 +2020,23 @@ class CSAAttentionKVPrefetchManager:
         scheduled_start = time.perf_counter()
         if scheduled is not None:
             try:
-                scheduled.result(timeout=max(0.0, deadline - time.monotonic()))
+                with detailed_io_nvtx.range(
+                    CsaNvtxEvent.FUTURE_WAIT,
+                    layer_id=int(layer_id),
+                    target_layer_id=int(layer_id),
+                    request_id=self.active_request_id,
+                    attributes={"kind": profile_kind},
+                ):
+                    result = scheduled.result(
+                        timeout=max(0.0, deadline - time.monotonic())
+                    )
+                # A gate-aligned shard gather books ``pending_read_count`` when
+                # it is prepared and only releases it when finalized.  Waiting
+                # on the future alone leaves that booking outstanding, so the
+                # loop below would block until the deadline on work that has
+                # already landed.  Mirror ``wait_for_tracked_submission``.
+                if isinstance(result, _DeferredShardGather):
+                    self.finalize_deferred_shard_gather(result)
             except Exception:
                 logger.exception(
                     "CSAAttentionKVPrefetchManager: scheduled layer %d "
@@ -1905,19 +2049,26 @@ class CSAAttentionKVPrefetchManager:
         if state is None:
             return True
         pending_start = time.perf_counter()
-        with state.pending_reads_lock:
-            pending_before = int(state.pending_read_count)
-            while state.pending_read_count:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    logger.warning(
-                        "CSAAttentionKVPrefetchManager: wait_for_layer %d "
-                        "timed out with %d reads still pending",
-                        layer_id,
-                        state.pending_read_count,
-                    )
-                    return False
-                state.pending_reads_lock.wait(remaining)
+        with detailed_io_nvtx.range(
+            CsaNvtxEvent.CONDITION_WAIT,
+            layer_id=int(layer_id),
+            target_layer_id=int(layer_id),
+            request_id=self.active_request_id,
+            attributes={"kind": profile_kind},
+        ):
+            with state.pending_reads_lock:
+                pending_before = int(state.pending_read_count)
+                while state.pending_read_count:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        logger.warning(
+                            "CSAAttentionKVPrefetchManager: wait_for_layer %d "
+                            "timed out with %d reads still pending",
+                            layer_id,
+                            state.pending_read_count,
+                        )
+                        return False
+                    state.pending_reads_lock.wait(remaining)
         pending_wait_ms = (time.perf_counter() - pending_start) * 1000.0
         drain_start = time.perf_counter()
         self.drain_for_layer(int(layer_id))
@@ -1961,12 +2112,32 @@ class CSAAttentionKVPrefetchManager:
             pending = state.pending_drains[:]
             state.pending_drains.clear()
         if event is not None:
+            gate_attributes = {
+                "kind": (
+                    "dsa_indexer"
+                    if self._data_group == "indexer"
+                    else (
+                        "hca_deterministic"
+                        if int(layer_id) in self.hca_layer_ids
+                        else "csa"
+                    )
+                )
+            }
             with csa_pipeline_nvtx.range(
                 CsaNvtxEvent.TARGET_GATE_WAIT,
                 layer_id=int(layer_id),
+                target_layer_id=int(layer_id),
                 request_id=self.active_request_id,
+                attributes=gate_attributes,
             ):
-                event.synchronize()
+                with detailed_io_nvtx.range(
+                    CsaNvtxEvent.CUDA_EVENT_WAIT,
+                    layer_id=int(layer_id),
+                    target_layer_id=int(layer_id),
+                    request_id=self.active_request_id,
+                    attributes=gate_attributes,
+                ):
+                    event.synchronize()
         # Release staging buffers now that the CUDA stream has confirmed all
         # non_blocking copies into the K cache have completed.
         for _, memory_objs, io_range, operation_id in pending:
@@ -2569,6 +2740,9 @@ class CSAAttentionKVPrefetchManager:
         *,
         raise_on_error: bool = False,
         request_token: Optional[Tuple[str, int]] = None,
+        source_layer_id: Optional[int] = None,
+        profile_operation_id: Optional[str] = None,
+        profile_kind: Optional[str] = None,
     ) -> bool:
         """Run one read submission while pinning the active request state."""
         with self._request_state:
@@ -2592,6 +2766,9 @@ class CSAAttentionKVPrefetchManager:
                 label,
                 io_priority,
                 raise_on_error=raise_on_error,
+                source_layer_id=source_layer_id,
+                profile_operation_id=profile_operation_id,
+                profile_kind=profile_kind,
             )
         finally:
             with self._request_state:
@@ -2606,6 +2783,9 @@ class CSAAttentionKVPrefetchManager:
         io_priority: str = "demand",
         *,
         raise_on_error: bool = False,
+        source_layer_id: Optional[int] = None,
+        profile_operation_id: Optional[str] = None,
+        profile_kind: Optional[str] = None,
     ) -> bool:
         """Submit reads and publish only blocks that actually completed.
 
@@ -2618,6 +2798,9 @@ class CSAAttentionKVPrefetchManager:
                 ``lookahead`` is required to reach Tutti but may fall back to
                 exact correction, and ``speculative`` permits cancellation.
             raise_on_error: Re-raise submission and completion failures.
+            source_layer_id: Optional layer that produced this I/O request.
+            profile_operation_id: Optional parent operation correlation id.
+            profile_kind: Optional profile-only I/O classification.
 
         Returns:
             ``True`` when the submission itself completed safely.  A
@@ -2738,13 +2921,31 @@ class CSAAttentionKVPrefetchManager:
                 new_count,
             )
 
-        operation_id = f"{label}-{time.monotonic_ns()}"
+        operation_id = profile_operation_id or f"{label}-{time.monotonic_ns()}"
+        effective_profile_kind = profile_kind or _io_profile_kind(label)
+        source_layer = (
+            int(source_layer_id) if source_layer_id is not None else int(layer_id)
+        )
+        issue_profile_kwargs = (
+            {
+                "profile_kind": effective_profile_kind,
+                "profile_source_layer": source_layer,
+                "profile_operation_id": operation_id,
+            }
+            if csa_pipeline_nvtx.enabled or detailed_io_nvtx.enabled
+            else {}
+        )
         io_range = csa_pipeline_nvtx.start_io(
-            layer_id=int(layer_id),
+            layer_id=source_layer,
             target_layer_id=int(layer_id),
             operation_id=operation_id,
             request_id=self.active_request_id,
-            attributes={"kind": label, "blocks": new_count},
+            attributes={
+                "kind": effective_profile_kind,
+                "detail": label,
+                "blocks": new_count,
+                "source_known": int(source_layer_id is not None),
+            },
         )
         try:
             # Predicted reads often finish on a background thread, outside
@@ -2772,22 +2973,36 @@ class CSAAttentionKVPrefetchManager:
                         else SSDReadMode.SHARD_GATHER_PREDICTED
                     )
                     issue_ids = candidate_ids
-                if active_sharding:
-                    event, issued_memory_objs, completed_ids = self._issue_reads(
-                        state,
-                        issue_ids,
-                        io_priority=io_priority,
-                        local_fallback_ids=new_ids,
-                        preferred_mode=preferred_mode,
-                    )
-                else:
-                    # Preserve the original call contract for local reads and
-                    # integrations that replace the issue hook in tests.
-                    event, issued_memory_objs, completed_ids = self._issue_reads(
-                        state,
-                        issue_ids,
-                        io_priority=io_priority,
-                    )
+                with detailed_io_nvtx.range(
+                    CsaNvtxEvent.IO_LOADER_CALL,
+                    layer_id=source_layer,
+                    target_layer_id=int(layer_id),
+                    operation_id=operation_id,
+                    request_id=self.active_request_id,
+                    attributes={
+                        "kind": effective_profile_kind,
+                        "detail": label,
+                        "blocks": new_count,
+                    },
+                ):
+                    if active_sharding:
+                        event, issued_memory_objs, completed_ids = self._issue_reads(
+                            state,
+                            issue_ids,
+                            io_priority=io_priority,
+                            local_fallback_ids=new_ids,
+                            preferred_mode=preferred_mode,
+                            **issue_profile_kwargs,
+                        )
+                    else:
+                        # Preserve the original call contract for local reads and
+                        # integrations that replace the issue hook in tests.
+                        event, issued_memory_objs, completed_ids = self._issue_reads(
+                            state,
+                            issue_ids,
+                            io_priority=io_priority,
+                            **issue_profile_kwargs,
+                        )
                 completed_ids = torch.unique(
                     completed_ids.to(device="cpu", dtype=torch.int64),
                     sorted=True,
@@ -2880,6 +3095,9 @@ class CSAAttentionKVPrefetchManager:
         io_priority: str = "demand",
         local_fallback_ids: Optional[Sequence[int] | torch.Tensor] = None,
         preferred_mode: Optional[SSDReadMode] = None,
+        profile_kind: Optional[str] = None,
+        profile_source_layer: Optional[int] = None,
+        profile_operation_id: Optional[str] = None,
     ) -> Tuple[Optional[torch.cuda.Event], List[Any], torch.Tensor]:
         """Choose shard-gather or the preserved rank-local read path."""
         if (
@@ -2893,6 +3111,9 @@ class CSAAttentionKVPrefetchManager:
                 if local_fallback_ids is not None
                 else sorted_block_ids,
                 io_priority=io_priority,
+                profile_kind=profile_kind,
+                profile_source_layer=profile_source_layer,
+                profile_operation_id=profile_operation_id,
             )
         local_capability = self._shard_capability_for(
             state,
@@ -2914,6 +3135,9 @@ class CSAAttentionKVPrefetchManager:
                     else sorted_block_ids
                 ),
                 local_capability=local_capability,
+                profile_kind=profile_kind,
+                profile_source_layer=profile_source_layer,
+                profile_operation_id=profile_operation_id,
             )
 
     def _issue_local_reads(
@@ -2922,6 +3146,9 @@ class CSAAttentionKVPrefetchManager:
         sorted_block_ids: Sequence[int] | torch.Tensor,
         *,
         io_priority: str = "demand",
+        profile_kind: Optional[str] = None,
+        profile_source_layer: Optional[int] = None,
+        profile_operation_id: Optional[str] = None,
     ) -> Tuple[Optional[torch.cuda.Event], List[Any], torch.Tensor]:
         """Issue Tutti reads grouped by chunk and copy bytes into the K cache.
 
@@ -2951,6 +3178,22 @@ class CSAAttentionKVPrefetchManager:
             dtype=torch.int64,
             device="cpu",
         ).reshape(-1)
+        profile_kwargs = (
+            {
+                "profile_kind": profile_kind,
+                "profile_source_layer": profile_source_layer,
+                "profile_operation_id": profile_operation_id,
+            }
+            if any(
+                value is not None
+                for value in (
+                    profile_kind,
+                    profile_source_layer,
+                    profile_operation_id,
+                )
+            )
+            else {}
+        )
         full_layer_major = bool(
             len(state.chunks) > 1
             and all(chunk.layer_major for chunk in state.chunks)
@@ -2963,6 +3206,7 @@ class CSAAttentionKVPrefetchManager:
             return self._issue_full_multi_layer_major_read(
                 state,
                 io_priority=io_priority,
+                **profile_kwargs,
             )
         if (
             len(state.chunks) == 1
@@ -2973,6 +3217,7 @@ class CSAAttentionKVPrefetchManager:
                 state,
                 selected_cpu,
                 io_priority=io_priority,
+                **profile_kwargs,
             )
         if (
             state.indexed_slba_table is not None
@@ -2985,6 +3230,7 @@ class CSAAttentionKVPrefetchManager:
                 state,
                 sorted_block_ids,
                 io_priority=io_priority,
+                **profile_kwargs,
             )
         if isinstance(sorted_block_ids, torch.Tensor):
             sorted_block_ids = sorted_block_ids.tolist()
@@ -3305,6 +3551,10 @@ class CSAAttentionKVPrefetchManager:
             # single Tutti queue between bounded speculative batches so HCA
             # and true-topK demand reads never queue behind the whole walk.
             "lock_per_batch": io_priority == "speculative",
+            "profile_layer_id": getattr(state, "layer_id", -1),
+            "profile_kind": profile_kind,
+            "profile_operation_id": profile_operation_id,
+            "profile_source_layer": profile_source_layer,
         }
         if io_priority == "speculative":
             # A long-prefix prediction can touch ranges in every layer-major
@@ -3356,6 +3606,9 @@ class CSAAttentionKVPrefetchManager:
         state: CSAAttentionKVLayerState,
         *,
         io_priority: str,
+        profile_kind: Optional[str] = None,
+        profile_source_layer: Optional[int] = None,
+        profile_operation_id: Optional[str] = None,
     ) -> Tuple[Optional[torch.cuda.Event], List[Any], torch.Tensor]:
         """Restore a complete layer from several admitted generation objects.
 
@@ -3514,6 +3767,10 @@ class CSAAttentionKVPrefetchManager:
             "max_batch_ios": 256,
             "max_batch_bytes": 128 * 1024**2,
             "wait_for_active_io": io_priority == "lookahead",
+            "profile_layer_id": getattr(state, "layer_id", -1),
+            "profile_kind": profile_kind,
+            "profile_operation_id": profile_operation_id,
+            "profile_source_layer": profile_source_layer,
         }
         if _csa_c_ops is not None and hasattr(
             _csa_c_ops,
@@ -3543,6 +3800,9 @@ class CSAAttentionKVPrefetchManager:
         selected_block_ids: torch.Tensor,
         *,
         io_priority: str,
+        profile_kind: Optional[str] = None,
+        profile_source_layer: Optional[int] = None,
+        profile_operation_id: Optional[str] = None,
     ) -> Tuple[Optional[torch.cuda.Event], List[Any], torch.Tensor]:
         """Read and scatter selected rows from a layer-major KV object.
 
@@ -3755,6 +4015,10 @@ class CSAAttentionKVPrefetchManager:
             "max_batch_ios": 256,
             "max_batch_bytes": 128 * 1024**2,
             "wait_for_active_io": io_priority == "lookahead",
+            "profile_layer_id": getattr(state, "layer_id", -1),
+            "profile_kind": profile_kind,
+            "profile_operation_id": profile_operation_id,
+            "profile_source_layer": profile_source_layer,
         }
         if _csa_c_ops is not None and hasattr(
             _csa_c_ops, "scatter_rows_from_object_ptrs"
@@ -3787,6 +4051,9 @@ class CSAAttentionKVPrefetchManager:
         sorted_block_ids: Sequence[int] | torch.Tensor,
         *,
         io_priority: str,
+        profile_kind: Optional[str] = None,
+        profile_source_layer: Optional[int] = None,
+        profile_operation_id: Optional[str] = None,
     ) -> Tuple[Optional[torch.cuda.Event], List[Any], torch.Tensor]:
         """Read one-range CSA blocks through the fused indexed CUDA path."""
         profile_start = time.perf_counter()
@@ -3826,16 +4093,60 @@ class CSAAttentionKVPrefetchManager:
             n_selected = int(batch_ids.numel())
             if n_selected == 0:
                 return
-            with torch.inference_mode(), torch.cuda.stream(io_stream):
-                source = torch.as_strided(
-                    staging,
-                    size=(n_selected, logical_nbytes),
-                    stride=(staging_stride, 1),
-                )
-                rows = dst_rows_table.index_select(0, batch_ids)
-                k_cache_flat.index_copy_(0, rows, source)
-                last_scatter_event = torch.cuda.Event()
-                last_scatter_event.record(io_stream)
+            with csa_pipeline_nvtx.range(
+                CsaNvtxEvent.IO_SCATTER,
+                layer_id=(
+                    int(profile_source_layer)
+                    if profile_source_layer is not None
+                    else state.layer_id
+                ),
+                target_layer_id=state.layer_id,
+                request_id=self.active_request_id,
+                attributes={
+                    "kind": profile_kind or "unknown",
+                    "blocks": n_selected,
+                },
+            ):
+                with detailed_io_nvtx.range(
+                    CsaNvtxEvent.IO_MATERIALIZE,
+                    layer_id=(
+                        int(profile_source_layer)
+                        if profile_source_layer is not None
+                        else state.layer_id
+                    ),
+                    target_layer_id=state.layer_id,
+                    request_id=self.active_request_id,
+                    operation_id=profile_operation_id,
+                    attributes={
+                        "kind": profile_kind or "unknown",
+                        "blocks": n_selected,
+                    },
+                ):
+                    with detailed_io_nvtx.range(
+                        CsaNvtxEvent.IO_SCATTER,
+                        layer_id=(
+                            int(profile_source_layer)
+                            if profile_source_layer is not None
+                            else state.layer_id
+                        ),
+                        target_layer_id=state.layer_id,
+                        request_id=self.active_request_id,
+                        operation_id=profile_operation_id,
+                        attributes={
+                            "kind": profile_kind or "unknown",
+                            "blocks": n_selected,
+                        },
+                    ):
+                        with torch.inference_mode(), torch.cuda.stream(io_stream):
+                            source = torch.as_strided(
+                                staging,
+                                size=(n_selected, logical_nbytes),
+                                stride=(staging_stride, 1),
+                            )
+                            rows = dst_rows_table.index_select(0, batch_ids)
+                            k_cache_flat.index_copy_(0, rows, source)
+                            last_scatter_event = torch.cuda.Event()
+                            last_scatter_event.record(io_stream)
             # The next indexed submit is enqueued on this same stream, so it
             # cannot let NVMe overwrite staging until this scatter completes.
             # The final event is returned to the target-layer consumption gate.
@@ -3847,7 +4158,10 @@ class CSAAttentionKVPrefetchManager:
             io_nbytes,
             _scatter_indexed_batch,
             io_priority=io_priority,
-            profile_layer_id=state.layer_id,
+            profile_layer_id=getattr(state, "layer_id", -1),
+            profile_kind=profile_kind,
+            profile_operation_id=profile_operation_id,
+            profile_source_layer=profile_source_layer,
             input_ready_event=input_ready_event,
             wait_for_active_io=io_priority == "lookahead",
         )
@@ -3939,8 +4253,11 @@ class CSAAttentionKVPrefetchManager:
                 selected_prefix.all().item()
             )
             return (
-                selected_prefix & ~state.in_pool_bitmap[:limit]
-            ).nonzero(as_tuple=False).reshape(-1).cpu()
+                (selected_prefix & ~state.in_pool_bitmap[:limit])
+                .nonzero(as_tuple=False)
+                .reshape(-1)
+                .cpu()
+            )
         native_select = getattr(
             _csa_c_ops,
             "select_missing_csa_blocks",
@@ -4080,6 +4397,9 @@ class CSAAttentionKVPrefetchManager:
         *,
         label: str,
         request_token: Optional[Tuple[str, int]],
+        profile_source_layer: Optional[int] = None,
+        profile_operation_id: Optional[str] = None,
+        profile_kind: Optional[str] = None,
     ) -> bool | _DeferredShardGather:
         """Book predicted blocks and read only this rank's owner shard."""
         selected = torch.as_tensor(
@@ -4105,13 +4425,28 @@ class CSAAttentionKVPrefetchManager:
             with torch.inference_mode():
                 state.pending_reads_bitmap[pending_ids] = True
             state.pending_read_count += int(pending_ids.numel())
-        operation_id = f"{label}-{time.monotonic_ns()}"
+        operation_id = profile_operation_id or f"{label}-{time.monotonic_ns()}"
+        source_layer = (
+            int(profile_source_layer)
+            if profile_source_layer is not None
+            else state.layer_id
+        )
+        if profile_source_layer is None and label.startswith("predicted_l"):
+            try:
+                source_layer -= int(label.rsplit("l", 1)[1])
+            except ValueError:
+                pass
+        effective_profile_kind = profile_kind or _io_profile_kind(label)
         io_range = csa_pipeline_nvtx.start_io(
-            layer_id=state.layer_id,
+            layer_id=source_layer,
             target_layer_id=state.layer_id,
             operation_id=operation_id,
             request_id=self.active_request_id,
-            attributes={"kind": label, "blocks": int(pending_ids.numel())},
+            attributes={
+                "kind": effective_profile_kind,
+                "detail": label,
+                "blocks": int(pending_ids.numel()),
+            },
         )
         try:
             work = self._prepare_shard_gather(
@@ -4120,6 +4455,9 @@ class CSAAttentionKVPrefetchManager:
                 mode=SSDReadMode.SHARD_GATHER_PREDICTED,
                 io_priority="lookahead",
                 request_token=request_token,
+                profile_operation_id=operation_id,
+                profile_kind=effective_profile_kind,
+                profile_source_layer=source_layer,
             )
         except Exception:
             with state.pending_reads_lock:
@@ -4152,6 +4490,9 @@ class CSAAttentionKVPrefetchManager:
         mode: SSDReadMode,
         io_priority: str,
         request_token: Optional[Tuple[str, int]],
+        profile_operation_id: Optional[str] = None,
+        profile_kind: Optional[str] = None,
+        profile_source_layer: Optional[int] = None,
     ) -> _DeferredShardGather:
         """Read this rank's owner shard without launching a collective."""
         with self._request_state:
@@ -4196,15 +4537,43 @@ class CSAAttentionKVPrefetchManager:
             local_objects: List[Any] = []
             local_completed = torch.empty(0, dtype=torch.int64)
             local_error: Optional[Exception] = None
+            detailed_operation_id = profile_operation_id or (
+                f"shard-{mode.value}-{time.monotonic_ns()}"
+            )
+            detailed_kind = profile_kind or (
+                "csa_dense"
+                if mode == SSDReadMode.SHARD_GATHER_DENSE
+                else "csa_predicted"
+            )
+            detailed_source_layer = (
+                int(profile_source_layer)
+                if profile_source_layer is not None
+                else state.layer_id
+            )
             if local_capability:
                 try:
-                    local_event, local_objects, local_completed = (
-                        self._issue_local_reads(
-                            state,
-                            owned,
-                            io_priority=io_priority,
+                    with detailed_io_nvtx.range(
+                        CsaNvtxEvent.IO_LOADER_CALL,
+                        layer_id=detailed_source_layer,
+                        target_layer_id=state.layer_id,
+                        operation_id=detailed_operation_id,
+                        request_id=self.active_request_id,
+                        attributes={
+                            "kind": detailed_kind,
+                            "detail": mode.value,
+                            "blocks": int(owned.numel()),
+                        },
+                    ):
+                        local_event, local_objects, local_completed = (
+                            self._issue_local_reads(
+                                state,
+                                owned,
+                                io_priority=io_priority,
+                                profile_kind=detailed_kind,
+                                profile_source_layer=detailed_source_layer,
+                                profile_operation_id=detailed_operation_id,
+                            )
                         )
-                    )
                 except Exception as exc:
                     local_error = exc
             local_complete = bool(
@@ -4226,6 +4595,10 @@ class CSAAttentionKVPrefetchManager:
                 local_objects=local_objects,
                 local_complete=local_complete,
                 local_capability=local_capability,
+                operation_id=detailed_operation_id,
+                profile_kind=detailed_kind,
+                profile_source_layer=detailed_source_layer,
+                request_id=self.active_request_id,
             )
         finally:
             with self._request_state:
@@ -4237,6 +4610,8 @@ class CSAAttentionKVPrefetchManager:
         prepared: _DeferredShardGather,
     ) -> None:
         """Run consensus/gather after all model ranks reach the layer gate."""
+        if not self._claim_deferred_shard_gather(prepared):
+            return
         state = prepared.state
         transport = self._shard_transport
         descriptor = prepared.descriptor
@@ -4268,11 +4643,34 @@ class CSAAttentionKVPrefetchManager:
                     missing = prepared.selected[
                         ~state.resident_blocks_bitmap[prepared.selected]
                     ]
-                    event, objects, completed = self._issue_local_reads(
-                        state,
-                        missing,
-                        io_priority="demand",
+                    fallback_operation_id = (
+                        f"{prepared.operation_id or 'shard'}-fallback"
                     )
+                    fallback_source = (
+                        prepared.profile_source_layer
+                        if prepared.profile_source_layer is not None
+                        else state.layer_id
+                    )
+                    with detailed_io_nvtx.range(
+                        CsaNvtxEvent.IO_LOADER_CALL,
+                        layer_id=int(fallback_source),
+                        target_layer_id=state.layer_id,
+                        operation_id=fallback_operation_id,
+                        request_id=self.active_request_id,
+                        attributes={
+                            "kind": prepared.profile_kind,
+                            "detail": "shard_fallback",
+                            "blocks": int(missing.numel()),
+                        },
+                    ):
+                        event, objects, completed = self._issue_local_reads(
+                            state,
+                            missing,
+                            io_priority="demand",
+                            profile_kind=prepared.profile_kind,
+                            profile_source_layer=int(fallback_source),
+                            profile_operation_id=fallback_operation_id,
+                        )
                     retained_objects.extend(objects)
                     if event is not None:
                         event.synchronize()
@@ -4326,30 +4724,74 @@ class CSAAttentionKVPrefetchManager:
                     descriptor.sequence_number,
                 )
         finally:
-            if prepared.local_ready_event is not None:
+            prepared.local_objects = retained_objects
+            self._release_deferred_shard_gather(
+                prepared,
+                status="complete" if completed else "error",
+            )
+
+    @staticmethod
+    def _claim_deferred_shard_gather(prepared: _DeferredShardGather) -> bool:
+        """Claim exactly one finalize-or-discard path for deferred work."""
+        with prepared.lifecycle_lock:
+            if prepared.lifecycle_claimed:
+                return False
+            prepared.lifecycle_claimed = True
+            return True
+
+    def _release_deferred_shard_gather(
+        self,
+        prepared: _DeferredShardGather,
+        *,
+        status: str,
+    ) -> None:
+        """Retire local CUDA work, pending bits, references, and profile state."""
+        state = prepared.state
+        event_error: Optional[BaseException] = None
+        if prepared.local_ready_event is not None:
+            try:
                 prepared.local_ready_event.synchronize()
-            for memory_obj in retained_objects:
-                ref_count_down = getattr(memory_obj, "ref_count_down", None)
-                if callable(ref_count_down):
+            except BaseException as exc:
+                event_error = exc
+            finally:
+                prepared.local_ready_event = None
+        memory_objects = prepared.local_objects
+        prepared.local_objects = []
+        for memory_obj in memory_objects:
+            ref_count_down = getattr(memory_obj, "ref_count_down", None)
+            if callable(ref_count_down):
+                try:
                     ref_count_down()
-            if prepared.pending_ids is not None:
-                with state.pending_reads_lock:
-                    with torch.inference_mode():
-                        state.pending_reads_bitmap[prepared.pending_ids] = False
-                    state.pending_read_count = max(
-                        0,
-                        state.pending_read_count - int(prepared.pending_ids.numel()),
+                except Exception:
+                    logger.exception(
+                        "CSAAttentionKVPrefetchManager: deferred staging "
+                        "release failed layer=%d",
+                        state.layer_id,
                     )
-                    state.pending_reads_lock.notify_all()
-            if prepared.io_range is not None:
-                csa_pipeline_nvtx.finish_io(
-                    prepared.io_range,
-                    layer_id=state.layer_id,
-                    target_layer_id=state.layer_id,
-                    operation_id=prepared.operation_id,
-                    request_id=self.active_request_id,
-                    status="complete" if completed else "error",
+        pending_ids = prepared.pending_ids
+        prepared.pending_ids = None
+        if pending_ids is not None:
+            with state.pending_reads_lock:
+                with torch.inference_mode():
+                    state.pending_reads_bitmap[pending_ids] = False
+                state.pending_read_count = max(
+                    0,
+                    state.pending_read_count - int(pending_ids.numel()),
                 )
+                state.pending_reads_lock.notify_all()
+        io_range = prepared.io_range
+        prepared.io_range = None
+        if io_range is not None:
+            csa_pipeline_nvtx.finish_io(
+                io_range,
+                layer_id=state.layer_id,
+                target_layer_id=state.layer_id,
+                operation_id=prepared.operation_id,
+                request_id=prepared.request_id,
+                status=status,
+            )
+        if event_error is not None:
+            raise event_error
 
     def _issue_shard_gather(
         self,
@@ -4360,6 +4802,9 @@ class CSAAttentionKVPrefetchManager:
         io_priority: str,
         local_fallback_ids: Sequence[int] | torch.Tensor,
         local_capability: bool,
+        profile_kind: Optional[str] = None,
+        profile_source_layer: Optional[int] = None,
+        profile_operation_id: Optional[str] = None,
     ) -> Tuple[Optional[torch.cuda.Event], List[Any], torch.Tensor]:
         """Read this rank's owner slice and gather the complete union."""
         transport = self._shard_transport
@@ -4369,6 +4814,9 @@ class CSAAttentionKVPrefetchManager:
                 state,
                 local_fallback_ids,
                 io_priority=io_priority,
+                profile_kind=profile_kind,
+                profile_source_layer=profile_source_layer,
+                profile_operation_id=profile_operation_id,
             )
         selected = torch.as_tensor(
             block_ids,
@@ -4402,6 +4850,9 @@ class CSAAttentionKVPrefetchManager:
                 state,
                 local_fallback_ids,
                 io_priority=io_priority,
+                profile_kind=profile_kind,
+                profile_source_layer=profile_source_layer,
+                profile_operation_id=profile_operation_id,
             )
         if not agreed:
             logger.warning(
@@ -4415,6 +4866,9 @@ class CSAAttentionKVPrefetchManager:
                 state,
                 local_fallback_ids,
                 io_priority=io_priority,
+                profile_kind=profile_kind,
+                profile_source_layer=profile_source_layer,
+                profile_operation_id=profile_operation_id,
             )
         if logical_rows is None:
             raise RuntimeError(
@@ -4435,6 +4889,9 @@ class CSAAttentionKVPrefetchManager:
                 state,
                 owned,
                 io_priority=io_priority,
+                profile_kind=profile_kind,
+                profile_source_layer=profile_source_layer,
+                profile_operation_id=profile_operation_id,
             )
         except Exception as exc:
             local_error = exc
@@ -4471,6 +4928,13 @@ class CSAAttentionKVPrefetchManager:
                 state,
                 local_fallback_ids,
                 io_priority=io_priority,
+                profile_kind=profile_kind,
+                profile_source_layer=profile_source_layer,
+                profile_operation_id=(
+                    f"{profile_operation_id}-fallback"
+                    if profile_operation_id is not None
+                    else None
+                ),
             )
             return (
                 fallback_event or local_event,
