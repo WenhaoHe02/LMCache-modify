@@ -507,9 +507,16 @@ def _lmcache_true_indexer_cp_context(
     num_rows: int,
     dcp_world_size: int,
     use_pcp: bool,
+    *,
+    proxy_mode: bool = False,
 ) -> tuple[int, int, object] | None:
     """Return TP rank, size, and process group for exact query-row CP."""
-    enabled = os.getenv("LMCACHE_TRUE_INDEXER_CP", "0").lower() in {{
+    prefix = (
+        "LMCACHE_PROXY_INDEXER_CP"
+        if proxy_mode
+        else "LMCACHE_TRUE_INDEXER_CP"
+    )
+    enabled = os.getenv(prefix, "0").lower() in {{
         "1",
         "true",
         "yes",
@@ -520,19 +527,19 @@ def _lmcache_true_indexer_cp_context(
     try:
         minimum_rows = max(
             1,
-            int(os.getenv("LMCACHE_TRUE_INDEXER_CP_MIN_ROWS", "1024")),
+            int(os.getenv(f"{{prefix}}_MIN_ROWS", "1024")),
         )
         expected_size = max(
             2,
-            int(os.getenv("LMCACHE_TRUE_INDEXER_CP_SIZE", "8")),
+            int(os.getenv(f"{{prefix}}_SIZE", "8")),
         )
     except ValueError as exc:
-        raise RuntimeError("invalid LMCache true-Indexer CP configuration") from exc
+        raise RuntimeError(f"invalid {{prefix}} configuration") from exc
     if int(num_rows) < minimum_rows:
         return None
     if int(dcp_world_size) != 1 or bool(use_pcp):
         raise RuntimeError(
-            "LMCache true-Indexer CP requires vLLM DCP=1 and PCP disabled"
+            f"{{prefix}} requires vLLM DCP=1 and PCP disabled"
         )
 
     import torch.distributed as dist
@@ -540,14 +547,14 @@ def _lmcache_true_indexer_cp_context(
 
     if not dist.is_available() or not dist.is_initialized():
         raise RuntimeError(
-            "LMCACHE_TRUE_INDEXER_CP requires initialized torch.distributed"
+            f"{{prefix}} requires initialized torch.distributed"
         )
     tp_group = get_tp_group()
     world_size = int(tp_group.world_size)
     rank = int(tp_group.rank_in_group)
     if world_size != expected_size:
         raise RuntimeError(
-            "LMCACHE_TRUE_INDEXER_CP_SIZE does not match the TP group: "
+            f"{{prefix}}_SIZE does not match the TP group: "
             f"configured={{expected_size}} runtime={{world_size}}"
         )
     return rank, world_size, tp_group.device_group
@@ -623,6 +630,7 @@ def _lmcache_true_indexer_cp_workspace(
                 chunk_rows,
                 dcp_world_size,
                 use_pcp,
+                proxy_mode=bool(skip_k_cache_insert),
             )
             if cp_context is None:
                 score_start = chunk_start
@@ -712,50 +720,64 @@ def _lmcache_true_indexer_cp_workspace(
                 row_starts=cu_seqlen_ks,
             )
             if cp_context is not None:
-                import torch.distributed as dist
-
-                direct_gather = (
-                    chunk_rows % cp_world_size == 0
-                    and complete_topk.is_contiguous()
-                )
-                if direct_gather:
-                    gathered_topk = complete_topk
+                exchange_proxy_rows = os.getenv(
+                    "LMCACHE_PROXY_INDEXER_CP_EXCHANGE",
+                    "1",
+                ).lower() in {"1", "true", "yes", "on"}
+                if bool(skip_k_cache_insert) and not exchange_proxy_rows:
+                    # Prediction consumes only the per-rank candidate union,
+                    # so retain local query rows and avoid the exact top-K
+                    # AllGather. The physical owner-gather exchanges the
+                    # selected KV rows later at the aligned consumer gate.
+                    complete_topk[:local_rows].copy_(topk_indices[:local_rows])
+                    complete_topk[local_rows:].fill_(-1)
+                    topk_indices = complete_topk[:local_rows]
                 else:
-                    gathered_topk = torch.empty(
-                        (padded_rows * cp_world_size, topk_tokens),
-                        dtype=complete_topk.dtype,
-                        device=complete_topk.device,
+                    import torch.distributed as dist
+
+                    direct_gather = (
+                        chunk_rows % cp_world_size == 0
+                        and complete_topk.is_contiguous()
                     )
-                logger.info_once(
-                    "LMCache true-indexer query CP is active: world_size=%d "
-                    "rows=%d topk=%d",
-                    cp_world_size,
-                    chunk_rows,
-                    topk_tokens,
-                )
-                with torch.cuda.nvtx.range(
-                    "lmcache.true_indexer_cp.all_gather_topk"
-                ):
-                    dist.all_gather_into_tensor(
-                        gathered_topk,
-                        topk_indices,
-                        group=_cp_group,
+                    if direct_gather:
+                        gathered_topk = complete_topk
+                    else:
+                        gathered_topk = torch.empty(
+                            (padded_rows * cp_world_size, topk_tokens),
+                            dtype=complete_topk.dtype,
+                            device=complete_topk.device,
+                        )
+                    logger.info_once(
+                        "LMCache indexer query CP is active: world_size=%d "
+                        "rows=%d topk=%d proxy=%d",
+                        cp_world_size,
+                        chunk_rows,
+                        topk_tokens,
+                        int(bool(skip_k_cache_insert)),
                     )
-                if not direct_gather:
-                    for owner in range(cp_world_size):
-                        owner_start, owner_end = _lmcache_balanced_row_bounds(
-                            chunk_rows,
-                            owner,
-                            cp_world_size,
+                    with torch.cuda.nvtx.range(
+                        "lmcache.indexer_cp.all_gather_topk"
+                    ):
+                        dist.all_gather_into_tensor(
+                            gathered_topk,
+                            topk_indices,
+                            group=_cp_group,
                         )
-                        owner_rows = owner_end - owner_start
-                        source_start = owner * padded_rows
-                        complete_topk[owner_start:owner_end].copy_(
-                            gathered_topk[
-                                source_start : source_start + owner_rows
-                            ]
-                        )
-                topk_indices = complete_topk
+                    if not direct_gather:
+                        for owner in range(cp_world_size):
+                            owner_start, owner_end = _lmcache_balanced_row_bounds(
+                                chunk_rows,
+                                owner,
+                                cp_world_size,
+                            )
+                            owner_rows = owner_end - owner_start
+                            source_start = owner * padded_rows
+                            complete_topk[owner_start:owner_end].copy_(
+                                gathered_topk[
+                                    source_start : source_start + owner_rows
+                                ]
+                            )
+                    topk_indices = complete_topk
 """
     source = _replace_once(
         source,

@@ -29,12 +29,13 @@ def test_glm_prediction_can_preserve_rank_local_ownership(
         "LMCACHE_GLM_DSA_OWNER_PARTITION",
         "1" if enabled else "0",
     )
+    monkeypatch.setenv("LMCACHE_CSA_OWNER_BLOCKS_PER_RANK", "2")
 
     class FakeAttentionKVManager:
         def __init__(self) -> None:
             self.active_request_id = "request"
             self.active_request_token = ("request", 1)
-            self.submissions: list[bool] = []
+            self.submissions: list[tuple[bool, list[int]]] = []
             self.futures: dict[int, Future[Any]] = {}
 
         def fire_predicted_reads(
@@ -46,7 +47,7 @@ def test_glm_prediction_can_preserve_rank_local_ownership(
             preserve_owner_partition: bool,
             **_kwargs: object,
         ) -> bool:
-            self.submissions.append(preserve_owner_partition)
+            self.submissions.append((preserve_owner_partition, _blocks.tolist()))
             return True
 
         def track_layer_submission(
@@ -88,4 +89,5 @@ def test_glm_prediction_can_preserve_rank_local_ownership(
 
     assert sink.wait_for_consumer(2)
     sink.close()
-    assert manager.submissions == [enabled]
+    expected_blocks = [0, 1] if enabled else [0, 1, 2]
+    assert manager.submissions == [(enabled, expected_blocks)]
