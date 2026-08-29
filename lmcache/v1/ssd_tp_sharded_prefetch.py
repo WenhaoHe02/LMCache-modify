@@ -742,6 +742,7 @@ class _GatherSlot:
     send_ids: torch.Tensor
     receive_ids: torch.Tensor
     completion_event: Optional[torch.cuda.Event] = None
+    completion_work: Any = None
 
 
 class TorchDistributedShardGather:
@@ -1081,16 +1082,14 @@ class TorchDistributedShardGather:
             )
         data_submitted = False
         try:
-            with self._lock, torch.inference_mode(), torch.cuda.stream(self._stream):
+            metadata_stream = self._metadata_stream
+            if metadata_stream is None:
+                raise RuntimeError("owner gather metadata stream is unavailable")
+            with self._lock, torch.inference_mode():
                 slot = self._slots[self._slot_cursor]
                 self._slot_cursor = (self._slot_cursor + 1) % len(self._slots)
                 if padded_blocks > int(slot.send.shape[0]):
                     raise ValueError("owner gather exceeds warmed row capacity")
-                if slot.completion_event is not None:
-                    self._stream.wait_event(slot.completion_event)
-                if local_ready_event is not None:
-                    self._stream.wait_event(local_ready_event)
-
                 local_cpu = torch.as_tensor(
                     local_block_ids,
                     dtype=torch.int64,
@@ -1101,40 +1100,54 @@ class TorchDistributedShardGather:
                     local_ready and int(local_cpu.numel()) <= padded_blocks
                 )
                 local_gpu = local_cpu.to(source_rows.device)
-                slot.send[:padded_blocks].zero_()
-                slot.send_ids[: padded_blocks + 1].fill_(-1)
-                slot.send_ids[0] = int(local_cpu.numel()) if rank_ready else -1
-                if rank_ready and local_gpu.numel():
-                    local_rows = logical_destination_rows.index_select(0, local_gpu)
-                    torch.index_select(
-                        source_rows,
-                        0,
-                        local_rows,
-                        out=slot.send[: int(local_gpu.numel())],
-                    )
-                    slot.send_ids[1 : 1 + int(local_gpu.numel())] = local_gpu
-                data_submitted = True
-                gathered_rows = padded_blocks * self._world_size
-                data_work = torch.distributed.all_gather_into_tensor(
-                    slot.receive[:gathered_rows],
-                    slot.send[:padded_blocks],
-                    group=self._process_group,
-                    async_op=True,
-                )
+                completion_event = slot.completion_event
                 id_width = padded_blocks + 1
-                id_work = torch.distributed.all_gather_into_tensor(
-                    slot.receive_ids[: self._world_size * id_width],
-                    slot.send_ids[:id_width],
-                    group=self._process_group,
-                    async_op=True,
-                )
-                data_work.wait()
+                with torch.cuda.stream(metadata_stream):
+                    if completion_event is not None:
+                        metadata_stream.wait_event(completion_event)
+                    slot.send_ids[:id_width].fill_(-1)
+                    slot.send_ids[0] = int(local_cpu.numel()) if rank_ready else -1
+                    if rank_ready and local_gpu.numel():
+                        slot.send_ids[1 : 1 + int(local_gpu.numel())] = local_gpu
+                    id_work = torch.distributed.all_gather_into_tensor(
+                        slot.receive_ids[: self._world_size * id_width],
+                        slot.send_ids[:id_width],
+                        group=self._metadata_process_group,
+                        async_op=True,
+                    )
+                gathered_rows = padded_blocks * self._world_size
+                with torch.cuda.stream(self._stream):
+                    if completion_event is not None:
+                        self._stream.wait_event(completion_event)
+                    if local_ready_event is not None:
+                        self._stream.wait_event(local_ready_event)
+                    slot.send[:padded_blocks].zero_()
+                    if rank_ready and local_gpu.numel():
+                        local_rows = logical_destination_rows.index_select(
+                            0,
+                            local_gpu,
+                        )
+                        torch.index_select(
+                            source_rows,
+                            0,
+                            local_rows,
+                            out=slot.send[: int(local_gpu.numel())],
+                        )
+                    data_submitted = True
+                    data_work = torch.distributed.all_gather_into_tensor(
+                        slot.receive[:gathered_rows],
+                        slot.send[:padded_blocks],
+                        group=self._process_group,
+                        async_op=True,
+                    )
                 id_work.wait()
-            self._stream.synchronize()
+            metadata_stream.synchronize()
 
-            payloads = slot.receive_ids[
-                : self._world_size * (padded_blocks + 1)
-            ].cpu().reshape(self._world_size, padded_blocks + 1)
+            payloads = (
+                slot.receive_ids[: self._world_size * (padded_blocks + 1)]
+                .cpu()
+                .reshape(self._world_size, padded_blocks + 1)
+            )
             all_ready = all(int(payload[0].item()) >= 0 for payload in payloads)
             rank_blocks: list[tuple[int, ...]] = []
             for payload in payloads:
@@ -1144,6 +1157,10 @@ class TorchDistributedShardGather:
                 )
             partition = partition_rank_local_blocks(rank_blocks)
             with torch.inference_mode(), torch.cuda.stream(self._stream):
+                # The data collective was enqueued first on this same stream;
+                # scatter and the completion event are naturally ordered
+                # after it. The metadata D2H/partition work above overlaps the
+                # KV transfer instead of forcing a full data-stream sync.
                 if all_ready and partition.union:
                     positions: list[int] = []
                     for rank, blocks in enumerate(partition.blocks_by_rank):
@@ -1178,6 +1195,7 @@ class TorchDistributedShardGather:
                 event = torch.cuda.Event()
                 event.record(self._stream)
                 slot.completion_event = event
+                slot.completion_work = data_work
             return event, partition, all_ready
         except Exception as exc:
             self._healthy = False
@@ -1185,7 +1203,6 @@ class TorchDistributedShardGather:
                 "owner KV gather failed",
                 data_submitted=data_submitted,
             ) from exc
-
 
     def preflight(
         self,
@@ -1441,9 +1458,7 @@ class TorchDistributedShardGather:
                 self._owns_process_group = False
         if self._owns_metadata_process_group:
             try:
-                torch.distributed.destroy_process_group(
-                    self._metadata_process_group
-                )
+                torch.distributed.destroy_process_group(self._metadata_process_group)
             finally:
                 self._owns_metadata_process_group = False
 
@@ -1580,11 +1595,7 @@ def partition_rank_local_blocks(
         deterministic_block_union(block_ids) for block_ids in rank_block_ids
     )
     union = deterministic_block_union(
-        tuple(
-            block_id
-            for blocks in canonical_by_rank
-            for block_id in blocks
-        )
+        tuple(block_id for blocks in canonical_by_rank for block_id in blocks)
     )
     if max_union_blocks is not None:
         union = union[:max_union_blocks]
