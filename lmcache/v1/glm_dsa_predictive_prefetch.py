@@ -284,6 +284,10 @@ class GLMDSAPhysicalPrefetchSink:
             ).strip().lower() in {"1", "true", "yes", "on"}
         self._enable_prediction = bool(enable_prediction)
         self._preserve_owner_partition = _owner_partition_prediction_enabled()
+        self._owner_blocks_per_rank = max(
+            1,
+            int(os.environ.get("LMCACHE_CSA_OWNER_BLOCKS_PER_RANK", "64")),
+        )
         self._early_dense_group = os.getenv(
             "LMCACHE_GLM_DSA_EARLY_DENSE_GROUP",
             "0",
@@ -342,12 +346,14 @@ class GLMDSAPhysicalPrefetchSink:
         self._decode_missing_blocks: dict[int, set[int]] = defaultdict(set)
         logger.info(
             "GLM DSA physical prediction reads enabled=%s block_budget=%d "
-            "shared_prediction_mode=%s early_dense_group=%s owner_partition=%s",
+            "shared_prediction_mode=%s early_dense_group=%s owner_partition=%s "
+            "owner_blocks_per_rank=%d",
             self._enable_prediction,
             self._prediction_block_budget,
             self._shared_prediction_mode,
             self._early_dense_group,
             self._preserve_owner_partition,
+            self._owner_blocks_per_rank,
         )
 
     def submit(self, event: GLMDSAPrefetchEvent) -> None:
@@ -415,9 +421,15 @@ class GLMDSAPhysicalPrefetchSink:
                     f"GLM DSA dense-group read timed out at layer {target_layer}"
                 )
             return
+        prediction_budget = self._prediction_block_budget
+        if not event.correction and self._preserve_owner_partition:
+            prediction_budget = min(
+                prediction_budget,
+                self._owner_blocks_per_rank,
+            )
         blocks = self._topk_to_blocks(
             event.topk_indices,
-            block_budget=(None if event.correction else self._prediction_block_budget),
+            block_budget=(None if event.correction else prediction_budget),
         )
         if event.correction:
             with self._lock:

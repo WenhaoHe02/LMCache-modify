@@ -175,9 +175,13 @@ def forward_cuda():
     assert "register_lmcache_topk_chunk_callback" in patched
     assert "for chunk_index, chunk in enumerate" in patched
     assert "_lmcache_true_indexer_cp_context(" in patched
+    assert '"LMCACHE_PROXY_INDEXER_CP"' in patched
+    assert "proxy_mode=bool(skip_k_cache_insert)" in patched
     assert "q_quant[score_start:score_end]" in patched
     assert patched.count("weights[score_start:score_end]") == 2
     assert "dist.all_gather_into_tensor(" in patched
+    assert '"LMCACHE_PROXY_INDEXER_CP_EXCHANGE"' in patched
+    assert "complete_topk[:local_rows].copy_" in patched
     assert "row_starts=cu_seqlen_ks" in patched
     assert "event=true_indexer_compute" in patched
     assert "with _lmcache_true_indexer_nvtx_context(self.k_cache.prefix):" in patched
