@@ -59,6 +59,14 @@ def _decode_coverage_profile_enabled() -> bool:
     ).lower() in {"1", "true", "yes", "on"}
 
 
+def _owner_partition_prediction_enabled() -> bool:
+    """Return whether GLM predictions preserve rank-local block ownership."""
+    return os.environ.get(
+        "LMCACHE_GLM_DSA_OWNER_PARTITION",
+        "0",
+    ).lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True, slots=True)
 class GLMDSAPredictionSchedule:
     """One early-prediction edge for an IndexShare group.
@@ -275,6 +283,7 @@ class GLMDSAPhysicalPrefetchSink:
                 "1",
             ).strip().lower() in {"1", "true", "yes", "on"}
         self._enable_prediction = bool(enable_prediction)
+        self._preserve_owner_partition = _owner_partition_prediction_enabled()
         self._early_dense_group = os.getenv(
             "LMCACHE_GLM_DSA_EARLY_DENSE_GROUP",
             "0",
@@ -333,11 +342,12 @@ class GLMDSAPhysicalPrefetchSink:
         self._decode_missing_blocks: dict[int, set[int]] = defaultdict(set)
         logger.info(
             "GLM DSA physical prediction reads enabled=%s block_budget=%d "
-            "shared_prediction_mode=%s early_dense_group=%s",
+            "shared_prediction_mode=%s early_dense_group=%s owner_partition=%s",
             self._enable_prediction,
             self._prediction_block_budget,
             self._shared_prediction_mode,
             self._early_dense_group,
+            self._preserve_owner_partition,
         )
 
     def submit(self, event: GLMDSAPrefetchEvent) -> None:
@@ -951,6 +961,7 @@ class GLMDSAPhysicalPrefetchSink:
             blocks,
             level,
             request_token=request_token,
+            preserve_owner_partition=self._preserve_owner_partition,
             **profile_kwargs,
         )
         manager.track_layer_submission(
