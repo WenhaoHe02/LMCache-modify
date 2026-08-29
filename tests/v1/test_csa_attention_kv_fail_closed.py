@@ -29,6 +29,9 @@ def _init_active_request_state(
     manager: CSAAttentionKVPrefetchManager,
 ) -> None:
     manager._active_request_id = "request-a"
+    manager._external_kv_forward_active = True
+    manager._kv_forward_phase = "prefill"
+    manager._decode_step = 0
     manager._request_transition_lock = threading.RLock()
     manager._request_state = threading.Condition()
     manager._active_submissions = 0
@@ -815,7 +818,7 @@ def test_late_prediction_falls_back_to_true_topk_without_blocking() -> None:
 
 
 def test_decode_bypasses_csa_indexer_correction() -> None:
-    """An inactive external-KV phase calls only the official indexer."""
+    """An inactive KV phase calls only the official indexer."""
     manager = object.__new__(CSAAttentionKVPrefetchManager)
     manager._patch_lock = threading.Lock()
     manager._patched_modules = []
@@ -831,6 +834,83 @@ def test_decode_bypasses_csa_indexer_correction() -> None:
 
     assert indexer.forward().tolist() == [1, 2]
     assert calls == ["true_indexer"]
+
+
+def test_decode_runs_authoritative_correction_without_prediction() -> None:
+    """Decode demand-reads true top-K misses and skips prefill prediction waits."""
+    manager = object.__new__(CSAAttentionKVPrefetchManager)
+    manager._patch_lock = threading.Lock()
+    manager._patched_modules = []
+    _init_active_request_state(manager)
+    manager.set_kv_forward_phase("decode", request_id="request-a")
+    manager._prediction_waiter = lambda _layer_id: pytest.fail(
+        "decode waited for a prefill prediction"
+    )
+    calls: list[tuple[str, object]] = []
+
+    def _miss_ids(
+        _self: CSAAttentionKVPrefetchManager,
+        layer_id: int,
+        true_topk: torch.Tensor,
+    ) -> torch.Tensor:
+        calls.append(("miss_filter", (layer_id, true_topk.tolist())))
+        return torch.tensor([3, 7], dtype=torch.int64)
+
+    def _submit(
+        _self: CSAAttentionKVPrefetchManager,
+        layer_id: int,
+        miss_ids: torch.Tensor,
+        *,
+        request_token: tuple[str, int] | None = None,
+        profile_operation_id: str | None = None,
+        profile_kind: str | None = None,
+    ) -> None:
+        calls.append(
+            (
+                "submit",
+                (
+                    layer_id,
+                    miss_ids.tolist(),
+                    request_token,
+                    profile_operation_id,
+                    profile_kind,
+                ),
+            )
+        )
+
+    manager._miss_ids_for_topk = MethodType(_miss_ids, manager)
+    manager.submit_miss_reads = MethodType(_submit, manager)
+    manager.drain_for_layer = MethodType(
+        lambda _self, layer_id: calls.append(("drain", layer_id)),
+        manager,
+    )
+    indexer = SimpleNamespace(forward=lambda: torch.tensor([3, 5, 7]))
+    manager.patch_indexer_forward(indexer, 2)
+
+    assert indexer.forward().tolist() == [3, 5, 7]
+    assert calls == [
+        ("miss_filter", (2, [3, 5, 7])),
+        (
+            "submit",
+            (
+                2,
+                [3, 7],
+                ("request-a", 1),
+                "decode-1-layer-2",
+                "csa_decode_miss",
+            ),
+        ),
+        ("drain", 2),
+    ]
+
+
+def test_decode_phase_rejects_a_stale_request_plan() -> None:
+    """Decode cannot consume another request's registered SSD plan."""
+    manager = object.__new__(CSAAttentionKVPrefetchManager)
+    _init_active_request_state(manager)
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        manager.set_kv_forward_phase("decode", request_id="request-b")
 
 
 def test_true_indexer_waits_for_native_cache(

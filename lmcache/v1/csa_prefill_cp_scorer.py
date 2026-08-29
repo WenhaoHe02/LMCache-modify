@@ -3,10 +3,126 @@
 
 # Standard
 import os
-from typing import Any
+import threading
+from typing import Any, Literal, cast
 
 # Third Party
 import torch
+
+
+_PROXY_K_WORKSPACE_LOCK = threading.Lock()
+_PROXY_K_WORKSPACES: dict[
+    tuple[str, int | None, int, int, bool, torch.dtype],
+    tuple[torch.Tensor, torch.Tensor],
+] = {}
+
+PrefillCPMode = Literal[
+    "query",
+    "key_history_only",
+    "key_sharded_early",
+    "key_sharded_union",
+    "key_contiguous_union",
+    "key_contiguous_replicated_append",
+    "key_sharded_owner",
+    "key_replicated_append",
+    "key_sharded_append",
+]
+_PREFILL_CP_MODES = frozenset(
+    {
+        "query",
+        "key_history_only",
+        "key_sharded_early",
+        "key_sharded_union",
+        "key_contiguous_union",
+        "key_contiguous_replicated_append",
+        "key_sharded_owner",
+        "key_replicated_append",
+        "key_sharded_append",
+    }
+)
+
+
+def resolve_prefill_cp_mode(value: str | None = None) -> PrefillCPMode:
+    """Resolve the opt-in speculative CP partition mode.
+
+    Args:
+        value: Explicit mode, or ``None`` to read
+            ``LMCACHE_CSA_PREFETCH_CP_MODE``.
+
+    Returns:
+        Validated partition mode. The default remains ``query``.
+
+    Raises:
+        ValueError: If the configured mode is unsupported.
+    """
+    configured = (
+        os.getenv("LMCACHE_CSA_PREFETCH_CP_MODE", "query") if value is None else value
+    )
+    normalized = configured.strip().lower()
+    if normalized not in _PREFILL_CP_MODES:
+        supported = ", ".join(sorted(_PREFILL_CP_MODES))
+        raise ValueError(
+            f"unsupported speculative CP mode {configured!r}; expected {supported}"
+        )
+    return cast(PrefillCPMode, normalized)
+
+
+def prefill_cp_requires_id_exchange(value: str | None = None) -> bool:
+    """Return whether a partition mode requires cross-rank candidate union."""
+    return resolve_prefill_cp_mode(value) in {
+        "query",
+        "key_sharded_union",
+        "key_contiguous_union",
+        "key_contiguous_replicated_append",
+    }
+
+
+def _private_proxy_k_workspace(
+    *,
+    device: torch.device,
+    total_capacity: int,
+    head_dim: int,
+    use_fp4: bool,
+    fp8_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return K scratch owned exclusively by the speculative proxy path."""
+    key = (
+        device.type,
+        device.index,
+        int(total_capacity),
+        int(head_dim),
+        bool(use_fp4),
+        fp8_dtype,
+    )
+    with _PROXY_K_WORKSPACE_LOCK:
+        cached = _PROXY_K_WORKSPACES.get(key)
+        if cached is not None:
+            return cached
+        if use_fp4:
+            values = torch.empty(
+                (total_capacity, head_dim // 2),
+                dtype=torch.uint8,
+                device=device,
+            )
+            scales = torch.empty(
+                (total_capacity, head_dim // 32),
+                dtype=torch.uint8,
+                device=device,
+            )
+        else:
+            values = torch.empty(
+                (total_capacity, head_dim),
+                dtype=fp8_dtype,
+                device=device,
+            )
+            scales = torch.empty(
+                (total_capacity, 4),
+                dtype=torch.uint8,
+                device=device,
+            )
+        cached = (values, scales)
+        _PROXY_K_WORKSPACES[key] = cached
+        return cached
 
 
 def _block_cyclic_indices(
@@ -71,6 +187,267 @@ def prefill_cp_key_indices(
     )
 
 
+def prefill_cp_key_indices_with_append(
+    total_tokens: int,
+    append_start: int,
+    rank: int,
+    world_size: int,
+    interleave_size: int,
+    device: torch.device,
+    *,
+    replicate_append: bool,
+) -> torch.Tensor:
+    """Return one rank's K rows for a history-plus-append prefill.
+
+    History is always block-cyclically sharded. Append K rows are either
+    replicated on every rank or sharded with the same global ownership rule.
+
+    Args:
+        total_tokens: Total K rows visible to the active prefill chunk.
+        append_start: First K row produced by the active append chunk.
+        rank: Rank in the speculative prefetch group.
+        world_size: Number of ranks sharing proxy scoring.
+        interleave_size: Consecutive K rows assigned to one rank.
+        device: Device on which to construct the indices.
+        replicate_append: Whether every rank keeps all append K rows.
+
+    Returns:
+        Sorted global K-row ids owned by this rank.
+
+    Raises:
+        ValueError: If ``append_start`` is outside ``[0, total_tokens]`` or a
+            partition argument is invalid.
+    """
+    if append_start < 0 or append_start > total_tokens:
+        raise ValueError("append_start must be within the K-token range")
+    if not replicate_append:
+        return prefill_cp_key_indices(
+            total_tokens,
+            rank,
+            world_size,
+            interleave_size,
+            device,
+        )
+    history = prefill_cp_key_indices(
+        append_start,
+        rank,
+        world_size,
+        interleave_size,
+        device,
+    )
+    append = torch.arange(
+        append_start,
+        total_tokens,
+        dtype=torch.int64,
+        device=device,
+    )
+    return torch.cat((history, append))
+
+
+def gather_prefill_cp_local_k_rows(
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    global_key_indices: torch.Tensor,
+    *,
+    value_bytes: int,
+    scale_bytes: int,
+    value_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather only one speculative rank's K rows from a paged cache.
+
+    Args:
+        kv_cache: Paged indexer cache shaped ``[blocks, block_size, stride]``.
+        block_table: Single-sequence logical-to-physical block table.
+        global_key_indices: Sorted global token rows owned by this rank.
+        value_bytes: Packed value bytes per cache row.
+        scale_bytes: Packed scale bytes per cache row.
+        value_dtype: Dtype used to reinterpret the packed value bytes.
+
+    Returns:
+        Contiguous value and scale tensors containing only the selected rows.
+
+    Raises:
+        ValueError: If a tensor layout or byte width is unsupported.
+
+    Notes:
+        This performs no cross-rank communication and does not materialize the
+        full logical K sequence before selecting the local partition.
+    """
+    if kv_cache.ndim != 3:
+        raise ValueError("kv_cache must have block, row, and byte dimensions")
+    if block_table.ndim != 2 or int(block_table.shape[0]) != 1:
+        raise ValueError("block_table must describe exactly one sequence")
+    if global_key_indices.ndim != 1:
+        raise ValueError("global_key_indices must be one-dimensional")
+    if value_bytes <= 0 or scale_bytes <= 0:
+        raise ValueError("K row byte widths must be positive")
+    row_bytes = value_bytes + scale_bytes
+    if int(kv_cache.shape[2]) < row_bytes:
+        raise ValueError("paged K-cache row is smaller than the requested layout")
+
+    block_size = int(kv_cache.shape[1])
+    logical_blocks = torch.div(
+        global_key_indices,
+        block_size,
+        rounding_mode="floor",
+    ).to(torch.int64)
+    block_offsets = torch.remainder(global_key_indices, block_size).to(torch.int64)
+    physical_blocks = block_table[0].index_select(0, logical_blocks).to(torch.int64)
+    packed_rows = kv_cache[physical_blocks, block_offsets]
+    values = packed_rows[:, :value_bytes].contiguous()
+    if values.dtype != value_dtype:
+        values = values.view(value_dtype)
+    scales = packed_rows[:, value_bytes:row_bytes].contiguous()
+    return values, scales
+
+
+def prefill_cp_key_block_partition(
+    total_tokens: int,
+    rank: int,
+    world_size: int,
+    interleave_blocks: int,
+    block_size: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return one rank's logical blocks and expanded global K rows.
+
+    Args:
+        total_tokens: Number of valid logical K rows.
+        rank: Rank in the speculative prefetch group.
+        world_size: Number of ranks sharing K scoring.
+        interleave_blocks: Consecutive cache blocks assigned to one rank.
+        block_size: Token rows stored in each cache block.
+        device: Device on which to construct the partition.
+
+    Returns:
+        Selected logical block ids and their valid global token-row ids.
+
+    Raises:
+        ValueError: If a length or partition argument is invalid.
+    """
+    if total_tokens < 0:
+        raise ValueError("total_tokens must be non-negative")
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+    num_blocks = (total_tokens + block_size - 1) // block_size
+    logical_blocks = _block_cyclic_indices(
+        num_blocks,
+        rank,
+        world_size,
+        interleave_blocks,
+        device,
+    )
+    offsets = torch.arange(block_size, dtype=torch.int64, device=device)
+    global_rows = (logical_blocks[:, None] * block_size + offsets).reshape(-1)
+    return logical_blocks, global_rows[global_rows < total_tokens]
+
+
+def prefill_cp_contiguous_key_block_partition(
+    total_tokens: int,
+    rank: int,
+    world_size: int,
+    block_size: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return one rank's contiguous, non-overlapping K-block partition.
+
+    Args:
+        total_tokens: Number of valid logical K rows.
+        rank: Rank in the speculative prefetch group.
+        world_size: Number of ranks sharing K scoring.
+        block_size: Token rows stored in each cache block.
+        device: Device on which to construct the partition.
+
+    Returns:
+        A contiguous logical-block slice and its valid global token-row ids.
+
+    Raises:
+        ValueError: If a length or partition argument is invalid.
+
+    Notes:
+        Uneven tails are assigned to the lowest ranks, so all blocks are
+        covered exactly once without padding or cross-rank synchronization.
+    """
+    if total_tokens < 0:
+        raise ValueError("total_tokens must be non-negative")
+    if world_size <= 0:
+        raise ValueError("world_size must be positive")
+    if rank < 0 or rank >= world_size:
+        raise ValueError("rank must be within the prefetch CP group")
+    if block_size <= 0:
+        raise ValueError("block_size must be positive")
+    num_blocks = (total_tokens + block_size - 1) // block_size
+    blocks_per_rank, remainder = divmod(num_blocks, world_size)
+    block_start = rank * blocks_per_rank + min(rank, remainder)
+    block_count = blocks_per_rank + int(rank < remainder)
+    logical_blocks = torch.arange(
+        block_start,
+        block_start + block_count,
+        dtype=torch.int64,
+        device=device,
+    )
+    offsets = torch.arange(block_size, dtype=torch.int64, device=device)
+    global_rows = (logical_blocks[:, None] * block_size + offsets).reshape(-1)
+    return logical_blocks, global_rows[global_rows < total_tokens]
+
+
+def prefill_cp_contiguous_history_with_replicated_append(
+    total_tokens: int,
+    append_start: int,
+    rank: int,
+    world_size: int,
+    block_size: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Partition history contiguously while replicating append K blocks.
+
+    Args:
+        total_tokens: Total history-plus-append K rows.
+        append_start: First append K row.
+        rank: Rank in the speculative prefetch group.
+        world_size: Number of ranks sharing K scoring.
+        block_size: Token rows stored in each cache block.
+        device: Device on which to construct the partition.
+
+    Returns:
+        Logical blocks to gather and their sorted global token-row ids.
+
+    Raises:
+        ValueError: If the range is invalid or append does not begin on a
+            cache-block boundary.
+
+    Notes:
+        The block-alignment requirement matches LMCache's admitted prefix
+        granularity and keeps the direct paged-cache gather copy-free.
+    """
+    if append_start < 0 or append_start > total_tokens:
+        raise ValueError("append_start must be within the K-token range")
+    if append_start % block_size != 0:
+        raise ValueError("replicated append must begin on a K-cache block")
+    history_blocks, history_rows = prefill_cp_contiguous_key_block_partition(
+        append_start,
+        rank,
+        world_size,
+        block_size,
+        device,
+    )
+    append_block_start = append_start // block_size
+    total_blocks = (total_tokens + block_size - 1) // block_size
+    append_blocks = torch.arange(
+        append_block_start,
+        total_blocks,
+        dtype=torch.int64,
+        device=device,
+    )
+    offsets = torch.arange(block_size, dtype=torch.int64, device=device)
+    append_rows = (append_blocks[:, None] * block_size + offsets).reshape(-1)
+    append_rows = append_rows[append_rows < total_tokens]
+    return (
+        torch.cat((history_blocks, append_blocks)),
+        torch.cat((history_rows, append_rows)),
+    )
+
+
 def prefill_cp_query_indices(
     token_start: int,
     token_end: int,
@@ -117,6 +494,39 @@ def prefill_cp_query_indices(
     ).add_(int(token_start))
 
 
+def prefill_cp_sampled_query_indices(
+    token_start: int,
+    token_end: int,
+    sample_stride: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return the common sampled Q rows used by every K-sharded rank.
+
+    Args:
+        token_start: Inclusive first global query-token offset.
+        token_end: Exclusive final global query-token offset.
+        sample_stride: Keep one query row per this many rows.
+        device: Device on which to construct the indices.
+
+    Returns:
+        Sampled global query-token ids.
+
+    Raises:
+        ValueError: If the token range or stride is invalid.
+    """
+    if token_start < 0 or token_end < token_start:
+        raise ValueError("invalid query token range")
+    if sample_stride <= 0:
+        raise ValueError("sample_stride must be positive")
+    return torch.arange(
+        token_start,
+        token_end,
+        sample_stride,
+        dtype=torch.int64,
+        device=device,
+    )
+
+
 def globalize_prefill_cp_topk(
     local_topk: torch.Tensor,
     global_key_indices: torch.Tensor,
@@ -136,6 +546,45 @@ def globalize_prefill_cp_topk(
     if global_key_indices.numel() > 0:
         result[valid] = global_key_indices[local_topk[valid].long()].to(result.dtype)
     return result
+
+
+def localize_prefill_cp_bounds(
+    global_key_indices: torch.Tensor,
+    global_starts: torch.Tensor,
+    global_ends: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map global causal K bounds into one sorted rank-local K matrix.
+
+    Args:
+        global_key_indices: Sorted global K ids present on the rank.
+        global_starts: Inclusive global K starts for query rows.
+        global_ends: Exclusive global K ends for query rows.
+
+    Returns:
+        Inclusive starts and exclusive ends in the compact local K matrix,
+        preserving the input bounds' dtype.
+
+    Raises:
+        ValueError: If an input is not one-dimensional or the bound shapes
+            differ.
+    """
+    if global_key_indices.ndim != 1:
+        raise ValueError("global_key_indices must be one-dimensional")
+    if global_starts.ndim != 1 or global_ends.ndim != 1:
+        raise ValueError("prefill K bounds must be one-dimensional")
+    if global_starts.shape != global_ends.shape:
+        raise ValueError("prefill K bound shapes must match")
+    local_starts = torch.searchsorted(
+        global_key_indices,
+        global_starts.to(torch.int64),
+        right=False,
+    ).to(global_starts.dtype)
+    local_ends = torch.searchsorted(
+        global_key_indices,
+        global_ends.to(torch.int64),
+        right=False,
+    ).to(global_ends.dtype)
+    return local_starts, local_ends
 
 
 def prefill_cp_local_topk_tokens(
@@ -241,18 +690,30 @@ def score_prefill_proxy_rank_local(
     world_size: int,
     interleave_size: int,
     oversubscribe: int = 1,
+    partition_mode: PrefillCPMode | str = "query",
     topk_tokens_override: int | None = None,
     metadata_query_row_start: int | None = None,
     preselected_query_rows: torch.Tensor | None = None,
     preselected_query_span: int | None = None,
     runtime_info: dict[str, int] | None = None,
 ) -> torch.Tensor:
-    """Run the speculative indexer for this rank's query shard over full K.
+    """Run one optional speculative query- or K-sharded indexer path.
 
     The official indexer op and its metadata are not modified. This function
-    mirrors its prefill gather/scoring path, selects one block-cyclic subset
-    of query rows, and computes the original full-width top-k against every K
-    row. It intentionally rejects decode and multi-sequence metadata.
+    mirrors its prefill gather/scoring path. ``query`` preserves the existing
+    query-sharded behavior. The ``key_*`` modes use the same sampled query rows
+    on every rank, score only one rank's K partition, emit a bounded local
+    candidate set, and intentionally avoid an exact global Top-K
+    synchronization. ``key_history_only`` excludes append K because append KV
+    is already resident and therefore cannot create an SSD miss.
+    ``key_sharded_early`` retains the original fully sharded K candidate set
+    while moving shared query sampling ahead of proxy Q preparation.
+    ``key_sharded_union`` exchanges only the bounded approximate candidate
+    IDs. ``key_contiguous_union`` does the same exchange after assigning each
+    rank one contiguous K slice. ``key_contiguous_replicated_append`` keeps
+    those contiguous history shards but scores the complete append on every
+    rank. ``key_sharded_owner`` leaves IDs rank-local so each rank can read
+    its own KV rows before the consumer-gate AllGather.
 
     Args:
         indexer_op: Active vLLM ``SparseAttnIndexer`` instance.
@@ -263,8 +724,18 @@ def score_prefill_proxy_rank_local(
         rank: Rank in the speculative prefetch group.
         world_size: Number of ranks sharing proxy scoring.
         interleave_size: Consecutive query rows assigned per rank.
-        oversubscribe: Reserved compatibility argument. Query sharding always
-            uses the official full top-k width.
+        oversubscribe: Multiplier for the per-rank K-shard candidate quota.
+            Query sharding continues to use the full proxy top-k width.
+        partition_mode: ``query`` (existing behavior),
+            ``key_history_only`` (sharded history K with append excluded),
+            ``key_sharded_early`` (sharded history and append K with early Q),
+            ``key_sharded_union`` (direct K shards plus approximate ID union),
+            ``key_contiguous_union`` (contiguous K shards plus ID union),
+            ``key_contiguous_replicated_append`` (contiguous history shards,
+            replicated append, and ID union),
+            ``key_sharded_owner`` (direct K shards plus owner-local KV reads),
+            ``key_replicated_append`` (sharded history plus full append K), or
+            ``key_sharded_append`` (sharded history and append K).
         topk_tokens_override: Optional wider speculative top-k width. This
             changes only proxy coverage; the official indexer's output width
             and sparse-attention semantics remain unchanged.
@@ -296,7 +767,6 @@ def score_prefill_proxy_rank_local(
     from vllm.v1.attention.backends.mla.indexer import (
         DeepseekV32IndexerMetadata,
     )
-    from vllm.v1.worker.workspace import current_workspace_manager
 
     metadata_by_layer = get_forward_context().attn_metadata
     if not isinstance(metadata_by_layer, dict):
@@ -322,6 +792,7 @@ def score_prefill_proxy_rank_local(
     output[: hidden_states.shape[0]] = -1
     if oversubscribe <= 0:
         raise RuntimeError("prefill CP oversubscribe must be positive")
+    mode = resolve_prefill_cp_mode(str(partition_mode))
     topk_tokens = (
         int(topk_tokens_override)
         if topk_tokens_override is not None
@@ -329,20 +800,8 @@ def score_prefill_proxy_rank_local(
     )
     if topk_tokens <= 0 or topk_tokens > int(output.shape[1]):
         raise RuntimeError("proxy top-k width does not fit the output buffer")
-    workspace = current_workspace_manager()
     fp8_dtype = current_platform.fp8_dtype()
     head_dim = int(indexer_op.head_dim)
-    total_capacity = int(indexer_op.max_total_seq_len)
-    if use_fp4:
-        values_spec = ((total_capacity, head_dim // 2), torch.uint8)
-        scales_spec = ((total_capacity, head_dim // 32), torch.uint8)
-    else:
-        values_spec = ((total_capacity, head_dim), fp8_dtype)
-        scales_spec = ((total_capacity, 4), torch.uint8)
-    k_quant_full, k_scale_full = workspace.get_simultaneous(
-        values_spec,
-        scales_spec,
-    )
 
     chunks = prefill.chunks
     if not chunks:
@@ -378,15 +837,8 @@ def score_prefill_proxy_rank_local(
     if gather_chunk is None:
         raise RuntimeError("prefill CP metadata has no K-gather chunk")
 
-    k_quant = k_quant_full[:total_seq_lens]
-    k_scale = k_scale_full[:total_seq_lens]
-    ops.cp_gather_indexer_k_quant_cache(
-        indexer_op.k_cache.kv_cache,
-        k_quant,
-        k_scale,
-        gather_chunk.block_table,
-        gather_chunk.cu_seq_lens,
-    )
+    global_ks = torch.cat(global_ks_parts)
+    global_ke = torch.cat(global_ke_parts)
     query_first = first_token
     query_final = final_token
     compact_query_base = 0
@@ -414,21 +866,10 @@ def score_prefill_proxy_rank_local(
         raise RuntimeError(
             "LMCACHE_CSA_PREFETCH_CP_QUERY_SAMPLE_STRIDE must be positive"
         )
-    if preselected_query_rows is None:
-        local_query_ids = prefill_cp_query_indices(
-            query_first,
-            query_final,
-            rank,
-            world_size,
-            interleave_size,
-            k_quant.device,
-            sample_stride=query_sample_stride,
-        )
-        input_query_rows = local_query_ids - compact_query_base
-    else:
+    if preselected_query_rows is not None:
         if preselected_query_rows.ndim != 1:
             raise RuntimeError("preselected proxy query rows must be one-dimensional")
-        if preselected_query_rows.device != k_quant.device:
+        if preselected_query_rows.device != hidden_states.device:
             raise RuntimeError("preselected proxy query rows must use the proxy device")
         if preselected_query_rows.numel() != hidden_states.shape[0]:
             raise RuntimeError(
@@ -443,23 +884,212 @@ def score_prefill_proxy_rank_local(
         input_query_rows = torch.arange(
             int(preselected_query_rows.numel()),
             dtype=torch.int64,
-            device=k_quant.device,
+            device=hidden_states.device,
         )
+    elif mode != "query":
+        local_query_ids = prefill_cp_sampled_query_indices(
+            query_first,
+            query_final,
+            query_sample_stride,
+            hidden_states.device,
+        )
+        input_query_rows = local_query_ids - query_first
+    else:
+        local_query_ids = prefill_cp_query_indices(
+            query_first,
+            query_final,
+            rank,
+            world_size,
+            interleave_size,
+            hidden_states.device,
+            sample_stride=query_sample_stride,
+        )
+        input_query_rows = local_query_ids - compact_query_base
     if runtime_info is not None:
         runtime_info["query_sample_stride"] = query_sample_stride
         runtime_info["local_query_rows"] = int(local_query_ids.numel())
     if local_query_ids.numel() == 0:
         return output
 
-    # Every rank sees the complete gathered K matrix but scores only 1/N query
-    # rows. This keeps MQA FLOPs equal to K sharding while making each local
-    # prediction semantically complete and eliminating the rank union.
-    global_ks = torch.cat(global_ks_parts)
-    global_ke = torch.cat(global_ke_parts)
+    if mode != "query":
+        append_rows = final_token - first_token
+        append_start = total_seq_lens - append_rows
+        if append_start < 0:
+            raise RuntimeError("prefill metadata has more append rows than K rows")
+        if mode in {"key_history_only", "key_sharded_early"}:
+            partition_tokens = (
+                append_start if mode == "key_history_only" else total_seq_lens
+            )
+            global_key_indices = prefill_cp_key_indices(
+                partition_tokens,
+                rank,
+                world_size,
+                interleave_size,
+                hidden_states.device,
+            )
+            if global_key_indices.numel() == 0:
+                return output
+            total_capacity = int(indexer_op.max_total_seq_len)
+            k_quant_full, k_scale_full = _private_proxy_k_workspace(
+                device=hidden_states.device,
+                total_capacity=total_capacity,
+                head_dim=head_dim,
+                use_fp4=use_fp4,
+                fp8_dtype=fp8_dtype,
+            )
+            gathered_k_quant = k_quant_full[:total_seq_lens]
+            gathered_k_scale = k_scale_full[:total_seq_lens]
+            ops.cp_gather_indexer_k_quant_cache(
+                indexer_op.k_cache.kv_cache,
+                gathered_k_quant,
+                gathered_k_scale,
+                gather_chunk.block_table,
+                gather_chunk.cu_seq_lens,
+            )
+            k_quant = gathered_k_quant.index_select(0, global_key_indices)
+            k_scale = gathered_k_scale.index_select(0, global_key_indices)
+        elif mode in {
+            "key_sharded_append",
+            "key_sharded_union",
+            "key_contiguous_union",
+            "key_contiguous_replicated_append",
+            "key_sharded_owner",
+        }:
+            cache_block_size = int(indexer_op.k_cache.kv_cache.shape[1])
+            if mode == "key_contiguous_union":
+                logical_blocks, global_key_indices = (
+                    prefill_cp_contiguous_key_block_partition(
+                        total_seq_lens,
+                        rank,
+                        world_size,
+                        cache_block_size,
+                        hidden_states.device,
+                    )
+                )
+            elif mode == "key_contiguous_replicated_append":
+                logical_blocks, global_key_indices = (
+                    prefill_cp_contiguous_history_with_replicated_append(
+                        total_seq_lens,
+                        append_start,
+                        rank,
+                        world_size,
+                        cache_block_size,
+                        hidden_states.device,
+                    )
+                )
+            else:
+                logical_blocks, global_key_indices = prefill_cp_key_block_partition(
+                    total_seq_lens,
+                    rank,
+                    world_size,
+                    interleave_size,
+                    cache_block_size,
+                    hidden_states.device,
+                )
+            if global_key_indices.numel() == 0:
+                return output
+            local_block_table = gather_chunk.block_table.index_select(
+                1,
+                logical_blocks.to(torch.int64),
+            )
+            local_cu_seq_lens = torch.tensor(
+                [0, int(global_key_indices.numel())],
+                dtype=gather_chunk.cu_seq_lens.dtype,
+                device=hidden_states.device,
+            )
+            local_capacity = (
+                int(indexer_op.max_total_seq_len) + world_size - 1
+            ) // world_size + cache_block_size
+            if mode == "key_contiguous_replicated_append":
+                required_capacity = int(global_key_indices.numel())
+                capacity_quantum = 8192
+                local_capacity = max(
+                    local_capacity,
+                    (
+                        (required_capacity + capacity_quantum - 1)
+                        // capacity_quantum
+                    )
+                    * capacity_quantum,
+                )
+            k_quant_full, k_scale_full = _private_proxy_k_workspace(
+                device=hidden_states.device,
+                total_capacity=local_capacity,
+                head_dim=head_dim,
+                use_fp4=use_fp4,
+                fp8_dtype=fp8_dtype,
+            )
+            k_quant = k_quant_full[: global_key_indices.numel()]
+            k_scale = k_scale_full[: global_key_indices.numel()]
+            ops.cp_gather_indexer_k_quant_cache(
+                indexer_op.k_cache.kv_cache,
+                k_quant,
+                k_scale,
+                local_block_table,
+                local_cu_seq_lens,
+            )
+        else:
+            global_key_indices = prefill_cp_key_indices_with_append(
+                total_seq_lens,
+                append_start,
+                rank,
+                world_size,
+                interleave_size,
+                hidden_states.device,
+                replicate_append=True,
+            )
+            if global_key_indices.numel() == 0:
+                return output
+            value_bytes = head_dim // 2 if use_fp4 else head_dim
+            scale_bytes = head_dim // 32 if use_fp4 else 4
+            k_quant, k_scale = gather_prefill_cp_local_k_rows(
+                indexer_op.k_cache.kv_cache,
+                gather_chunk.block_table,
+                global_key_indices,
+                value_bytes=value_bytes,
+                scale_bytes=scale_bytes,
+                value_dtype=torch.uint8 if use_fp4 else fp8_dtype,
+            )
+        local_topk_tokens = min(
+            int(global_key_indices.numel()),
+            prefill_cp_local_topk_tokens(
+                topk_tokens,
+                world_size,
+                oversubscribe,
+            ),
+        )
+        if runtime_info is not None:
+            runtime_info["append_start"] = int(append_start)
+            runtime_info["local_key_rows"] = int(global_key_indices.numel())
+            runtime_info["local_topk_tokens"] = int(local_topk_tokens)
+    else:
+        total_capacity = int(indexer_op.max_total_seq_len)
+        k_quant_full, k_scale_full = _private_proxy_k_workspace(
+            device=hidden_states.device,
+            total_capacity=total_capacity,
+            head_dim=head_dim,
+            use_fp4=use_fp4,
+            fp8_dtype=fp8_dtype,
+        )
+        k_quant = k_quant_full[:total_seq_lens]
+        k_scale = k_scale_full[:total_seq_lens]
+        ops.cp_gather_indexer_k_quant_cache(
+            indexer_op.k_cache.kv_cache,
+            k_quant,
+            k_scale,
+            gather_chunk.block_table,
+            gather_chunk.cu_seq_lens,
+        )
+        global_key_indices = torch.arange(
+            total_seq_lens,
+            dtype=torch.int64,
+            device=k_quant.device,
+        )
+        local_topk_tokens = topk_tokens
+
     max_logits_bytes = _prefill_cp_max_logits_bytes(
         envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB
     )
-    max_query_tokens = max_logits_bytes // max(1, total_seq_lens * 4)
+    max_query_tokens = max_logits_bytes // max(1, int(k_quant.shape[0]) * 4)
     if max_query_tokens <= 0:
         raise RuntimeError("CP logits budget cannot hold one full-K query row")
 
@@ -473,11 +1103,18 @@ def score_prefill_proxy_rank_local(
     for query_start in range(0, int(local_query_ids.numel()), max_query_tokens):
         query_ids = local_query_ids[query_start : query_start + max_query_tokens]
         metadata_ids = query_ids - first_token
-        query_row_ids = input_query_rows[
-            query_start : query_start + max_query_tokens
-        ]
-        local_ks = global_ks.index_select(0, metadata_ids)
-        local_ke = global_ke.index_select(0, metadata_ids)
+        query_row_ids = input_query_rows[query_start : query_start + max_query_tokens]
+        selected_global_ks = global_ks.index_select(0, metadata_ids)
+        selected_global_ke = global_ke.index_select(0, metadata_ids)
+        if mode == "query":
+            local_ks = selected_global_ks
+            local_ke = selected_global_ke
+        else:
+            local_ks, local_ke = localize_prefill_cp_bounds(
+                global_key_indices,
+                selected_global_ks,
+                selected_global_ke,
+            )
         q_slice = q_values.index_select(0, query_row_ids)
         q_scale_slice = (
             q_scale.index_select(0, query_row_ids) if q_scale is not None else None
@@ -495,7 +1132,7 @@ def score_prefill_proxy_rank_local(
             clean_logits=False,
         )
         local_output = torch.empty(
-            (int(query_ids.numel()), topk_tokens),
+            (int(query_ids.numel()), local_topk_tokens),
             dtype=output.dtype,
             device=output.device,
         )
@@ -507,7 +1144,14 @@ def score_prefill_proxy_rank_local(
             int(logits.shape[0]),
             int(logits.stride(0)),
             int(logits.stride(1)),
-            topk_tokens,
+            local_topk_tokens,
         )
-        output.index_copy_(0, query_row_ids, local_output)
+        if mode != "query":
+            local_output = globalize_prefill_cp_topk(
+                local_output,
+                global_key_indices,
+            )
+            output[query_row_ids, :local_topk_tokens] = local_output
+        else:
+            output.index_copy_(0, query_row_ids, local_output)
     return output

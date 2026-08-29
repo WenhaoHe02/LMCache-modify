@@ -243,6 +243,9 @@ class VLLM0202GLMDSAHooks:
         forward_enabled: Optional callback that identifies an external-KV
             prefill forward. Disabled forwards bypass every LMCache gate,
             prediction, and authoritative-observation hook.
+        disabled_authoritative_observer: Optional profile-only callback for
+            authoritative Full-index output from disabled (normally decode)
+            forwards. It must not submit I/O or alter model state.
     """
 
     def __init__(
@@ -252,6 +255,10 @@ class VLLM0202GLMDSAHooks:
         *,
         indexer_types: tuple[str, ...] = (),
         authoritative_observer: Callable[[int, torch.Tensor], None] | None = None,
+        disabled_authoritative_observer: Callable[
+            [int, torch.Tensor], None
+        ]
+        | None = None,
         consumer_waiter: Callable[[int], bool] | None = None,
         forward_enabled: Callable[[], bool] | None = None,
     ) -> None:
@@ -259,6 +266,7 @@ class VLLM0202GLMDSAHooks:
         self._manager = manager
         self._indexer_types = indexer_types
         self._authoritative_observer = authoritative_observer
+        self._disabled_authoritative_observer = disabled_authoritative_observer
         self._consumer_waiter = consumer_waiter
         self._forward_enabled = forward_enabled
         self._patched_decoders: list[Any] = []
@@ -395,12 +403,14 @@ class VLLM0202GLMDSAHooks:
 
         def _forward(instance: Any, *args: Any, **kwargs: Any) -> Any:
             result = original(*args, **kwargs)
-            if self._forward_enabled is not None and not self._forward_enabled():
-                return result
             hidden = args[0] if args else kwargs.get("hidden_states")
             if isinstance(result, torch.Tensor) and isinstance(hidden, torch.Tensor):
                 rows = int(hidden.shape[0])
                 true_topk = result[:rows]
+                if self._forward_enabled is not None and not self._forward_enabled():
+                    if self._disabled_authoritative_observer is not None:
+                        self._disabled_authoritative_observer(target_layer, true_topk)
+                    return result
                 manager.observe_true_topk(target_layer, true_topk)
                 if self._authoritative_observer is not None:
                     self._authoritative_observer(target_layer, true_topk)

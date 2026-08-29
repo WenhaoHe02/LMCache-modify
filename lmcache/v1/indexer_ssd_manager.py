@@ -123,13 +123,12 @@ def _estimated_proxy_block_coverage(
     # otherwise the exchanged union represents one in ``stride`` query rows.
     sampled_queries = int(append_rows)
     if sampled_queries >= int(minimum_sample_span):
-        sampled_queries = (
-            sampled_queries + int(query_sample_stride) - 1
-        ) // int(query_sample_stride)
+        sampled_queries = (sampled_queries + int(query_sample_stride) - 1) // int(
+            query_sample_stride
+        )
     topk_blocks = max(
         1,
-        (int(topk_tokens) + DEEPGEMM_PAGED_BLOCK_SIZE - 1)
-        // DEEPGEMM_PAGED_BLOCK_SIZE,
+        (int(topk_tokens) + DEEPGEMM_PAGED_BLOCK_SIZE - 1) // DEEPGEMM_PAGED_BLOCK_SIZE,
     )
     draws = max(0, sampled_queries) * topk_blocks
     return 1.0 - math.exp(-float(draws) / float(history_blocks))
@@ -2250,9 +2249,7 @@ class IndexerSSDManager:
                 future.cancel()
             for layer_id, future in current:
                 try:
-                    work = future.result(
-                        timeout=max(0.0, deadline - time.monotonic())
-                    )
+                    work = future.result(timeout=max(0.0, deadline - time.monotonic()))
                     if callable(discard):
                         discard(work, status="request_deactivated")
                 except CancelledError:
@@ -2552,6 +2549,7 @@ class IndexerSSDManager:
             return
 
         for layer_id in pending_layer_ids:
+
             def _fire(
                 target_layer_id: int = layer_id,
                 token: Tuple[str, int] = request_token,
@@ -2898,7 +2896,11 @@ class IndexerSSDManager:
                                 num_blocks,
                                 self._proxy_block_budget,
                             ).to(torch.int32)
-                            if cp_context is not None and self._cp_exchange_proxy_ids:
+                            if (
+                                cp_context is not None
+                                and self._cp_exchange_proxy_ids
+                                and self._prefill_cp_exchanges_proxy_ids()
+                            ):
                                 import torch.distributed as dist
                                 from vllm.distributed import get_tp_group
 
@@ -3084,6 +3086,13 @@ class IndexerSSDManager:
         )
         dispatched_blocks = int(block_ids_tensor.numel())
         dispatched_batches = 0
+        io_future: Optional[Future[Any]] = None
+        fire_kwargs: dict[str, Any] = {
+            "prefetch_level": prefetch_level,
+            "request_token": request_token,
+        }
+        if self._prefill_cp_partition_mode() == "key_sharded_owner":
+            fire_kwargs["preserve_owner_partition"] = True
         with self._lock:
             expired = (
                 int(layer_id) in self._expired_proxy_layers
@@ -3092,12 +3101,25 @@ class IndexerSSDManager:
                 or request_id != self._csa_fired_request_id
                 or int(request_token[1]) != self._csa_fired_request_generation
             )
-            self._last_proxy_blocks[int(layer_id)] = (
-                [int(block_id) for block_id in block_ids_tensor.tolist()]
-                if not expired
-                else None
-            )
-        if dispatched_blocks and not expired:
+            if dispatched_blocks and not expired:
+                # Publish the candidate set and its I/O Future atomically.
+                # The target-layer gate treats a visible candidate set as a
+                # submitted prediction; exposing it before the Future lets the
+                # gate return without consuming deferred shard-gather work.
+                io_future = self._proxy_io_executor.submit(
+                    manager.fire_predicted_reads,
+                    layer_id,
+                    block_ids_tensor,
+                    **fire_kwargs,
+                )
+                self._proxy_futures[layer_id].append(io_future)
+                self._last_proxy_blocks[int(layer_id)] = [
+                    int(block_id) for block_id in block_ids_tensor.tolist()
+                ]
+                dispatched_batches = 1
+            else:
+                self._last_proxy_blocks[int(layer_id)] = None
+        if io_future is not None:
             self._log_timing(
                 "dispatch_csa_attention_kv_predicted",
                 layer_id,
@@ -3105,15 +3127,6 @@ class IndexerSSDManager:
                 blocks=dispatched_blocks,
                 mode="single_layer_batch",
             )
-            io_future = self._proxy_io_executor.submit(
-                manager.fire_predicted_reads,
-                layer_id,
-                block_ids_tensor,
-                prefetch_level=prefetch_level,
-                request_token=request_token,
-            )
-            with self._lock:
-                self._proxy_futures[layer_id].append(io_future)
 
             def _report_io_done(done_future: Future[Any]) -> None:
                 try:
@@ -3131,7 +3144,6 @@ class IndexerSSDManager:
                 # run on the aligned model-forward thread, not this callback.
 
             io_future.add_done_callback(_report_io_done)
-            dispatched_batches = 1
         proxy_ms = (time.perf_counter() - t0) * 1000.0
         self._log_timing(
             "prefill_fire_async",
@@ -3178,13 +3190,26 @@ class IndexerSSDManager:
             positions,
         )
         cp_context = self._prefill_cp_context(layer_id) if enable_prefill_cp else None
+        partition_mode = (
+            self._prefill_cp_partition_mode() if cp_context is not None else "query"
+        )
         query_sample_stride: Optional[int] = None
-        if cp_context is not None:
-            _rank, world_size, interleave, _oversubscribe = cp_context
+        if cp_context is not None and partition_mode in {
+            "query",
+            "key_history_only",
+            "key_sharded_early",
+            "key_sharded_union",
+            "key_contiguous_union",
+            "key_contiguous_replicated_append",
+            "key_sharded_owner",
+        }:
             query_sample_stride = _env_int(
                 "LMCACHE_CSA_PREFETCH_CP_QUERY_SAMPLE_STRIDE",
                 1,
             )
+        if cp_context is not None and partition_mode == "query":
+            _rank, world_size, interleave, _oversubscribe = cp_context
+            assert query_sample_stride is not None
             minimum_cp_span = (
                 int(world_size) * int(interleave) * int(query_sample_stride)
             )
@@ -3205,7 +3230,7 @@ class IndexerSSDManager:
                 cp_context = None
         preselected_query_rows: Optional[torch.Tensor] = None
         preselected_query_span: Optional[int] = None
-        if cp_context is not None:
+        if cp_context is not None and partition_mode == "query":
             from lmcache.v1.csa_prefill_cp_scorer import (
                 prefill_cp_query_indices,
             )
@@ -3221,6 +3246,32 @@ class IndexerSSDManager:
                 interleave,
                 residual_f.device,
                 sample_stride=query_sample_stride,
+            )
+            residual_f = residual_f.index_select(0, preselected_query_rows)
+            position_rows = preselected_query_rows
+            if positions.device != preselected_query_rows.device:
+                position_rows = preselected_query_rows.to(positions.device)
+            positions = positions.index_select(0, position_rows)
+            selected_rows = int(preselected_query_rows.numel())
+        elif cp_context is not None and partition_mode in {
+            "key_history_only",
+            "key_sharded_early",
+            "key_sharded_union",
+            "key_contiguous_union",
+            "key_contiguous_replicated_append",
+            "key_sharded_owner",
+        }:
+            from lmcache.v1.csa_prefill_cp_scorer import (
+                prefill_cp_sampled_query_indices,
+            )
+
+            assert query_sample_stride is not None
+            preselected_query_span = selected_rows
+            preselected_query_rows = prefill_cp_sampled_query_indices(
+                0,
+                selected_rows,
+                query_sample_stride,
+                residual_f.device,
             )
             residual_f = residual_f.index_select(0, preselected_query_rows)
             position_rows = preselected_query_rows
@@ -3248,6 +3299,7 @@ class IndexerSSDManager:
             indexer,
             rotary_emb,
             prefill_cp_context=cp_context,
+            prefill_cp_partition_mode=partition_mode,
             timing_events=timing_events,
             proxy_topk_tokens=proxy_topk_tokens,
             metadata_query_row_start=metadata_query_row_start,
@@ -3438,6 +3490,7 @@ class IndexerSSDManager:
         rotary_emb: Any,
         *,
         prefill_cp_context: Optional[Tuple[int, int, int, int]] = None,
+        prefill_cp_partition_mode: str = "query",
         timing_events: Optional[dict[str, Any]] = None,
         proxy_topk_tokens: Optional[int] = None,
         metadata_query_row_start: Optional[int] = None,
@@ -3539,6 +3592,7 @@ class IndexerSSDManager:
                         world_size=world_size,
                         interleave_size=interleave_size,
                         oversubscribe=oversubscribe,
+                        partition_mode=prefill_cp_partition_mode,
                         topk_tokens_override=proxy_width,
                         metadata_query_row_start=metadata_query_row_start,
                         preselected_query_rows=preselected_query_rows,
@@ -3610,6 +3664,22 @@ class IndexerSSDManager:
                 )
             return None
         return native_rank, native_world, interleave, oversubscribe
+
+    @staticmethod
+    def _prefill_cp_partition_mode() -> str:
+        """Return the validated optional query/K partition strategy."""
+        from lmcache.v1.csa_prefill_cp_scorer import resolve_prefill_cp_mode
+
+        return resolve_prefill_cp_mode()
+
+    @staticmethod
+    def _prefill_cp_exchanges_proxy_ids() -> bool:
+        """Return whether the configured partition needs an ID collective."""
+        from lmcache.v1.csa_prefill_cp_scorer import (
+            prefill_cp_requires_id_exchange,
+        )
+
+        return prefill_cp_requires_id_exchange()
 
     def _log_prefill_cp_fallback(self, layer_id: int, reason: str) -> None:
         """Log one prefill-only CP fallback reason per target layer."""
@@ -3810,23 +3880,16 @@ class IndexerSSDManager:
             )
             active_request_id = str(active_request_token[0] or "")
             active_request_generation = int(active_request_token[1])
-            producer_request_id = str(
-                getattr(self, "_csa_fired_request_id", "") or ""
-            )
+            producer_request_id = str(getattr(self, "_csa_fired_request_id", "") or "")
             producer_request_generation = int(
                 getattr(self, "_csa_fired_request_generation", -1)
             )
-            same_request = (
-                not active_request_id
-                or (
-                    active_request_id == producer_request_id
-                    and active_request_generation == producer_request_generation
-                )
+            same_request = not active_request_id or (
+                active_request_id == producer_request_id
+                and active_request_generation == producer_request_generation
             )
             futures = (
-                tuple(self._proxy_futures.get(layer_id, ()))
-                if same_request
-                else ()
+                tuple(self._proxy_futures.get(layer_id, ())) if same_request else ()
             )
             prediction_submitted = same_request and (
                 bool(futures) or bool(self._last_proxy_blocks.get(layer_id))
@@ -5161,25 +5224,37 @@ class IndexerSSDManager:
                 self._drain_cuda_events[int(layer_id)] = None
 
     def _proxy_stream_for(self, layer_id: int) -> torch.cuda.Stream:
-        """Return the reusable CUDA proxy stream for a target layer.
+        """Return the shared CUDA stream for speculative proxy work.
 
-        A per-layer stream keeps independent lookahead targets concurrent while
-        naturally ordering repeated work for the same target. Streams are
-        created lazily on the manager's active CUDA device and retained for the
-        manager lifetime.
+        Proxy scorers reuse one private K workspace. Ordering every target on
+        one side stream prevents another target from overwriting that workspace
+        while a custom scorer kernel still consumes it. The side stream still
+        overlaps prediction with the model stream.
 
         Args:
             layer_id: Target CSA layer whose proxy work will use the stream.
 
         Returns:
-            Reusable CUDA stream dedicated to ``layer_id``.
+            Reusable CUDA stream shared by all target layers.
         """
+        del layer_id
         with self._proxy_streams_lock:
-            stream = self._proxy_streams.get(int(layer_id))
+            stream = self._proxy_streams.get(-1)
             if stream is None:
                 stream = torch.cuda.Stream()
-                self._proxy_streams[int(layer_id)] = stream
+                self._proxy_streams[-1] = stream
             return stream
+
+    def order_true_indexer_after_proxy(self) -> None:
+        """Order the model stream after proxy scorer work already submitted."""
+        if self._device.type != "cuda" or not torch.cuda.is_available():
+            return
+        with self._proxy_streams_lock:
+            proxy_stream = self._proxy_streams.get(-1)
+        if proxy_stream is None:
+            return
+        with torch.cuda.device(self._device):
+            torch.cuda.current_stream(self._device).wait_stream(proxy_stream)
 
     def _acquire_proxy_cpu_selection(
         self,

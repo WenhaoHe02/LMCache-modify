@@ -51,6 +51,14 @@ def _accuracy_profile_enabled() -> bool:
     }
 
 
+def _decode_coverage_profile_enabled() -> bool:
+    """Return whether read-only decode residency telemetry is enabled."""
+    return os.environ.get(
+        "LMCACHE_GLM_DSA_DECODE_COVERAGE_PROFILE",
+        "0",
+    ).lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True, slots=True)
 class GLMDSAPredictionSchedule:
     """One early-prediction edge for an IndexShare group.
@@ -267,6 +275,10 @@ class GLMDSAPhysicalPrefetchSink:
                 "1",
             ).strip().lower() in {"1", "true", "yes", "on"}
         self._enable_prediction = bool(enable_prediction)
+        self._early_dense_group = os.getenv(
+            "LMCACHE_GLM_DSA_EARLY_DENSE_GROUP",
+            "0",
+        ).strip().lower() in {"1", "true", "yes", "on"}
         shared_prediction_value = (
             os.getenv(
                 "LMCACHE_GLM_DSA_PREDICT_SHARED_CONSUMERS",
@@ -311,18 +323,21 @@ class GLMDSAPhysicalPrefetchSink:
             thread_name_prefix="lmcache-glm-dsa-predict",
         )
         self._lock = RLock()
-        self._predicted_blocks: dict[int, torch.Tensor] = {}
+        self._predicted_blocks: dict[int, torch.Tensor | None] = {}
         self._staged_request_id: str | None = None
         self._pending_prediction_stages: dict[int, list[_StagedPrediction]] = (
             defaultdict(list)
         )
         self._staged_prediction_futures: dict[int, Future[Any]] = {}
+        self._decode_selected_blocks: dict[int, set[int]] = defaultdict(set)
+        self._decode_missing_blocks: dict[int, set[int]] = defaultdict(set)
         logger.info(
             "GLM DSA physical prediction reads enabled=%s block_budget=%d "
-            "shared_prediction_mode=%s",
+            "shared_prediction_mode=%s early_dense_group=%s",
             self._enable_prediction,
             self._prediction_block_budget,
             self._shared_prediction_mode,
+            self._early_dense_group,
         )
 
     def submit(self, event: GLMDSAPrefetchEvent) -> None:
@@ -336,12 +351,64 @@ class GLMDSAPhysicalPrefetchSink:
             return
         if not event.correction and not self._enable_prediction:
             return
+        consumers = event.schedule.consumer_layers
+        request_token = getattr(manager, "active_request_token", None)
+        if not event.correction and self._early_dense_group:
+            # Dense-group overlap is an opt-in alternative to sparse physical
+            # prediction.  The model predictor still decides *when* the group
+            # becomes available, while the storage path uses complete
+            # layer-major reads.  This avoids one fragmented indexed-read
+            # submission per predicted block and lets independent local layers
+            # overlap on the regular I/O executor.  TP-sharded deployments
+            # should leave this mode disabled because dense shard gather owns
+            # collective ordering separately.
+            with self._lock:
+                if self._staged_request_id != event.request_id:
+                    self._pending_prediction_stages.clear()
+                    self._staged_prediction_futures.clear()
+                    self._staged_request_id = event.request_id
+                self._predicted_blocks[event.schedule.target_layer] = None
+            for layer_id in consumers:
+                future = self._executor.submit(
+                    manager.fire_dense_layer,
+                    int(layer_id),
+                    request_token=request_token,
+                    source_layer_id=event.schedule.source_layer,
+                )
+                manager.track_layer_submission(
+                    int(layer_id),
+                    future,
+                    request_token=request_token,
+                )
+            return
+        if event.correction and self._early_dense_group:
+            # ``fire_dense_layer`` covers every registered block, so the
+            # authoritative top-K cannot discover a physical miss.  Avoid
+            # flattening/uniquing the full top-K tensor and rescanning the
+            # resident bitmap once per consumer.  Only the Full target is on
+            # the current critical path; later consumers keep their tracked
+            # dense futures and join them at their own attention gates.  In
+            # particular, do not eagerly join the whole group here, which
+            # would serialize otherwise-overlappable reads behind this Full
+            # layer.
+            target_layer = int(event.schedule.target_layer)
+            with self._lock:
+                self._predicted_blocks.pop(target_layer, None)
+                self._drop_pending_target_locked(target_layer)
+            if target_layer not in consumers:
+                return
+            if not manager.wait_for_layer(
+                target_layer,
+                timeout_s=self._gate_timeout_s(),
+            ):
+                raise RuntimeError(
+                    f"GLM DSA dense-group read timed out at layer {target_layer}"
+                )
+            return
         blocks = self._topk_to_blocks(
             event.topk_indices,
             block_budget=(None if event.correction else self._prediction_block_budget),
         )
-        consumers = event.schedule.consumer_layers
-        request_token = getattr(manager, "active_request_token", None)
         if event.correction:
             with self._lock:
                 predicted = self._predicted_blocks.pop(
@@ -582,6 +649,40 @@ class GLMDSAPhysicalPrefetchSink:
                 request_token=request_token,
             )
 
+    def profile_decode_authoritative(
+        self,
+        target_layer: int,
+        true_topk: torch.Tensor,
+    ) -> None:
+        """Accumulate decode coverage relative to append-prefill residency.
+
+        Args:
+            target_layer: Full indexer layer producing ``true_topk``.
+            true_topk: Authoritative decode top-K indices for this group.
+
+        Notes:
+            Enabled only by ``LMCACHE_GLM_DSA_DECODE_COVERAGE_PROFILE``. This
+            method performs no I/O and never changes the resident bitmap.
+        """
+        if not _decode_coverage_profile_enabled():
+            return
+        consumers = self._index_groups.get(int(target_layer), ())
+        manager = self._attention_kv_manager
+        if not consumers or not str(getattr(manager, "active_request_id", "")):
+            return
+        query = getattr(manager, "profile_topk_residency", None)
+        if not callable(query):
+            return
+        for layer_id in consumers:
+            selected, missing = query(int(layer_id), true_topk)
+            with self._lock:
+                self._decode_selected_blocks[int(layer_id)].update(
+                    int(value) for value in selected.tolist()
+                )
+                self._decode_missing_blocks[int(layer_id)].update(
+                    int(value) for value in missing.tolist()
+                )
+
     def wait_for_consumer(self, layer_id: int) -> bool:
         """Wait until one consumer layer's predicted/corrected KV has landed.
 
@@ -620,6 +721,32 @@ class GLMDSAPhysicalPrefetchSink:
         manager = self._attention_kv_manager
         if manager.active_request_id != str(request_id):
             return True
+        with self._lock:
+            selected = sum(
+                len(values) for values in self._decode_selected_blocks.values()
+            )
+            missing = sum(
+                len(values) for values in self._decode_missing_blocks.values()
+            )
+            per_layer = {
+                str(layer_id): {
+                    "selected": len(values),
+                    "missing": len(self._decode_missing_blocks.get(layer_id, ())),
+                }
+                for layer_id, values in sorted(self._decode_selected_blocks.items())
+            }
+        if selected:
+            logger.info(
+                "GLM_DSA_DECODE_COVERAGE request=%s selected_unique_blocks=%d "
+                "missing_unique_blocks=%d resident_unique_blocks=%d "
+                "resident_fraction=%.9f per_layer=%s",
+                request_id,
+                selected,
+                missing,
+                selected - missing,
+                (selected - missing) / selected,
+                per_layer,
+            )
         drained = manager.deactivate_request(timeout_s=self._gate_timeout_s())
         if not drained:
             return False
@@ -628,6 +755,8 @@ class GLMDSAPhysicalPrefetchSink:
             self._pending_prediction_stages.clear()
             self._staged_prediction_futures.clear()
             self._staged_request_id = None
+            self._decode_selected_blocks.clear()
+            self._decode_missing_blocks.clear()
         return True
 
     def close(self) -> None:
@@ -1062,6 +1191,10 @@ class GLMDSAPredictivePrefetchManager:
         self._submit_prefetch = submit_prefetch
         self._sample_rows = sample_rows
         self._enable_prediction = bool(enable_prediction)
+        self._early_dense_group_trigger = os.getenv(
+            "LMCACHE_GLM_DSA_EARLY_DENSE_GROUP",
+            "0",
+        ).strip().lower() in {"1", "true", "yes", "on"}
         self._by_source = dict(sources)
         self._by_target = targets
         self._lock = RLock()
@@ -1135,13 +1268,24 @@ class GLMDSAPredictivePrefetchManager:
         if request_id is None:
             return ()
 
-        activation = post_decoder_layer_activation(hidden_states, residual)
-        if activation.shape[0] != positions.shape[0]:
+        # Dense-group triggering depends only on the static layer schedule.
+        # Do not materialize the full post-MLP residual tensor when no proxy
+        # indexer will consume it; at long prefill lengths that addition is a
+        # large GPU kernel and allocation of its own.
+        activation = (
+            None
+            if self._early_dense_group_trigger
+            else post_decoder_layer_activation(hidden_states, residual)
+        )
+        activation_rows = (
+            hidden_states.shape[0] if activation is None else activation.shape[0]
+        )
+        if activation_rows != positions.shape[0]:
             logger.warning(
                 "GLM DSA prediction skipped at L%d: activation rows=%d, "
                 "position rows=%d",
                 source_layer,
-                activation.shape[0],
+                activation_rows,
                 positions.shape[0],
             )
             return ()
@@ -1154,15 +1298,26 @@ class GLMDSAPredictivePrefetchManager:
                 if csa_pipeline_nvtx.enabled
                 else None
             )
-            with csa_pipeline_nvtx.range(
-                CsaNvtxEvent.GLM_DSA_PREDICTION,
-                layer_id=int(source_layer),
-                target_layer_id=schedule.target_layer,
-                request_id=request_id,
-                operation_id=operation_id,
-                attributes={"kind": "glm_dsa", "group": schedule.group_id},
-            ):
-                topk = self._predictor(schedule, activation, positions)
+            if self._early_dense_group_trigger:
+                # The physical sink reads the complete consumer group, so its
+                # launch depends only on the deterministic schedule. Avoid
+                # computing proxy top-K that this mode deliberately ignores.
+                topk = torch.empty(
+                    (0, 0),
+                    dtype=torch.int64,
+                    device=positions.device,
+                )
+            else:
+                assert activation is not None
+                with csa_pipeline_nvtx.range(
+                    CsaNvtxEvent.GLM_DSA_PREDICTION,
+                    layer_id=int(source_layer),
+                    target_layer_id=schedule.target_layer,
+                    request_id=request_id,
+                    operation_id=operation_id,
+                    attributes={"kind": "glm_dsa", "group": schedule.group_id},
+                ):
+                    topk = self._predictor(schedule, activation, positions)
             if topk.ndim != 2:
                 raise ValueError("predictor must return a two-dimensional tensor")
             topk = topk.detach()

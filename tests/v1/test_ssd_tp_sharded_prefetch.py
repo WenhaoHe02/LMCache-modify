@@ -18,6 +18,7 @@ from lmcache.v1.ssd_tp_sharded_prefetch import (
     deterministic_block_union,
     parse_layer_ranges,
     partition_block_union,
+    partition_rank_local_blocks,
     rank_major_inverse_indices,
     stable_union_hash,
 )
@@ -102,6 +103,30 @@ def test_rank_major_inverse_skips_padding() -> None:
     assert partition.counts == (2, 2, 1)
     assert partition.padded_blocks == 2
     assert rank_major_inverse_indices(partition) == (0, 1, 2, 3, 4)
+
+
+def test_rank_local_partition_preserves_owner_and_deduplicates() -> None:
+    """Owner-compute candidates stay with their rank for the SSD read."""
+    partition = partition_rank_local_blocks(
+        ((8, 2, 8), (7, 2, 9), (), (5,)),
+    )
+
+    assert partition.union == (2, 5, 7, 8, 9)
+    assert partition.blocks_by_rank == ((2, 8), (7, 9), (), (5,))
+    assert partition.counts == (2, 2, 0, 1)
+    assert partition.padded_blocks == 2
+    assert rank_major_inverse_indices(partition) == (0, 6, 2, 1, 3)
+
+
+def test_rank_local_partition_applies_global_staging_limit() -> None:
+    """A global cap is identical across ranks without changing ownership."""
+    partition = partition_rank_local_blocks(
+        ((9, 1), (7, 3), (5,)),
+        max_union_blocks=4,
+    )
+
+    assert partition.union == (1, 3, 5, 7)
+    assert partition.blocks_by_rank == ((1,), (3, 7), (5,))
 
 
 def test_cp_row_ownership_covers_context_without_overlap() -> None:

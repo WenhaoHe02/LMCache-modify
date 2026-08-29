@@ -697,6 +697,28 @@ class ShardGatherTransport(Protocol):
     ) -> torch.Tensor:
         """Exchange rank-local predictions and return one global block union."""
 
+    def exchange_block_partition(
+        self,
+        local_block_ids: torch.Tensor,
+        *,
+        device: torch.device,
+    ) -> BlockPartition:
+        """Exchange rank-local predictions while preserving their owners."""
+
+    def gather_owner_rows_into(
+        self,
+        *,
+        local_block_ids: torch.Tensor,
+        local_ready: bool,
+        padded_blocks: int,
+        source_rows: torch.Tensor,
+        logical_destination_rows: torch.Tensor,
+        destination_rows: torch.Tensor,
+        local_ready_event: Optional[torch.cuda.Event],
+        resident_bitmap: torch.Tensor,
+    ) -> tuple[torch.cuda.Event, BlockPartition, bool]:
+        """AllGather owner KV rows with an in-stream block-ID sidecar."""
+
     def gather_into(
         self,
         descriptor: CollectiveDescriptor,
@@ -717,6 +739,8 @@ class ShardGatherTransport(Protocol):
 class _GatherSlot:
     send: torch.Tensor
     receive: torch.Tensor
+    send_ids: torch.Tensor
+    receive_ids: torch.Tensor
     completion_event: Optional[torch.cuda.Event] = None
 
 
@@ -867,6 +891,16 @@ class TorchDistributedShardGather:
                         dtype=torch.uint8,
                         device=device,
                     ),
+                    send_ids=torch.empty(
+                        padded + 1,
+                        dtype=torch.int64,
+                        device=device,
+                    ),
+                    receive_ids=torch.empty(
+                        self._world_size * (padded + 1),
+                        dtype=torch.int64,
+                        device=device,
+                    ),
                 )
                 for _ in range(self._config.staging_slots)
             ]
@@ -916,6 +950,54 @@ class TorchDistributedShardGather:
         Raises:
             ShardCollectiveError: If the metadata exchange fails.
         """
+        try:
+            rank_blocks = self._exchange_rank_block_ids(local_block_ids, device=device)
+            union = deterministic_block_union(
+                block_id for blocks in rank_blocks for block_id in blocks
+            )
+            return torch.as_tensor(
+                union[: self._max_union_blocks],
+                dtype=torch.int64,
+            )
+        except Exception as exc:
+            self._healthy = False
+            raise ShardCollectiveError(
+                "predicted block-union exchange failed",
+                data_submitted=False,
+            ) from exc
+
+    def exchange_block_partition(
+        self,
+        local_block_ids: torch.Tensor,
+        *,
+        device: torch.device,
+    ) -> BlockPartition:
+        """Exchange candidate IDs and retain the rank that selected each ID.
+
+        Duplicate IDs are assigned to the lowest selecting rank. The returned
+        descriptor is identical on every rank and can therefore drive the
+        existing KV-row AllGather without an exact distributed Top-K merge.
+        """
+        try:
+            rank_blocks = self._exchange_rank_block_ids(local_block_ids, device=device)
+            return partition_rank_local_blocks(
+                rank_blocks,
+                max_union_blocks=self._max_union_blocks,
+            )
+        except Exception as exc:
+            self._healthy = False
+            raise ShardCollectiveError(
+                "predicted owner-partition exchange failed",
+                data_submitted=False,
+            ) from exc
+
+    def _exchange_rank_block_ids(
+        self,
+        local_block_ids: torch.Tensor,
+        *,
+        device: torch.device,
+    ) -> tuple[tuple[int, ...], ...]:
+        """Return each rank's canonical candidate IDs on the CPU."""
         if not self._healthy:
             raise ShardCollectiveError(
                 "shard-gather metadata communicator is unhealthy",
@@ -927,69 +1009,183 @@ class TorchDistributedShardGather:
                 "shard-gather metadata resources are not warmed",
                 data_submitted=False,
             )
-        try:
-            metadata_stream = self._metadata_stream or torch.cuda.current_stream(
-                device
+        metadata_stream = self._metadata_stream or torch.cuda.current_stream(device)
+        with (
+            self._metadata_lock,
+            torch.cuda.device(device),
+            torch.inference_mode(),
+            torch.cuda.stream(metadata_stream),
+        ):
+            local = torch.as_tensor(
+                local_block_ids,
+                dtype=torch.int64,
+                device=device,
+            ).reshape(-1)
+            local = torch.unique(local[local >= 0], sorted=True)[:max_blocks]
+            payload = torch.full(
+                (max_blocks + 1,),
+                -1,
+                dtype=torch.int64,
+                device=device,
             )
-            with (
-                self._metadata_lock,
-                torch.cuda.device(device),
-                torch.inference_mode(),
-                torch.cuda.stream(metadata_stream),
-            ):
-                local = torch.as_tensor(
+            payload[0] = int(local.numel())
+            if local.numel():
+                payload[1 : 1 + int(local.numel())] = local
+            gathered = torch.empty(
+                self._world_size * (max_blocks + 1),
+                dtype=torch.int64,
+                device=device,
+            )
+            torch.distributed.all_gather_into_tensor(
+                gathered,
+                payload,
+                group=self._metadata_process_group,
+            )
+        metadata_stream.synchronize()
+        gathered_cpu = gathered.cpu().reshape(self._world_size, max_blocks + 1)
+        blocks_by_rank: list[tuple[int, ...]] = []
+        for rank_payload in gathered_cpu:
+            length = max(0, min(int(rank_payload[0].item()), max_blocks))
+            blocks_by_rank.append(
+                deterministic_block_union(rank_payload[1 : 1 + length].tolist())
+            )
+        return tuple(blocks_by_rank)
+
+    def gather_owner_rows_into(
+        self,
+        *,
+        local_block_ids: torch.Tensor,
+        local_ready: bool,
+        padded_blocks: int,
+        source_rows: torch.Tensor,
+        logical_destination_rows: torch.Tensor,
+        destination_rows: torch.Tensor,
+        local_ready_event: Optional[torch.cuda.Event],
+        resident_bitmap: torch.Tensor,
+    ) -> tuple[torch.cuda.Event, BlockPartition, bool]:
+        """AllGather owner rows and routing IDs without a pre-read union.
+
+        Every rank always enters both collectives. A negative sidecar count
+        advertises a failed local read; callers then use authoritative local
+        correction instead of publishing gathered rows.
+        """
+        if (
+            not self._healthy
+            or not self._slots
+            or self._stream is None
+            or padded_blocks <= 0
+        ):
+            raise ShardCollectiveError(
+                "owner gather resources are unavailable",
+                data_submitted=False,
+            )
+        data_submitted = False
+        try:
+            with self._lock, torch.inference_mode(), torch.cuda.stream(self._stream):
+                slot = self._slots[self._slot_cursor]
+                self._slot_cursor = (self._slot_cursor + 1) % len(self._slots)
+                if padded_blocks > int(slot.send.shape[0]):
+                    raise ValueError("owner gather exceeds warmed row capacity")
+                if slot.completion_event is not None:
+                    self._stream.wait_event(slot.completion_event)
+                if local_ready_event is not None:
+                    self._stream.wait_event(local_ready_event)
+
+                local_cpu = torch.as_tensor(
                     local_block_ids,
                     dtype=torch.int64,
-                    device=device,
+                    device="cpu",
                 ).reshape(-1)
-                local = torch.unique(local[local >= 0], sorted=True)
-                if int(local.numel()) > max_blocks:
-                    local = local[:max_blocks]
-                payload = torch.full(
-                    (max_blocks + 1,),
-                    -1,
-                    dtype=torch.int64,
-                    device=device,
+                local_cpu = torch.unique(local_cpu[local_cpu >= 0], sorted=True)
+                rank_ready = bool(
+                    local_ready and int(local_cpu.numel()) <= padded_blocks
                 )
-                payload[0] = int(local.numel())
-                if local.numel():
-                    payload[1 : 1 + int(local.numel())] = local
-                # Keep the NCCL receive buffer one-dimensional and do all
-                # variable-length parsing on CPU after the stream completes.
-                # Boolean indexing followed by ``torch.unique`` on this
-                # private CUDA stream caused misaligned-address faults on the
-                # serving H100 stack.  Metadata is only a few KiB, so CPU
-                # parsing is both safer and outside the model thread.
-                gathered = torch.empty(
-                    self._world_size * (max_blocks + 1),
-                    dtype=torch.int64,
-                    device=device,
+                local_gpu = local_cpu.to(source_rows.device)
+                slot.send[:padded_blocks].zero_()
+                slot.send_ids[: padded_blocks + 1].fill_(-1)
+                slot.send_ids[0] = int(local_cpu.numel()) if rank_ready else -1
+                if rank_ready and local_gpu.numel():
+                    local_rows = logical_destination_rows.index_select(0, local_gpu)
+                    torch.index_select(
+                        source_rows,
+                        0,
+                        local_rows,
+                        out=slot.send[: int(local_gpu.numel())],
+                    )
+                    slot.send_ids[1 : 1 + int(local_gpu.numel())] = local_gpu
+                data_submitted = True
+                gathered_rows = padded_blocks * self._world_size
+                data_work = torch.distributed.all_gather_into_tensor(
+                    slot.receive[:gathered_rows],
+                    slot.send[:padded_blocks],
+                    group=self._process_group,
+                    async_op=True,
                 )
-                torch.distributed.all_gather_into_tensor(
-                    gathered,
-                    payload,
-                    group=self._metadata_process_group,
+                id_width = padded_blocks + 1
+                id_work = torch.distributed.all_gather_into_tensor(
+                    slot.receive_ids[: self._world_size * id_width],
+                    slot.send_ids[:id_width],
+                    group=self._process_group,
+                    async_op=True,
                 )
-            metadata_stream.synchronize()
-            gathered_cpu = gathered.cpu().reshape(
-                self._world_size,
-                max_blocks + 1,
-            )
-            rank_blocks: list[torch.Tensor] = []
-            for rank_payload in gathered_cpu:
-                length = max(0, min(int(rank_payload[0].item()), max_blocks))
-                if length:
-                    rank_blocks.append(rank_payload[1 : 1 + length])
-            if not rank_blocks:
-                return torch.empty(0, dtype=torch.int64)
-            union = torch.unique(torch.cat(rank_blocks), sorted=True)
-            return union[:max_blocks]
+                data_work.wait()
+                id_work.wait()
+            self._stream.synchronize()
+
+            payloads = slot.receive_ids[
+                : self._world_size * (padded_blocks + 1)
+            ].cpu().reshape(self._world_size, padded_blocks + 1)
+            all_ready = all(int(payload[0].item()) >= 0 for payload in payloads)
+            rank_blocks: list[tuple[int, ...]] = []
+            for payload in payloads:
+                count = max(0, min(int(payload[0].item()), padded_blocks))
+                rank_blocks.append(
+                    deterministic_block_union(payload[1 : 1 + count].tolist())
+                )
+            partition = partition_rank_local_blocks(rank_blocks)
+            with torch.inference_mode(), torch.cuda.stream(self._stream):
+                if all_ready and partition.union:
+                    positions: list[int] = []
+                    for rank, blocks in enumerate(partition.blocks_by_rank):
+                        positions.extend(
+                            rank * padded_blocks + offset
+                            for offset in range(len(blocks))
+                        )
+                    position_tensor = torch.as_tensor(
+                        positions,
+                        dtype=torch.int64,
+                        device=source_rows.device,
+                    )
+                    union_tensor = torch.as_tensor(
+                        tuple(
+                            block_id
+                            for blocks in partition.blocks_by_rank
+                            for block_id in blocks
+                        ),
+                        dtype=torch.int64,
+                        device=source_rows.device,
+                    )
+                    gathered = slot.receive[:gathered_rows].index_select(
+                        0,
+                        position_tensor,
+                    )
+                    destination = logical_destination_rows.index_select(
+                        0,
+                        union_tensor,
+                    )
+                    destination_rows.index_copy_(0, destination, gathered)
+                    resident_bitmap[union_tensor] = True
+                event = torch.cuda.Event()
+                event.record(self._stream)
+                slot.completion_event = event
+            return event, partition, all_ready
         except Exception as exc:
             self._healthy = False
             raise ShardCollectiveError(
-                "predicted block-union exchange failed",
-                data_submitted=False,
+                "owner KV gather failed",
+                data_submitted=data_submitted,
             ) from exc
+
 
     def preflight(
         self,
@@ -1351,6 +1547,62 @@ def partition_block_union(
     return BlockPartition(
         union=union,
         blocks_by_rank=tuple(partitions),
+        padded_blocks=padded,
+        union_hash=stable_union_hash(union),
+    )
+
+
+def partition_rank_local_blocks(
+    rank_block_ids: Sequence[Sequence[int]],
+    *,
+    max_union_blocks: Optional[int] = None,
+) -> BlockPartition:
+    """Preserve rank-local candidate ownership in one collective descriptor.
+
+    Args:
+        rank_block_ids: Candidate block IDs selected independently by each rank.
+        max_union_blocks: Optional global staging limit. The canonical union is
+            truncated before ownership is materialized.
+
+    Returns:
+        A deterministic partition. Duplicate candidates are owned by the
+        lowest rank that selected them.
+
+    Raises:
+        ValueError: If there are no ranks, the limit is invalid, or an ID is
+            negative.
+    """
+    if not rank_block_ids:
+        raise ValueError("rank_block_ids must contain at least one rank")
+    if max_union_blocks is not None and max_union_blocks <= 0:
+        raise ValueError("max_union_blocks must be positive")
+    canonical_by_rank = tuple(
+        deterministic_block_union(block_ids) for block_ids in rank_block_ids
+    )
+    union = deterministic_block_union(
+        tuple(
+            block_id
+            for blocks in canonical_by_rank
+            for block_id in blocks
+        )
+    )
+    if max_union_blocks is not None:
+        union = union[:max_union_blocks]
+    retained = set(union)
+    claimed: set[int] = set()
+    owners: list[tuple[int, ...]] = []
+    for blocks in canonical_by_rank:
+        owned = tuple(
+            block_id
+            for block_id in blocks
+            if block_id in retained and block_id not in claimed
+        )
+        claimed.update(owned)
+        owners.append(owned)
+    padded = max((len(blocks) for blocks in owners), default=0)
+    return BlockPartition(
+        union=union,
+        blocks_by_rank=tuple(owners),
         padded_blocks=padded,
         union_hash=stable_union_hash(union),
     )

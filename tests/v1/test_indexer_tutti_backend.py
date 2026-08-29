@@ -21,11 +21,20 @@ from lmcache.v1.indexer_ssd_manager import (
     TuttiIndexerBlockStore,
 )
 from lmcache.v1.csa_prefill_cp_scorer import (
+    gather_prefill_cp_local_k_rows,
     globalize_prefill_cp_topk,
+    localize_prefill_cp_bounds,
+    prefill_cp_contiguous_history_with_replicated_append,
+    prefill_cp_contiguous_key_block_partition,
+    prefill_cp_key_block_partition,
     prefill_cp_key_indices,
+    prefill_cp_key_indices_with_append,
     prefill_cp_local_topk_tokens,
     prefill_cp_query_indices,
     prefill_cp_query_ranges,
+    prefill_cp_sampled_query_indices,
+    prefill_cp_requires_id_exchange,
+    resolve_prefill_cp_mode,
 )
 from lmcache.v1.indexer_tutti_backend import TuttiIndexerStorage
 
@@ -640,6 +649,247 @@ def test_prefill_cp_partitions_cover_k_once_and_bound_union_budget() -> None:
     assert torch.equal(merged, torch.arange(100))
     assert prefill_cp_local_topk_tokens(2048, 8) == 256
     assert prefill_cp_local_topk_tokens(2048, 8, oversubscribe=2) == 512
+
+
+def test_prefill_cp_replicated_append_shards_only_history() -> None:
+    """Replicated-append K mode owns history once and append on every rank."""
+    total_tokens = 38
+    append_start = 26
+    partitions = [
+        prefill_cp_key_indices_with_append(
+            total_tokens,
+            append_start,
+            rank,
+            world_size=4,
+            interleave_size=3,
+            device=torch.device("cpu"),
+            replicate_append=True,
+        )
+        for rank in range(4)
+    ]
+
+    history = torch.cat([part[part < append_start] for part in partitions])
+    assert torch.equal(history.sort().values, torch.arange(append_start))
+    expected_append = torch.arange(append_start, total_tokens)
+    for partition in partitions:
+        assert torch.equal(partition[partition >= append_start], expected_append)
+        assert torch.equal(partition, partition.sort().values)
+
+
+def test_prefill_cp_sharded_append_owns_every_k_row_once() -> None:
+    """Fully sharded K mode partitions history and append without overlap."""
+    partitions = [
+        prefill_cp_key_indices_with_append(
+            38,
+            append_start=26,
+            rank=rank,
+            world_size=4,
+            interleave_size=3,
+            device=torch.device("cpu"),
+            replicate_append=False,
+        )
+        for rank in range(4)
+    ]
+
+    merged = torch.cat(partitions).sort().values
+    assert torch.equal(merged, torch.arange(38))
+
+
+@pytest.mark.parametrize("value_dtype", [torch.uint8, torch.float8_e4m3fn])
+def test_prefill_cp_gathers_only_local_paged_k_rows(
+    value_dtype: torch.dtype,
+) -> None:
+    """Direct K gather follows the block table without materializing full K."""
+    cache = torch.empty((3, 4, 6), dtype=torch.uint8)
+    for physical_block in range(3):
+        for block_offset in range(4):
+            cache[physical_block, block_offset] = torch.arange(
+                6,
+                dtype=torch.uint8,
+            ).add_(physical_block * 40 + block_offset * 6)
+    block_table = torch.tensor([[2, 0, 1]], dtype=torch.int32)
+    selected = torch.tensor([0, 3, 4, 7, 8, 10], dtype=torch.int64)
+
+    values, scales = gather_prefill_cp_local_k_rows(
+        cache,
+        block_table,
+        selected,
+        value_bytes=4,
+        scale_bytes=2,
+        value_dtype=value_dtype,
+    )
+
+    logical_blocks = selected // 4
+    offsets = selected % 4
+    physical_blocks = block_table[0].index_select(0, logical_blocks)
+    expected = cache[physical_blocks.long(), offsets]
+    assert values.dtype == value_dtype
+    assert torch.equal(values.view(torch.uint8), expected[:, :4])
+    assert torch.equal(scales, expected[:, 4:])
+    assert values.shape[0] == selected.numel()
+
+
+def test_prefill_cp_block_partition_covers_k_once() -> None:
+    """Native block gathers partition every valid K row exactly once."""
+    partitions = [
+        prefill_cp_key_block_partition(
+            total_tokens=38,
+            rank=rank,
+            world_size=4,
+            interleave_blocks=1,
+            block_size=4,
+            device=torch.device("cpu"),
+        )
+        for rank in range(4)
+    ]
+
+    logical_blocks = torch.cat([partition[0] for partition in partitions])
+    global_rows = torch.cat([partition[1] for partition in partitions])
+    assert torch.equal(logical_blocks.sort().values, torch.arange(10))
+    assert torch.equal(global_rows.sort().values, torch.arange(38))
+
+
+def test_prefill_cp_contiguous_block_partition_covers_k_once() -> None:
+    """Contiguous K shards cover every block and token exactly once."""
+    partitions = [
+        prefill_cp_contiguous_key_block_partition(
+            total_tokens=38,
+            rank=rank,
+            world_size=4,
+            block_size=4,
+            device=torch.device("cpu"),
+        )
+        for rank in range(4)
+    ]
+
+    logical_blocks = torch.cat([partition[0] for partition in partitions])
+    global_rows = torch.cat([partition[1] for partition in partitions])
+    assert torch.equal(logical_blocks, torch.arange(10))
+    assert torch.equal(global_rows, torch.arange(38))
+    for logical, _rows in partitions:
+        if logical.numel() > 1:
+            deltas = logical[1:] - logical[:-1]
+            assert torch.equal(deltas, torch.ones_like(deltas))
+
+
+def test_prefill_cp_contiguous_history_replicates_only_append() -> None:
+    """History is disjoint while every rank receives all append rows."""
+    partitions = [
+        prefill_cp_contiguous_history_with_replicated_append(
+            total_tokens=48,
+            append_start=32,
+            rank=rank,
+            world_size=4,
+            block_size=4,
+            device=torch.device("cpu"),
+        )
+        for rank in range(4)
+    ]
+
+    history_rows = torch.cat([rows[rows < 32] for _blocks, rows in partitions])
+    assert torch.equal(history_rows.sort().values, torch.arange(32))
+    for _blocks, rows in partitions:
+        assert torch.equal(rows[rows >= 32], torch.arange(32, 48))
+
+
+def test_prefill_cp_localizes_causal_bounds_for_compact_k() -> None:
+    """Global causal intervals map to the correct compact K offsets."""
+    local_keys = torch.tensor([0, 2, 4, 6, 7, 8], dtype=torch.int64)
+    starts, ends = localize_prefill_cp_bounds(
+        local_keys,
+        torch.tensor([0, 3, 7], dtype=torch.int32),
+        torch.tensor([5, 7, 9], dtype=torch.int32),
+    )
+
+    assert starts.tolist() == [0, 2, 4]
+    assert ends.tolist() == [3, 4, 6]
+    assert starts.dtype == torch.int32
+    assert ends.dtype == torch.int32
+
+
+@pytest.mark.parametrize(
+    ("mode", "needs_exchange"),
+    [
+        ("query", True),
+        ("key_history_only", False),
+        ("key_sharded_early", False),
+        ("key_sharded_union", True),
+        ("key_contiguous_union", True),
+        ("key_contiguous_replicated_append", True),
+        ("key_sharded_owner", False),
+        ("key_replicated_append", False),
+        ("key_sharded_append", False),
+    ],
+)
+def test_prefill_cp_mode_controls_candidate_exchange(
+    mode: str,
+    needs_exchange: bool,
+) -> None:
+    """Only explicitly unioned modes perform a candidate collective."""
+    assert resolve_prefill_cp_mode(mode) == mode
+    assert prefill_cp_requires_id_exchange(mode) is needs_exchange
+
+
+def test_prefill_cp_mode_rejects_unknown_value() -> None:
+    """A misspelled opt-in mode fails instead of changing prediction silently."""
+    with pytest.raises(ValueError, match="unsupported speculative CP mode"):
+        resolve_prefill_cp_mode("key_magic")
+
+
+def test_prefill_cp_mode_defaults_to_existing_query_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Leaving the new option unset preserves the deployed query partition."""
+    monkeypatch.delenv("LMCACHE_CSA_PREFETCH_CP_MODE", raising=False)
+
+    assert resolve_prefill_cp_mode() == "query"
+    assert prefill_cp_requires_id_exchange() is True
+
+
+def test_prefill_cp_k_shards_share_the_same_sampled_queries() -> None:
+    """K-sharded ranks retain the configured Q sampling reduction."""
+    sampled = prefill_cp_sampled_query_indices(
+        100,
+        113,
+        sample_stride=4,
+        device=torch.device("cpu"),
+    )
+
+    assert sampled.tolist() == [100, 104, 108, 112]
+
+
+def test_prefill_cp_history_only_never_scores_resident_append() -> None:
+    """History-only K shards cover cached rows once and exclude append rows."""
+    history_tokens = 26
+    total_tokens = 38
+    partitions = [
+        prefill_cp_key_indices(
+            history_tokens,
+            rank=rank,
+            world_size=4,
+            interleave_size=3,
+            device=torch.device("cpu"),
+        )
+        for rank in range(4)
+    ]
+
+    merged = torch.cat(partitions).sort().values
+    assert torch.equal(merged, torch.arange(history_tokens))
+    assert all(torch.all(partition < total_tokens - 12) for partition in partitions)
+
+
+def test_prefill_cp_append_boundary_is_validated() -> None:
+    """K partitioning rejects append offsets outside the logical K range."""
+    with pytest.raises(ValueError, match="append_start"):
+        prefill_cp_key_indices_with_append(
+            8,
+            append_start=9,
+            rank=0,
+            world_size=2,
+            interleave_size=1,
+            device=torch.device("cpu"),
+            replicate_append=True,
+        )
 
 
 def test_prefill_cp_query_partitions_cover_each_row_once() -> None:
