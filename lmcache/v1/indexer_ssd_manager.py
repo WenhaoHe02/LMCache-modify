@@ -1149,11 +1149,6 @@ class IndexerSSDManager:
         self._proxy_io_executor = ThreadPoolExecutor(
             max_workers=max(2, min(io_workers, 4))
         )
-        # Predicted owner gathers are collectives and must enter NCCL in the
-        # same layer order on every rank. Local SSD reads may finish out of
-        # order on the wider I/O pool; this FIFO waits for them in submission
-        # order and can move the collective into the lookahead window.
-        self._predicted_collective_executor = ThreadPoolExecutor(max_workers=1)
         # Direct LMCache seed persistence is latency-insensitive and may wait
         # for Tutti's idle-write window. Keep it off the general I/O executor:
         # HCA submissions and HBM-pool readiness must never queue behind the
@@ -3168,35 +3163,12 @@ class IndexerSSDManager:
                 # The target-layer gate treats a visible candidate set as a
                 # submitted prediction; exposing it before the Future lets the
                 # gate return without consuming deferred shard-gather work.
-                read_future = self._proxy_io_executor.submit(
+                io_future = self._proxy_io_executor.submit(
                     manager.fire_predicted_reads,
                     layer_id,
                     block_ids_tensor,
                     **fire_kwargs,
                 )
-                io_future = read_future
-                if partition_mode in {
-                    "key_sharded_owner",
-                    "key_contiguous_owner",
-                } and _env_flag("LMCACHE_SSD_TP_EARLY_COLLECTIVE"):
-
-                    def _finalize_in_prediction_window(
-                        pending_read: Future[Any] = read_future,
-                        csa_manager: Any = manager,
-                    ) -> Any:
-                        prepared = pending_read.result()
-                        finalize = getattr(
-                            csa_manager,
-                            "finalize_deferred_shard_gather",
-                            None,
-                        )
-                        if callable(finalize) and finalize(prepared):
-                            return True
-                        return prepared
-
-                    io_future = self._predicted_collective_executor.submit(
-                        _finalize_in_prediction_window
-                    )
                 self._proxy_futures[layer_id].append(io_future)
                 self._last_proxy_blocks[int(layer_id)] = [
                     int(block_id) for block_id in block_ids_tensor.tolist()
@@ -3223,9 +3195,8 @@ class IndexerSSDManager:
                         "failed for layer %d",
                         layer_id,
                     )
-                # Keep the completed Future in _proxy_futures until the target
-                # gate consumes it. With early collectives enabled the Future
-                # already includes the ordered owner gather.
+                # Keep the completed Future in _proxy_futures until the true
+                # target-layer gate consumes its result.
 
             io_future.add_done_callback(_report_io_done)
         proxy_ms = (time.perf_counter() - t0) * 1000.0
@@ -5093,7 +5064,6 @@ class IndexerSSDManager:
         self._closed = True
         self._proxy_executor.shutdown(wait=True)
         self._proxy_io_executor.shutdown(wait=True)
-        self._predicted_collective_executor.shutdown(wait=True)
         self._executor.shutdown(wait=True)
         self._dense_shard_executor.shutdown(wait=True)
         self._persistence_executor.shutdown(wait=True)

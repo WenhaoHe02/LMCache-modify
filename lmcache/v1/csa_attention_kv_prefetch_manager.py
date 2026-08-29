@@ -92,7 +92,6 @@ from lmcache.v1.ssd_tp_sharded_prefetch import (
     ShardPrefetchDecisionTable,
     bucket_prefetch_key,
     compile_cp_read_plan,
-    owner_gather_padded_blocks,
     partition_block_union,
     partition_rank_local_blocks,
 )
@@ -4893,7 +4892,7 @@ class CSAAttentionKVPrefetchManager:
                         int(state.k_cache_tensor.shape[0]),
                         -1,
                     )
-                    owner_capacity = max(
+                    padded_blocks = max(
                         1,
                         int(
                             os.environ.get(
@@ -4901,15 +4900,6 @@ class CSAAttentionKVPrefetchManager:
                                 "64",
                             )
                         ),
-                    )
-                    total_blocks = min(
-                        int(state.chunks[-1].end_compressed_block),
-                        int(state.in_pool_bitmap.numel()),
-                    )
-                    padded_blocks = owner_gather_padded_blocks(
-                        total_blocks,
-                        transport.world_size,
-                        owner_capacity,
                     )
                     gather_event, partition, all_reads_ready = (
                         transport.gather_owner_rows_into(
