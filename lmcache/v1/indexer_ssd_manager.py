@@ -188,17 +188,38 @@ def _env_int(name: str, default: int) -> int:
 def _proxy_candidate_block_budget(
     configured_budget: int,
     partition_mode: str,
+    world_size: int = 1,
 ) -> int:
-    """Return a producer budget compatible with the selected transport."""
+    """Return a producer budget compatible with the selected transport.
+
+    Args:
+        configured_budget: Global candidate-block budget for one target layer.
+        partition_mode: Active speculative CP partition mode.
+        world_size: Speculative CP group size; used only by modes whose
+            per-rank candidates are unioned across ranks afterwards.
+
+    Returns:
+        Maximum candidate blocks this rank may emit for one target layer.
+
+    Raises:
+        ValueError: If the configured budget or world size is not positive.
+    """
     if configured_budget <= 0:
         raise ValueError("configured proxy block budget must be positive")
-    if partition_mode not in {"key_sharded_owner", "key_contiguous_owner"}:
-        return configured_budget
-    owner_blocks_per_rank = max(
-        1,
-        _env_int("LMCACHE_CSA_OWNER_BLOCKS_PER_RANK", 64),
-    )
-    return min(configured_budget, owner_blocks_per_rank)
+    if world_size <= 0:
+        raise ValueError("world_size must be positive")
+    if partition_mode in {"key_sharded_owner", "key_contiguous_owner"}:
+        owner_blocks_per_rank = max(
+            1,
+            _env_int("LMCACHE_CSA_OWNER_BLOCKS_PER_RANK", 64),
+        )
+        return min(configured_budget, owner_blocks_per_rank)
+    if partition_mode == "key_sharded_local":
+        # Each rank's bounded IDs are exchanged and every rank reads the
+        # union locally, so the per-rank share keeps the final union at the
+        # configured budget instead of ``world_size`` times it.
+        return max(1, (configured_budget + world_size - 1) // world_size)
+    return configured_budget
 
 
 def _proxy_topk_tokens_by_layer(spec: str) -> dict[int, int]:
@@ -1128,6 +1149,11 @@ class IndexerSSDManager:
         self._proxy_io_executor = ThreadPoolExecutor(
             max_workers=max(2, min(io_workers, 4))
         )
+        # Predicted owner gathers are collectives and must enter NCCL in the
+        # same layer order on every rank. Local SSD reads may finish out of
+        # order on the wider I/O pool; this FIFO waits for them in submission
+        # order and can move the collective into the lookahead window.
+        self._predicted_collective_executor = ThreadPoolExecutor(max_workers=1)
         # Direct LMCache seed persistence is latency-insensitive and may wait
         # for Tutti's idle-write window. Keep it off the general I/O executor:
         # HCA submissions and HBM-pool readiness must never queue behind the
@@ -2914,6 +2940,7 @@ class IndexerSSDManager:
                             candidate_block_budget = _proxy_candidate_block_budget(
                                 self._proxy_block_budget,
                                 partition_mode,
+                                int(cp_context[1]) if cp_context is not None else 1,
                             )
                             selected_blocks = _select_rank_local_proxy_blocks(
                                 selected_topk,
@@ -3116,11 +3143,18 @@ class IndexerSSDManager:
             "prefetch_level": prefetch_level,
             "request_token": request_token,
         }
-        if self._prefill_cp_partition_mode() in {
+        partition_mode = self._prefill_cp_partition_mode()
+        if partition_mode in {
             "key_sharded_owner",
             "key_contiguous_owner",
         }:
             fire_kwargs["preserve_owner_partition"] = True
+        if self._prefill_cp_reads_rank_local():
+            # Every rank holds a complete replica, so a rank may serve any
+            # candidate in the exchanged union from its own SSD without a
+            # KV-row collective. The union restores full-budget coverage
+            # while scoring cost stays sharded.
+            fire_kwargs["shard_local_only"] = True
         with self._lock:
             expired = (
                 int(layer_id) in self._expired_proxy_layers
@@ -3134,12 +3168,35 @@ class IndexerSSDManager:
                 # The target-layer gate treats a visible candidate set as a
                 # submitted prediction; exposing it before the Future lets the
                 # gate return without consuming deferred shard-gather work.
-                io_future = self._proxy_io_executor.submit(
+                read_future = self._proxy_io_executor.submit(
                     manager.fire_predicted_reads,
                     layer_id,
                     block_ids_tensor,
                     **fire_kwargs,
                 )
+                io_future = read_future
+                if partition_mode in {
+                    "key_sharded_owner",
+                    "key_contiguous_owner",
+                } and _env_flag("LMCACHE_SSD_TP_EARLY_COLLECTIVE"):
+
+                    def _finalize_in_prediction_window(
+                        pending_read: Future[Any] = read_future,
+                        csa_manager: Any = manager,
+                    ) -> Any:
+                        prepared = pending_read.result()
+                        finalize = getattr(
+                            csa_manager,
+                            "finalize_deferred_shard_gather",
+                            None,
+                        )
+                        if callable(finalize) and finalize(prepared):
+                            return True
+                        return prepared
+
+                    io_future = self._predicted_collective_executor.submit(
+                        _finalize_in_prediction_window
+                    )
                 self._proxy_futures[layer_id].append(io_future)
                 self._last_proxy_blocks[int(layer_id)] = [
                     int(block_id) for block_id in block_ids_tensor.tolist()
@@ -3166,10 +3223,9 @@ class IndexerSSDManager:
                         "failed for layer %d",
                         layer_id,
                     )
-                # Keep the completed Future in _proxy_futures until the true
-                # target-layer gate consumes its result. TP-sharded predicted
-                # reads return rank-local work whose private collective must
-                # run on the aligned model-forward thread, not this callback.
+                # Keep the completed Future in _proxy_futures until the target
+                # gate consumes it. With early collectives enabled the Future
+                # already includes the ordered owner gather.
 
             io_future.add_done_callback(_report_io_done)
         proxy_ms = (time.perf_counter() - t0) * 1000.0
@@ -3227,6 +3283,7 @@ class IndexerSSDManager:
             "key_history_only",
             "key_sharded_early",
             "key_sharded_union",
+            "key_sharded_local",
             "key_contiguous_union",
             "key_contiguous_replicated_append",
             "key_sharded_owner",
@@ -3286,6 +3343,7 @@ class IndexerSSDManager:
             "key_history_only",
             "key_sharded_early",
             "key_sharded_union",
+            "key_sharded_local",
             "key_contiguous_union",
             "key_contiguous_replicated_append",
             "key_sharded_owner",
@@ -3623,6 +3681,7 @@ class IndexerSSDManager:
                         interleave_size=interleave_size,
                         oversubscribe=oversubscribe,
                         partition_mode=prefill_cp_partition_mode,
+                        workspace_slot=self._proxy_workspace_slot_for(layer_id),
                         topk_tokens_override=proxy_width,
                         metadata_query_row_start=metadata_query_row_start,
                         preselected_query_rows=preselected_query_rows,
@@ -3710,6 +3769,24 @@ class IndexerSSDManager:
         )
 
         return prefill_cp_requires_id_exchange()
+
+    @staticmethod
+    def _prefill_cp_reads_rank_local() -> bool:
+        """Return whether predicted reads bypass every TP shard collective."""
+        from lmcache.v1.csa_prefill_cp_scorer import (
+            prefill_cp_reads_rank_local,
+        )
+
+        return prefill_cp_reads_rank_local()
+
+    @staticmethod
+    def _prediction_gate_fails_open() -> bool:
+        """Return whether the target gate skips joining speculative futures."""
+        from lmcache.v1.csa_prefill_cp_scorer import (
+            resolve_prediction_gate_policy,
+        )
+
+        return resolve_prediction_gate_policy() == "fail_open"
 
     def _log_prefill_cp_fallback(self, layer_id: int, reason: str) -> None:
         """Log one prefill-only CP fallback reason per target layer."""
@@ -3888,12 +3965,26 @@ class IndexerSSDManager:
         Otherwise the target can skip a block merely because it is pending and
         run attention before that block has landed.
 
+        Under the ``fail_open`` gate policy
+        (:func:`lmcache.v1.csa_prefill_cp_scorer.resolve_prediction_gate_policy`)
+        this gate never blocks on speculative work: it closes the target's
+        submission window (so a late proxy result is dropped by the producer's
+        expiry check), harvests futures that already completed, cancels work
+        that is still queued, and skips — without joining — work that is
+        already running, leaving it tracked for request teardown. The caller
+        then treats the prediction as not ready and resolves any in-flight
+        read bookings via its own pending-read barrier before attention. The
+        policy is honoured only when the prediction path creates no deferred
+        KV-row collective, i.e. with rank-local predicted reads or without
+        gate-aligned TP shard-gather.
+
         Args:
             layer_id: CSA layer whose async proxy prediction should be joined.
 
         Returns:
             ``True`` when every prediction completed, or ``False`` when at
-            least one queued prediction was cancelled.
+            least one queued prediction was cancelled or a fail-open gate
+            skipped still-running work.
 
         Raises:
             RuntimeError: If running prediction work fails or does not finish
@@ -3901,6 +3992,7 @@ class IndexerSSDManager:
         """
         gate_start = time.perf_counter()
         layer_id = int(layer_id)
+        requested_fail_open = self._prediction_gate_fails_open()
         with self._lock:
             manager = getattr(self, "_csa_attention_kv_manager", None)
             active_request_token = getattr(
@@ -3925,7 +4017,7 @@ class IndexerSSDManager:
                 bool(futures) or bool(self._last_proxy_blocks.get(layer_id))
             )
             ready = prediction_submitted and all(future.done() for future in futures)
-            gate_aligned = bool(
+            transport_gate_aligned = bool(
                 callable(
                     uses_gate_aligned := getattr(
                         manager,
@@ -3935,6 +4027,15 @@ class IndexerSSDManager:
                 )
                 and uses_gate_aligned()
             )
+            # Fail-open is honoured only when this rank's prediction path
+            # cannot have produced deferred collective work: either sharding
+            # is not gate-aligned at all, or predicted reads are rank-local.
+            # Otherwise skipping the join would strand a KV-row collective
+            # and deadlock the remaining ranks at their gates.
+            fail_open = requested_fail_open and (
+                not transport_gate_aligned or self._prefill_cp_reads_rank_local()
+            )
+            gate_aligned = transport_gate_aligned and not fail_open
             # A target with no submitted prediction has already passed its
             # only consumption gate. Expire it even in gate-aligned mode so a
             # late proxy callback cannot enqueue rank-local shard work that no
@@ -3974,6 +4075,7 @@ class IndexerSSDManager:
 
         cancelled = False
         running_count = 0
+        skipped_futures: list[Future[Any]] = []
         timeout_s = max(
             0.0,
             float(getattr(self, "_prediction_gate_timeout_s", 5.0)),
@@ -3994,6 +4096,16 @@ class IndexerSSDManager:
                     cancelled = True
                     continue
                 if not future.done():
+                    if fail_open:
+                        # The submission window is already closed above, so a
+                        # still-running producer either drops its result at
+                        # the expiry check or finishes a rank-local read in
+                        # the background. Correction reports the prediction
+                        # as not ready and re-verifies residency after its
+                        # pending-read barrier instead of blocking here. The
+                        # future stays tracked for request-teardown joining.
+                        skipped_futures.append(future)
+                        continue
                     running_count += 1
                 try:
                     result = future.result(
@@ -4018,6 +4130,9 @@ class IndexerSSDManager:
                     raise RuntimeError(
                         f"CSA prediction for layer {layer_id} failed at target gate"
                     ) from exc
+        if skipped_futures:
+            with self._lock:
+                self._proxy_futures[layer_id].extend(skipped_futures)
         if cancelled:
             logger.debug(
                 "IndexerSSDManager: cancelled queued CSA prediction for layer %d",
@@ -4026,14 +4141,16 @@ class IndexerSSDManager:
         if _profile_accuracy_enabled():
             logger.info(
                 "IndexerSSDManager: prediction_target_gate layer %d "
-                "submitted=1 was_ready=%d cancelled=%d running=%d wait_ms=%.3f",
+                "submitted=1 was_ready=%d cancelled=%d running=%d "
+                "fail_open_skipped=%d wait_ms=%.3f",
                 layer_id,
                 int(ready),
                 int(cancelled),
                 running_count,
+                len(skipped_futures),
                 (time.perf_counter() - gate_start) * 1000.0,
             )
-        return not cancelled
+        return not cancelled and not skipped_futures
 
     def pool_ids_for_layer(self, layer_id: int) -> torch.Tensor:
         """Return pool_ids tensor [pool_size] int64 for *layer_id*.
@@ -4976,6 +5093,7 @@ class IndexerSSDManager:
         self._closed = True
         self._proxy_executor.shutdown(wait=True)
         self._proxy_io_executor.shutdown(wait=True)
+        self._predicted_collective_executor.shutdown(wait=True)
         self._executor.shutdown(wait=True)
         self._dense_shard_executor.shutdown(wait=True)
         self._persistence_executor.shutdown(wait=True)
@@ -5254,37 +5372,50 @@ class IndexerSSDManager:
                 self._drain_cuda_events[int(layer_id)] = None
 
     def _proxy_stream_for(self, layer_id: int) -> torch.cuda.Stream:
-        """Return the shared CUDA stream for speculative proxy work.
+        """Return the reusable CUDA proxy stream for a target layer.
 
-        Proxy scorers reuse one private K workspace. Ordering every target on
-        one side stream prevents another target from overwriting that workspace
-        while a custom scorer kernel still consumes it. The side stream still
-        overlaps prediction with the model stream.
+        A per-layer stream keeps independent lookahead targets concurrent
+        while naturally ordering repeated work for the same target. Each
+        target also owns a private K-workspace slot in the scorer, so
+        concurrent streams never share gather scratch. Streams are created
+        lazily on the manager's active CUDA device and retained for the
+        manager lifetime.
 
         Args:
             layer_id: Target CSA layer whose proxy work will use the stream.
 
         Returns:
-            Reusable CUDA stream shared by all target layers.
+            Reusable CUDA stream dedicated to ``layer_id``.
         """
-        del layer_id
         with self._proxy_streams_lock:
-            stream = self._proxy_streams.get(-1)
+            stream = self._proxy_streams.get(int(layer_id))
             if stream is None:
                 stream = torch.cuda.Stream()
-                self._proxy_streams[-1] = stream
+                self._proxy_streams[int(layer_id)] = stream
             return stream
 
-    def order_true_indexer_after_proxy(self) -> None:
-        """Order the model stream after proxy scorer work already submitted."""
-        if self._device.type != "cuda" or not torch.cuda.is_available():
-            return
-        with self._proxy_streams_lock:
-            proxy_stream = self._proxy_streams.get(-1)
-        if proxy_stream is None:
-            return
-        with torch.cuda.device(self._device):
-            torch.cuda.current_stream(self._device).wait_stream(proxy_stream)
+    def _proxy_workspace_slot_for(self, layer_id: int) -> int:
+        """Return the scorer K-workspace slot owned by one target layer.
+
+        Slots isolate concurrent per-layer proxy streams from each other:
+        two targets scoring at once must never gather K rows into the same
+        scratch tensors. Slot identity follows the layer's position in the
+        registered CSA layer list so the number of live workspaces is bounded
+        by the lookahead depth actually used, not by the layer-id range.
+
+        Args:
+            layer_id: Target CSA layer id.
+
+        Returns:
+            Small non-negative slot index stable for the manager lifetime.
+        """
+        try:
+            return self._csa_layer_ids.index(int(layer_id)) % max(
+                1,
+                _env_int("LMCACHE_CSA_PROXY_WORKSPACE_SLOTS", 4),
+            )
+        except ValueError:
+            return 0
 
     def _acquire_proxy_cpu_selection(
         self,

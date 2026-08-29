@@ -12,7 +12,7 @@ import torch
 
 _PROXY_K_WORKSPACE_LOCK = threading.Lock()
 _PROXY_K_WORKSPACES: dict[
-    tuple[str, int | None, int, int, bool, torch.dtype],
+    tuple[str, int | None, int, int, bool, torch.dtype, int],
     tuple[torch.Tensor, torch.Tensor],
 ] = {}
 
@@ -21,6 +21,7 @@ PrefillCPMode = Literal[
     "key_history_only",
     "key_sharded_early",
     "key_sharded_union",
+    "key_sharded_local",
     "key_contiguous_union",
     "key_contiguous_replicated_append",
     "key_sharded_owner",
@@ -34,6 +35,7 @@ _PREFILL_CP_MODES = frozenset(
         "key_history_only",
         "key_sharded_early",
         "key_sharded_union",
+        "key_sharded_local",
         "key_contiguous_union",
         "key_contiguous_replicated_append",
         "key_sharded_owner",
@@ -74,9 +76,76 @@ def prefill_cp_requires_id_exchange(value: str | None = None) -> bool:
     return resolve_prefill_cp_mode(value) in {
         "query",
         "key_sharded_union",
+        "key_sharded_local",
         "key_contiguous_union",
         "key_contiguous_replicated_append",
     }
+
+
+def prefill_cp_reads_rank_local(value: str | None = None) -> bool:
+    """Return whether a partition mode keeps prediction I/O fully rank-local.
+
+    The rank-local mode never enters a collective on the prediction path:
+    each rank scores its own K shard, reads only its own candidate blocks
+    from its own SSD replica, and lets authoritative miss correction cover
+    every block the local shard could not predict. It requires byte-identical
+    CSA replicas across ranks (``LMCACHE_SSD_TP_CSA_REPLICA_VERIFIED``).
+
+    Args:
+        value: Explicit mode, or ``None`` to read
+            ``LMCACHE_CSA_PREFETCH_CP_MODE``.
+
+    Returns:
+        ``True`` only for ``key_sharded_local``.
+    """
+    return resolve_prefill_cp_mode(value) == "key_sharded_local"
+
+
+PredictionGatePolicy = Literal["join", "fail_open"]
+_PREDICTION_GATE_POLICIES = frozenset({"join", "fail_open"})
+
+
+def resolve_prediction_gate_policy(
+    value: str | None = None,
+) -> PredictionGatePolicy:
+    """Resolve how the target-layer gate treats an unfinished prediction.
+
+    ``join`` preserves the deployed behavior: the gate blocks until proxy
+    scoring and prediction I/O futures complete, so the resident view is
+    final before miss filtering. ``fail_open`` never blocks on speculative
+    scoring: the gate closes the layer's submission window, waits only for
+    prediction I/O that already reached the storage layer, and lets
+    authoritative miss correction demand-read everything else.
+
+    ``fail_open`` is valid only for prediction paths without a deferred
+    KV-row collective, because skipping a collective on a subset of ranks
+    would deadlock the transport. The rank-local partition mode satisfies
+    this by construction.
+
+    Args:
+        value: Explicit policy, or ``None`` to read
+            ``LMCACHE_CSA_PREDICTION_GATE``. When the variable is unset, the
+            policy defaults to ``fail_open`` for the rank-local partition
+            mode and ``join`` otherwise.
+
+    Returns:
+        Validated gate policy.
+
+    Raises:
+        ValueError: If the configured policy is unsupported.
+    """
+    configured = (
+        os.getenv("LMCACHE_CSA_PREDICTION_GATE", "") if value is None else value
+    )
+    normalized = configured.strip().lower()
+    if not normalized:
+        return "fail_open" if prefill_cp_reads_rank_local() else "join"
+    if normalized not in _PREDICTION_GATE_POLICIES:
+        supported = ", ".join(sorted(_PREDICTION_GATE_POLICIES))
+        raise ValueError(
+            f"unsupported prediction gate policy {configured!r}; expected {supported}"
+        )
+    return cast(PredictionGatePolicy, normalized)
 
 
 def _private_proxy_k_workspace(
@@ -86,8 +155,23 @@ def _private_proxy_k_workspace(
     head_dim: int,
     use_fp4: bool,
     fp8_dtype: torch.dtype,
+    slot: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return K scratch owned exclusively by the speculative proxy path."""
+    """Return K scratch owned exclusively by the speculative proxy path.
+
+    Args:
+        device: CUDA device that owns the workspace.
+        total_capacity: Maximum K rows the workspace must hold.
+        head_dim: Indexer head dimension.
+        use_fp4: Whether the packed K layout is FP4.
+        fp8_dtype: Platform FP8 dtype for the non-FP4 layout.
+        slot: Concurrency slot. Callers that score different target layers
+            concurrently must pass distinct slots so one scorer's gather
+            cannot overwrite another's K rows mid-kernel.
+
+    Returns:
+        Value and scale tensors reused across calls with the same key.
+    """
     key = (
         device.type,
         device.index,
@@ -95,6 +179,7 @@ def _private_proxy_k_workspace(
         int(head_dim),
         bool(use_fp4),
         fp8_dtype,
+        int(slot),
     )
     with _PROXY_K_WORKSPACE_LOCK:
         cached = _PROXY_K_WORKSPACES.get(key)
@@ -693,6 +778,7 @@ def score_prefill_proxy_rank_local(
     interleave_size: int,
     oversubscribe: int = 1,
     partition_mode: PrefillCPMode | str = "query",
+    workspace_slot: int = 0,
     topk_tokens_override: int | None = None,
     metadata_query_row_start: int | None = None,
     preselected_query_rows: torch.Tensor | None = None,
@@ -739,6 +825,8 @@ def score_prefill_proxy_rank_local(
             ``key_sharded_owner`` (direct K shards plus owner-local KV reads),
             ``key_contiguous_owner`` (contiguous K shards plus owner-local
             KV reads),
+            ``key_sharded_local`` (direct K shards with fully rank-local
+            SSD reads and no prediction-path collective),
             ``key_replicated_append`` (sharded history plus full append K), or
             ``key_sharded_append`` (sharded history and append K).
         topk_tokens_override: Optional wider speculative top-k width. This
@@ -941,6 +1029,7 @@ def score_prefill_proxy_rank_local(
                 head_dim=head_dim,
                 use_fp4=use_fp4,
                 fp8_dtype=fp8_dtype,
+                slot=workspace_slot,
             )
             gathered_k_quant = k_quant_full[:total_seq_lens]
             gathered_k_scale = k_scale_full[:total_seq_lens]
@@ -956,6 +1045,7 @@ def score_prefill_proxy_rank_local(
         elif mode in {
             "key_sharded_append",
             "key_sharded_union",
+            "key_sharded_local",
             "key_contiguous_union",
             "key_contiguous_replicated_append",
             "key_sharded_owner",
@@ -1011,10 +1101,7 @@ def score_prefill_proxy_rank_local(
                 capacity_quantum = 8192
                 local_capacity = max(
                     local_capacity,
-                    (
-                        (required_capacity + capacity_quantum - 1)
-                        // capacity_quantum
-                    )
+                    ((required_capacity + capacity_quantum - 1) // capacity_quantum)
                     * capacity_quantum,
                 )
             k_quant_full, k_scale_full = _private_proxy_k_workspace(
@@ -1023,6 +1110,7 @@ def score_prefill_proxy_rank_local(
                 head_dim=head_dim,
                 use_fp4=use_fp4,
                 fp8_dtype=fp8_dtype,
+                slot=workspace_slot,
             )
             k_quant = k_quant_full[: global_key_indices.numel()]
             k_scale = k_scale_full[: global_key_indices.numel()]
@@ -1075,6 +1163,7 @@ def score_prefill_proxy_rank_local(
             head_dim=head_dim,
             use_fp4=use_fp4,
             fp8_dtype=fp8_dtype,
+            slot=workspace_slot,
         )
         k_quant = k_quant_full[:total_seq_lens]
         k_scale = k_scale_full[:total_seq_lens]

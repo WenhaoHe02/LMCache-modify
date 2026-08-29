@@ -92,6 +92,7 @@ from lmcache.v1.ssd_tp_sharded_prefetch import (
     ShardPrefetchDecisionTable,
     bucket_prefetch_key,
     compile_cp_read_plan,
+    owner_gather_padded_blocks,
     partition_block_union,
     partition_rank_local_blocks,
 )
@@ -104,6 +105,12 @@ logger = init_logger(__name__)
 _ACTIVE_MANAGER: Optional["CSAAttentionKVPrefetchManager"] = None
 
 _DSV4_CSA_COMPRESS_RATIO = 4
+
+# Upper bound on resolving in-flight predicted-read bookings between miss
+# submission and the pre-attention drain. Bookings resolve as soon as their
+# submission thread publishes a drain event, so this only guards against a
+# wedged storage backend; it matches the prediction gate's default timeout.
+_PENDING_READS_CORRECTION_TIMEOUT_S = 5.0
 
 
 _ACTIVE_MANAGER_LOCK = threading.Lock()
@@ -1658,6 +1665,7 @@ class CSAAttentionKVPrefetchManager:
         profile_operation_id: Optional[str] = None,
         profile_kind: Optional[str] = None,
         preserve_owner_partition: bool = False,
+        shard_local_only: bool = False,
     ) -> bool | _DeferredShardGather:
         """Submit Tutti reads for the predicted ``top-K`` of one CSA layer.
 
@@ -1676,18 +1684,30 @@ class CSAAttentionKVPrefetchManager:
             preserve_owner_partition: Keep this rank's predicted IDs as its
                 SSD-read ownership and exchange only the descriptor at the
                 aligned consumer gate.
+            shard_local_only: Read the predicted blocks from this rank's own
+                replica even when TP shard-gather is configured. No deferred
+                collective is created, so the target gate never has shard
+                work to finalize for this prediction. Requires byte-identical
+                CSA replicas across ranks. Mutually exclusive with
+                ``preserve_owner_partition``.
 
         Raises:
-            ValueError: If ``prefetch_level`` is unsupported.
+            ValueError: If ``prefetch_level`` is unsupported or both partition
+                overrides are requested together.
         """
         if prefetch_level not in (1, 2):
             raise ValueError("prefetch_level must be 1 or 2")
+        if preserve_owner_partition and shard_local_only:
+            raise ValueError(
+                "preserve_owner_partition and shard_local_only are exclusive"
+            )
         state = self._layers.get(int(layer_id))
         active_sharding = bool(
             state is not None
             and self._shard_transport is not None
             and self._shard_config.enabled
             and self._shard_config.csa_enabled
+            and not shard_local_only
         )
         if active_sharding:
             if not self._shard_prediction_path_logged:
@@ -1709,6 +1729,13 @@ class CSAAttentionKVPrefetchManager:
                 profile_kind=profile_kind,
                 preserve_owner_partition=preserve_owner_partition,
             )
+        if shard_local_only and not self._shard_prediction_path_logged:
+            self._shard_prediction_path_logged = True
+            logger.info(
+                "CSA_SHARD_PREDICTION_ACTIVE rank=%d world_size=%d shard_local_only=1",
+                getattr(self._shard_transport, "rank", 0),
+                getattr(self._shard_transport, "world_size", 1),
+            )
         return self._submit_reads(
             layer_id,
             compressed_block_ids,
@@ -1722,6 +1749,7 @@ class CSAAttentionKVPrefetchManager:
             ),
             profile_operation_id=profile_operation_id,
             profile_kind=profile_kind,
+            force_local=shard_local_only,
         )
 
     def set_prediction_waiter(
@@ -2202,6 +2230,42 @@ class CSAAttentionKVPrefetchManager:
             )
         return True
 
+    def wait_for_pending_reads(self, layer_id: int, timeout_s: float = 2.0) -> bool:
+        """Block until no read submission for one layer is still in flight.
+
+        Miss correction dedupes against blocks another submission already
+        booked, so before attention consumes the layer it must wait until
+        every booking has been resolved and its drain event published.
+        Joining the prediction future at the target gate used to guarantee
+        this ordering; the fail-open gate policy does not, so the correction
+        path calls this immediately before :meth:`drain_for_layer`.
+
+        Args:
+            layer_id: Transformer-side CSA layer id.
+            timeout_s: Upper bound on the wait.
+
+        Returns:
+            ``True`` when the layer has no pending read bookings, ``False``
+            on timeout.
+        """
+        state = getattr(self, "_layers", {}).get(int(layer_id))
+        if state is None:
+            return True
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        with state.pending_reads_lock:
+            while state.pending_read_count:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.warning(
+                        "CSAAttentionKVPrefetchManager: wait_for_pending_reads "
+                        "layer %d timed out with %d reads still pending",
+                        int(layer_id),
+                        state.pending_read_count,
+                    )
+                    return False
+                state.pending_reads_lock.wait(remaining)
+        return True
+
     def drain_for_layer(self, layer_id: int) -> None:
         """Block until all pending reads for ``layer_id`` have completed.
 
@@ -2433,14 +2497,6 @@ class CSAAttentionKVPrefetchManager:
                     raise RuntimeError(
                         f"tracked shard submission failed for layer {layer_id}"
                     )
-                if indexer_manager is not None:
-                    order_after_proxy = getattr(
-                        indexer_manager,
-                        "order_true_indexer_after_proxy",
-                        None,
-                    )
-                    if callable(order_after_proxy):
-                        order_after_proxy()
                 reused_residual = False
                 true_indexer_start = time.perf_counter() if _timing_enabled() else 0.0
                 with csa_pipeline_nvtx.range(
@@ -2531,6 +2587,20 @@ class CSAAttentionKVPrefetchManager:
                             **decode_profile_kwargs,
                         )
                     t_drain1 = time.perf_counter() if _timing_enabled() else 0.0
+                    # Miss submission deduplicates against blocks another
+                    # submission already booked as pending. With a fail-open
+                    # prediction gate those bookings can still be in flight
+                    # here, so resolve them before the drain event is trusted;
+                    # otherwise attention could consume a block whose scatter
+                    # was never ordered on the synchronized event.
+                    if not mgr.wait_for_pending_reads(
+                        layer_id,
+                        timeout_s=_PENDING_READS_CORRECTION_TIMEOUT_S,
+                    ):
+                        raise RuntimeError(
+                            f"pending reads for layer {layer_id} did not "
+                            "resolve before attention"
+                        )
                     mgr.drain_for_layer(layer_id)
                     second_drain_ms = (
                         (time.perf_counter() - t_drain1) * 1000.0
@@ -2906,6 +2976,7 @@ class CSAAttentionKVPrefetchManager:
         source_layer_id: Optional[int] = None,
         profile_operation_id: Optional[str] = None,
         profile_kind: Optional[str] = None,
+        force_local: bool = False,
     ) -> bool:
         """Run one read submission while pinning the active request state."""
         with self._request_state:
@@ -2932,6 +3003,7 @@ class CSAAttentionKVPrefetchManager:
                 source_layer_id=source_layer_id,
                 profile_operation_id=profile_operation_id,
                 profile_kind=profile_kind,
+                force_local=force_local,
             )
         finally:
             with self._request_state:
@@ -2949,6 +3021,7 @@ class CSAAttentionKVPrefetchManager:
         source_layer_id: Optional[int] = None,
         profile_operation_id: Optional[str] = None,
         profile_kind: Optional[str] = None,
+        force_local: bool = False,
     ) -> bool:
         """Submit reads and publish only blocks that actually completed.
 
@@ -2964,6 +3037,10 @@ class CSAAttentionKVPrefetchManager:
             source_layer_id: Optional layer that produced this I/O request.
             profile_operation_id: Optional parent operation correlation id.
             profile_kind: Optional profile-only I/O classification.
+            force_local: Read every requested block from this rank's own
+                replica, bypassing shard-gather mode selection entirely. Used
+                by the rank-local prediction path, which never creates
+                deferred collective work.
 
         Returns:
             ``True`` when the submission itself completed safely.  A
@@ -2988,7 +3065,8 @@ class CSAAttentionKVPrefetchManager:
             device="cpu",
         ).reshape(-1)
         active_sharding = bool(
-            getattr(self, "_shard_transport", None) is not None
+            not force_local
+            and getattr(self, "_shard_transport", None) is not None
             and getattr(self, "_shard_config", None) is not None
             and self._shard_config.enabled
             and self._shard_config.csa_enabled
@@ -4815,7 +4893,7 @@ class CSAAttentionKVPrefetchManager:
                         int(state.k_cache_tensor.shape[0]),
                         -1,
                     )
-                    padded_blocks = max(
+                    owner_capacity = max(
                         1,
                         int(
                             os.environ.get(
@@ -4824,12 +4902,20 @@ class CSAAttentionKVPrefetchManager:
                             )
                         ),
                     )
+                    total_blocks = min(
+                        int(state.chunks[-1].end_compressed_block),
+                        int(state.in_pool_bitmap.numel()),
+                    )
+                    padded_blocks = owner_gather_padded_blocks(
+                        total_blocks,
+                        transport.world_size,
+                        owner_capacity,
+                    )
                     gather_event, partition, all_reads_ready = (
                         transport.gather_owner_rows_into(
                             local_block_ids=prepared.owned,
                             local_ready=(
-                                prepared.local_capability
-                                and prepared.local_complete
+                                prepared.local_capability and prepared.local_complete
                             ),
                             padded_blocks=padded_blocks,
                             source_rows=k_cache_rows,

@@ -799,6 +799,82 @@ def test_background_prediction_updates_inference_bitmaps() -> None:
     assert not bool(torch.any(state.pending_reads_bitmap))
 
 
+def test_shard_local_prediction_bypasses_gather_and_reads_locally() -> None:
+    """Rank-local predicted reads never prepare deferred collective work."""
+    manager = _minimal_manager_with_partial_issue()
+    manager._shard_transport = SimpleNamespace(rank=3, world_size=8)
+    manager._shard_config = SimpleNamespace(enabled=True, csa_enabled=True)
+    manager._shard_prediction_path_logged = True
+
+    def _fail_gather(
+        _self: CSAAttentionKVPrefetchManager,
+        *_args: object,
+        **_kwargs: object,
+    ) -> None:
+        raise AssertionError("rank-local prediction entered shard gather")
+
+    manager._prepare_predicted_shard_gather = MethodType(_fail_gather, manager)
+
+    result = manager.fire_predicted_reads(
+        2,
+        torch.tensor([0, 1]),
+        prefetch_level=2,
+        shard_local_only=True,
+    )
+
+    state = manager._layers[2]
+    assert result is True
+    assert state.resident_blocks_bitmap.tolist() == [True, False, False, False]
+    assert not bool(torch.any(state.pending_reads_bitmap))
+
+
+def test_shard_local_and_owner_partition_are_mutually_exclusive() -> None:
+    """Requesting both partition overrides is a configuration error."""
+    manager = _minimal_manager_with_partial_issue()
+
+    with pytest.raises(ValueError, match="exclusive"):
+        manager.fire_predicted_reads(
+            2,
+            torch.tensor([0]),
+            prefetch_level=2,
+            preserve_owner_partition=True,
+            shard_local_only=True,
+        )
+
+
+def test_wait_for_pending_reads_blocks_until_booking_resolves() -> None:
+    """The correction barrier waits out an in-flight predicted booking."""
+    manager = _minimal_manager_with_partial_issue()
+    state = manager._layers[2]
+    with state.pending_reads_lock:
+        state.pending_reads_bitmap[1] = True
+        state.pending_read_count = 1
+
+    def _resolve_booking() -> None:
+        with state.pending_reads_lock:
+            state.pending_reads_bitmap[1] = False
+            state.pending_read_count = 0
+            state.pending_reads_lock.notify_all()
+
+    timer = threading.Timer(0.05, _resolve_booking)
+    timer.start()
+    try:
+        assert manager.wait_for_pending_reads(2, timeout_s=1.0)
+    finally:
+        timer.cancel()
+    assert manager.wait_for_pending_reads(99)
+
+
+def test_wait_for_pending_reads_times_out_instead_of_hanging() -> None:
+    """A wedged booking produces a bounded, observable failure."""
+    manager = _minimal_manager_with_partial_issue()
+    state = manager._layers[2]
+    with state.pending_reads_lock:
+        state.pending_read_count = 1
+
+    assert not manager.wait_for_pending_reads(2, timeout_s=0.05)
+
+
 def test_late_prediction_falls_back_to_true_topk_without_blocking() -> None:
     """A late speculative result must not block true-topK correction."""
     manager = object.__new__(CSAAttentionKVPrefetchManager)

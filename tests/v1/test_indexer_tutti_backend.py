@@ -32,8 +32,10 @@ from lmcache.v1.csa_prefill_cp_scorer import (
     prefill_cp_local_topk_tokens,
     prefill_cp_query_indices,
     prefill_cp_query_ranges,
+    prefill_cp_reads_rank_local,
     prefill_cp_sampled_query_indices,
     prefill_cp_requires_id_exchange,
+    resolve_prediction_gate_policy,
     resolve_prefill_cp_mode,
 )
 from lmcache.v1.indexer_tutti_backend import TuttiIndexerStorage
@@ -814,6 +816,7 @@ def test_prefill_cp_localizes_causal_bounds_for_compact_k() -> None:
         ("key_history_only", False),
         ("key_sharded_early", False),
         ("key_sharded_union", True),
+        ("key_sharded_local", True),
         ("key_contiguous_union", True),
         ("key_contiguous_replicated_append", True),
         ("key_sharded_owner", False),
@@ -857,10 +860,7 @@ def test_owner_candidate_budget_matches_transport_capacity(
         )
         == 256
     )
-    assert (
-        indexer_manager_module._proxy_candidate_block_budget(2048, "query")
-        == 2048
-    )
+    assert indexer_manager_module._proxy_candidate_block_budget(2048, "query") == 2048
 
 
 def test_prefill_cp_mode_defaults_to_existing_query_path(
@@ -871,6 +871,121 @@ def test_prefill_cp_mode_defaults_to_existing_query_path(
 
     assert resolve_prefill_cp_mode() == "query"
     assert prefill_cp_requires_id_exchange() is True
+
+
+def test_rank_local_mode_splits_budget_and_defaults_to_fail_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The local mode shares one global budget and never joins at the gate."""
+    monkeypatch.setenv("LMCACHE_CSA_PREFETCH_CP_MODE", "key_sharded_local")
+    monkeypatch.delenv("LMCACHE_CSA_PREDICTION_GATE", raising=False)
+
+    assert prefill_cp_reads_rank_local() is True
+    assert prefill_cp_requires_id_exchange() is True
+    assert resolve_prediction_gate_policy() == "fail_open"
+    assert (
+        indexer_manager_module._proxy_candidate_block_budget(
+            2048,
+            "key_sharded_local",
+            8,
+        )
+        == 256
+    )
+    assert (
+        indexer_manager_module._proxy_candidate_block_budget(
+            2048,
+            "key_sharded_local",
+            1,
+        )
+        == 2048
+    )
+
+
+def test_gate_policy_defaults_to_join_and_rejects_unknown_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Existing partition modes keep the blocking gate unless opted in."""
+    monkeypatch.delenv("LMCACHE_CSA_PREFETCH_CP_MODE", raising=False)
+    monkeypatch.delenv("LMCACHE_CSA_PREDICTION_GATE", raising=False)
+
+    assert resolve_prediction_gate_policy() == "join"
+    assert resolve_prediction_gate_policy("fail_open") == "fail_open"
+    with pytest.raises(ValueError, match="unsupported prediction gate policy"):
+        resolve_prediction_gate_policy("open_sesame")
+
+
+def test_fail_open_gate_skips_running_prediction_without_cancelling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fail-open gate returns immediately and keeps running work tracked."""
+    monkeypatch.setenv("LMCACHE_CSA_PREFETCH_CP_MODE", "key_sharded_local")
+    monkeypatch.setenv("LMCACHE_CSA_PREDICTION_GATE", "fail_open")
+    manager = object.__new__(IndexerSSDManager)
+    manager._lock = threading.Lock()
+    manager._prediction_gate_timeout_s = 1.0
+    manager._expired_proxy_layers = set()
+    manager._expired_proxy_targets = set()
+    manager._last_proxy_blocks = {2: [7]}
+    manager._csa_attention_kv_manager = SimpleNamespace(
+        uses_gate_aligned_shard_gather=lambda: True,
+        active_request_id="request-a",
+        active_request_token=("request-a", 1),
+    )
+    manager._csa_fired_request_id = "request-a"
+    manager._csa_fired_request_generation = 1
+    release = threading.Event()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        started = threading.Event()
+
+        def _running_prediction() -> None:
+            started.set()
+            assert release.wait(timeout=2.0)
+
+        pending = executor.submit(_running_prediction)
+        assert started.wait(timeout=1.0)
+        manager._proxy_futures = {2: [pending]}
+
+        gate_start = time.perf_counter()
+        assert not manager.wait_for_csa_attention_kv_prediction(2)
+        gate_ms = (time.perf_counter() - gate_start) * 1000.0
+        release.set()
+
+    # The gate must not have blocked on the still-running prediction, must
+    # close the submission window, and must keep the future tracked so
+    # request teardown can join it.
+    assert gate_ms < 500.0
+    assert not pending.cancelled()
+    assert manager._expired_proxy_layers == {2}
+    assert manager._proxy_futures[2] == [pending]
+
+
+def test_fail_open_gate_consumes_completed_predictions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Completed rank-local reads are still acknowledged as ready."""
+    monkeypatch.setenv("LMCACHE_CSA_PREFETCH_CP_MODE", "key_sharded_local")
+    monkeypatch.setenv("LMCACHE_CSA_PREDICTION_GATE", "fail_open")
+    manager = object.__new__(IndexerSSDManager)
+    manager._lock = threading.Lock()
+    manager._prediction_gate_timeout_s = 1.0
+    manager._expired_proxy_layers = set()
+    manager._expired_proxy_targets = set()
+    manager._last_proxy_blocks = {2: [7]}
+    manager._csa_attention_kv_manager = SimpleNamespace(
+        uses_gate_aligned_shard_gather=lambda: True,
+        active_request_id="request-a",
+        active_request_token=("request-a", 1),
+    )
+    manager._csa_fired_request_id = "request-a"
+    manager._csa_fired_request_generation = 1
+    done: Future[bool] = Future()
+    done.set_result(True)
+    manager._proxy_futures = {2: [done]}
+
+    assert manager.wait_for_csa_attention_kv_prediction(2)
+    assert manager._proxy_futures[2] == []
+    assert manager._expired_proxy_layers == set()
 
 
 def test_prefill_cp_k_shards_share_the_same_sampled_queries() -> None:
