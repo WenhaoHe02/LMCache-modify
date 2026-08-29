@@ -817,6 +817,7 @@ def test_prefill_cp_localizes_causal_bounds_for_compact_k() -> None:
         ("key_contiguous_union", True),
         ("key_contiguous_replicated_append", True),
         ("key_sharded_owner", False),
+        ("key_contiguous_owner", False),
         ("key_replicated_append", False),
         ("key_sharded_append", False),
     ],
@@ -834,6 +835,32 @@ def test_prefill_cp_mode_rejects_unknown_value() -> None:
     """A misspelled opt-in mode fails instead of changing prediction silently."""
     with pytest.raises(ValueError, match="unsupported speculative CP mode"):
         resolve_prefill_cp_mode("key_magic")
+
+
+def test_owner_candidate_budget_matches_transport_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Owner reads never exceed the per-rank gather slot capacity."""
+    monkeypatch.setenv("LMCACHE_CSA_OWNER_BLOCKS_PER_RANK", "256")
+
+    assert (
+        indexer_manager_module._proxy_candidate_block_budget(
+            2048,
+            "key_sharded_owner",
+        )
+        == 256
+    )
+    assert (
+        indexer_manager_module._proxy_candidate_block_budget(
+            2048,
+            "key_contiguous_owner",
+        )
+        == 256
+    )
+    assert (
+        indexer_manager_module._proxy_candidate_block_budget(2048, "query")
+        == 2048
+    )
 
 
 def test_prefill_cp_mode_defaults_to_existing_query_path(

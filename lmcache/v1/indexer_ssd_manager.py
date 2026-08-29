@@ -185,6 +185,22 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _proxy_candidate_block_budget(
+    configured_budget: int,
+    partition_mode: str,
+) -> int:
+    """Return a producer budget compatible with the selected transport."""
+    if configured_budget <= 0:
+        raise ValueError("configured proxy block budget must be positive")
+    if partition_mode not in {"key_sharded_owner", "key_contiguous_owner"}:
+        return configured_budget
+    owner_blocks_per_rank = max(
+        1,
+        _env_int("LMCACHE_CSA_OWNER_BLOCKS_PER_RANK", 64),
+    )
+    return min(configured_budget, owner_blocks_per_rank)
+
+
 def _proxy_topk_tokens_by_layer(spec: str) -> dict[int, int]:
     """Parse ``layer:width`` proxy top-k overrides.
 
@@ -2890,11 +2906,20 @@ class IndexerSSDManager:
                             cursor + DEEPGEMM_PAGED_BLOCK_SIZE - 1
                         ) // DEEPGEMM_PAGED_BLOCK_SIZE
                         if num_blocks > 0:
+                            partition_mode = (
+                                self._prefill_cp_partition_mode()
+                                if cp_context is not None
+                                else "query"
+                            )
+                            candidate_block_budget = _proxy_candidate_block_budget(
+                                self._proxy_block_budget,
+                                partition_mode,
+                            )
                             selected_blocks = _select_rank_local_proxy_blocks(
                                 selected_topk,
                                 cursor,
                                 num_blocks,
-                                self._proxy_block_budget,
+                                candidate_block_budget,
                             ).to(torch.int32)
                             if (
                                 cp_context is not None
@@ -3091,7 +3116,10 @@ class IndexerSSDManager:
             "prefetch_level": prefetch_level,
             "request_token": request_token,
         }
-        if self._prefill_cp_partition_mode() == "key_sharded_owner":
+        if self._prefill_cp_partition_mode() in {
+            "key_sharded_owner",
+            "key_contiguous_owner",
+        }:
             fire_kwargs["preserve_owner_partition"] = True
         with self._lock:
             expired = (
@@ -3202,6 +3230,7 @@ class IndexerSSDManager:
             "key_contiguous_union",
             "key_contiguous_replicated_append",
             "key_sharded_owner",
+            "key_contiguous_owner",
         }:
             query_sample_stride = _env_int(
                 "LMCACHE_CSA_PREFETCH_CP_QUERY_SAMPLE_STRIDE",
@@ -3260,6 +3289,7 @@ class IndexerSSDManager:
             "key_contiguous_union",
             "key_contiguous_replicated_append",
             "key_sharded_owner",
+            "key_contiguous_owner",
         }:
             from lmcache.v1.csa_prefill_cp_scorer import (
                 prefill_cp_sampled_query_indices,

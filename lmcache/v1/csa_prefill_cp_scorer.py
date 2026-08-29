@@ -24,6 +24,7 @@ PrefillCPMode = Literal[
     "key_contiguous_union",
     "key_contiguous_replicated_append",
     "key_sharded_owner",
+    "key_contiguous_owner",
     "key_replicated_append",
     "key_sharded_append",
 ]
@@ -36,6 +37,7 @@ _PREFILL_CP_MODES = frozenset(
         "key_contiguous_union",
         "key_contiguous_replicated_append",
         "key_sharded_owner",
+        "key_contiguous_owner",
         "key_replicated_append",
         "key_sharded_append",
     }
@@ -712,8 +714,9 @@ def score_prefill_proxy_rank_local(
     IDs. ``key_contiguous_union`` does the same exchange after assigning each
     rank one contiguous K slice. ``key_contiguous_replicated_append`` keeps
     those contiguous history shards but scores the complete append on every
-    rank. ``key_sharded_owner`` leaves IDs rank-local so each rank can read
-    its own KV rows before the consumer-gate AllGather.
+    rank. The two owner modes leave IDs rank-local so each rank can read its
+    own KV rows before the consumer-gate AllGather; ``key_contiguous_owner``
+    uses contiguous instead of block-cyclic K ownership.
 
     Args:
         indexer_op: Active vLLM ``SparseAttnIndexer`` instance.
@@ -734,6 +737,8 @@ def score_prefill_proxy_rank_local(
             ``key_contiguous_replicated_append`` (contiguous history shards,
             replicated append, and ID union),
             ``key_sharded_owner`` (direct K shards plus owner-local KV reads),
+            ``key_contiguous_owner`` (contiguous K shards plus owner-local
+            KV reads),
             ``key_replicated_append`` (sharded history plus full append K), or
             ``key_sharded_append`` (sharded history and append K).
         topk_tokens_override: Optional wider speculative top-k width. This
@@ -954,9 +959,10 @@ def score_prefill_proxy_rank_local(
             "key_contiguous_union",
             "key_contiguous_replicated_append",
             "key_sharded_owner",
+            "key_contiguous_owner",
         }:
             cache_block_size = int(indexer_op.k_cache.kv_cache.shape[1])
-            if mode == "key_contiguous_union":
+            if mode in {"key_contiguous_union", "key_contiguous_owner"}:
                 logical_blocks, global_key_indices = (
                     prefill_cp_contiguous_key_block_partition(
                         total_seq_lens,
