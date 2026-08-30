@@ -4980,8 +4980,21 @@ class CSAAttentionKVPrefetchManager:
                         completed = True
                         return
                 else:
+                    dense_covered_end = (
+                        int(state.chunks[-1].end_compressed_block)
+                        if state.chunks
+                        else 0
+                    )
+                    dense_union = descriptor.partition.union
+                    dense_full_range = (
+                        dense_covered_end > 0
+                        and len(dense_union) == dense_covered_end
+                        and dense_union[0] == 0
+                        and dense_union[-1] == dense_covered_end - 1
+                    )
                     dense_gpu_fastpath = (
                         descriptor.mode is SSDReadMode.SHARD_GATHER_DENSE
+                        and dense_full_range
                         and os.environ.get("LMCACHE_CSA_DENSE_GPU_FASTPATH", "0")
                         .strip()
                         .lower()
