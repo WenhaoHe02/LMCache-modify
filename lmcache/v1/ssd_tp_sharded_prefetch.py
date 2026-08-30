@@ -1274,13 +1274,14 @@ class TorchDistributedShardGather:
                 self._slot_cursor = (self._slot_cursor + 1) % len(self._slots)
                 if padded_blocks > int(slot.send.shape[0]):
                     raise ValueError("owner gather exceeds warmed row capacity")
-                local_gpu = torch.as_tensor(
+                local_cpu = torch.as_tensor(
                     local_block_ids,
                     dtype=torch.int64,
-                    device=source_rows.device,
+                    device="cpu",
                 ).reshape(-1)
-                local_gpu = torch.unique(local_gpu[local_gpu >= 0], sorted=True)
-                rank_ready = bool(local_ready and local_gpu.numel() <= padded_blocks)
+                local_cpu = torch.unique(local_cpu[local_cpu >= 0], sorted=True)
+                rank_ready = bool(local_ready and local_cpu.numel() <= padded_blocks)
+                local_gpu = local_cpu.to(source_rows.device)
                 completion_event = slot.completion_event
                 id_width = padded_blocks + 1
                 with torch.cuda.stream(self._metadata_stream):
