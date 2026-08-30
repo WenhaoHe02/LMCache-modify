@@ -900,6 +900,7 @@ def _attach_glm_dsa_predictive_prefetch(
             schedules,
             proxy.predict,
             submit_prefetch,
+            async_predictor=proxy.predict_async,
             sample_rows=_env_int("LMCACHE_GLM_DSA_ACCURACY_ROWS", 32),
             enable_prediction=_glm_dsa_predictive_prefetch_enabled(),
         )
@@ -941,6 +942,7 @@ def close_vllm_prefetch_managers() -> None:
 
     _FULL_NSYS_CAPTURE_CONTROLLER.reset()
 
+    glm_manager = _GLM_DSA_PREDICTIVE_PREFETCH_MANAGER
     glm_hooks = _GLM_DSA_VLLM_HOOKS
     _GLM_DSA_VLLM_HOOKS = None
     _GLM_DSA_PREDICTIVE_PREFETCH_MANAGER = None
@@ -949,6 +951,11 @@ def close_vllm_prefetch_managers() -> None:
             glm_hooks.close()
         except Exception:
             logger.exception("Failed to restore vLLM GLM DSA prediction hooks")
+    if glm_manager is not None:
+        try:
+            glm_manager.close()
+        except Exception:
+            logger.exception("Failed to close GLM DSA prediction compute")
 
     physical_sink = _GLM_DSA_PHYSICAL_PREFETCH_SINK
     _GLM_DSA_PHYSICAL_PREFETCH_SINK = None
@@ -4596,8 +4603,7 @@ class LMCacheConnectorV1Impl:
             for request_id in finished_req_ids:
                 if not glm_sink.finish_request(str(request_id)):
                     raise RuntimeError(
-                        "GLM DSA physical request teardown timed out for "
-                        f"{request_id}"
+                        f"GLM DSA physical request teardown timed out for {request_id}"
                     )
         glm_manager = _GLM_DSA_PREDICTIVE_PREFETCH_MANAGER
         if glm_manager is not None:

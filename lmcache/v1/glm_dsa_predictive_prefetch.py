@@ -220,6 +220,9 @@ class GLMDSALayerStats:
 PredictTopK = Callable[
     [GLMDSAPredictionSchedule, torch.Tensor, torch.Tensor], torch.Tensor
 ]
+PredictTopKAsync = Callable[
+    [GLMDSAPredictionSchedule, torch.Tensor, torch.Tensor | None, torch.Tensor], Any
+]
 SubmitPrefetch = Callable[[GLMDSAPrefetchEvent], None]
 
 
@@ -1194,6 +1197,7 @@ class GLMDSAPredictivePrefetchManager:
         predictor: PredictTopK,
         submit_prefetch: SubmitPrefetch | None = None,
         *,
+        async_predictor: PredictTopKAsync | None = None,
         sample_rows: int = 32,
         enable_prediction: bool = True,
     ) -> None:
@@ -1211,6 +1215,16 @@ class GLMDSAPredictivePrefetchManager:
 
         self.schedules = schedules
         self._predictor = predictor
+        self._async_predictor = async_predictor
+        self._async_prediction_enabled = bool(
+            async_predictor is not None
+            and os.getenv("LMCACHE_GLM_DSA_ASYNC_PREDICTION", "0").lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self._prediction_compute_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="lmcache-glm-dsa-compute",
+        )
         self._submit_prefetch = submit_prefetch
         self._sample_rows = sample_rows
         self._enable_prediction = bool(enable_prediction)
@@ -1223,6 +1237,9 @@ class GLMDSAPredictivePrefetchManager:
         self._lock = RLock()
         self._request_id: str | None = None
         self._predictions: dict[int, torch.Tensor] = {}
+        self._prediction_compute_futures: dict[int, list[Future[Any]]] = defaultdict(
+            list
+        )
         self._stats: dict[int, list[int]] = {}
 
     def begin_request(self, request_id: str) -> None:
@@ -1233,9 +1250,11 @@ class GLMDSAPredictivePrefetchManager:
         """
         if not request_id:
             raise ValueError("request_id must be non-empty")
+        self._drain_prediction_compute()
         with self._lock:
             self._request_id = request_id
             self._predictions.clear()
+            self._prediction_compute_futures.clear()
 
     def end_request(self, request_id: str) -> None:
         """End a request if it still owns this manager's active generation.
@@ -1243,17 +1262,26 @@ class GLMDSAPredictivePrefetchManager:
         Args:
             request_id: Request identifier previously passed to begin_request.
         """
+        self._drain_prediction_compute()
         with self._lock:
             if request_id != self._request_id:
                 return
             self._request_id = None
             self._predictions.clear()
+            self._prediction_compute_futures.clear()
 
     def cancel_active_request(self) -> None:
         """Disable prediction and discard all request-scoped state."""
+        self._drain_prediction_compute()
         with self._lock:
             self._request_id = None
+            self._prediction_compute_futures.clear()
             self._predictions.clear()
+
+    def close(self) -> None:
+        """Drain private-stream predictions and release the completion worker."""
+        self.cancel_active_request()
+        self._prediction_compute_executor.shutdown(wait=True, cancel_futures=False)
 
     def set_submit_prefetch(self, submit_prefetch: SubmitPrefetch | None) -> None:
         """Install or remove the physical prefetch event sink.
@@ -1295,11 +1323,9 @@ class GLMDSAPredictivePrefetchManager:
         # Do not materialize the full post-MLP residual tensor when no proxy
         # indexer will consume it; at long prefill lengths that addition is a
         # large GPU kernel and allocation of its own.
-        activation = (
-            None
-            if self._early_dense_group_trigger
-            else post_decoder_layer_activation(hidden_states, residual)
-        )
+        activation = None
+        if not self._early_dense_group_trigger and not self._async_prediction_enabled:
+            activation = post_decoder_layer_activation(hidden_states, residual)
         activation_rows = (
             hidden_states.shape[0] if activation is None else activation.shape[0]
         )
@@ -1331,6 +1357,32 @@ class GLMDSAPredictivePrefetchManager:
                     device=positions.device,
                 )
             else:
+                if self._async_prediction_enabled:
+                    assert self._async_predictor is not None
+                    pending = self._async_predictor(
+                        schedule,
+                        hidden_states,
+                        residual,
+                        positions,
+                    )
+                    future = self._prediction_compute_executor.submit(
+                        self._complete_async_prediction,
+                        request_id,
+                        schedule,
+                        pending,
+                        operation_id,
+                    )
+                    with self._lock:
+                        same_request = request_id == self._request_id
+                        if same_request:
+                            self._prediction_compute_futures[
+                                schedule.target_layer
+                            ].append(future)
+                    if not same_request:
+                        future.result()
+                        return tuple(predicted_targets)
+                    predicted_targets.append(schedule.target_layer)
+                    continue
                 assert activation is not None
                 with csa_pipeline_nvtx.range(
                     CsaNvtxEvent.GLM_DSA_PREDICTION,
@@ -1359,6 +1411,54 @@ class GLMDSAPredictivePrefetchManager:
             )
             predicted_targets.append(schedule.target_layer)
         return tuple(predicted_targets)
+
+    def wait_for_prediction(self, target_layer: int) -> bool:
+        """Join async predictor computation before a target layer starts."""
+        with self._lock:
+            futures = tuple(self._prediction_compute_futures.pop(int(target_layer), ()))
+        if not futures:
+            return True
+        for future in futures:
+            future.result()
+        return True
+
+    def _complete_async_prediction(
+        self,
+        request_id: str,
+        schedule: GLMDSAPredictionSchedule,
+        pending: Any,
+        operation_id: str | None,
+    ) -> None:
+        """Publish one private-stream prediction after its CUDA event."""
+        pending.done_event.synchronize()
+        topk = pending.topk_indices.detach()
+        if topk.ndim != 2:
+            raise ValueError("predictor must return a two-dimensional tensor")
+        with self._lock:
+            if request_id != self._request_id:
+                return
+            self._predictions[schedule.target_layer] = topk
+        self._submit(
+            GLMDSAPrefetchEvent(
+                request_id=request_id,
+                schedule=schedule,
+                topk_indices=topk,
+                correction=False,
+                profile_operation_id=operation_id,
+            )
+        )
+
+    def _drain_prediction_compute(self) -> None:
+        """Join all enqueued CUDA prediction completion tasks."""
+        with self._lock:
+            futures = tuple(
+                future
+                for target_futures in self._prediction_compute_futures.values()
+                for future in target_futures
+            )
+            self._prediction_compute_futures.clear()
+        for future in futures:
+            future.result()
 
     def observe_true_topk(
         self,

@@ -5,8 +5,10 @@ from __future__ import annotations
 
 # Standard
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from types import MethodType
 from typing import Any
+import threading
 import weakref
 
 # Third Party
@@ -20,6 +22,15 @@ from lmcache.v1.glm_dsa_predictive_prefetch import (
 )
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class GLMDSAAsyncPrediction:
+    """Top-K output and completion event for one private-stream prediction."""
+
+    topk_indices: torch.Tensor
+    done_event: torch.cuda.Event
+
 
 _SUPPORTED_VLLM_VERSION = "0.20.2"
 _DECODER_REGISTRY: weakref.WeakSet[Any] = weakref.WeakSet()
@@ -109,6 +120,9 @@ class VLLM0202GLMDSAProxy:
 
     def __init__(self, decoder_layers: Mapping[int, Any]) -> None:
         self._decoder_layers = dict(decoder_layers)
+        self._prediction_stream: torch.cuda.Stream | None = None
+        self._prediction_device: torch.device | None = None
+        self._launch_lock = threading.Lock()
 
     def validate_schedule(
         self,
@@ -188,6 +202,50 @@ class VLLM0202GLMDSAProxy:
         """
         if activation.is_cuda and torch.cuda.is_current_stream_capturing():
             raise RuntimeError("GLM DSA proxy is not supported during CUDA capture")
+        return self._predict_activation(schedule, activation, positions)
+
+    def predict_async(
+        self,
+        schedule: GLMDSAPredictionSchedule,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        positions: torch.Tensor,
+    ) -> GLMDSAAsyncPrediction:
+        """Enqueue activation and prediction on one ordered private stream."""
+        if not hidden_states.is_cuda:
+            raise RuntimeError("asynchronous GLM prediction requires CUDA tensors")
+        device = hidden_states.device
+        with self._launch_lock, torch.cuda.device(device):
+            if self._prediction_stream is None:
+                self._prediction_stream = torch.cuda.Stream(device=device)
+                self._prediction_device = device
+            elif self._prediction_device != device:
+                raise RuntimeError("GLM prediction stream device changed")
+            model_stream = torch.cuda.current_stream(device)
+            source_ready = torch.cuda.Event()
+            source_ready.record(model_stream)
+            self._prediction_stream.wait_event(source_ready)
+            hidden_states.record_stream(self._prediction_stream)
+            positions.record_stream(self._prediction_stream)
+            if residual is not None:
+                residual.record_stream(self._prediction_stream)
+            with torch.cuda.stream(self._prediction_stream):
+                activation = (
+                    hidden_states if residual is None else hidden_states + residual
+                )
+                topk = self._predict_activation(schedule, activation, positions)
+                topk.record_stream(self._prediction_stream)
+                done = torch.cuda.Event()
+                done.record(self._prediction_stream)
+        return GLMDSAAsyncPrediction(topk, done)
+
+    def _predict_activation(
+        self,
+        schedule: GLMDSAPredictionSchedule,
+        activation: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Launch one read-only target indexer for a prepared activation."""
         target = self._decoder_layers[schedule.target_layer]
         attention = target.self_attn
         proxy_hidden = target.input_layernorm(activation)
@@ -255,9 +313,7 @@ class VLLM0202GLMDSAHooks:
         *,
         indexer_types: tuple[str, ...] = (),
         authoritative_observer: Callable[[int, torch.Tensor], None] | None = None,
-        disabled_authoritative_observer: Callable[
-            [int, torch.Tensor], None
-        ]
+        disabled_authoritative_observer: Callable[[int, torch.Tensor], None]
         | None = None,
         consumer_waiter: Callable[[int], bool] | None = None,
         forward_enabled: Callable[[], bool] | None = None,
@@ -286,9 +342,7 @@ class VLLM0202GLMDSAHooks:
             if decoder is not None:
                 self._patch_source_decoder(decoder, layer_id)
 
-        full_layer_ids = {
-            schedule.target_layer for schedule in self._manager.schedules
-        }
+        full_layer_ids = {schedule.target_layer for schedule in self._manager.schedules}
         full_layer_ids.update(
             layer_id
             for layer_id, indexer_type in enumerate(self._indexer_types)
@@ -364,6 +418,10 @@ class VLLM0202GLMDSAHooks:
 
         def _forward(instance: Any, *args: Any, **kwargs: Any) -> Any:
             enabled = self._forward_enabled is None or self._forward_enabled()
+            if enabled and not manager.wait_for_prediction(source_layer):
+                raise RuntimeError(
+                    f"GLM DSA prediction timed out at layer {source_layer}"
+                )
             if (
                 enabled
                 and self._consumer_waiter is not None
@@ -376,8 +434,7 @@ class VLLM0202GLMDSAHooks:
             positions = args[0] if args else kwargs.get("positions")
             if (
                 enabled
-                and
-                isinstance(result, tuple)
+                and isinstance(result, tuple)
                 and len(result) >= 2
                 and isinstance(result[0], torch.Tensor)
                 and isinstance(result[1], torch.Tensor)
