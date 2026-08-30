@@ -2,6 +2,7 @@
 """Source-contract tests for the vLLM 0.26.0 LMCache overlay."""
 
 # Standard
+import ast
 from pathlib import Path
 
 # First Party
@@ -183,6 +184,17 @@ def forward_cuda():
 
     patched = _patch_sparse_indexer(source)
     compile(patched, "patched_sparse_attn_indexer.py", "exec")
+    tree = ast.parse(patched)
+    topk_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "top_k_per_row_prefill"
+    ]
+    assert len(topk_calls) == 1
+    assert isinstance(topk_calls[0].args[-1], ast.Name)
+    assert topk_calls[0].args[-1].id == "score_topk_tokens"
 
     assert "register_lmcache_topk_chunk_callback" in patched
     assert "for chunk_index, chunk in enumerate" in patched

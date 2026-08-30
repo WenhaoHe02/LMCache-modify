@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 from typing import Final
+import re
 
 
 _MARKER: Final = "LMCACHE_VLLM_0260_OVERLAY"
@@ -801,19 +802,19 @@ def _lmcache_true_indexer_cp_workspace(
             "vLLM 0.26.0 marker count changed for sparse indexer weight slices"
         )
     source = source.replace(weight_slice, "weights[score_start:score_end]", 2)
-    topk_call_marker = """                logits.stride(1),
-                topk_tokens,
-            )
-"""
-    source = _replace_once(
+    source, replacements = re.subn(
+        r"(ops\.top_k_per_row_prefill\(.*?logits\.stride\(1\),\s*)"
+        r"topk_tokens,",
+        r"\1score_topk_tokens,",
         source,
-        topk_call_marker,
-        topk_call_marker.replace(
-            "                topk_tokens,\n",
-            "                score_topk_tokens,\n",
-        ),
-        "sparse indexer prediction K-CP top-k width",
+        count=1,
+        flags=re.DOTALL,
     )
+    if replacements != 1:
+        raise PatchError(
+            "vLLM 0.26.0 marker not found for sparse indexer "
+            "prediction K-CP top-k width"
+        )
     merge_marker = """            _merge_dcp_topk_global(
                 logits,
                 topk_indices,
