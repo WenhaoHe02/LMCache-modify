@@ -1197,7 +1197,6 @@ class TorchDistributedShardGather:
                         group=self._metadata_process_group,
                         async_op=True,
                     )
-                gathered_rows = padded_blocks * self._world_size
                 with torch.cuda.stream(self._stream):
                     if completion_event is not None:
                         self._stream.wait_event(completion_event)
@@ -1215,13 +1214,6 @@ class TorchDistributedShardGather:
                             local_rows,
                             out=slot.send[: int(local_gpu.numel())],
                         )
-                    data_submitted = True
-                    data_work = torch.distributed.all_gather_into_tensor(
-                        slot.receive[:gathered_rows],
-                        slot.send[:padded_blocks],
-                        group=self._process_group,
-                        async_op=True,
-                    )
                 id_work.wait()
             metadata_stream.synchronize()
 
@@ -1237,6 +1229,35 @@ class TorchDistributedShardGather:
                 rank_blocks.append(
                     deterministic_block_union(payload[1 : 1 + count].tolist())
                 )
+            # The gathered ID payload is identical on every rank, so every
+            # rank derives the same effective width. Shrinking the KV
+            # collective to the actual maximum advertised count (instead of
+            # the fixed warmed capacity) removes the dominant fixed cost of
+            # the owner gather: with a 512-block capacity but e.g. 80
+            # candidates per rank, the transfer drops by 6x. NCCL still sees
+            # equal send sizes on all ranks.
+            effective_padded = max(
+                1,
+                min(
+                    padded_blocks,
+                    max(
+                        (len(blocks) for blocks in rank_blocks),
+                        default=0,
+                    ),
+                ),
+            )
+            gathered_rows = effective_padded * self._world_size
+            with self._lock, torch.inference_mode(), torch.cuda.stream(self._stream):
+                # Every rank reaches this collective unconditionally, failed
+                # local reads included (they advertised -1 and send stale
+                # rows that no receiver scatters).
+                data_submitted = True
+                data_work = torch.distributed.all_gather_into_tensor(
+                    slot.receive[:gathered_rows],
+                    slot.send[:effective_padded],
+                    group=self._process_group,
+                    async_op=True,
+                )
             partition = partition_rank_local_blocks(rank_blocks)
             with torch.inference_mode(), torch.cuda.stream(self._stream):
                 # The data collective was enqueued first on this same stream;
@@ -1244,12 +1265,19 @@ class TorchDistributedShardGather:
                 # after it. The metadata D2H/partition work above overlaps the
                 # KV transfer instead of forcing a full data-stream sync.
                 if all_ready and partition.union:
-                    positions: list[int] = []
-                    for rank, blocks in enumerate(partition.blocks_by_rank):
-                        positions.extend(
-                            rank * padded_blocks + offset
-                            for offset in range(len(blocks))
-                        )
+                    # Each rank sent its complete candidate list in sorted
+                    # order, but ownership dedup may drop interior entries
+                    # (a duplicate is owned by the lowest selecting rank).
+                    # Row offsets must therefore come from each owned block's
+                    # position within the rank's SENT list, not from the
+                    # owned list's enumeration order. The receive layout
+                    # stride is the shrunken effective width, not the warmed
+                    # capacity.
+                    positions = owner_gather_receive_positions(
+                        rank_blocks,
+                        partition.blocks_by_rank,
+                        effective_padded,
+                    )
                     position_tensor = torch.as_tensor(
                         positions,
                         dtype=torch.int64,

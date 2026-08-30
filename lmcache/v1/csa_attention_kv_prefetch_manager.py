@@ -4795,6 +4795,16 @@ class CSAAttentionKVPrefetchManager:
                 dtype=torch.int64,
                 device="cpu",
             )
+            # SSD I/O reads only owned blocks that are not already resident.
+            # The gate-side AllGather sends KV rows from the K cache tensor,
+            # not from this read's staging, so resident blocks are complete
+            # without touching NVMe. Multi-chunk appends revisit each layer
+            # with heavily overlapping candidate sets; skipping the resident
+            # majority removes that repeated SSD traffic entirely while the
+            # advertised candidate list (and thus the collective descriptor)
+            # keeps the full owned set.
+            with state.pending_reads_lock:
+                owned_to_read = owned[~state.resident_blocks_bitmap[owned]]
             local_event: Optional[torch.cuda.Event] = None
             local_objects: List[Any] = []
             local_completed = torch.empty(0, dtype=torch.int64)
@@ -4823,13 +4833,13 @@ class CSAAttentionKVPrefetchManager:
                         attributes={
                             "kind": detailed_kind,
                             "detail": mode.value,
-                            "blocks": int(owned.numel()),
+                            "blocks": int(owned_to_read.numel()),
                         },
                     ):
                         local_event, local_objects, local_completed = (
                             self._issue_local_reads(
                                 state,
-                                owned,
+                                owned_to_read,
                                 io_priority=io_priority,
                                 profile_kind=detailed_kind,
                                 profile_source_layer=detailed_source_layer,
@@ -4842,9 +4852,27 @@ class CSAAttentionKVPrefetchManager:
                 local_error is None
                 and torch.equal(
                     torch.unique(local_completed.cpu(), sorted=True),
-                    owned,
+                    owned_to_read,
                 )
             )
+            if (
+                local_complete
+                and local_event is None
+                and owned.numel()
+                and int(owned_to_read.numel()) < int(owned.numel())
+                and state.k_cache_tensor.is_cuda
+            ):
+                # Every owned block was already resident, so no fresh read
+                # produced an ordering event. Residency means the block's
+                # scatter was enqueued on the shared scatter stream; record
+                # an event there now so the gate-side gather is still ordered
+                # after those earlier copies.
+                with torch.cuda.device(state.k_cache_tensor.device):
+                    scatter_stream = self._scatter_stream_for(
+                        state.k_cache_tensor.device
+                    )
+                    local_event = torch.cuda.Event()
+                    local_event.record(scatter_stream)
             if local_complete and owned.numel():
                 with state.pending_reads_lock, torch.inference_mode():
                     state.resident_blocks_bitmap[owned] = True
