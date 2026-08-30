@@ -18,5 +18,11 @@ export LMCACHE_GLM_DSA_ASYNC_PREDICTION=1
 # Keep headroom for the row union; compact AllGather still transmits only the
 # actual width rather than this capacity.
 export LMCACHE_CSA_OWNER_BLOCKS_PER_RANK="${LMCACHE_CSA_OWNER_BLOCKS_PER_RANK:-512}"
+# GLM K-cache rows are much wider than DSv4 rows.  The former 128 MiB slot
+# could warm fewer rows than the 512-row owner bound and made the first gather
+# fail before compact-width transmission was reached.  Two slots at 1 GiB cap
+# still allocate only the geometry requested by warm(), while safely covering
+# 512 rows/rank for this model.
+export LMCACHE_SSD_TP_STAGING_SLOT_BYTES="${LMCACHE_SSD_TP_STAGING_SLOT_BYTES:-1073741824}"
 
 exec bash "${script_dir}/launch_glm52_owner_io_v60.sh"
