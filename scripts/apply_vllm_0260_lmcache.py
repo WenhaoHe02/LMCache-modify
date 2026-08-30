@@ -16,6 +16,24 @@ class PatchError(RuntimeError):
     """Raised when a vLLM source tree does not match the supported layout."""
 
 
+def _balanced_causal_k_bounds(
+    k_start: int,
+    k_end: int,
+    rank: int,
+    world_size: int,
+) -> tuple[int, int]:
+    """Split one causal K interval into contiguous, non-overlapping shards."""
+    if k_start < 0 or k_end < k_start:
+        raise ValueError("K bounds must satisfy 0 <= start <= end")
+    if world_size <= 0 or rank < 0 or rank >= world_size:
+        raise ValueError("invalid K partition rank or world size")
+    span = k_end - k_start
+    return (
+        k_start + span * rank // world_size,
+        k_start + span * (rank + 1) // world_size,
+    )
+
+
 def _replace_once(source: str, old: str, new: str, label: str) -> str:
     if old not in source:
         raise PatchError(f"vLLM 0.26.0 marker not found for {label}")
@@ -524,6 +542,12 @@ def _lmcache_true_indexer_cp_context(
     }}
     if not enabled:
         return None
+    if proxy_mode and os.getenv(
+        "LMCACHE_PROXY_INDEXER_K_CP", "0"
+    ).lower() in {{"1", "true", "yes", "on"}}:
+        # Prediction-only K-CP owns all query rows; query-CP would otherwise
+        # discard seven eighths of them before the K partition is applied.
+        return None
     try:
         minimum_rows = max(
             1,
@@ -570,6 +594,63 @@ def _lmcache_balanced_row_bounds(
         int(num_rows) * int(rank) // int(world_size),
         int(num_rows) * (int(rank) + 1) // int(world_size),
     )
+
+
+def _lmcache_proxy_indexer_k_cp_context(
+    skip_k_cache_insert: bool,
+    dcp_world_size: int,
+    use_pcp: bool,
+) -> tuple[int, int] | None:
+    """Return TP rank/size for prediction-only contiguous K partitioning."""
+    enabled = os.getenv("LMCACHE_PROXY_INDEXER_K_CP", "0").lower() in {{
+        "1",
+        "true",
+        "yes",
+        "on",
+    }}
+    if not bool(skip_k_cache_insert) or not enabled:
+        return None
+    if int(dcp_world_size) != 1 or bool(use_pcp):
+        raise RuntimeError(
+            "LMCACHE_PROXY_INDEXER_K_CP requires vLLM DCP=1 and PCP disabled"
+        )
+    import torch.distributed as dist
+    from vllm.distributed import get_tp_group
+
+    if not dist.is_available() or not dist.is_initialized():
+        raise RuntimeError(
+            "LMCACHE_PROXY_INDEXER_K_CP requires initialized torch.distributed"
+        )
+    tp_group = get_tp_group()
+    world_size = int(tp_group.world_size)
+    rank = int(tp_group.rank_in_group)
+    expected_size = max(
+        2,
+        int(os.getenv("LMCACHE_PROXY_INDEXER_K_CP_SIZE", "8")),
+    )
+    if world_size != expected_size:
+        raise RuntimeError(
+            "LMCACHE_PROXY_INDEXER_K_CP_SIZE does not match the TP group: "
+            f"configured={{expected_size}} runtime={{world_size}}"
+        )
+    return rank, world_size
+
+
+def _lmcache_contiguous_k_bounds(
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    rank: int,
+    world_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split every row's complete causal K interval across TP ranks."""
+    spans = row_ends - row_starts
+    local_starts = row_starts + torch.div(
+        spans * int(rank), int(world_size), rounding_mode="floor"
+    )
+    local_ends = row_starts + torch.div(
+        spans * (int(rank) + 1), int(world_size), rounding_mode="floor"
+    )
+    return local_starts, local_ends
 
 
 def _lmcache_true_indexer_cp_workspace(
@@ -632,6 +713,11 @@ def _lmcache_true_indexer_cp_workspace(
                 use_pcp,
                 proxy_mode=bool(skip_k_cache_insert),
             )
+            k_cp_context = _lmcache_proxy_indexer_k_cp_context(
+                bool(skip_k_cache_insert),
+                dcp_world_size,
+                use_pcp,
+            )
             if cp_context is None:
                 score_start = chunk_start
                 score_end = chunk_end
@@ -648,6 +734,18 @@ def _lmcache_true_indexer_cp_workspace(
             relative_end = score_end - chunk_start
             cu_seqlen_ks = chunk.cu_seqlen_ks[relative_start:relative_end]
             cu_seqlen_ke = chunk.cu_seqlen_ke[relative_start:relative_end]
+            score_topk_tokens = topk_tokens
+            if k_cp_context is not None:
+                k_cp_rank, k_cp_world_size = k_cp_context
+                cu_seqlen_ks, cu_seqlen_ke = _lmcache_contiguous_k_bounds(
+                    cu_seqlen_ks,
+                    cu_seqlen_ke,
+                    k_cp_rank,
+                    k_cp_world_size,
+                )
+                score_topk_tokens = (
+                    topk_tokens + k_cp_world_size - 1
+                ) // k_cp_world_size
 """
     source = _replace_once(
         source,
@@ -674,7 +772,10 @@ def _lmcache_true_indexer_cp_workspace(
             complete_topk = topk_indices_buffer[
                 chunk_start:chunk_end, :topk_tokens
             ]
-            if cp_context is None:
+            if k_cp_context is not None:
+                complete_topk.fill_(-1)
+                topk_indices = complete_topk[:, :score_topk_tokens]
+            elif cp_context is None:
                 topk_indices = complete_topk
             else:
                 padded_rows = (chunk_rows + cp_world_size - 1) // cp_world_size
@@ -700,6 +801,19 @@ def _lmcache_true_indexer_cp_workspace(
             "vLLM 0.26.0 marker count changed for sparse indexer weight slices"
         )
     source = source.replace(weight_slice, "weights[score_start:score_end]", 2)
+    topk_call_marker = """                logits.stride(1),
+                topk_tokens,
+            )
+"""
+    source = _replace_once(
+        source,
+        topk_call_marker,
+        topk_call_marker.replace(
+            "                topk_tokens,\n",
+            "                score_topk_tokens,\n",
+        ),
+        "sparse indexer prediction K-CP top-k width",
+    )
     merge_marker = """            _merge_dcp_topk_global(
                 logits,
                 topk_indices,
@@ -713,7 +827,7 @@ def _lmcache_true_indexer_cp_workspace(
     cp_merge = """            _merge_dcp_topk_global(
                 logits,
                 topk_indices,
-                topk_tokens,
+                score_topk_tokens,
                 dcp_rank,
                 dcp_world_size,
                 cp_kv_cache_interleave_size,

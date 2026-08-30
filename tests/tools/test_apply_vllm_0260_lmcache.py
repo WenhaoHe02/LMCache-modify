@@ -7,6 +7,7 @@ from pathlib import Path
 # First Party
 from scripts.apply_vllm_0260_lmcache import (
     _MARKER,
+    _balanced_causal_k_bounds,
     _patch_api_server,
     _patch_cache_utils,
     _patch_connector,
@@ -154,6 +155,16 @@ def score():
             cuda_logits = score_cuda(
                 weights[chunk.token_start : chunk.token_end]
             )
+            ops.top_k_per_row_prefill(
+                logits,
+                cu_seqlen_ks,
+                cu_seqlen_ke,
+                topk_indices,
+                num_rows,
+                logits.stride(0),
+                logits.stride(1),
+                topk_tokens,
+            )
             _merge_dcp_topk_global(
                 logits,
                 topk_indices,
@@ -171,11 +182,18 @@ def forward_cuda():
 """
 
     patched = _patch_sparse_indexer(source)
+    compile(patched, "patched_sparse_attn_indexer.py", "exec")
 
     assert "register_lmcache_topk_chunk_callback" in patched
     assert "for chunk_index, chunk in enumerate" in patched
     assert "_lmcache_true_indexer_cp_context(" in patched
     assert '"LMCACHE_PROXY_INDEXER_CP"' in patched
+    assert '"LMCACHE_PROXY_INDEXER_K_CP"' in patched
+    assert "_lmcache_proxy_indexer_k_cp_context(" in patched
+    assert "_lmcache_contiguous_k_bounds(" in patched
+    assert "complete_topk[:, :score_topk_tokens]" in patched
+    assert "topk_tokens + k_cp_world_size - 1" in patched
+    assert "score_topk_tokens," in patched
     assert "proxy_mode=bool(skip_k_cache_insert)" in patched
     assert "q_quant[score_start:score_end]" in patched
     assert patched.count("weights[score_start:score_end]") == 2
@@ -188,6 +206,30 @@ def forward_cuda():
     assert patched.index("_merge_dcp_topk_global(") < patched.index(
         "chunk_callback(topk_indices, chunk_index)"
     )
+
+
+def test_balanced_causal_k_bounds_cover_nondivisible_intervals() -> None:
+    """Every causal interval is covered exactly once across prediction ranks."""
+    for start, end in ((0, 0), (0, 1), (3, 10), (17, 1042), (0, 131073)):
+        shards = [_balanced_causal_k_bounds(start, end, rank, 8) for rank in range(8)]
+        assert shards[0][0] == start
+        assert shards[-1][1] == end
+        assert all(
+            left[1] == right[0] for left, right in zip(shards, shards[1:], strict=False)
+        )
+        assert sum(shard_end - shard_start for shard_start, shard_end in shards) == (
+            end - start
+        )
+
+
+def test_balanced_causal_k_bounds_follow_each_query_causal_end() -> None:
+    """A later query's append tail is partitioned as part of its total K range."""
+    early = [_balanced_causal_k_bounds(0, 1001, rank, 8) for rank in range(8)]
+    later = [_balanced_causal_k_bounds(0, 1007, rank, 8) for rank in range(8)]
+
+    assert early[-1][1] == 1001
+    assert later[-1][1] == 1007
+    assert later != early
 
 
 def test_flashmla_overlay_remaps_only_compact_csa_rows() -> None:
