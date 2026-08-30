@@ -1370,6 +1370,15 @@ class TorchDistributedShardGather:
                         world_size=self._world_size,
                         padded_blocks=padded_blocks,
                     )
+                    valid = (
+                        (selected >= 0)
+                        & (selected < int(logical_destination_rows.numel()))
+                        & (source_positions >= 0)
+                        & (source_positions < gathered_rows)
+                    )
+                    all_ready = all_ready & torch.all(valid)
+                    selected = selected[valid]
+                    source_positions = source_positions[valid]
                     gathered = slot.receive[:gathered_rows].index_select(
                         0, source_positions
                     )
