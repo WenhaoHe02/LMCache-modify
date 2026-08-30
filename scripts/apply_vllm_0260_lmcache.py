@@ -35,6 +35,29 @@ def _balanced_causal_k_bounds(
     )
 
 
+def _compact_causal_k_union(
+    k_starts: tuple[int, ...],
+    k_ends: tuple[int, ...],
+    rank: int,
+    world_size: int,
+) -> tuple[int, int, tuple[int, ...], tuple[int, ...]]:
+    """Return one compact union and rebased per-query K intervals."""
+    if len(k_starts) != len(k_ends) or not k_starts:
+        raise ValueError("K interval lists must be non-empty and aligned")
+    shards = [
+        _balanced_causal_k_bounds(start, end, rank, world_size)
+        for start, end in zip(k_starts, k_ends, strict=True)
+    ]
+    union_start = min(start for start, _end in shards)
+    union_end = max(end for _start, end in shards)
+    return (
+        union_start,
+        union_end,
+        tuple(start - union_start for start, _end in shards),
+        tuple(end - union_start for _start, end in shards),
+    )
+
+
 def _replace_once(source: str, old: str, new: str, label: str) -> str:
     if old not in source:
         raise PatchError(f"vLLM 0.26.0 marker not found for {label}")
@@ -796,6 +819,75 @@ def _lmcache_true_indexer_cp_workspace(
         cp_query_output,
         "sparse indexer query CP slices",
     )
+    full_k_gather = """            assert chunk.local_cu_seq_lens is not None
+            k_quant = k_quant_full[: chunk.max_local_total_seq_lens]
+            k_scale = k_scale_full[: chunk.max_local_total_seq_lens]
+            if not chunk.skip_kv_gather and chunk.local_total_seq_lens > 0:
+                ops.cp_gather_indexer_k_quant_cache(
+                    kv_cache,
+                    k_quant,
+                    k_scale,
+                    chunk.block_table,
+                    chunk.local_cu_seq_lens,
+                )
+"""
+    compact_k_gather = """            assert chunk.local_cu_seq_lens is not None
+            compact_k_cp = False
+            compact_k_global_start = 0
+            compact_supported = (
+                k_cp_context is not None
+                and chunk.block_table.ndim == 2
+                and int(chunk.block_table.shape[0]) == 1
+                and cu_seqlen_ks.numel() > 0
+            )
+            if compact_supported:
+                compact_k_global_start = int(cu_seqlen_ks.min().item())
+                compact_k_global_end = int(cu_seqlen_ke.max().item())
+                compact_supported = compact_k_global_end > compact_k_global_start
+            if compact_supported:
+                from lmcache.v1.csa_prefill_cp_scorer import (
+                    gather_prefill_cp_local_k_rows,
+                )
+
+                global_key_indices = torch.arange(
+                    compact_k_global_start,
+                    compact_k_global_end,
+                    dtype=torch.int64,
+                    device=kv_cache.device,
+                )
+                value_bytes = head_dim // 2 if use_fp4_cache else head_dim
+                scale_bytes = head_dim // MXFP4_BLOCK_SIZE if use_fp4_cache else 4
+                k_quant, k_scale = gather_prefill_cp_local_k_rows(
+                    kv_cache,
+                    chunk.block_table,
+                    global_key_indices,
+                    value_bytes=value_bytes,
+                    scale_bytes=scale_bytes,
+                    value_dtype=torch.uint8 if use_fp4_cache else fp8_dtype,
+                )
+                cu_seqlen_ks = cu_seqlen_ks - compact_k_global_start
+                cu_seqlen_ke = cu_seqlen_ke - compact_k_global_start
+                compact_k_cp = True
+            else:
+                # Unsupported batched/non-standard metadata keeps the exact
+                # established full gather rather than changing candidates.
+                k_quant = k_quant_full[: chunk.max_local_total_seq_lens]
+                k_scale = k_scale_full[: chunk.max_local_total_seq_lens]
+                if not chunk.skip_kv_gather and chunk.local_total_seq_lens > 0:
+                    ops.cp_gather_indexer_k_quant_cache(
+                        kv_cache,
+                        k_quant,
+                        k_scale,
+                        chunk.block_table,
+                        chunk.local_cu_seq_lens,
+                    )
+"""
+    source = _replace_once(
+        source,
+        full_k_gather,
+        compact_k_gather,
+        "sparse indexer compact prediction K gather",
+    )
     weight_slice = "weights[chunk.token_start : chunk.token_end]"
     if source.count(weight_slice) != 2:
         raise PatchError(
@@ -815,6 +907,19 @@ def _lmcache_true_indexer_cp_workspace(
             "vLLM 0.26.0 marker not found for sparse indexer "
             "prediction K-CP top-k width"
         )
+    topk_restore_marker = """            _merge_dcp_topk_global(
+"""
+    topk_restore = """            if compact_k_cp:
+                valid_local_topk = topk_indices >= 0
+                topk_indices[valid_local_topk] += compact_k_global_start
+            _merge_dcp_topk_global(
+"""
+    source = _replace_once(
+        source,
+        topk_restore_marker,
+        topk_restore,
+        "sparse indexer compact K global ID restore",
+    )
     merge_marker = """            _merge_dcp_topk_global(
                 logits,
                 topk_indices,

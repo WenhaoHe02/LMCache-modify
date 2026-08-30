@@ -9,6 +9,7 @@ from pathlib import Path
 from scripts.apply_vllm_0260_lmcache import (
     _MARKER,
     _balanced_causal_k_bounds,
+    _compact_causal_k_union,
     _patch_api_server,
     _patch_cache_utils,
     _patch_connector,
@@ -141,6 +142,17 @@ def score():
         for chunk in prefill_metadata.chunks:
             cu_seqlen_ks = chunk.cu_seqlen_ks
             cu_seqlen_ke = chunk.cu_seqlen_ke
+            assert chunk.local_cu_seq_lens is not None
+            k_quant = k_quant_full[: chunk.max_local_total_seq_lens]
+            k_scale = k_scale_full[: chunk.max_local_total_seq_lens]
+            if not chunk.skip_kv_gather and chunk.local_total_seq_lens > 0:
+                ops.cp_gather_indexer_k_quant_cache(
+                    kv_cache,
+                    k_quant,
+                    k_scale,
+                    chunk.block_table,
+                    chunk.local_cu_seq_lens,
+                )
             q_slice = q_quant[chunk.token_start : chunk.token_end]
             q_scale_slice = (
                 q_scale[chunk.token_start : chunk.token_end]
@@ -205,6 +217,10 @@ def forward_cuda():
     assert "_lmcache_contiguous_k_bounds(" in patched
     assert "complete_topk[:, :score_topk_tokens]" in patched
     assert "topk_tokens + k_cp_world_size - 1" in patched
+    assert "gather_prefill_cp_local_k_rows(" in patched
+    assert "cu_seqlen_ks = cu_seqlen_ks - compact_k_global_start" in patched
+    assert "topk_indices[valid_local_topk] += compact_k_global_start" in patched
+    assert "int(chunk.block_table.shape[0]) == 1" in patched
     assert "score_topk_tokens," in patched
     assert "proxy_mode=bool(skip_k_cache_insert)" in patched
     assert "q_quant[score_start:score_end]" in patched
@@ -242,6 +258,40 @@ def test_balanced_causal_k_bounds_follow_each_query_causal_end() -> None:
     assert early[-1][1] == 1001
     assert later[-1][1] == 1007
     assert later != early
+
+
+def test_compact_causal_union_preserves_every_local_visible_set() -> None:
+    """Rebased compact bounds reconstruct exact global K shards per query."""
+    starts = (0, 0, 0, 0, 0)
+    ends = (1001, 1002, 1003, 1004, 1009)
+    for rank in range(8):
+        union_start, union_end, local_starts, local_ends = _compact_causal_k_union(
+            starts, ends, rank, 8
+        )
+        assert 0 <= union_start <= union_end
+        for start, end, local_start, local_end in zip(
+            starts, ends, local_starts, local_ends, strict=True
+        ):
+            expected = _balanced_causal_k_bounds(start, end, rank, 8)
+            assert (local_start + union_start, local_end + union_start) == expected
+
+
+def test_compact_causal_union_covers_nonzero_and_nondivisible_prefix() -> None:
+    """Sequence offsets and append tails retain exact rank-local boundaries."""
+    starts = (17, 17, 17)
+    ends = (131071, 131072, 131079)
+    union_start, union_end, local_starts, local_ends = _compact_causal_k_union(
+        starts, ends, rank=5, world_size=8
+    )
+    assert union_end > union_start
+    assert tuple(value + union_start for value in local_starts) == tuple(
+        _balanced_causal_k_bounds(start, end, 5, 8)[0]
+        for start, end in zip(starts, ends, strict=True)
+    )
+    assert tuple(value + union_start for value in local_ends) == tuple(
+        _balanced_causal_k_bounds(start, end, 5, 8)[1]
+        for start, end in zip(starts, ends, strict=True)
+    )
 
 
 def test_flashmla_overlay_remaps_only_compact_csa_rows() -> None:
