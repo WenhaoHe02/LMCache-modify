@@ -188,6 +188,18 @@ def score():
                 row_starts=chunk.cu_seqlen_ks,
             )
 
+def decode():
+        if has_decode:
+            _merge_dcp_topk_global(
+                decode_logits,
+                decode_topk_indices,
+                topk_tokens,
+                dcp_rank,
+                dcp_world_size,
+                cp_kv_cache_interleave_size,
+                row_starts=decode_row_starts,
+            )
+
 def forward_cuda():
         return torch.ops.vllm.sparse_attn_indexer(
             hidden_states,
@@ -197,6 +209,42 @@ def forward_cuda():
     patched = _patch_sparse_indexer(source)
     compile(patched, "patched_sparse_attn_indexer.py", "exec")
     tree = ast.parse(patched)
+    original_decode = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "decode"
+    )
+    patched_decode = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "decode"
+    )
+    assert ast.dump(patched_decode) == ast.dump(original_decode)
+    assert not any(
+        isinstance(node, ast.Name) and node.id.startswith("compact_k")
+        for node in ast.walk(patched_decode)
+    )
+    prefill = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "score"
+    )
+    restores = [
+        node
+        for node in ast.walk(prefill)
+        if isinstance(node, ast.AugAssign)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "compact_k_global_start"
+    ]
+    merges = [
+        node
+        for node in ast.walk(prefill)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_merge_dcp_topk_global"
+    ]
+    assert len(restores) == len(merges) == 1
+    assert restores[0].lineno < merges[0].lineno
     topk_calls = [
         node
         for node in ast.walk(tree)

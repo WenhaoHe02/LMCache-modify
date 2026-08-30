@@ -907,19 +907,6 @@ def _lmcache_true_indexer_cp_workspace(
             "vLLM 0.26.0 marker not found for sparse indexer "
             "prediction K-CP top-k width"
         )
-    topk_restore_marker = """            _merge_dcp_topk_global(
-"""
-    topk_restore = """            if compact_k_cp:
-                valid_local_topk = topk_indices >= 0
-                topk_indices[valid_local_topk] += compact_k_global_start
-            _merge_dcp_topk_global(
-"""
-    source = _replace_once(
-        source,
-        topk_restore_marker,
-        topk_restore,
-        "sparse indexer compact K global ID restore",
-    )
     merge_marker = """            _merge_dcp_topk_global(
                 logits,
                 topk_indices,
@@ -930,7 +917,10 @@ def _lmcache_true_indexer_cp_workspace(
                 row_starts=chunk.cu_seqlen_ks,
             )
 """
-    cp_merge = """            _merge_dcp_topk_global(
+    cp_merge = """            if compact_k_cp:
+                valid_local_topk = topk_indices >= 0
+                topk_indices[valid_local_topk] += compact_k_global_start
+            _merge_dcp_topk_global(
                 logits,
                 topk_indices,
                 score_topk_tokens,
