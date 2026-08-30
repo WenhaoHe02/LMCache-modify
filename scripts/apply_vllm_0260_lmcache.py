@@ -677,6 +677,26 @@ def _lmcache_contiguous_k_bounds(
     return local_starts, local_ends
 
 
+def _lmcache_publish_k_cp_topk(
+    local_topk: torch.Tensor,
+    row_offsets: torch.Tensor,
+    complete_topk: torch.Tensor,
+) -> None:
+    """Publish sampler row-relative IDs in original sequence coordinates.
+
+    The native prefill sampler writes a packed rows*topk output and returns
+    indices relative to each row's K start, not the compact matrix. Offsets
+    are shard start minus original sequence start. Fixed-shape publication
+    preserves padding without boolean-indexing/nonzero synchronization.
+    """
+    local_topk.copy_(torch.where(
+        local_topk >= 0,
+        local_topk + row_offsets[:, None],
+        local_topk,
+    ))
+    complete_topk[:, :local_topk.shape[1]].copy_(local_topk)
+
+
 def _lmcache_true_indexer_cp_workspace(
     reference: torch.Tensor,
     padded_rows: int,
@@ -759,14 +779,17 @@ def _lmcache_true_indexer_cp_workspace(
             cu_seqlen_ks = chunk.cu_seqlen_ks[relative_start:relative_end]
             cu_seqlen_ke = chunk.cu_seqlen_ke[relative_start:relative_end]
             score_topk_tokens = topk_tokens
+            k_cp_row_offsets = None
             if k_cp_context is not None:
                 k_cp_rank, k_cp_world_size = k_cp_context
+                original_row_starts = cu_seqlen_ks
                 cu_seqlen_ks, cu_seqlen_ke = _lmcache_contiguous_k_bounds(
                     cu_seqlen_ks,
                     cu_seqlen_ke,
                     k_cp_rank,
                     k_cp_world_size,
                 )
+                k_cp_row_offsets = cu_seqlen_ks - original_row_starts
                 score_topk_tokens = (
                     topk_tokens + k_cp_world_size - 1
                 ) // k_cp_world_size
@@ -798,7 +821,13 @@ def _lmcache_true_indexer_cp_workspace(
             ]
             if k_cp_context is not None:
                 complete_topk.fill_(-1)
-                topk_indices = complete_topk[:, :score_topk_tokens]
+                # The native sampler advances output by row * topk; it does
+                # not honor a sliced tensor's larger parent row stride.
+                topk_indices = torch.empty(
+                    (chunk_rows, score_topk_tokens),
+                    dtype=complete_topk.dtype,
+                    device=complete_topk.device,
+                )
             elif cp_context is None:
                 topk_indices = complete_topk
             else:
@@ -917,9 +946,12 @@ def _lmcache_true_indexer_cp_workspace(
                 row_starts=chunk.cu_seqlen_ks,
             )
 """
-    cp_merge = """            if compact_k_cp:
-                valid_local_topk = topk_indices >= 0
-                topk_indices[valid_local_topk] += compact_k_global_start
+    cp_merge = """            if k_cp_context is not None:
+                _lmcache_publish_k_cp_topk(
+                    topk_indices,
+                    k_cp_row_offsets,
+                    complete_topk,
+                )
             _merge_dcp_topk_global(
                 logits,
                 topk_indices,

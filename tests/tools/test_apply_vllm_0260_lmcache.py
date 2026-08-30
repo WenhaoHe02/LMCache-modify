@@ -4,6 +4,12 @@
 # Standard
 import ast
 from pathlib import Path
+import sys
+from types import SimpleNamespace
+
+# Third Party
+import pytest
+import torch
 
 # First Party
 from scripts.apply_vllm_0260_lmcache import (
@@ -134,8 +140,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         assert f'"{event}"' in patched
 
 
-def test_sparse_indexer_overlay_observes_chunks_after_global_merge() -> None:
-    source = """import torch
+def _sparse_indexer_source() -> str:
+    return """import torch
 MXFP4_BLOCK_SIZE = 32
 
 def score():
@@ -206,6 +212,9 @@ def forward_cuda():
         )
 """
 
+
+def test_sparse_indexer_overlay_observes_chunks_after_global_merge() -> None:
+    source = _sparse_indexer_source()
     patched = _patch_sparse_indexer(source)
     compile(patched, "patched_sparse_attn_indexer.py", "exec")
     tree = ast.parse(patched)
@@ -232,9 +241,9 @@ def forward_cuda():
     restores = [
         node
         for node in ast.walk(prefill)
-        if isinstance(node, ast.AugAssign)
-        and isinstance(node.value, ast.Name)
-        and node.value.id == "compact_k_global_start"
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_lmcache_publish_k_cp_topk"
     ]
     merges = [
         node
@@ -263,11 +272,11 @@ def forward_cuda():
     assert '"LMCACHE_PROXY_INDEXER_K_CP"' in patched
     assert "_lmcache_proxy_indexer_k_cp_context(" in patched
     assert "_lmcache_contiguous_k_bounds(" in patched
-    assert "complete_topk[:, :score_topk_tokens]" in patched
+    assert "(chunk_rows, score_topk_tokens)" in patched
     assert "topk_tokens + k_cp_world_size - 1" in patched
     assert "gather_prefill_cp_local_k_rows(" in patched
     assert "cu_seqlen_ks = cu_seqlen_ks - compact_k_global_start" in patched
-    assert "topk_indices[valid_local_topk] += compact_k_global_start" in patched
+    assert "k_cp_row_offsets = cu_seqlen_ks - original_row_starts" in patched
     assert "int(chunk.block_table.shape[0]) == 1" in patched
     assert "score_topk_tokens," in patched
     assert "proxy_mode=bool(skip_k_cache_insert)" in patched
@@ -282,6 +291,133 @@ def forward_cuda():
     assert patched.index("_merge_dcp_topk_global(") < patched.index(
         "chunk_callback(topk_indices, chunk_index)"
     )
+
+
+@pytest.mark.parametrize("rank", [None, 0, 1, 7])
+@pytest.mark.parametrize("compact", [False, True])
+def test_generated_k_cp_obeys_native_sampler_contract(
+    monkeypatch: pytest.MonkeyPatch, rank: int | None, compact: bool
+) -> None:
+    """Packed native writes and row-relative IDs survive K partitioning.
+
+    Model vLLM ffd46bf csrc/libtorch_stable/sampler.cu: output advances by row*topk
+    stride, and each returned index is relative to that query's rowStart.
+    Execute the generated prefill loop, not a separate implementation of it.
+    """
+    tree = ast.parse(_patch_sparse_indexer(_sparse_indexer_source()))
+    names = {"score", "_lmcache_contiguous_k_bounds", "_lmcache_publish_k_cp_topk"}
+    functions = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    starts = torch.tensor([0, 0, 0, 0] if compact else [0, 1000, 1000, 2000])
+    ends = starts + torch.tensor([1, 7, 39, 49])
+    complete = torch.full((8, 16), 777, dtype=torch.int32)
+    chunk = SimpleNamespace(
+        token_start=2,
+        token_end=6,
+        cu_seqlen_ks=starts,
+        cu_seqlen_ke=ends,
+        block_table=torch.zeros((1 if compact else 2, 64), dtype=torch.int32),
+        local_cu_seq_lens=torch.tensor([0, 2049]),
+        max_local_total_seq_lens=2049,
+        local_total_seq_lens=2049,
+        skip_kv_gather=False,
+    )
+    gathered: list[torch.Tensor] = []
+
+    def gather_rows(
+        *args: object, **kwargs: object
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        keys = args[2]
+        assert isinstance(keys, torch.Tensor)
+        gathered.append(keys.clone())
+        return torch.zeros((len(keys), 4)), torch.zeros((len(keys), 4))
+
+    monkeypatch.setitem(
+        sys.modules,
+        "lmcache.v1.csa_prefill_cp_scorer",
+        SimpleNamespace(gather_prefill_cp_local_k_rows=gather_rows),
+    )
+
+    def native_sampler(
+        logits: torch.Tensor,
+        ks: torch.Tensor,
+        ke: torch.Tensor,
+        output: torch.Tensor,
+        rows: int,
+        stride0: int,
+        stride1: int,
+        width: int,
+    ) -> None:
+        assert width == (16 if rank is None else 2)
+        assert output.is_contiguous(), "native sampler ignores output strides"
+        packed = output.as_strided((rows, width), (width, 1))
+        packed.fill_(-1)
+        for row in range(rows):
+            # Strictly increasing scores: choose the last visible K columns.
+            length = int(ke[row] - ks[row])
+            count = min(length, width)
+            packed[row, :count] = torch.arange(length - 1, length - count - 1, -1)
+
+    ns = {
+        "torch": torch,
+        "prefill_metadata": SimpleNamespace(chunks=[chunk]),
+        "_LMCACHE_TOPK_CHUNK_CALLBACKS": {},
+        "k_cache_prefix": "test",
+        "_lmcache_true_indexer_cp_context": lambda *a, **kw: None,
+        "_lmcache_proxy_indexer_k_cp_context": (
+            lambda *a: None if rank is None else (rank, 8)
+        ),
+        "dcp_world_size": 1,
+        "dcp_rank": 0,
+        "use_pcp": False,
+        "skip_k_cache_insert": True,
+        "topk_tokens": 16,
+        "q_quant": torch.zeros((8, 4)),
+        "q_scale": None,
+        "weights": torch.zeros((8, 1)),
+        "topk_indices_buffer": complete,
+        "k_quant_full": torch.zeros((2049, 4)),
+        "k_scale_full": torch.zeros((2049, 4)),
+        "kv_cache": torch.zeros((64, 64, 8), dtype=torch.uint8),
+        "head_dim": 4,
+        "use_fp4_cache": False,
+        "fp8_dtype": torch.uint8,
+        "ops": SimpleNamespace(
+            cp_gather_indexer_k_quant_cache=lambda *a: None,
+            top_k_per_row_prefill=native_sampler,
+        ),
+        "score_xpu": lambda *a: None,
+        "score_cuda": lambda *a: None,
+        "logits": torch.zeros((4, 2049)),
+        "num_rows": 4,
+        "_merge_dcp_topk_global": lambda *a, **kw: None,
+        "cp_kv_cache_interleave_size": 64,
+    }
+    exec(
+        compile(ast.Module(body=functions, type_ignores=[]), "generated.py", "exec"), ns
+    )
+    ns["score"]()
+    expected = torch.full((4, 16), -1, dtype=torch.int32)
+    for row, (start, end) in enumerate(
+        zip(starts.tolist(), ends.tolist(), strict=True)
+    ):
+        shard_start, shard_end = (
+            (start, end)
+            if rank is None
+            else _balanced_causal_k_bounds(start, end, rank, 8)
+        )
+        count = min(16 if rank is None else 2, shard_end - shard_start)
+        expected[row, :count] = torch.arange(
+            shard_end - start - 1,
+            shard_end - start - count - 1,
+            -1,
+        )
+    torch.testing.assert_close(complete[2:6], expected)
+    assert torch.all(complete[:2] == 777) and torch.all(complete[6:] == 777)
+    assert bool(gathered) == (compact and rank is not None)
 
 
 def test_balanced_causal_k_bounds_cover_nondivisible_intervals() -> None:
