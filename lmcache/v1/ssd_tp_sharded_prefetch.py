@@ -753,6 +753,10 @@ class ShardGatherTransport(Protocol):
         """Return the prefetch group size."""
 
     @property
+    def owner_row_capacity(self) -> int:
+        """Return warmed owner send rows, or zero before warmup."""
+
+    @property
     def healthy(self) -> bool:
         """Return whether future shard-gather submissions are allowed."""
 
@@ -949,6 +953,12 @@ class TorchDistributedShardGather:
     def world_size(self) -> int:
         """Return the prefetch group size."""
         return self._world_size
+
+    @property
+    def owner_row_capacity(self) -> int:
+        """Return the smallest warmed owner send-row capacity."""
+        with self._lock:
+            return min((int(slot.send.shape[0]) for slot in self._slots), default=0)
 
     @property
     def healthy(self) -> bool:

@@ -4930,6 +4930,16 @@ class CSAAttentionKVPrefetchManager:
                             )
                         ),
                     )
+                    owner_capacity = int(
+                        getattr(transport, "owner_row_capacity", padded_blocks)
+                    )
+                    if owner_capacity <= 0:
+                        # No owner collective can be submitted before warmup.
+                        # Publish nothing and let authoritative correction
+                        # recover the complete true selection at the target.
+                        completed = True
+                        return
+                    padded_blocks = min(padded_blocks, owner_capacity)
                     gpu_owner_metadata = os.environ.get(
                         "LMCACHE_CSA_OWNER_GPU_METADATA", "0"
                     ).strip().lower() in {"1", "true", "yes", "on"}

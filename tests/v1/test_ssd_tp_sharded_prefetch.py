@@ -311,6 +311,20 @@ def test_owner_gather_uses_actual_max_width_and_duplicate_send_offset(
     assert resident.nonzero().reshape(-1).tolist() == [2, 7, 8, 9]
 
 
+def test_owner_row_capacity_reports_warmed_slot_rows() -> None:
+    """The manager can cap configured owner width to actual staging geometry."""
+    transport = object.__new__(TorchDistributedShardGather)
+    transport._lock = threading.Lock()
+    transport._slots = []
+    assert transport.owner_row_capacity == 0
+
+    transport._slots = [
+        SimpleNamespace(send=torch.empty((80, 4), dtype=torch.uint8)),
+        SimpleNamespace(send=torch.empty((64, 4), dtype=torch.uint8)),
+    ]
+    assert transport.owner_row_capacity == 64
+
+
 def test_rank_local_partition_applies_global_staging_limit() -> None:
     """A global cap is identical across ranks without changing ownership."""
     partition = partition_rank_local_blocks(
