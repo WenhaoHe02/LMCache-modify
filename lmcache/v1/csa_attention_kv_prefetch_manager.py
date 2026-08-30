@@ -4915,6 +4915,15 @@ class CSAAttentionKVPrefetchManager:
                             covered_end,
                             world_size=transport.world_size,
                             configured_cap=padded_blocks,
+                            append_reserve_blocks=max(
+                                0,
+                                int(
+                                    os.environ.get(
+                                        "LMCACHE_CSA_OWNER_APPEND_RESERVE_BLOCKS",
+                                        "0",
+                                    )
+                                ),
+                            ),
                         )
                         gather_event, _selected_gpu, _all_ready_gpu = (
                             transport.gather_owner_rows_gpu_into(

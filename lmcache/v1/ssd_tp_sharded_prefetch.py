@@ -159,11 +159,13 @@ def owner_gpu_padded_blocks(
     *,
     world_size: int,
     configured_cap: int,
+    append_reserve_blocks: int = 0,
 ) -> int:
     """Return the safe per-rank owner width for a globally covered prefix."""
-    if world_size <= 0 or configured_cap <= 0:
+    if world_size <= 0 or configured_cap <= 0 or append_reserve_blocks < 0:
         raise ValueError("owner padding geometry must be positive")
-    return max(1, min(configured_cap, math.ceil(max(0, covered_end) / world_size)))
+    history_shard = math.ceil(max(0, covered_end) / world_size)
+    return max(1, min(configured_cap, history_shard + append_reserve_blocks))
 
 
 @dataclass(frozen=True, slots=True)

@@ -74,6 +74,28 @@ def test_owner_gpu_padding_tracks_covered_prefix(
     } == {expected}
 
 
+def test_owner_gpu_padding_reserves_suffix_blocks_and_honors_cap() -> None:
+    """Append reserve prevents one suffix block from failing owner readiness."""
+    assert (
+        owner_gpu_padded_blocks(
+            384, world_size=8, configured_cap=512, append_reserve_blocks=1
+        )
+        == 49
+    )
+    assert (
+        owner_gpu_padded_blocks(
+            384, world_size=8, configured_cap=512, append_reserve_blocks=32
+        )
+        == 80
+    )
+    assert (
+        owner_gpu_padded_blocks(
+            4096, world_size=8, configured_cap=512, append_reserve_blocks=32
+        )
+        == 512
+    )
+
+
 @pytest.mark.parametrize(
     ("available_blocks", "block_nbytes", "aligned_length"),
     [
