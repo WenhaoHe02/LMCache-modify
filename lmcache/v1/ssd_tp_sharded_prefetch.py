@@ -168,6 +168,22 @@ def owner_gpu_padded_blocks(
     return max(1, min(configured_cap, history_shard + append_reserve_blocks))
 
 
+def dense_rank_major_metadata(
+    partition: BlockPartition,
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    """Return dense IDs, rank-major receive positions, and owner ranks."""
+    ids: list[int] = []
+    positions: list[int] = []
+    owners: list[int] = []
+    for rank, blocks in enumerate(partition.blocks_by_rank):
+        ids.extend(blocks)
+        positions.extend(
+            rank * partition.padded_blocks + offset for offset in range(len(blocks))
+        )
+        owners.extend([rank] * len(blocks))
+    return tuple(ids), tuple(positions), tuple(owners)
+
+
 @dataclass(frozen=True, slots=True)
 class CPReadPlan:
     """Compiled CP ownership expressed as coalesced rows and SSD blocks.
@@ -771,6 +787,19 @@ class ShardGatherTransport(Protocol):
         resident_bitmap: torch.Tensor,
     ) -> tuple[torch.cuda.Event, torch.Tensor, torch.Tensor]:
         """AllGather and route owner rows using GPU-resident metadata."""
+
+    def gather_dense_rows_gpu_into(
+        self,
+        descriptor: CollectiveDescriptor,
+        *,
+        local_ready: bool,
+        source_rows: torch.Tensor,
+        logical_destination_rows: torch.Tensor,
+        destination_rows: torch.Tensor,
+        local_ready_event: Optional[torch.cuda.Event],
+        resident_bitmap: torch.Tensor,
+    ) -> tuple[torch.cuda.Event, torch.Tensor]:
+        """Gather a fixed dense partition with GPU-resident readiness."""
 
     def gather_into(
         self,
@@ -1443,6 +1472,113 @@ class TorchDistributedShardGather:
             raise ShardCollectiveError(
                 "shard-gather metadata consensus failed",
                 data_submitted=False,
+            ) from exc
+
+    def gather_dense_rows_gpu_into(
+        self,
+        descriptor: CollectiveDescriptor,
+        *,
+        local_ready: bool,
+        source_rows: torch.Tensor,
+        logical_destination_rows: torch.Tensor,
+        destination_rows: torch.Tensor,
+        local_ready_event: Optional[torch.cuda.Event],
+        resident_bitmap: torch.Tensor,
+    ) -> tuple[torch.cuda.Event, torch.Tensor]:
+        """Gather dense rows with one data collective and GPU ready flags."""
+        partition = descriptor.partition
+        if descriptor.mode is not SSDReadMode.SHARD_GATHER_DENSE:
+            raise ValueError("GPU dense gather requires a dense descriptor")
+        if partition.world_size != self._world_size:
+            raise ValueError("partition world size does not match transport")
+        if not self._healthy or not self._slots or self._stream is None:
+            raise ShardCollectiveError(
+                "GPU dense gather resources are unavailable",
+                data_submitted=False,
+            )
+        if self._metadata_stream is None:
+            raise ShardCollectiveError(
+                "GPU dense metadata stream is unavailable",
+                data_submitted=False,
+            )
+        data_submitted = False
+        try:
+            with self._lock, torch.inference_mode():
+                slot = self._slots[self._slot_cursor]
+                self._slot_cursor = (self._slot_cursor + 1) % len(self._slots)
+                local_blocks = partition.blocks_for_rank(self._rank)
+                ready = bool(
+                    local_ready and len(local_blocks) <= partition.padded_blocks
+                )
+                ready_send = torch.tensor(
+                    [int(ready)], dtype=torch.int32, device=source_rows.device
+                )
+                ready_receive = torch.empty(
+                    self._world_size, dtype=torch.int32, device=source_rows.device
+                )
+                with torch.cuda.stream(self._metadata_stream):
+                    torch.distributed.all_gather_into_tensor(
+                        ready_receive,
+                        ready_send,
+                        group=self._metadata_process_group,
+                        async_op=True,
+                    )
+                    metadata_ready = torch.cuda.Event()
+                    metadata_ready.record(self._metadata_stream)
+                with torch.cuda.stream(self._stream):
+                    if slot.completion_event is not None:
+                        self._stream.wait_event(slot.completion_event)
+                    if ready and local_ready_event is not None:
+                        self._stream.wait_event(local_ready_event)
+                    slot.send[: partition.padded_blocks].zero_()
+                    local_ids = torch.as_tensor(
+                        local_blocks, dtype=torch.int64, device=source_rows.device
+                    )
+                    if ready and local_ids.numel():
+                        local_rows = logical_destination_rows.index_select(0, local_ids)
+                        torch.index_select(
+                            source_rows,
+                            0,
+                            local_rows,
+                            out=slot.send[: local_ids.numel()],
+                        )
+                    gathered_rows = partition.padded_blocks * self._world_size
+                    data_submitted = True
+                    data_work = torch.distributed.all_gather_into_tensor(
+                        slot.receive[:gathered_rows],
+                        slot.send[: partition.padded_blocks],
+                        group=self._process_group,
+                        async_op=True,
+                    )
+                    self._stream.wait_event(metadata_ready)
+                    ids, positions, owners = dense_rank_major_metadata(partition)
+                    ids_gpu = torch.as_tensor(
+                        ids, dtype=torch.int64, device=source_rows.device
+                    )
+                    positions_gpu = torch.as_tensor(
+                        positions, dtype=torch.int64, device=source_rows.device
+                    )
+                    owners_gpu = torch.as_tensor(
+                        owners, dtype=torch.int64, device=source_rows.device
+                    )
+                    publish = ready_receive.index_select(0, owners_gpu).bool()
+                    selected = ids_gpu[publish]
+                    source_positions = positions_gpu[publish]
+                    gathered = slot.receive[:gathered_rows].index_select(
+                        0, source_positions
+                    )
+                    destination = logical_destination_rows.index_select(0, selected)
+                    destination_rows.index_copy_(0, destination, gathered)
+                    resident_bitmap[selected] = True
+                    event = torch.cuda.Event()
+                    event.record(self._stream)
+                    slot.completion_event = event
+                    slot.completion_work = data_work
+            return event, selected
+        except Exception as exc:
+            self._healthy = False
+            raise ShardCollectiveError(
+                "GPU dense gather failed", data_submitted=data_submitted
             ) from exc
 
     def gather_into(

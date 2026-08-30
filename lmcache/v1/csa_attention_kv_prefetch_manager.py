@@ -4980,6 +4980,39 @@ class CSAAttentionKVPrefetchManager:
                         completed = True
                         return
                 else:
+                    dense_gpu_fastpath = (
+                        descriptor.mode is SSDReadMode.SHARD_GATHER_DENSE
+                        and os.environ.get("LMCACHE_CSA_DENSE_GPU_FASTPATH", "0")
+                        .strip()
+                        .lower()
+                        in {"1", "true", "yes", "on"}
+                    )
+                    if dense_gpu_fastpath:
+                        logical_rows = self._logical_destination_rows(state)
+                        if logical_rows is None or state.block_slot_scatter:
+                            raise RuntimeError(
+                                "shard destination layout is unavailable"
+                            )
+                        k_cache_rows = state.k_cache_tensor.view(torch.uint8).reshape(
+                            int(state.k_cache_tensor.shape[0]), -1
+                        )
+                        gather_event, _selected_gpu = (
+                            transport.gather_dense_rows_gpu_into(
+                                descriptor,
+                                local_ready=(
+                                    prepared.local_capability
+                                    and prepared.local_complete
+                                ),
+                                source_rows=k_cache_rows,
+                                logical_destination_rows=logical_rows,
+                                destination_rows=k_cache_rows,
+                                local_ready_event=prepared.local_ready_event,
+                                resident_bitmap=state.in_pool_bitmap,
+                            )
+                        )
+                        torch.cuda.current_stream(device).wait_event(gather_event)
+                        completed = True
+                        return
                     agreed = transport.preflight(
                         descriptor,
                         local_capability=prepared.local_capability,

@@ -16,6 +16,7 @@ from lmcache.v1.ssd_tp_sharded_prefetch import (
     compile_layer_major_read_ranges,
     compile_cp_read_plan,
     cp_owned_row_ranges,
+    dense_rank_major_metadata,
     deterministic_block_union,
     owner_gpu_route,
     owner_gpu_padded_blocks,
@@ -94,6 +95,18 @@ def test_owner_gpu_padding_reserves_suffix_blocks_and_honors_cap() -> None:
         )
         == 512
     )
+
+
+def test_dense_gpu_metadata_masks_failed_rank_and_padding() -> None:
+    """Dense fixed metadata maps only valid rows from ready owner ranks."""
+    partition = partition_block_union([2, 4, 6, 8, 10], 3)
+    ids, positions, owners = dense_rank_major_metadata(partition)
+    ready = torch.tensor([1, 0, 1], dtype=torch.bool)
+    publish = ready[torch.tensor(owners)]
+
+    assert partition.padded_blocks == 2
+    assert torch.tensor(ids)[publish].tolist() == [2, 4, 10]
+    assert torch.tensor(positions)[publish].tolist() == [0, 1, 4]
 
 
 @pytest.mark.parametrize(
