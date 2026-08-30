@@ -891,7 +891,16 @@ def score_prefill_proxy_rank_local(
         if topk_tokens_override is not None
         else int(indexer_op.topk_tokens)
     )
-    if topk_tokens <= 0 or topk_tokens > int(output.shape[1]):
+    if topk_tokens <= 0:
+        raise RuntimeError("proxy top-k width must be positive")
+    required_output_width = topk_tokens
+    if mode != "query":
+        required_output_width = prefill_cp_local_topk_tokens(
+            topk_tokens,
+            world_size,
+            oversubscribe,
+        )
+    if required_output_width > int(output.shape[1]):
         raise RuntimeError("proxy top-k width does not fit the output buffer")
     fp8_dtype = current_platform.fp8_dtype()
     head_dim = int(indexer_op.head_dim)

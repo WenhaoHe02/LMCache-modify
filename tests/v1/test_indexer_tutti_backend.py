@@ -388,6 +388,20 @@ def test_rank_local_proxy_selection_pads_empty_budget_slots() -> None:
     assert 0 in selected.tolist()
 
 
+def test_proxy_consumer_uses_only_rank_local_topk_columns() -> None:
+    """K-sharded consumers ignore unwritten columns in the global buffer."""
+    topk = torch.full((3, 8), 777, dtype=torch.int32)
+    topk[:, :2] = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32)
+
+    selected = indexer_manager_module._valid_proxy_topk_columns(
+        topk,
+        num_rows=2,
+        runtime_info={"local_topk_tokens": 2},
+    )
+
+    assert selected.tolist() == [[1, 2], [3, 4]]
+
+
 def test_weighted_predicted_block_hits_preserves_topk_frequency() -> None:
     """Weighted coverage counts repeated true entries, not only the union."""
     block = indexer_manager_module.DEEPGEMM_PAGED_BLOCK_SIZE

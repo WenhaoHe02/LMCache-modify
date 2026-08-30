@@ -362,6 +362,20 @@ def _select_rank_local_proxy_blocks(
     )
 
 
+def _valid_proxy_topk_columns(
+    topk_buffer: torch.Tensor,
+    num_rows: int,
+    runtime_info: dict[str, int],
+) -> torch.Tensor:
+    """Return only the top-k columns actually written by the proxy scorer."""
+    selected_width = int(
+        runtime_info.get("local_topk_tokens", int(topk_buffer.shape[1]))
+    )
+    if selected_width < 0 or selected_width > int(topk_buffer.shape[1]):
+        raise RuntimeError("proxy scorer returned an invalid local top-k width")
+    return topk_buffer[:num_rows, :selected_width]
+
+
 def _weighted_predicted_block_hits(
     entries: torch.Tensor,
     valid: torch.Tensor,
@@ -2894,6 +2908,7 @@ class IndexerSSDManager:
                         phase_events: dict[str, Any] = {}
                         if proxy_start is not None:
                             proxy_start.record(proxy_stream)
+                        proxy_runtime_info: dict[str, int] = {}
                         topk_buf, num_rows, cp_context = self._residual_proxy_topk_gpu(
                             layer_id,
                             decoder_layer,
@@ -2910,10 +2925,15 @@ class IndexerSSDManager:
                                     else None,
                                 )
                             ),
+                            runtime_info=proxy_runtime_info,
                         )
                         if proxy_done is not None:
                             proxy_done.record(proxy_stream)
-                        selected_topk = topk_buf[:num_rows]
+                        selected_topk = _valid_proxy_topk_columns(
+                            topk_buf,
+                            num_rows,
+                            proxy_runtime_info,
+                        )
                         # Reduce the rank-local query shard to a bounded block
                         # list, then exchange only those fixed-size IDs. Enqueue
                         # this tiny collective here, while every model rank is
@@ -3616,8 +3636,20 @@ class IndexerSSDManager:
             if proxy_topk_tokens is not None
             else int(reference_topk.shape[1])
         )
+        output_width = proxy_width
+        if prefill_cp_context is not None and prefill_cp_partition_mode != "query":
+            from lmcache.v1.csa_prefill_cp_scorer import (
+                prefill_cp_local_topk_tokens,
+            )
+
+            _rank, world_size, _interleave, oversubscribe = prefill_cp_context
+            output_width = prefill_cp_local_topk_tokens(
+                proxy_width,
+                world_size,
+                oversubscribe,
+            )
         topk_buf = torch.empty(
-            (int(proxy_hidden.shape[0]), proxy_width),
+            (int(proxy_hidden.shape[0]), output_width),
             dtype=reference_topk.dtype,
             device=reference_topk.device,
         )
