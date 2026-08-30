@@ -3,6 +3,7 @@
 
 # Third Party
 import pytest
+import torch
 
 # First Party
 from lmcache.v1.config import LMCacheEngineConfig
@@ -16,12 +17,42 @@ from lmcache.v1.ssd_tp_sharded_prefetch import (
     compile_cp_read_plan,
     cp_owned_row_ranges,
     deterministic_block_union,
+    owner_gpu_route,
     parse_layer_ranges,
     partition_block_union,
     partition_rank_local_blocks,
     rank_major_inverse_indices,
     stable_union_hash,
 )
+
+
+def test_owner_gpu_route_handles_padding_and_duplicate_ids() -> None:
+    """GPU route keeps the first owner row and ignores rank padding."""
+    payloads = torch.tensor(
+        [[2, 8, 2, -1], [3, 7, 2, 9], [0, -1, -1, -1]],
+        dtype=torch.int64,
+    )
+
+    selected, positions, all_ready = owner_gpu_route(
+        payloads.reshape(-1), world_size=3, padded_blocks=3
+    )
+
+    assert selected.tolist() == [2, 7, 8, 9]
+    assert positions.tolist() == [1, 3, 0, 5]
+    assert bool(all_ready)
+
+
+def test_owner_gpu_route_excludes_failed_rank_but_keeps_ready_ranks() -> None:
+    """A negative count publishes no rows from that rank for later correction."""
+    payloads = torch.tensor([[2, 4, 6], [-1, 8, 10], [1, 12, -1]], dtype=torch.int64)
+
+    selected, positions, all_ready = owner_gpu_route(
+        payloads.reshape(-1), world_size=3, padded_blocks=2
+    )
+
+    assert selected.tolist() == [4, 6, 12]
+    assert positions.tolist() == [0, 1, 4]
+    assert not bool(all_ready)
 
 
 @pytest.mark.parametrize(

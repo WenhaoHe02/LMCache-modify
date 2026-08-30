@@ -4901,6 +4901,31 @@ class CSAAttentionKVPrefetchManager:
                             )
                         ),
                     )
+                    gpu_owner_metadata = os.environ.get(
+                        "LMCACHE_CSA_OWNER_GPU_METADATA", "0"
+                    ).strip().lower() in {"1", "true", "yes", "on"}
+                    if gpu_owner_metadata:
+                        gather_event, _selected_gpu, _all_ready_gpu = (
+                            transport.gather_owner_rows_gpu_into(
+                                local_block_ids=prepared.owned,
+                                local_ready=(
+                                    prepared.local_capability
+                                    and prepared.local_complete
+                                ),
+                                padded_blocks=padded_blocks,
+                                source_rows=k_cache_rows,
+                                logical_destination_rows=logical_rows,
+                                destination_rows=k_cache_rows,
+                                local_ready_event=prepared.local_ready_event,
+                                resident_bitmap=state.in_pool_bitmap,
+                            )
+                        )
+                        torch.cuda.current_stream(device).wait_event(gather_event)
+                        # Do not build a host partition here. Exact top-K
+                        # correction consumes the GPU resident bitmap and
+                        # demand-reads any failed-rank or unpredicted blocks.
+                        completed = True
+                        return
                     gather_event, partition, all_reads_ready = (
                         transport.gather_owner_rows_into(
                             local_block_ids=prepared.owned,

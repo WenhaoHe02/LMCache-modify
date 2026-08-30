@@ -129,6 +129,31 @@ def compile_layer_major_read_ranges(
     return tuple(ranges)
 
 
+def owner_gpu_route(
+    gathered_ids: torch.Tensor,
+    *,
+    world_size: int,
+    padded_blocks: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build a duplicate-free owner route without copying IDs to the CPU."""
+    payloads = gathered_ids.reshape(world_size, padded_blocks + 1)
+    counts = payloads[:, 0]
+    all_ready = (counts >= 0).all()
+    offsets = torch.arange(padded_blocks, device=gathered_ids.device)
+    valid = offsets.unsqueeze(0) < counts.clamp(min=0, max=padded_blocks).unsqueeze(1)
+    block_ids = payloads[:, 1:].reshape(-1)
+    # A failed rank contributes no valid IDs. Successful ranks are still
+    # published; authoritative correction later fills the failed rank's IDs.
+    valid = valid.reshape(-1) & (block_ids >= 0)
+    sentinel = torch.iinfo(torch.int64).max
+    sortable = torch.where(valid, block_ids, sentinel)
+    sorted_ids, source_positions = torch.sort(sortable, stable=True)
+    unique = sorted_ids != sentinel
+    if sorted_ids.numel() > 1:
+        unique[1:] &= sorted_ids[1:] != sorted_ids[:-1]
+    return sorted_ids[unique], source_positions[unique], all_ready
+
+
 @dataclass(frozen=True, slots=True)
 class CPReadPlan:
     """Compiled CP ownership expressed as coalesced rows and SSD blocks.
@@ -719,6 +744,20 @@ class ShardGatherTransport(Protocol):
     ) -> tuple[torch.cuda.Event, BlockPartition, bool]:
         """AllGather owner KV rows with an in-stream block-ID sidecar."""
 
+    def gather_owner_rows_gpu_into(
+        self,
+        *,
+        local_block_ids: torch.Tensor,
+        local_ready: bool,
+        padded_blocks: int,
+        source_rows: torch.Tensor,
+        logical_destination_rows: torch.Tensor,
+        destination_rows: torch.Tensor,
+        local_ready_event: Optional[torch.cuda.Event],
+        resident_bitmap: torch.Tensor,
+    ) -> tuple[torch.cuda.Event, torch.Tensor, torch.Tensor]:
+        """AllGather and route owner rows using GPU-resident metadata."""
+
     def gather_into(
         self,
         descriptor: CollectiveDescriptor,
@@ -1201,6 +1240,107 @@ class TorchDistributedShardGather:
             self._healthy = False
             raise ShardCollectiveError(
                 "owner KV gather failed",
+                data_submitted=data_submitted,
+            ) from exc
+
+    def gather_owner_rows_gpu_into(
+        self,
+        *,
+        local_block_ids: torch.Tensor,
+        local_ready: bool,
+        padded_blocks: int,
+        source_rows: torch.Tensor,
+        logical_destination_rows: torch.Tensor,
+        destination_rows: torch.Tensor,
+        local_ready_event: Optional[torch.cuda.Event],
+        resident_bitmap: torch.Tensor,
+    ) -> tuple[torch.cuda.Event, torch.Tensor, torch.Tensor]:
+        """Gather owner rows without a host metadata barrier or partition."""
+        if (
+            not self._healthy
+            or not self._slots
+            or self._stream is None
+            or self._metadata_stream is None
+            or padded_blocks <= 0
+        ):
+            raise ShardCollectiveError(
+                "GPU owner gather resources are unavailable",
+                data_submitted=False,
+            )
+        data_submitted = False
+        try:
+            with self._lock, torch.inference_mode():
+                slot = self._slots[self._slot_cursor]
+                self._slot_cursor = (self._slot_cursor + 1) % len(self._slots)
+                if padded_blocks > int(slot.send.shape[0]):
+                    raise ValueError("owner gather exceeds warmed row capacity")
+                local_gpu = torch.as_tensor(
+                    local_block_ids,
+                    dtype=torch.int64,
+                    device=source_rows.device,
+                ).reshape(-1)
+                local_gpu = torch.unique(local_gpu[local_gpu >= 0], sorted=True)
+                rank_ready = bool(local_ready and local_gpu.numel() <= padded_blocks)
+                completion_event = slot.completion_event
+                id_width = padded_blocks + 1
+                with torch.cuda.stream(self._metadata_stream):
+                    if completion_event is not None:
+                        self._metadata_stream.wait_event(completion_event)
+                    slot.send_ids[:id_width].fill_(-1)
+                    slot.send_ids[0] = int(local_gpu.numel()) if rank_ready else -1
+                    if rank_ready and local_gpu.numel():
+                        slot.send_ids[1 : 1 + local_gpu.numel()] = local_gpu
+                    torch.distributed.all_gather_into_tensor(
+                        slot.receive_ids[: self._world_size * id_width],
+                        slot.send_ids[:id_width],
+                        group=self._metadata_process_group,
+                        async_op=True,
+                    )
+                    metadata_ready = torch.cuda.Event()
+                    metadata_ready.record(self._metadata_stream)
+                gathered_rows = padded_blocks * self._world_size
+                with torch.cuda.stream(self._stream):
+                    if completion_event is not None:
+                        self._stream.wait_event(completion_event)
+                    if local_ready_event is not None:
+                        self._stream.wait_event(local_ready_event)
+                    slot.send[:padded_blocks].zero_()
+                    if rank_ready and local_gpu.numel():
+                        local_rows = logical_destination_rows.index_select(0, local_gpu)
+                        torch.index_select(
+                            source_rows,
+                            0,
+                            local_rows,
+                            out=slot.send[: local_gpu.numel()],
+                        )
+                    data_submitted = True
+                    data_work = torch.distributed.all_gather_into_tensor(
+                        slot.receive[:gathered_rows],
+                        slot.send[:padded_blocks],
+                        group=self._process_group,
+                        async_op=True,
+                    )
+                    self._stream.wait_event(metadata_ready)
+                    selected, source_positions, all_ready = owner_gpu_route(
+                        slot.receive_ids[: self._world_size * id_width],
+                        world_size=self._world_size,
+                        padded_blocks=padded_blocks,
+                    )
+                    gathered = slot.receive[:gathered_rows].index_select(
+                        0, source_positions
+                    )
+                    destination = logical_destination_rows.index_select(0, selected)
+                    destination_rows.index_copy_(0, destination, gathered)
+                    resident_bitmap[selected] = True
+                    event = torch.cuda.Event()
+                    event.record(self._stream)
+                    slot.completion_event = event
+                    slot.completion_work = data_work
+            return event, selected, all_ready
+        except Exception as exc:
+            self._healthy = False
+            raise ShardCollectiveError(
+                "GPU owner KV gather failed",
                 data_submitted=data_submitted,
             ) from exc
 
