@@ -842,6 +842,94 @@ def test_shard_local_and_owner_partition_are_mutually_exclusive() -> None:
         )
 
 
+def test_owner_gather_filters_resident_reads_and_keeps_ordering_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resident owner rows avoid SSD IDs but retain scatter-stream ordering."""
+    manager = object.__new__(CSAAttentionKVPrefetchManager)
+    _init_active_request_state(manager)
+    issued: list[torch.Tensor] = []
+    scatter_stream = object()
+
+    class _Transport:
+        rank = 0
+        world_size = 1
+        healthy = True
+
+    class _CudaTensor:
+        is_cuda = True
+        device = torch.device("cuda", 0)
+
+    class _DeviceContext:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    class _Event:
+        recorded_stream: object | None = None
+
+        def record(self, stream: object) -> None:
+            self.recorded_stream = stream
+
+    state = SimpleNamespace(
+        layer_id=2,
+        compressed_block_size=64,
+        token_bytes=4,
+        k_cache_tensor=_CudaTensor(),
+        in_pool_bitmap=torch.zeros(4, dtype=torch.bool),
+        chunks=[SimpleNamespace(end_compressed_block=4)],
+        pending_reads_lock=threading.Condition(),
+        pending_reads_bitmap=torch.zeros(4, dtype=torch.bool),
+        resident_blocks_bitmap=torch.tensor([True, True, False, False]),
+        pending_read_count=0,
+        last_drain_event=None,
+        pending_drains=[],
+        block_slot_scatter=False,
+        indexed_dst_rows_table=torch.arange(4, dtype=torch.int64),
+        layer_major_dst_rows_table=None,
+    )
+    manager._layers = {2: state}
+    manager._data_group = "csa"
+    manager._shard_transport = _Transport()
+    manager._shard_config = SimpleNamespace(
+        enabled=True,
+        csa_enabled=True,
+        csa_replica_verified=True,
+        cp_size=1,
+    )
+    manager._bytes_per_block = 256
+    manager._shard_prediction_path_logged = False
+
+    def _issue(
+        _self: CSAAttentionKVPrefetchManager,
+        _state: object,
+        block_ids: torch.Tensor,
+        **_kwargs: object,
+    ) -> tuple[None, list[object], torch.Tensor]:
+        issued.append(block_ids.clone())
+        return None, [], block_ids.clone()
+
+    manager._issue_local_reads = MethodType(_issue, manager)
+    manager._scatter_stream_for = lambda _device: scatter_stream
+    monkeypatch.setattr(torch.cuda, "device", lambda _device: _DeviceContext())
+    monkeypatch.setattr(torch.cuda, "Event", _Event)
+
+    work = manager.fire_predicted_reads(
+        2,
+        torch.tensor([0, 1]),
+        request_token=("request-a", 1),
+        preserve_owner_partition=True,
+    )
+
+    assert len(issued) == 1
+    assert issued[0].numel() == 0
+    assert work.local_complete
+    assert isinstance(work.local_ready_event, _Event)
+    assert work.local_ready_event.recorded_stream is scatter_stream
+
+
 def test_wait_for_pending_reads_blocks_until_booking_resolves() -> None:
     """The correction barrier waits out an in-flight predicted booking."""
     manager = _minimal_manager_with_partial_issue()

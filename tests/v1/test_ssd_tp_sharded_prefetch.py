@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Public-contract tests for TP-sharded SSD prefetch planning."""
 
+# Standard
+from types import SimpleNamespace
+import threading
+
 # Third Party
 import pytest
 import torch
@@ -12,12 +16,14 @@ from lmcache.v1.ssd_tp_sharded_prefetch import (
     SSDReadMode,
     SSDTPShardedPrefetchConfig,
     ShardPrefetchDecisionTable,
+    TorchDistributedShardGather,
     bucket_prefetch_key,
     compile_layer_major_read_ranges,
     compile_cp_read_plan,
     cp_owned_row_ranges,
     dense_rank_major_metadata,
     deterministic_block_union,
+    owner_gather_receive_positions,
     owner_gpu_route,
     owner_gpu_padded_blocks,
     parse_layer_ranges,
@@ -201,6 +207,108 @@ def test_rank_local_partition_preserves_owner_and_deduplicates() -> None:
     assert partition.counts == (2, 2, 0, 1)
     assert partition.padded_blocks == 2
     assert rank_major_inverse_indices(partition) == (0, 6, 2, 1, 3)
+
+
+def test_owner_receive_positions_use_sent_offsets_and_effective_width() -> None:
+    """Dedup holes retain their original send rows under a shrunken stride."""
+    sent = ((2, 8), (2, 7, 9), (), (5,))
+    partition = partition_rank_local_blocks(sent)
+
+    assert owner_gather_receive_positions(
+        sent, partition.blocks_by_rank, effective_padded=3
+    ) == (0, 1, 4, 5, 9)
+
+
+def test_owner_receive_positions_reject_invalid_metadata() -> None:
+    """Invalid metadata fails before selecting the wrong KV receive row."""
+    with pytest.raises(ValueError, match="absent"):
+        owner_gather_receive_positions(((2,),), ((3,),), effective_padded=1)
+    with pytest.raises(ValueError, match="exceed"):
+        owner_gather_receive_positions(((2, 3),), ((2,),), effective_padded=1)
+
+
+def test_owner_gather_uses_actual_max_width_and_duplicate_send_offset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """KV gather shrinks to max count and scatters the first duplicate owner."""
+    transport = object.__new__(TorchDistributedShardGather)
+    transport._healthy = True
+    transport._world_size = 3
+    transport._rank = 0
+    transport._lock = threading.Lock()
+    transport._stream = object()
+    transport._metadata_stream = SimpleNamespace(synchronize=lambda: None)
+    transport._metadata_process_group = object()
+    transport._process_group = object()
+    transport._slot_cursor = 0
+    transport._config = SimpleNamespace()
+    slot = SimpleNamespace(
+        send=torch.zeros((8, 1), dtype=torch.uint8),
+        receive=torch.zeros((24, 1), dtype=torch.uint8),
+        send_ids=torch.full((9,), -1, dtype=torch.int64),
+        receive_ids=torch.full((27,), -1, dtype=torch.int64),
+        completion_event=None,
+        completion_work=None,
+    )
+    transport._slots = [slot]
+    gathered_widths: list[int] = []
+
+    class _Context:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    class _Work:
+        def wait(self) -> None:
+            return None
+
+    class _Event:
+        def record(self, _stream: object) -> None:
+            return None
+
+    payloads = torch.full((3, 9), -1, dtype=torch.int64)
+    payloads[0, :3] = torch.tensor([2, 2, 8])
+    payloads[1, :4] = torch.tensor([3, 2, 7, 9])
+    payloads[2, 0] = 0
+    gathered_rows = torch.tensor(
+        [[20], [80], [0], [200], [70], [90], [0], [0], [0]],
+        dtype=torch.uint8,
+    )
+
+    def _all_gather(
+        output: torch.Tensor, input_: torch.Tensor, **_kwargs: object
+    ) -> _Work:
+        gathered_widths.append(int(input_.shape[0]))
+        if input_.dtype == torch.int64:
+            output.copy_(payloads.reshape(-1))
+        else:
+            output.copy_(gathered_rows)
+        return _Work()
+
+    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: _Context())
+    monkeypatch.setattr(torch.cuda, "Event", _Event)
+    monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", _all_gather)
+    destination = torch.zeros((10, 1), dtype=torch.uint8)
+    resident = torch.zeros(10, dtype=torch.bool)
+
+    _event, partition, ready = transport.gather_owner_rows_into(
+        local_block_ids=torch.tensor([2, 8]),
+        local_ready=True,
+        padded_blocks=8,
+        source_rows=torch.arange(10, dtype=torch.uint8).reshape(10, 1),
+        logical_destination_rows=torch.arange(10),
+        destination_rows=destination,
+        local_ready_event=None,
+        resident_bitmap=resident,
+    )
+
+    assert ready
+    assert partition.blocks_by_rank == ((2, 8), (7, 9), ())
+    assert gathered_widths == [9, 3]
+    assert destination[[2, 7, 8, 9], 0].tolist() == [20, 70, 80, 90]
+    assert resident.nonzero().reshape(-1).tolist() == [2, 7, 8, 9]
 
 
 def test_rank_local_partition_applies_global_staging_limit() -> None:

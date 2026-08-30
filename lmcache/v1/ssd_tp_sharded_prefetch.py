@@ -184,6 +184,36 @@ def dense_rank_major_metadata(
     return tuple(ids), tuple(positions), tuple(owners)
 
 
+def owner_gather_receive_positions(
+    sent_blocks_by_rank: Sequence[Sequence[int]],
+    owned_blocks_by_rank: Sequence[Sequence[int]],
+    effective_padded: int,
+) -> tuple[int, ...]:
+    """Map deduplicated owner blocks to their rank-major receive rows."""
+    if effective_padded <= 0:
+        raise ValueError("effective owner gather width must be positive")
+    if len(sent_blocks_by_rank) != len(owned_blocks_by_rank):
+        raise ValueError("sent and owned rank counts must match")
+    positions: list[int] = []
+    for rank, (sent_blocks, owned_blocks) in enumerate(
+        zip(sent_blocks_by_rank, owned_blocks_by_rank, strict=True)
+    ):
+        if len(sent_blocks) > effective_padded:
+            raise ValueError("sent owner blocks exceed effective gather width")
+        sent_offsets = {
+            int(block_id): offset for offset, block_id in enumerate(sent_blocks)
+        }
+        for block_id in owned_blocks:
+            try:
+                offset = sent_offsets[int(block_id)]
+            except KeyError as exc:
+                raise ValueError(
+                    "owned block is absent from its rank send list"
+                ) from exc
+            positions.append(rank * effective_padded + offset)
+    return tuple(positions)
+
+
 @dataclass(frozen=True, slots=True)
 class CPReadPlan:
     """Compiled CP ownership expressed as coalesced rows and SSD blocks.
