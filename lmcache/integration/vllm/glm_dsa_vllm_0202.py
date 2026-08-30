@@ -8,6 +8,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MethodType
 from typing import Any
+import os
 import threading
 import weakref
 
@@ -30,6 +31,7 @@ class GLMDSAAsyncPrediction:
 
     topk_indices: torch.Tensor
     done_event: torch.cuda.Event
+    phase_events: tuple[torch.cuda.Event, ...] = ()
 
 
 _SUPPORTED_VLLM_VERSION = "0.20.2"
@@ -230,25 +232,50 @@ class VLLM0202GLMDSAProxy:
             if residual is not None:
                 residual.record_stream(self._prediction_stream)
             with torch.cuda.stream(self._prediction_stream):
+                diag_enabled = os.path.exists("/tmp/lmcache_glm_kcp_phase_diag")
+                phase_events = (
+                    tuple(torch.cuda.Event(enable_timing=True) for _ in range(4))
+                    if diag_enabled
+                    else ()
+                )
+                if phase_events:
+                    phase_events[0].record(self._prediction_stream)
                 activation = (
                     hidden_states if residual is None else hidden_states + residual
                 )
-                topk = self._predict_activation(schedule, activation, positions)
+                topk = self._predict_activation(
+                    schedule,
+                    activation,
+                    positions,
+                    phase_events=(
+                        (phase_events[1], phase_events[2], phase_events[3])
+                        if phase_events
+                        else None
+                    ),
+                )
                 topk.record_stream(self._prediction_stream)
                 done = torch.cuda.Event()
                 done.record(self._prediction_stream)
-        return GLMDSAAsyncPrediction(topk, done)
+        return GLMDSAAsyncPrediction(
+            topk,
+            done,
+            phase_events,
+        )
 
     def _predict_activation(
         self,
         schedule: GLMDSAPredictionSchedule,
         activation: torch.Tensor,
         positions: torch.Tensor,
+        phase_events: tuple[torch.cuda.Event, torch.cuda.Event, torch.cuda.Event]
+        | None = None,
     ) -> torch.Tensor:
         """Launch one read-only target indexer for a prepared activation."""
         target = self._decoder_layers[schedule.target_layer]
         attention = target.self_attn
         proxy_hidden = target.input_layernorm(activation)
+        if phase_events is not None:
+            phase_events[0].record()
         projected = attention.fused_qkv_a_proj(proxy_hidden)
         if isinstance(projected, tuple):
             projected = projected[0]
@@ -258,6 +285,8 @@ class VLLM0202GLMDSAProxy:
         kv_width = int(attention.kv_lora_rank) + int(attention.qk_rope_head_dim)
         q_c, _ = projected.split([q_width, kv_width], dim=-1)
         q_c = attention.q_a_layernorm(q_c)
+        if phase_events is not None:
+            phase_events[1].record()
 
         indexer = attention.indexer
         indexer_op = indexer.indexer_op
@@ -287,6 +316,8 @@ class VLLM0202GLMDSAProxy:
         finally:
             indexer_op.topk_indices_buffer = old_buffer
             indexer_op.skip_k_cache_insert = old_skip_insert
+        if phase_events is not None:
+            phase_events[2].record()
         return private_topk
 
 

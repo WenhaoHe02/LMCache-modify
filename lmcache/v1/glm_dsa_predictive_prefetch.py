@@ -1431,6 +1431,17 @@ class GLMDSAPredictivePrefetchManager:
     ) -> None:
         """Publish one private-stream prediction after its CUDA event."""
         pending.done_event.synchronize()
+        phase_events = tuple(getattr(pending, "phase_events", ()))
+        if len(phase_events) == 4 and os.path.exists("/tmp/lmcache_glm_kcp_phase_diag"):
+            logger.info(
+                "GLM_KCP_PHASE target=L%d activation_norm_ms=%.3f "
+                "projection_qnorm_ms=%.3f indexer_ms=%.3f total_ms=%.3f",
+                schedule.target_layer,
+                phase_events[0].elapsed_time(phase_events[1]),
+                phase_events[1].elapsed_time(phase_events[2]),
+                phase_events[2].elapsed_time(phase_events[3]),
+                phase_events[0].elapsed_time(phase_events[3]),
+            )
         topk = pending.topk_indices.detach()
         if topk.ndim != 2:
             raise ValueError("predictor must return a two-dimensional tensor")
