@@ -18,6 +18,7 @@ from lmcache.v1.ssd_tp_sharded_prefetch import (
     cp_owned_row_ranges,
     deterministic_block_union,
     owner_gpu_route,
+    owner_gpu_padded_blocks,
     parse_layer_ranges,
     partition_block_union,
     partition_rank_local_blocks,
@@ -53,6 +54,24 @@ def test_owner_gpu_route_excludes_failed_rank_but_keeps_ready_ranks() -> None:
     assert selected.tolist() == [4, 6, 12]
     assert positions.tolist() == [0, 1, 4]
     assert not bool(all_ready)
+
+
+@pytest.mark.parametrize(
+    ("covered_end", "expected"),
+    [(384, 48), (512, 64), (1920, 240), (4096, 512)],
+)
+def test_owner_gpu_padding_tracks_covered_prefix(
+    covered_end: int, expected: int
+) -> None:
+    """All ranks derive the same bounded width from shared prefix geometry."""
+    assert (
+        owner_gpu_padded_blocks(covered_end, world_size=8, configured_cap=512)
+        == expected
+    )
+    assert {
+        owner_gpu_padded_blocks(covered_end, world_size=8, configured_cap=512)
+        for _rank in range(8)
+    } == {expected}
 
 
 @pytest.mark.parametrize(

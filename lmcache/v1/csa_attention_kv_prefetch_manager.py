@@ -92,6 +92,7 @@ from lmcache.v1.ssd_tp_sharded_prefetch import (
     ShardPrefetchDecisionTable,
     bucket_prefetch_key,
     compile_cp_read_plan,
+    owner_gpu_padded_blocks,
     partition_block_union,
     partition_rank_local_blocks,
 )
@@ -4905,6 +4906,16 @@ class CSAAttentionKVPrefetchManager:
                         "LMCACHE_CSA_OWNER_GPU_METADATA", "0"
                     ).strip().lower() in {"1", "true", "yes", "on"}
                     if gpu_owner_metadata:
+                        covered_end = (
+                            int(state.chunks[-1].end_compressed_block)
+                            if state.chunks
+                            else 0
+                        )
+                        padded_blocks = owner_gpu_padded_blocks(
+                            covered_end,
+                            world_size=transport.world_size,
+                            configured_cap=padded_blocks,
+                        )
                         gather_event, _selected_gpu, _all_ready_gpu = (
                             transport.gather_owner_rows_gpu_into(
                                 local_block_ids=prepared.owned,

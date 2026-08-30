@@ -154,6 +154,18 @@ def owner_gpu_route(
     return sorted_ids[unique], source_positions[unique], all_ready
 
 
+def owner_gpu_padded_blocks(
+    covered_end: int,
+    *,
+    world_size: int,
+    configured_cap: int,
+) -> int:
+    """Return the safe per-rank owner width for a globally covered prefix."""
+    if world_size <= 0 or configured_cap <= 0:
+        raise ValueError("owner padding geometry must be positive")
+    return max(1, min(configured_cap, math.ceil(max(0, covered_end) / world_size)))
+
+
 @dataclass(frozen=True, slots=True)
 class CPReadPlan:
     """Compiled CP ownership expressed as coalesced rows and SSD blocks.
