@@ -4875,7 +4875,7 @@ class CSAAttentionKVPrefetchManager:
             selected[(selected >= 0) & (selected < limit)],
             sorted=True,
         )
-        if selected.numel() == 0:
+        if selected.numel() == 0 and not preserve_owner_partition:
             return True
         with state.pending_reads_lock:
             pending_ids = selected[

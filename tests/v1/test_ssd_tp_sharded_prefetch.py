@@ -90,6 +90,24 @@ def test_owner_gpu_route_excludes_failed_rank_but_keeps_ready_ranks() -> None:
     assert not bool(all_ready)
 
 
+def test_padded_owner_route_scatter_never_publishes_padding_or_failed_rank() -> None:
+    """A fixed-shape route exactly preserves the compact route's valid rows."""
+    payloads = torch.tensor([[2, 4, 6], [-1, 8, 10], [2, 4, 12]])
+    ids, positions, ready = owner_gpu_route(
+        payloads.flatten(), world_size=3, padded_blocks=2, keep_padding=True
+    )
+    assert ids.numel() == positions.numel() == 6
+    assert ids[ids >= 0].tolist() == [4, 6, 12]
+    assert not bool(ready)
+    receive = torch.arange(48, dtype=torch.uint8).reshape(6, 8)
+    destination = torch.full((13, 8), 255, dtype=torch.uint8)
+    scatter_received_owner_rows(receive, positions, destination, ids)
+    assert torch.equal(destination[4], receive[0])
+    assert torch.equal(destination[6], receive[1])
+    assert torch.equal(destination[12], receive[5])
+    assert (destination[8] == 255).all() and (destination[10] == 255).all()
+
+
 @pytest.mark.parametrize(
     ("covered_end", "expected"),
     [(384, 48), (512, 64), (1920, 240), (4096, 512)],

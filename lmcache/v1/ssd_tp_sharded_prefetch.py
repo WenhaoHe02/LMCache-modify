@@ -146,7 +146,7 @@ def scatter_received_owner_rows(
         receive: Two-dimensional uint8 AllGather receive buffer.
         source_positions: Valid receive-row offsets, in destination order.
         destination: Final uint8 K-cache rows; outer row strides are supported.
-        destination_rows: Final row indices paired with source_positions.
+        destination_rows: Final row indices; negative/out-of-range rows are skipped.
 
     Returns:
         None. GPU writes are enqueued on the caller's current CUDA stream.
@@ -176,8 +176,9 @@ def scatter_received_owner_rows(
             receive.data_ptr() % 8 == 0 and receive.stride(0) % 8 == 0,
         )
     else:
+        valid = (destination_rows >= 0) & (destination_rows < destination.shape[0])
         destination.index_copy_(
-            0, destination_rows, receive.index_select(0, source_positions)
+            0, destination_rows[valid], receive.index_select(0, source_positions[valid])
         )
 
 
@@ -186,8 +187,21 @@ def owner_gpu_route(
     *,
     world_size: int,
     padded_blocks: int,
+    keep_padding: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build a duplicate-free owner route without copying IDs to the CPU."""
+    """Build a duplicate-free owner route from rank-major ID sidecars.
+
+    Args:
+        gathered_ids: Flattened [count, IDs...] payloads for every rank.
+        world_size: Number of participating ranks.
+        padded_blocks: Per-rank ID capacity.
+        keep_padding: Return fixed-size outputs with invalid IDs set to -1.
+            This avoids dynamic CUDA indexing and its host synchronization.
+
+    Returns:
+        Block IDs, source-row positions, and a scalar all-ranks-ready tensor.
+        Duplicate IDs use the first rank's valid row.
+    """
     payloads = gathered_ids.reshape(world_size, padded_blocks + 1)
     counts = payloads[:, 0]
     all_ready = (counts >= 0).all()
@@ -203,6 +217,8 @@ def owner_gpu_route(
     unique = sorted_ids != sentinel
     if sorted_ids.numel() > 1:
         unique[1:] &= sorted_ids[1:] != sorted_ids[:-1]
+    if keep_padding:
+        return torch.where(unique, sorted_ids, -1), source_positions, all_ready
     return sorted_ids[unique], source_positions[unique], all_ready
 
 
@@ -1448,10 +1464,12 @@ class TorchDistributedShardGather:
                 ).reshape(-1)
                 local_cpu = torch.unique(local_cpu[local_cpu >= 0], sorted=True)
                 rank_ready = bool(local_ready and local_cpu.numel() <= padded_blocks)
-                local_gpu = local_cpu.to(source_rows.device)
                 completion_event = slot.completion_event
                 id_width = padded_blocks + 1
                 with torch.cuda.stream(self._metadata_stream):
+                    local_gpu = local_cpu.to(source_rows.device)
+                    local_ids_ready = torch.cuda.Event()
+                    local_ids_ready.record(self._metadata_stream)
                     if completion_event is not None:
                         self._metadata_stream.wait_event(completion_event)
                     slot.send_ids[:id_width].fill_(-1)
@@ -1469,6 +1487,7 @@ class TorchDistributedShardGather:
                     metadata_ready.record(self._metadata_stream)
                 gathered_rows = padded_blocks * self._world_size
                 with torch.cuda.stream(self._stream):
+                    self._stream.wait_event(local_ids_ready)
                     if completion_event is not None:
                         self._stream.wait_event(completion_event)
                     if local_ready_event is not None:
@@ -1495,6 +1514,7 @@ class TorchDistributedShardGather:
                         slot.receive_ids[: self._world_size * id_width],
                         world_size=self._world_size,
                         padded_blocks=padded_blocks,
+                        keep_padding=True,
                     )
                     valid = (
                         (selected >= 0)
@@ -1502,17 +1522,26 @@ class TorchDistributedShardGather:
                         & (source_positions >= 0)
                         & (source_positions < gathered_rows)
                     )
-                    all_ready = all_ready & torch.all(valid)
-                    selected = selected[valid]
-                    source_positions = source_positions[valid]
-                    destination = logical_destination_rows.index_select(0, selected)
+                    all_ready = all_ready & torch.all((selected < 0) | valid)
+                    safe_selected = selected.clamp(
+                        min=0, max=int(logical_destination_rows.numel()) - 1
+                    )
+                    destination = torch.where(
+                        valid,
+                        logical_destination_rows.index_select(0, safe_selected),
+                        -1,
+                    )
                     scatter_received_owner_rows(
                         slot.receive[:gathered_rows],
                         source_positions,
                         destination_rows,
                         destination,
                     )
-                    resident_bitmap[selected] = True
+                    # False padding must not clear a previously resident row.
+                    # amax also handles duplicate clamped padding indices.
+                    resident_bitmap.scatter_reduce_(
+                        0, safe_selected, valid, reduce="amax", include_self=True
+                    )
                     event = torch.cuda.Event()
                     event.record(self._stream)
                     slot.completion_event = event
