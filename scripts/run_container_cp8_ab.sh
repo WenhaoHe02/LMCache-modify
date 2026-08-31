@@ -116,7 +116,10 @@ case "${LMCACHE_GLM_DSA_LAYER_MAJOR:-0}" in
 esac
 tutti_handoff_id=${LMCACHE_TUTTI_HANDOFF_ID:-$(date +%s%N)}
 tutti_handoff_dir="/tmp/lmcache_tutti_mount_handoff_${tutti_handoff_id}"
-rm -rf "$tutti_handoff_dir"
+if [[ -e "$tutti_handoff_dir" ]]; then
+  echo "Tutti handoff directory already exists: $tutti_handoff_dir" >&2
+  exit 2
+fi
 mkdir -p "$tutti_handoff_dir"
 
 # Mount namespace reassociation from a multi-threaded worker can fail with
@@ -245,6 +248,7 @@ sudo docker run -d \
   -e LMCACHE_GLM_DSA_GATE_TIMEOUT_SEC="${LMCACHE_GLM_DSA_GATE_TIMEOUT_SEC:-30}" \
   -e LMCACHE_GLM_DSA_OWNER_PARTITION="${LMCACHE_GLM_DSA_OWNER_PARTITION:-0}" \
   -e LMCACHE_GLM_DSA_ASYNC_PREDICTION="${LMCACHE_GLM_DSA_ASYNC_PREDICTION:-0}" \
+  -e LMCACHE_GLM_DSA_SHARED_CORRECTION_AT_CONSUMER="${LMCACHE_GLM_DSA_SHARED_CORRECTION_AT_CONSUMER:-0}" \
   -e LMCACHE_INDEXER_REUSE_RESIDUAL_TOPK=0 \
   -e LMCACHE_INDEXER_EXPERIMENTAL_RESIDUAL_LOOKAHEAD=0 \
   -e LMCACHE_NATIVE_INDEXER_STAGE0_LAYERS="${LMCACHE_NATIVE_INDEXER_STAGE0_LAYERS:-1}" \

@@ -13,6 +13,7 @@ export LMCACHE_PROXY_INDEXER_CP_EXCHANGE=0
 export LMCACHE_PROXY_INDEXER_K_CP=1
 export LMCACHE_PROXY_INDEXER_K_CP_SIZE=8
 export LMCACHE_GLM_DSA_ASYNC_PREDICTION=1
+export LMCACHE_GLM_DSA_SHARED_CORRECTION_AT_CONSUMER=1
 
 # GLM's official top-k is 2048, hence up to 256 candidates per rank and query.
 # Keep headroom for the row union; compact AllGather still transmits only the
