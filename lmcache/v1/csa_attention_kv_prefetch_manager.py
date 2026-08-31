@@ -4092,7 +4092,6 @@ class CSAAttentionKVPrefetchManager:
             if at_end or run_broken or size_limit:
                 segment_bounds.append((segment_start, index))
                 segment_start = index
-        segments = [selected[start:end] for start, end in segment_bounds]
         scatter_stream = self._scatter_stream_for(state.k_cache_tensor.device)
         if dst_rows_table.device.type == "cuda":
             # Build destination rows on the same private stream that consumes
@@ -4111,16 +4110,16 @@ class CSAAttentionKVPrefetchManager:
             # the CPU here or launch an upload/gather for every sparse run.
         else:
             selected_rows = dst_rows_table.index_select(0, selected)
-        segment_rows = [selected_rows[start:end] for start, end in segment_bounds]
 
         def _read_plan_for_segment(
-            segment: torch.Tensor,
+            start: int,
+            end: int,
         ) -> Tuple[Tuple[KVObjectByteRange, ...], int]:
             """Return a direct-I/O range and payload skip for one block run."""
             payload_offset = int(chunk.layer_byte_offset) + (
-                int(segment[0]) * block_nbytes
+                selected_ids[start] * block_nbytes
             )
-            payload_length = int(segment.numel()) * block_nbytes
+            payload_length = (end - start) * block_nbytes
             aligned_offset = payload_offset - payload_offset % 512
             aligned_end = ((payload_offset + payload_length + 511) // 512) * 512
             payload_skip = payload_offset - aligned_offset
@@ -4135,7 +4134,9 @@ class CSAAttentionKVPrefetchManager:
                 payload_skip,
             )
 
-        segment_read_plans = [_read_plan_for_segment(segment) for segment in segments]
+        segment_read_plans = [
+            _read_plan_for_segment(start, end) for start, end in segment_bounds
+        ]
 
         def _restore_lba_cache() -> None:
             if self._pending_raw_lba_cache:
@@ -4161,8 +4162,8 @@ class CSAAttentionKVPrefetchManager:
                             "layer-major Tutti segment returned no payload"
                         )
                     key_index = batch_start + offset_in_batch
-                    segment = segments[key_index]
-                    segment_blocks = int(segment.numel())
+                    span_start, span_end = segment_bounds[key_index]
+                    segment_blocks = span_end - span_start
                     segment_nbytes = segment_blocks * block_nbytes
                     payload_skip = segment_read_plans[key_index][1]
                     tensor = memory_obj.raw_tensor
@@ -4179,7 +4180,7 @@ class CSAAttentionKVPrefetchManager:
                         segment_blocks,
                         block_nbytes,
                     )
-                    rows = segment_rows[key_index]
+                    rows = selected_rows[span_start:span_end]
                     if state.block_slot_scatter:
                         slot_size = state.block_slot_size
                         block_ids = torch.div(
@@ -4191,7 +4192,7 @@ class CSAAttentionKVPrefetchManager:
                         k_cache.index_put_((block_ids, slot_ids), source)
                     else:
                         k_cache.index_copy_(0, rows, source)
-                    completed_block_ids.extend(int(value) for value in segment.tolist())
+                    completed_block_ids.extend(selected_ids[span_start:span_end])
             scatter_stream.synchronize()
 
         def _scatter_raw_batch(
@@ -4272,7 +4273,7 @@ class CSAAttentionKVPrefetchManager:
 
         load_kwargs: Dict[str, Any] = {
             "shapes_per_key": None,
-            "file_offsets": [0] * len(segments),
+            "file_offsets": [0] * len(segment_bounds),
             "read_ranges_per_key": [read_plan[0] for read_plan in segment_read_plans],
             "io_priority": io_priority,
             "before_batch": _restore_lba_cache,
@@ -4291,8 +4292,8 @@ class CSAAttentionKVPrefetchManager:
         else:
             load_kwargs["on_batch_loaded"] = _scatter_tensor_batch
         self._tutti_loader.load_chunks_to_hbm(
-            [chunk.key] * len(segments),
-            [chunk.disk_meta] * len(segments),
+            [chunk.key] * len(segment_bounds),
+            [chunk.disk_meta] * len(segment_bounds),
             **load_kwargs,
         )
         completed_ids = torch.as_tensor(
