@@ -1539,8 +1539,15 @@ class TorchDistributedShardGather:
                     )
                     # False padding must not clear a previously resident row.
                     # amax also handles duplicate clamped padding indices.
-                    resident_bitmap.scatter_reduce_(
-                        0, safe_selected, valid, reduce="amax", include_self=True
+                    # CUDA scatter_reduce does not dispatch Bool; the bool
+                    # bitmap uses identical 0/1 byte storage, so update that
+                    # view without a full-bitmap conversion/allocation.
+                    resident_bitmap.view(torch.uint8).scatter_reduce_(
+                        0,
+                        safe_selected,
+                        valid.to(torch.uint8),
+                        reduce="amax",
+                        include_self=True,
                     )
                     event = torch.cuda.Event()
                     event.record(self._stream)
