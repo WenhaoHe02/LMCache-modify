@@ -273,3 +273,49 @@ def test_async_shared_correction_owns_prediction_and_preserves_order(
     finally:
         release.set()
         sink.close()
+
+
+def test_gate_aligned_owner_reads_can_prepare_four_consumers_concurrently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only read preparation runs concurrently; its futures remain per layer."""
+    monkeypatch.setenv("LMCACHE_GLM_DSA_OWNER_PARTITION", "1")
+    monkeypatch.setenv("LMCACHE_GLM_DSA_PREDICT_SHARED_CONSUMERS", "all")
+    monkeypatch.setenv("LMCACHE_GLM_DSA_OWNER_READ_WORKERS", "4")
+    arrived = threading.Barrier(4)
+
+    class Manager:
+        active_request_id = "request"
+        active_request_token = ("request", 1)
+
+        def __init__(self) -> None:
+            self.futures: dict[int, Future[Any]] = {}
+
+        def uses_gate_aligned_shard_gather(self) -> bool:
+            return True
+
+        def fire_predicted_reads(self, layer: int, *args: Any, **kwargs: Any) -> int:
+            arrived.wait(timeout=3)
+            return layer
+
+        def track_layer_submission(
+            self, layer: int, future: Future[Any], **kwargs: Any
+        ) -> None:
+            self.futures[layer] = future
+
+    manager = Manager()
+    schedule = GLMDSAPredictionSchedule(0, 2, "group-2", (2, 3, 4, 5), True)
+    sink = GLMDSAPhysicalPrefetchSink(
+        manager, (schedule,), {2: (2, 3, 4, 5)}, compressed_block_size=64
+    )
+    try:
+        sink.submit(
+            GLMDSAPrefetchEvent(
+                "request", schedule, torch.tensor([[0, 64]]), correction=False
+            )
+        )
+        assert {
+            layer: future.result(timeout=4) for layer, future in manager.futures.items()
+        } == {2: 2, 3: 3, 4: 4, 5: 5}
+    finally:
+        sink.close()

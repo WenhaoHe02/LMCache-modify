@@ -329,13 +329,23 @@ class GLMDSAPhysicalPrefetchSink:
             max_workers=io_workers,
             thread_name_prefix="lmcache-glm-dsa-kv",
         )
-        # Sharded predicted reads execute CP collectives.  A multi-worker
-        # executor can start adjacent consumer layers in a different order on
-        # each TP rank, so one rank may enter L76 while another enters L75.
-        # Keep collective-producing prediction work FIFO while retaining the
-        # general executor above for local miss-correction submissions.
+        # Only owner-mode preparation with gate-aligned collectives is local
+        # work: it can prepare independent layer reads concurrently. Other
+        # modes may execute collectives here and must remain strictly FIFO.
+        aligned_gather = getattr(
+            attention_kv_manager, "uses_gate_aligned_shard_gather", None
+        )
+        owner_read_workers = 1
+        if (
+            self._preserve_owner_partition
+            and callable(aligned_gather)
+            and aligned_gather()
+        ):
+            owner_read_workers = max(
+                1, min(8, int(os.getenv("LMCACHE_GLM_DSA_OWNER_READ_WORKERS", "1")))
+            )
         self._prediction_executor = ThreadPoolExecutor(
-            max_workers=1,
+            max_workers=owner_read_workers,
             thread_name_prefix="lmcache-glm-dsa-predict",
         )
         self._lock = RLock()
