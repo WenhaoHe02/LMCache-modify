@@ -748,6 +748,35 @@ def _attach_glm_dsa_physical_prefetch(
     return sink
 
 
+def set_glm_dsa_prediction_enabled(enabled: bool) -> dict[str, bool]:
+    """Switch GLM prediction and physical I/O policy on a quiesced worker.
+
+    Args:
+        enabled: Desired prediction mode, applied on every TP rank before
+            admitting another request.
+
+    Returns:
+        Effective predictor and physical-sink states for experiment auditing.
+
+    Raises:
+        RuntimeError: If either component is unattached or a request is active.
+    """
+    manager = _GLM_DSA_PREDICTIVE_PREFETCH_MANAGER
+    sink = _GLM_DSA_PHYSICAL_PREFETCH_SINK
+    if manager is None or sink is None:
+        raise RuntimeError("GLM prediction and physical sink must both be attached")
+    if _GLM_DSA_PREFILL_FORWARD_ACTIVE:
+        raise RuntimeError("cannot switch prediction during a GLM prefill forward")
+    manager.set_prediction_enabled(enabled)
+    if manager.prediction_enabled != sink.prediction_enabled:
+        raise RuntimeError("GLM prediction sink is not bound to the active manager")
+    os.environ["LMCACHE_GLM_DSA_PREDICTIVE_PREFETCH"] = "1" if enabled else "0"
+    return {
+        "predictive_manager_enabled": manager.prediction_enabled,
+        "physical_sink_enabled": sink.prediction_enabled,
+    }
+
+
 def _glm_dsa_observe_authoritative(
     target_layer: int,
     true_topk: torch.Tensor,

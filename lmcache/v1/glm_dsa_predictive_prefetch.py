@@ -375,6 +375,25 @@ class GLMDSAPhysicalPrefetchSink:
             self._owner_blocks_per_rank,
         )
 
+    @property
+    def prediction_enabled(self) -> bool:
+        """Return whether scheduled groups receive speculative physical reads."""
+        return self._enable_prediction
+
+    def set_prediction_enabled(self, enabled: bool) -> None:
+        """Switch physical prediction while request admission is quiesced.
+
+        Args:
+            enabled: Enable speculative reads, or demand-load every group.
+
+        Raises:
+            RuntimeError: If a physical request is still active.
+        """
+        with self._lock:
+            if self._attention_kv_manager.active_request_id:
+                raise RuntimeError("cannot switch prediction during a physical request")
+            self._enable_prediction = bool(enabled)
+
     def submit(self, event: GLMDSAPrefetchEvent) -> None:
         """Submit predicted blocks or authoritative miss correction.
 
@@ -651,7 +670,7 @@ class GLMDSAPhysicalPrefetchSink:
         target_layer: int,
         true_topk: torch.Tensor,
     ) -> None:
-        """Demand-load correction-only early Full groups (L0 and L1).
+        """Demand-load early Full groups, or every group when prediction is off.
 
         Args:
             target_layer: Full indexer layer producing ``true_topk``.
@@ -1528,6 +1547,32 @@ class GLMDSAPredictivePrefetchManager:
         """
         with self._lock:
             self._submit_prefetch = submit_prefetch
+
+    @property
+    def prediction_enabled(self) -> bool:
+        """Return whether source-layer prediction computation is enabled."""
+        return self._enable_prediction
+
+    def set_prediction_enabled(self, enabled: bool) -> None:
+        """Switch prediction and its bound physical sink together between requests.
+
+        Args:
+            enabled: Enable prediction, or retain only authoritative demand I/O.
+
+        Raises:
+            RuntimeError: If prediction or physical I/O still owns a request.
+
+        Notes:
+            The caller must quiesce request admission on all TP ranks. A rejected
+            switch changes neither component; no per-layer checks are added.
+        """
+        with self._lock:
+            if self._request_id is not None:
+                raise RuntimeError("cannot switch prediction during an active request")
+            sink = getattr(self._submit_prefetch, "__self__", None)
+            if isinstance(sink, GLMDSAPhysicalPrefetchSink):
+                sink.set_prediction_enabled(enabled)
+            self._enable_prediction = bool(enabled)
 
     def after_source_layer(
         self,
