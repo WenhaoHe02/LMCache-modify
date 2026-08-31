@@ -23,6 +23,8 @@ name="dsv4-csa-cp8-${case_name}"
 image="${LMCACHE_ABLATION_IMAGE:-lmcache/vllm-openai:indexer-ssd-hca-prefetch-decodegate-20260528_0630}"
 model_host=${LMCACHE_ABLATION_MODEL_HOST:-/mnt/dockerdisk/models/DeepSeek-V4-flash}
 model_container=/pro_model
+runtime_cache_host=${LMCACHE_RUNTIME_CACHE_HOST:-/home/zbuser02/lmcache_v026_20260806_run/runtime_cache/vllm_v0260}
+mkdir -p "$runtime_cache_host/vllm" "$runtime_cache_host/flashinfer"
 # This legacy recovery service remounts every fstab entry every 20 seconds.
 # It must stay inactive while snvme owns the cache controllers.
 sudo systemctl stop lmcache-remount.service 2>/dev/null || true
@@ -203,6 +205,8 @@ sudo docker run -d \
   -v /sys:/sys \
   -v /opt/nvidia/nsight-systems:/opt/nvidia/nsight-systems:ro \
   -v /tmp:/tmp \
+  -v "$runtime_cache_host/vllm:/root/.cache/vllm" \
+  -v "$runtime_cache_host/flashinfer:/root/.cache/flashinfer" \
   -v "$model_host:$model_container:ro" \
   -v "$patches_host:/patches:ro" \
   -v "$startup_host:/startup.sh:ro" \
