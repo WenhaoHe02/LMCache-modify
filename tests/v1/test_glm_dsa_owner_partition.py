@@ -95,16 +95,19 @@ def test_glm_prediction_can_preserve_rank_local_ownership(
 
 @pytest.mark.parametrize("prediction_mode", ["all", "staged"])
 @pytest.mark.parametrize("failed_join", [False, True])
+@pytest.mark.parametrize("gpu_filter", [False, True])
 def test_shared_correction_waits_only_at_its_consumer(
     monkeypatch: pytest.MonkeyPatch,
     prediction_mode: str,
     failed_join: bool,
+    gpu_filter: bool,
 ) -> None:
     """A Full gate never joins future consumers; misses follow their gather."""
     monkeypatch.setenv("LMCACHE_GLM_DSA_OWNER_PARTITION", "1")
     monkeypatch.setenv("LMCACHE_GLM_DSA_SHARED_CORRECTION_AT_CONSUMER", "1")
     monkeypatch.setenv("LMCACHE_GLM_DSA_PREDICT_SHARED_CONSUMERS", prediction_mode)
     monkeypatch.setenv("LMCACHE_INDEXER_PROFILE_ACCURACY", "0")
+    monkeypatch.setenv("LMCACHE_CSA_ATTENTION_KV_TIMING", "0")
 
     class Manager:
         def __init__(self) -> None:
@@ -112,6 +115,8 @@ def test_shared_correction_waits_only_at_its_consumer(
             self.active_request_token = ("request", 1)
             self.futures: dict[int, Future[Any]] = {}
             self.events: list[tuple[str, int]] = []
+            if gpu_filter:
+                self.submit_topk_miss_reads = self.submit_true_topk_misses
 
         def fire_predicted_reads(self, layer: int, *args: Any, **kwargs: Any) -> int:
             return layer
@@ -131,7 +136,15 @@ def test_shared_correction_waits_only_at_its_consumer(
             return not (failed_join and layer == 3)
 
         def submit_miss_reads(self, layer: int, *args: Any, **kwargs: Any) -> None:
+            assert not gpu_filter, "GPU routing must not consult a stale CPU shadow"
             assert ("gather", layer) in self.events
+            self.events.append(("miss", layer))
+
+        def submit_true_topk_misses(
+            self, layer: int, topk: torch.Tensor, **kwargs: Any
+        ) -> None:
+            assert ("gather", layer) in self.events
+            assert topk.tolist() == [[0, 64, 128]]
             self.events.append(("miss", layer))
 
         def wait_for_layer(self, layer: int, timeout_s: float) -> bool:

@@ -346,7 +346,7 @@ class GLMDSAPhysicalPrefetchSink:
         )
         self._staged_prediction_futures: dict[int, Future[Any]] = {}
         self._pending_shared_corrections: dict[
-            int, tuple[GLMDSAPrefetchEvent, torch.Tensor, Any]
+            int, tuple[GLMDSAPrefetchEvent, torch.Tensor | None, Any]
         ] = {}
         self._decode_selected_blocks: dict[int, set[int]] = defaultdict(set)
         self._decode_missing_blocks: dict[int, set[int]] = defaultdict(set)
@@ -433,9 +433,18 @@ class GLMDSAPhysicalPrefetchSink:
                 prediction_budget,
                 self._owner_blocks_per_rank,
             )
-        blocks = self._topk_to_blocks(
-            event.topk_indices,
-            block_budget=(None if event.correction else prediction_budget),
+        use_gpu_miss_filter = event.correction and callable(
+            getattr(manager, "submit_topk_miss_reads", None)
+        )
+        blocks = (
+            None
+            if use_gpu_miss_filter
+            and not _accuracy_profile_enabled()
+            and not _timing_enabled()
+            else self._topk_to_blocks(
+                event.topk_indices,
+                block_budget=(None if event.correction else prediction_budget),
+            )
         )
         if event.correction:
             with self._lock:
@@ -444,7 +453,8 @@ class GLMDSAPhysicalPrefetchSink:
                     None,
                 )
                 self._drop_pending_target_locked(event.schedule.target_layer)
-            self._log_block_agreement(event, predicted, blocks)
+            if blocks is not None:
+                self._log_block_agreement(event, predicted, blocks)
             for layer_id in consumers:
                 if int(layer_id) == event.schedule.target_layer:
                     correction_start = time.perf_counter()
@@ -454,16 +464,7 @@ class GLMDSAPhysicalPrefetchSink:
                     )
                     join_ms = (time.perf_counter() - join_start) * 1000.0
                     submit_start = time.perf_counter()
-                    manager.submit_miss_reads(
-                        int(layer_id),
-                        blocks,
-                        request_token=request_token,
-                        **_glm_io_profile_kwargs(
-                            event,
-                            "correction",
-                            int(layer_id),
-                        ),
-                    )
+                    self._submit_correction(int(layer_id), blocks, request_token, event)
                     submit_ms = (time.perf_counter() - submit_start) * 1000.0
                     gate_start = time.perf_counter()
                     gate_ready = manager.wait_for_layer(
@@ -478,7 +479,7 @@ class GLMDSAPhysicalPrefetchSink:
                             "submit_ms=%.3f gate_ms=%.3f total_ms=%.3f",
                             event.request_id,
                             int(layer_id),
-                            int(blocks.numel()),
+                            int(blocks.numel()) if blocks is not None else -1,
                             int(prediction_ready),
                             join_ms,
                             submit_ms,
@@ -541,15 +542,11 @@ class GLMDSAPhysicalPrefetchSink:
                     )
                 else:
                     future = self._executor.submit(
-                        manager.submit_miss_reads,
+                        self._submit_correction,
                         int(layer_id),
                         blocks,
-                        request_token=request_token,
-                        **_glm_io_profile_kwargs(
-                            event,
-                            "correction",
-                            int(layer_id),
-                        ),
+                        request_token,
+                        event,
                     )
                 manager.track_layer_submission(
                     int(layer_id),
@@ -564,13 +561,14 @@ class GLMDSAPhysicalPrefetchSink:
                         event.request_id,
                         event.schedule.target_layer,
                         int(layer_id),
-                        int(blocks.numel()),
+                        int(blocks.numel()) if blocks is not None else -1,
                         int(shared_prediction_ready),
                         shared_join_ms,
                         (time.perf_counter() - shared_submit_start) * 1000.0,
                     )
             return
 
+        assert blocks is not None
         with self._lock:
             if self._staged_request_id != event.request_id:
                 self._pending_prediction_stages.clear()
@@ -763,12 +761,7 @@ class GLMDSAPhysicalPrefetchSink:
                         raise RuntimeError(
                             f"GLM shared prediction failed at layer {layer_id}"
                         )
-                    manager.submit_miss_reads(
-                        int(layer_id),
-                        blocks,
-                        request_token=request_token,
-                        **_glm_io_profile_kwargs(event, "correction", int(layer_id)),
-                    )
+                    self._submit_correction(int(layer_id), blocks, request_token, event)
             return bool(
                 manager.wait_for_layer(
                     int(layer_id),
@@ -1034,13 +1027,38 @@ class GLMDSAPhysicalPrefetchSink:
         self,
         prediction_future: Future[Any] | None,
         layer_id: int,
-        blocks: torch.Tensor,
+        blocks: torch.Tensor | None,
         request_token: Any,
         event: GLMDSAPrefetchEvent,
     ) -> None:
         if prediction_future is not None:
             prediction_future.result()
-        self._attention_kv_manager.submit_miss_reads(
+        self._submit_correction(layer_id, blocks, request_token, event)
+
+    def _submit_correction(
+        self,
+        layer_id: int,
+        blocks: torch.Tensor | None,
+        request_token: Any,
+        event: GLMDSAPrefetchEvent,
+    ) -> None:
+        """Use the same authoritative GPU-residency filter as no-prefetch."""
+        manager = self._attention_kv_manager
+        submit_topk_misses = getattr(manager, "submit_topk_miss_reads", None)
+        if callable(submit_topk_misses):
+            # GPU owner routing publishes into the GPU bitmap, not its CPU
+            # shadow. Filtering there avoids rereading already gathered KV
+            # and avoids a full token-to-block unique/sort before correction.
+            submit_topk_misses(
+                layer_id,
+                event.topk_indices,
+                request_token=request_token,
+                **_glm_io_profile_kwargs(event, "correction", int(layer_id)),
+            )
+            return
+        if blocks is None:
+            raise RuntimeError("GLM correction requires a supported miss filter")
+        manager.submit_miss_reads(
             layer_id,
             blocks,
             request_token=request_token,
