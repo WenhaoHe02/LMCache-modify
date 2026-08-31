@@ -252,17 +252,31 @@ def test_owner_gather_uses_actual_max_width_and_duplicate_send_offset(
     )
     transport._slots = [slot]
     gathered_widths: list[int] = []
+    active_stream: list[object | None] = [None]
 
     class _Context:
+        def __init__(self, stream: object) -> None:
+            self.stream = stream
+            self.previous: object | None = None
+
         def __enter__(self) -> None:
-            return None
+            self.previous = active_stream[0]
+            active_stream[0] = self.stream
 
         def __exit__(self, *_args: object) -> None:
-            return None
+            active_stream[0] = self.previous
 
     class _Work:
+        def __init__(
+            self, output: torch.Tensor, payload: torch.Tensor, stream: object
+        ) -> None:
+            self.output, self.payload, self.stream = output, payload, stream
+
         def wait(self) -> None:
-            return None
+            # Async collectives are not visible to consumers until ordered on
+            # the intended private stream, not accidentally on the model stream.
+            assert active_stream[0] is self.stream
+            self.output.copy_(self.payload)
 
     class _Event:
         def record(self, _stream: object) -> None:
@@ -282,12 +296,10 @@ def test_owner_gather_uses_actual_max_width_and_duplicate_send_offset(
     ) -> _Work:
         gathered_widths.append(int(input_.shape[0]))
         if input_.dtype == torch.int64:
-            output.copy_(payloads.reshape(-1))
-        else:
-            output.copy_(gathered_rows)
-        return _Work()
+            return _Work(output, payloads.reshape(-1), transport._metadata_stream)
+        return _Work(output, gathered_rows, transport._stream)
 
-    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: _Context())
+    monkeypatch.setattr(torch.cuda, "stream", _Context)
     monkeypatch.setattr(torch.cuda, "Event", _Event)
     monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", _all_gather)
     destination = torch.zeros((10, 1), dtype=torch.uint8)

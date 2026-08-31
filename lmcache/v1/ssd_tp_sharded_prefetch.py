@@ -1221,7 +1221,8 @@ class TorchDistributedShardGather:
                 rank_ready = bool(
                     local_ready and int(local_cpu.numel()) <= padded_blocks
                 )
-                local_gpu = local_cpu.to(source_rows.device)
+                with torch.cuda.stream(metadata_stream):
+                    local_gpu = local_cpu.to(source_rows.device)
                 completion_event = slot.completion_event
                 id_width = padded_blocks + 1
                 with torch.cuda.stream(metadata_stream):
@@ -1254,14 +1255,16 @@ class TorchDistributedShardGather:
                             local_rows,
                             out=slot.send[: int(local_gpu.numel())],
                         )
-                id_work.wait()
+                with torch.cuda.stream(metadata_stream):
+                    id_work.wait()
             metadata_stream.synchronize()
 
-            payloads = (
-                slot.receive_ids[: self._world_size * (padded_blocks + 1)]
-                .cpu()
-                .reshape(self._world_size, padded_blocks + 1)
-            )
+            with torch.cuda.stream(metadata_stream):
+                payloads = (
+                    slot.receive_ids[: self._world_size * (padded_blocks + 1)]
+                    .cpu()
+                    .reshape(self._world_size, padded_blocks + 1)
+                )
             all_ready = all(int(payload[0].item()) >= 0 for payload in payloads)
             rank_blocks: list[tuple[int, ...]] = []
             for payload in payloads:
@@ -1300,10 +1303,10 @@ class TorchDistributedShardGather:
                 )
             partition = partition_rank_local_blocks(rank_blocks)
             with torch.inference_mode(), torch.cuda.stream(self._stream):
-                # The data collective was enqueued first on this same stream;
-                # scatter and the completion event are naturally ordered
-                # after it. The metadata D2H/partition work above overlaps the
-                # KV transfer instead of forcing a full data-stream sync.
+                # ProcessGroupNCCL runs on its own stream. Work.wait orders
+                # this consumer stream after the collective; keeping the Work
+                # alive alone does not establish that dependency.
+                data_work.wait()
                 if all_ready and partition.union:
                     # Each rank sent its complete candidate list in sorted
                     # order, but ownership dedup may drop interior entries
@@ -1402,12 +1405,13 @@ class TorchDistributedShardGather:
                     slot.send_ids[0] = int(local_gpu.numel()) if rank_ready else -1
                     if rank_ready and local_gpu.numel():
                         slot.send_ids[1 : 1 + local_gpu.numel()] = local_gpu
-                    torch.distributed.all_gather_into_tensor(
+                    id_work = torch.distributed.all_gather_into_tensor(
                         slot.receive_ids[: self._world_size * id_width],
                         slot.send_ids[:id_width],
                         group=self._metadata_process_group,
                         async_op=True,
                     )
+                    id_work.wait()
                     metadata_ready = torch.cuda.Event()
                     metadata_ready.record(self._metadata_stream)
                 gathered_rows = padded_blocks * self._world_size
@@ -1432,6 +1436,7 @@ class TorchDistributedShardGather:
                         group=self._process_group,
                         async_op=True,
                     )
+                    data_work.wait()
                     self._stream.wait_event(metadata_ready)
                     selected, source_positions, all_ready = owner_gpu_route(
                         slot.receive_ids[: self._world_size * id_width],
