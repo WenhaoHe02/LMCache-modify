@@ -1489,13 +1489,43 @@ class CSAAttentionKVPrefetchManager:
         if (
             state.block_slot_scatter
             or not state.chunks
-            or (len(state.chunks) == 1 and state.chunks[0].layer_major)
+            or (
+                len(state.chunks) == 1
+                and state.chunks[0].layer_major
+                and os.getenv("LMCACHE_CSA_LAYER_MAJOR_INDEXED_SPARSE", "0") != "1"
+            )
         ):
             return
         io_nbytes = state.compressed_block_size * state.token_bytes
         if io_nbytes <= 0 or io_nbytes % 512:
             return
 
+        cache = getattr(self, "_indexed_table_cache", None)
+        if cache is None:
+            cache = {}
+            self._indexed_table_cache = cache
+        cache_key = (
+            str(state.k_cache_tensor.device),
+            int(state.k_cache_tensor.shape[0]),
+            io_nbytes,
+            tuple(
+                (
+                    chunk.disk_meta.path,
+                    chunk.first_compressed_block,
+                    chunk.n_compressed_blocks,
+                    chunk.layer_byte_offset,
+                    chunk.payload_skip,
+                    tuple(chunk.raw_extents),
+                    tuple(chunk.physical_block_ids),
+                )
+                for chunk in state.chunks
+            ),
+        )
+        cached = cache.pop(cache_key, None)
+        if cached is not None:
+            cache[cache_key] = cached
+            state.indexed_slba_table, state.indexed_dst_rows_table = cached
+            return
         table_size = int(state.chunks[-1].end_compressed_block)
         slbas = torch.full((table_size,), -1, dtype=torch.int64)
         dst_rows = torch.full((table_size,), -1, dtype=torch.int64)
@@ -1577,9 +1607,15 @@ class CSAAttentionKVPrefetchManager:
                         device,
                         non_blocking=True,
                     )
+                # These immutable tables may be read by the loader's own
+                # stream. Complete this once-per-plan upload before caching.
+                io_stream.synchronize()
             else:
                 state.indexed_slba_table = slbas.to(device)
                 state.indexed_dst_rows_table = dst_rows.to(device)
+        if len(cache) >= 512:
+            cache.pop(next(iter(cache)))
+        cache[cache_key] = (state.indexed_slba_table, state.indexed_dst_rows_table)
         logger.info(
             "CSAAttentionKVPrefetchManager: compiled indexed Tutti table "
             "layer=%d blocks=%d bytes_per_block=%d",
@@ -2737,6 +2773,7 @@ class CSAAttentionKVPrefetchManager:
                 shard_transport.close()
                 self._shard_transport = None
             self._layers.clear()
+            getattr(self, "_indexed_table_cache", {}).clear()
             self._prediction_waiter = None
 
     # ------------------------------------------------------------------
@@ -3472,6 +3509,24 @@ class CSAAttentionKVPrefetchManager:
             and state.chunks[0].layer_major
             and state.layer_major_dst_rows_table is not None
         ):
+            if (
+                os.getenv("LMCACHE_CSA_LAYER_MAJOR_INDEXED_SPARSE", "0") == "1"
+                and state.indexed_slba_table is not None
+                and state.indexed_dst_rows_table is not None
+                and _csa_c_ops is not None
+                and hasattr(_csa_c_ops, "tutti_submit_indexed_sgl_read")
+                and hasattr(self._tutti_loader, "load_indexed_chunks_to_hbm")
+            ):
+                run_count = 1 + int(
+                    torch.count_nonzero(selected_cpu[1:] - selected_cpu[:-1] != 1)
+                )
+                # Same blocks, different submission machinery. Preserve large
+                # sequential runs; use GPU-resident descriptors only for
+                # highly fragmented sets (average run <= 2 blocks).
+                if run_count >= 8 and run_count * 2 >= int(selected_cpu.numel()):
+                    return self._issue_indexed_reads(
+                        state, selected_cpu, io_priority=io_priority, **profile_kwargs
+                    )
             return self._issue_layer_major_read(
                 state,
                 selected_cpu,

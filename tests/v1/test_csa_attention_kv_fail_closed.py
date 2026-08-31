@@ -300,8 +300,15 @@ def test_multi_generation_layer_major_plan_compiles_indexed_tables() -> None:
     assert state.indexed_dst_rows_table.tolist() == [3, 2, 1, 0]
 
 
-def test_single_layer_major_plan_stays_on_coalesced_path() -> None:
-    """One layer-major object retains the contiguous-range I/O plan."""
+@pytest.mark.parametrize("indexed_enabled", [False, True])
+def test_single_layer_major_plan_stays_on_coalesced_path(
+    monkeypatch: pytest.MonkeyPatch,
+    indexed_enabled: bool,
+) -> None:
+    """Indexed single-object tables are opt-in and reused for the same map."""
+    monkeypatch.setenv(
+        "LMCACHE_CSA_LAYER_MAJOR_INDEXED_SPARSE", "1" if indexed_enabled else "0"
+    )
 
     class _Loader:
         io_stream = None
@@ -336,8 +343,15 @@ def test_single_layer_major_plan_stays_on_coalesced_path() -> None:
     manager.register_request_chunks("request-one-layer-object", chunks)
 
     state = manager._layers[2]
-    assert state.indexed_slba_table is None
-    assert state.indexed_dst_rows_table is None
+    if indexed_enabled:
+        assert state.indexed_slba_table.tolist() == [100, 102, 104, 106]
+        assert state.indexed_dst_rows_table.tolist() == [3, 2, 1, 0]
+        first_slbas = state.indexed_slba_table
+        manager.register_request_chunks("request-same-map", chunks)
+        assert state.indexed_slba_table is first_slbas
+    else:
+        assert state.indexed_slba_table is None
+        assert state.indexed_dst_rows_table is None
     assert state.layer_major_dst_rows_table.tolist() == [3, 2, 1, 0]
 
 
@@ -388,8 +402,11 @@ def test_single_layer_major_plan_tracks_new_destination_rows() -> None:
     assert manager._layers[2].layer_major_dst_rows_table.tolist() == [0, 1]
 
 
-def test_single_layer_major_plan_crossing_extent_uses_general_path() -> None:
+def test_single_layer_major_plan_crossing_extent_uses_general_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A block crossing an extent cannot use the one-command indexed op."""
+    monkeypatch.setenv("LMCACHE_CSA_LAYER_MAJOR_INDEXED_SPARSE", "1")
 
     class _Loader:
         io_stream = None
@@ -1220,6 +1237,60 @@ def test_prefill_correction_reads_only_active_topk() -> None:
     assert result is workspace
     assert len(observed) == 1
     assert observed[0].tolist() == [[1, 2], [3, 4]]
+
+
+@pytest.mark.parametrize(
+    "ids, expected_path",
+    [
+        (list(range(1, 21, 2)), "indexed"),
+        (list(range(20)), "coalesced"),
+        ([1, 3], "coalesced"),
+    ],
+)
+def test_fragmented_single_object_read_keeps_exact_block_set(
+    monkeypatch: pytest.MonkeyPatch,
+    ids: list[int],
+    expected_path: str,
+) -> None:
+    """Only fragmented sets use indexed submit; neither branch adds blocks."""
+    monkeypatch.setenv("LMCACHE_CSA_LAYER_MAJOR_INDEXED_SPARSE", "1")
+    monkeypatch.setattr(
+        csa_manager,
+        "_csa_c_ops",
+        SimpleNamespace(tutti_submit_indexed_sgl_read=object()),
+    )
+    manager = object.__new__(CSAAttentionKVPrefetchManager)
+    manager._tutti_loader = SimpleNamespace(load_indexed_chunks_to_hbm=object())
+    state = SimpleNamespace(
+        chunks=[SimpleNamespace(layer_major=True, end_compressed_block=32)],
+        layer_major_dst_rows_table=torch.arange(32),
+        indexed_slba_table=torch.arange(32),
+        indexed_dst_rows_table=torch.arange(32),
+    )
+    selected = torch.tensor(ids, dtype=torch.int64)
+    calls: list[str] = []
+
+    def indexed(
+        _self: object, _state: object, block_ids: torch.Tensor, **kwargs: Any
+    ) -> tuple[None, list[object], torch.Tensor]:
+        assert torch.equal(block_ids, selected)
+        calls.append("indexed")
+        return None, [], selected
+
+    def coalesced(
+        _self: object, _state: object, block_ids: torch.Tensor, **kwargs: Any
+    ) -> tuple[None, list[object], torch.Tensor]:
+        assert torch.equal(block_ids, selected)
+        calls.append("coalesced")
+        return None, [], selected
+
+    manager._issue_indexed_reads = MethodType(indexed, manager)
+    manager._issue_layer_major_read = MethodType(coalesced, manager)
+    _event, _objects, completed = manager._issue_reads(
+        state, selected, io_priority="demand"
+    )
+    assert calls == [expected_path]
+    assert torch.equal(completed, selected)
 
 
 def test_layer_major_full_read_is_split_into_bounded_segments() -> None:
