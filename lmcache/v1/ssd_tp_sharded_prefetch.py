@@ -1439,6 +1439,17 @@ class TorchDistributedShardGather:
         resident_bitmap: torch.Tensor,
     ) -> tuple[torch.cuda.Event, torch.Tensor, torch.Tensor]:
         """Gather owner rows without a host metadata barrier or partition."""
+        if os.getenv("LMCACHE_CSA_OWNER_KV_PACKET", "0") == "1":
+            return self._gather_owner_packet(
+                local_block_ids=local_block_ids,
+                local_ready=local_ready,
+                padded_blocks=padded_blocks,
+                source_rows=source_rows,
+                logical_destination_rows=logical_destination_rows,
+                destination_rows=destination_rows,
+                local_ready_event=local_ready_event,
+                resident_bitmap=resident_bitmap,
+            )
         if (
             not self._healthy
             or not self._slots
@@ -1914,6 +1925,7 @@ class TorchDistributedShardGather:
                 if slot.completion_event is not None:
                     slot.completion_event.synchronize()
             self._slots.clear()
+            getattr(self, "_owner_packet_slots", {}).clear()
             self._stream = None
         if self._owns_process_group:
             try:
@@ -1925,6 +1937,109 @@ class TorchDistributedShardGather:
                 torch.distributed.destroy_process_group(self._metadata_process_group)
             finally:
                 self._owns_metadata_process_group = False
+
+    def _gather_owner_packet(
+        self,
+        *,
+        local_block_ids: torch.Tensor,
+        local_ready: bool,
+        padded_blocks: int,
+        source_rows: torch.Tensor,
+        logical_destination_rows: torch.Tensor,
+        destination_rows: torch.Tensor,
+        local_ready_event: Optional[torch.cuda.Event],
+        resident_bitmap: torch.Tensor,
+    ) -> tuple[torch.cuda.Event, torch.Tensor, torch.Tensor]:
+        """Exchange IDs and KV together; keep routing and publication on GPU."""
+        from lmcache.v1.owner_kv_packet import pack_owner_rows, scatter_owner_packets
+
+        data_submitted = False
+        try:
+            if not self._healthy or self._stream is None or not self._slots:
+                raise RuntimeError("owner packet transport is not warmed")
+            row_bytes = int(source_rows.shape[1])
+            if (
+                row_bytes % 8
+                or source_rows.dtype != torch.uint8
+                or destination_rows.dtype != torch.uint8
+                or source_rows.stride(1) != 1
+                or destination_rows.stride(1) != 1
+                or padded_blocks <= 0
+                or padded_blocks * self._world_size * (row_bytes + 8)
+                > self._config.staging_slot_bytes
+            ):
+                raise ValueError("unsupported owner packet geometry")
+            with self._lock, torch.inference_mode(), torch.cuda.stream(self._stream):
+                slot_index = self._slot_cursor
+                slot = self._slots[slot_index]
+                self._slot_cursor = (slot_index + 1) % len(self._slots)
+                if slot.completion_event is not None:
+                    self._stream.wait_event(slot.completion_event)
+                if local_ready_event is not None:
+                    self._stream.wait_event(local_ready_event)
+                packets = getattr(self, "_owner_packet_slots", None)
+                if packets is None:
+                    packets = {}
+                    self._owner_packet_slots = packets
+                logical_limit = min(
+                    logical_destination_rows.numel(), resident_bitmap.numel()
+                )
+                geometry = (padded_blocks, row_bytes, logical_limit, source_rows.device)
+                cached = packets.get(slot_index)
+                if cached is None or cached[0] != geometry:
+                    send = torch.empty(
+                        (padded_blocks, row_bytes + 8),
+                        dtype=torch.uint8,
+                        device=source_rows.device,
+                    )
+                    receive = torch.empty(
+                        (padded_blocks * self._world_size, row_bytes + 8),
+                        dtype=torch.uint8,
+                        device=source_rows.device,
+                    )
+                    claims = torch.empty(
+                        logical_limit, dtype=torch.int32, device=source_rows.device
+                    )
+                    cached = (geometry, send, receive, claims)
+                    packets[slot_index] = cached
+                _, send, receive, claims = cached
+                local = local_block_ids.to(
+                    device=source_rows.device, dtype=torch.int64, non_blocking=True
+                )
+                pack_owner_rows(
+                    source_rows,
+                    logical_destination_rows,
+                    local,
+                    send,
+                    local_ready=bool(local_ready and local.numel() <= padded_blocks),
+                )
+                data_submitted = True
+                work = torch.distributed.all_gather_into_tensor(
+                    receive,
+                    send,
+                    group=self._process_group,
+                    async_op=True,
+                )
+                work.wait()
+                selected = scatter_owner_packets(
+                    receive,
+                    claims,
+                    logical_destination_rows,
+                    destination_rows,
+                    resident_bitmap,
+                )
+                headers = receive.view(torch.int64)[:, 0]
+                all_ready = (headers[::padded_blocks] != -2).all()
+                event = torch.cuda.Event()
+                event.record(self._stream)
+                slot.completion_event = event
+                slot.completion_work = work
+            return event, selected, all_ready
+        except Exception as exc:
+            self._healthy = False
+            raise ShardCollectiveError(
+                "owner ID+KV packet gather failed", data_submitted=data_submitted
+            ) from exc
 
 
 def parse_layer_ranges(specification: str) -> frozenset[int]:
