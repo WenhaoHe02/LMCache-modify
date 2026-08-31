@@ -775,6 +775,24 @@ class GLMDSAPhysicalPrefetchSink:
                     int(value) for value in missing.tolist()
                 )
 
+    def start_consumer_prefetch(self, layer_id: int) -> bool:
+        """Start the next layer's owner gather at an aligned model boundary.
+
+        Args:
+            layer_id: Next physical consumer. Its normal gate remains active.
+
+        Returns:
+            Whether the producer completed and the gather could be enqueued.
+            Disabled prediction and transports without this API are no-ops.
+        """
+        if not self._enable_prediction or not self._preserve_owner_partition:
+            return True
+        self._release_prediction_stages(int(layer_id))
+        launch = getattr(self._attention_kv_manager, "launch_layer_gather", None)
+        return not callable(launch) or bool(
+            launch(int(layer_id), timeout_s=self._gate_timeout_s())
+        )
+
     def wait_for_consumer(self, layer_id: int) -> bool:
         """Wait until one consumer layer's predicted/corrected KV has landed.
 

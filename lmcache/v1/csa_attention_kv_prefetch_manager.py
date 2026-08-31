@@ -2009,7 +2009,47 @@ class CSAAttentionKVPrefetchManager:
         if not isinstance(work, _DeferredShardGather):
             return False
         self._finalize_shard_gather(work)
+        # An earlier aligned decoder boundary may already have launched this
+        # gather. Its future is retained until the real consumer takes it.
+        with work.state.pending_reads_lock:
+            ready = work.state.last_drain_event
+        if ready is not None and work.state.k_cache_tensor.is_cuda:
+            torch.cuda.current_stream(work.state.k_cache_tensor.device).wait_event(
+                ready
+            )
         return True
+
+    def launch_layer_gather(self, layer_id: int, timeout_s: float = 30.0) -> bool:
+        """Launch a tracked owner gather without waiting for GPU completion.
+
+        Args:
+            layer_id: Next physical consumer at an all-rank decoder boundary.
+            timeout_s: Maximum wait for its rank-local SSD producer.
+
+        Returns:
+            True if submitted or no work exists; False on producer failure.
+            Only the fixed GPU metadata path supports early launch. The
+            future remains tracked, and the regular consumer gate still joins
+            its completion event before reading or correcting KV.
+
+        Notes:
+            Call in identical model-layer order on every rank, never from an
+            unordered background executor.
+        """
+        if os.getenv("LMCACHE_CSA_OWNER_GPU_METADATA", "0") != "1":
+            return True
+        with self._scheduled_layer_futures_lock:
+            future = self._scheduled_layer_futures.get(int(layer_id))
+        if future is None:
+            return True
+        try:
+            work = future.result(timeout=max(0.0, timeout_s))
+            if isinstance(work, _DeferredShardGather) and work.exchange_owner_partition:
+                self._finalize_shard_gather(work, wait_on_consumer=False)
+            return True
+        except Exception:
+            logger.exception("Early owner gather failed at layer %d", layer_id)
+            return False
 
     def discard_deferred_shard_gather(
         self,
@@ -5110,6 +5150,8 @@ class CSAAttentionKVPrefetchManager:
     def _finalize_shard_gather(
         self,
         prepared: _DeferredShardGather,
+        *,
+        wait_on_consumer: bool = True,
     ) -> None:
         """Run consensus/gather after all model ranks reach the layer gate."""
         if not self._claim_deferred_shard_gather(prepared):
@@ -5189,7 +5231,10 @@ class CSAAttentionKVPrefetchManager:
                                 resident_bitmap=state.in_pool_bitmap,
                             )
                         )
-                        torch.cuda.current_stream(device).wait_event(gather_event)
+                        with state.pending_reads_lock:
+                            state.last_drain_event = gather_event
+                        if wait_on_consumer:
+                            torch.cuda.current_stream(device).wait_event(gather_event)
                         # Do not build a host partition here. Exact top-K
                         # correction consumes the GPU resident bitmap and
                         # demand-reads any failed-rank or unpredicted blocks.

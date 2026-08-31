@@ -7,6 +7,7 @@ from typing import Any
 
 # Third Party
 import torch
+import pytest
 
 # First Party
 from lmcache.integration.vllm.glm_dsa_vllm_0202 import VLLM0202GLMDSAHooks
@@ -73,5 +74,50 @@ def test_full_indexer_precedes_kv_join_and_proxy_does_not_join() -> None:
         layers[2].self_attn.indexer.indexer_op.skip_k_cache_insert = True
         layers[2].self_attn.indexer(hidden)
         assert events == [("indexer", 2)]
+    finally:
+        hooks.close()
+
+
+def test_owner_gather_launch_is_ordered_after_source_before_next_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Early communication does not bypass the real consumer's completion gate."""
+    monkeypatch.setenv("LMCACHE_GLM_DSA_PREFIRE_OWNER_GATHER", "1")
+    events: list[tuple[str, int]] = []
+
+    class Decoder:
+        def __init__(self, layer: int) -> None:
+            self.layer_idx = layer
+            self.self_attn = SimpleNamespace(indexer=None)
+
+        def forward(self, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            events.append(("compute", self.layer_idx))
+            return positions, positions
+
+    class Manager:
+        schedules = (GLMDSAPredictionSchedule(0, 2, "group", (2, 3), True),)
+
+        def wait_for_prediction(self, layer: int) -> bool:
+            events.append(("prediction_ready", layer))
+            return True
+
+        def after_source_layer(self, layer: int, *args: Any) -> None:
+            events.append(("predict", layer))
+
+    layers = {layer: Decoder(layer) for layer in range(4)}
+    hooks = VLLM0202GLMDSAHooks(
+        layers,
+        Manager(),
+        indexer_types=("full", "full", "full", "shared"),
+        consumer_waiter=lambda layer: events.append(("join", layer)) or True,
+        consumer_starter=lambda layer: events.append(("launch", layer)) or True,
+    )
+    hooks.attach()
+    try:
+        layers[2].forward(torch.arange(3))
+        layers[3].forward(torch.arange(3))
+        assert events.index(("compute", 2)) < events.index(("launch", 3))
+        assert events.index(("launch", 3)) < events.index(("join", 3))
+        assert events.index(("join", 3)) < events.index(("compute", 3))
     finally:
         hooks.close()

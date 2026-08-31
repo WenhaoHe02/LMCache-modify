@@ -803,6 +803,12 @@ def _glm_dsa_wait_for_consumer(layer_id: int) -> bool:
     return sink is None or bool(sink.wait_for_consumer(layer_id))
 
 
+def _glm_dsa_start_consumer_prefetch(layer_id: int) -> bool:
+    """Launch next-layer owner communication in deterministic model order."""
+    sink = _GLM_DSA_PHYSICAL_PREFETCH_SINK
+    return sink is None or bool(sink.start_consumer_prefetch(layer_id))
+
+
 def _attach_glm_dsa_predictive_prefetch(
     vllm_config: Any,
     engine: Any,
@@ -910,6 +916,7 @@ def _attach_glm_dsa_predictive_prefetch(
             indexer_types=tuple(layer.indexer_mode.value for layer in topology.layers),
             authoritative_observer=_glm_dsa_observe_authoritative,
             consumer_waiter=_glm_dsa_wait_for_consumer,
+            consumer_starter=_glm_dsa_start_consumer_prefetch,
             forward_enabled=_glm_dsa_forward_enabled,
         )
         hooks.attach()

@@ -335,6 +335,8 @@ class VLLM0202GLMDSAHooks:
         disabled_authoritative_observer: Optional profile-only callback for
             authoritative Full-index output from disabled (normally decode)
             forwards. It must not submit I/O or alter model state.
+        consumer_starter: Optional launch-only next-layer prefetch callback.
+            Invoked in model order when PREFIRE_OWNER_GATHER is enabled.
     """
 
     def __init__(
@@ -347,6 +349,7 @@ class VLLM0202GLMDSAHooks:
         disabled_authoritative_observer: Callable[[int, torch.Tensor], None]
         | None = None,
         consumer_waiter: Callable[[int], bool] | None = None,
+        consumer_starter: Callable[[int], bool] | None = None,
         forward_enabled: Callable[[], bool] | None = None,
     ) -> None:
         self._decoder_layers = dict(decoder_layers)
@@ -355,6 +358,7 @@ class VLLM0202GLMDSAHooks:
         self._authoritative_observer = authoritative_observer
         self._disabled_authoritative_observer = disabled_authoritative_observer
         self._consumer_waiter = consumer_waiter
+        self._consumer_starter = consumer_starter
         self._forward_enabled = forward_enabled
         self._patched_decoders: list[Any] = []
         self._patched_indexers: list[Any] = []
@@ -485,6 +489,20 @@ class VLLM0202GLMDSAHooks:
                     result[1],
                     positions,
                 )
+            next_layer = source_layer + 1
+            starter = getattr(self, "_consumer_starter", None)
+            if (
+                enabled
+                and starter is not None
+                and next_layer in self._decoder_layers
+                and os.getenv("LMCACHE_GLM_DSA_PREFIRE_OWNER_GATHER", "0") == "1"
+            ):
+                if not manager.wait_for_prediction(next_layer) or not starter(
+                    next_layer
+                ):
+                    raise RuntimeError(
+                        f"GLM early owner gather failed at layer {next_layer}"
+                    )
             return result
 
         decoder._lmcache_glm_dsa_original_forward = original
