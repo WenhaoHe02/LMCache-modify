@@ -345,6 +345,9 @@ class GLMDSAPhysicalPrefetchSink:
             defaultdict(list)
         )
         self._staged_prediction_futures: dict[int, Future[Any]] = {}
+        self._pending_shared_corrections: dict[
+            int, tuple[GLMDSAPrefetchEvent, torch.Tensor, Any]
+        ] = {}
         self._decode_selected_blocks: dict[int, set[int]] = defaultdict(set)
         self._decode_missing_blocks: dict[int, set[int]] = defaultdict(set)
         logger.info(
@@ -486,6 +489,24 @@ class GLMDSAPhysicalPrefetchSink:
                         raise RuntimeError(
                             f"GLM DSA KV correction timed out at layer {layer_id}"
                         )
+                    continue
+                if (
+                    self._preserve_owner_partition
+                    and os.getenv("LMCACHE_GLM_DSA_SHARED_CORRECTION_AT_CONSUMER", "0")
+                    == "1"
+                ):
+                    # Keep the prediction future tracked until this consumer's
+                    # aligned gate. Joining every shared layer here serializes
+                    # the entire group before its Full layer can run attention.
+                    with self._lock:
+                        if not hasattr(self, "_pending_shared_corrections"):
+                            self._pending_shared_corrections = {}
+                        self._pending_shared_corrections[int(layer_id)] = (
+                            event,
+                            blocks,
+                            request_token,
+                        )
+                        self._staged_prediction_futures.pop(int(layer_id), None)
                     continue
                 shared_join_start = time.perf_counter()
                 with self._lock:
@@ -726,6 +747,28 @@ class GLMDSAPhysicalPrefetchSink:
             attributes={"kind": "glm_dsa"},
         ):
             self._release_prediction_stages(int(layer_id))
+            with self._lock:
+                correction = getattr(self, "_pending_shared_corrections", {}).pop(
+                    int(layer_id), None
+                )
+            if correction is not None:
+                event, blocks, request_token = correction
+                if (
+                    manager.active_request_id == event.request_id
+                    and manager.active_request_token == request_token
+                ):
+                    if not manager.wait_for_tracked_submission(
+                        int(layer_id), timeout_s=self._gate_timeout_s()
+                    ):
+                        raise RuntimeError(
+                            f"GLM shared prediction failed at layer {layer_id}"
+                        )
+                    manager.submit_miss_reads(
+                        int(layer_id),
+                        blocks,
+                        request_token=request_token,
+                        **_glm_io_profile_kwargs(event, "correction", int(layer_id)),
+                    )
             return bool(
                 manager.wait_for_layer(
                     int(layer_id),
@@ -779,6 +822,7 @@ class GLMDSAPhysicalPrefetchSink:
             self._predicted_blocks.clear()
             self._pending_prediction_stages.clear()
             self._staged_prediction_futures.clear()
+            getattr(self, "_pending_shared_corrections", {}).clear()
             self._staged_request_id = None
             self._decode_selected_blocks.clear()
             self._decode_missing_blocks.clear()
