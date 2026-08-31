@@ -1913,8 +1913,7 @@ class CSAAttentionKVPrefetchManager:
         Returns:
             ``True`` when no producer is tracked or it completed successfully.
         """
-        with self._scheduled_layer_futures_lock:
-            future = self._scheduled_layer_futures.pop(int(layer_id), None)
+        future = self.take_layer_submission(layer_id)
         if future is None:
             return True
         try:
@@ -1929,6 +1928,21 @@ class CSAAttentionKVPrefetchManager:
                 layer_id,
             )
             return False
+
+    def take_layer_submission(self, layer_id: int) -> Any:
+        """Transfer ownership of a tracked producer without waiting for it.
+
+        Args:
+            layer_id: Layer whose current producer is detached.
+
+        Returns:
+            The tracked future, or ``None``. The caller must either consume
+            and finalize its deferred result or explicitly discard that work.
+            This permits a dependent correction future to replace the producer
+            without accidentally waiting on itself at the consumer gate.
+        """
+        with self._scheduled_layer_futures_lock:
+            return self._scheduled_layer_futures.pop(int(layer_id), None)
 
     def finalize_deferred_shard_gather(self, work: Any) -> bool:
         """Finish a deferred TP shard gather at an aligned model-layer gate.

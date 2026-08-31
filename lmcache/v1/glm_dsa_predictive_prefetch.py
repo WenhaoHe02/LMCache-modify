@@ -345,6 +345,7 @@ class GLMDSAPhysicalPrefetchSink:
             defaultdict(list)
         )
         self._staged_prediction_futures: dict[int, Future[Any]] = {}
+        self._shared_correction_executor: ThreadPoolExecutor | None = None
         self._pending_shared_corrections: dict[
             int, tuple[GLMDSAPrefetchEvent, torch.Tensor | None, Any]
         ] = {}
@@ -493,6 +494,36 @@ class GLMDSAPhysicalPrefetchSink:
                     continue
                 if (
                     self._preserve_owner_partition
+                    and os.getenv("LMCACHE_GLM_DSA_ASYNC_SHARED_CORRECTION", "0") == "1"
+                ):
+                    # Detach the prediction before tracking its dependent job;
+                    # looking it up from that job would otherwise find itself.
+                    prediction_future = manager.take_layer_submission(int(layer_id))
+                    with self._lock:
+                        executor = getattr(self, "_shared_correction_executor", None)
+                        if executor is None:
+                            executor = ThreadPoolExecutor(
+                                max_workers=1, thread_name_prefix="glm-shared-gate"
+                            )
+                            self._shared_correction_executor = executor
+                        self._staged_prediction_futures.pop(int(layer_id), None)
+                        future = executor.submit(
+                            self._submit_after_prediction,
+                            prediction_future,
+                            int(layer_id),
+                            blocks,
+                            request_token,
+                            event,
+                        )
+                    # Shared layers are queued in consumer order on every
+                    # rank. The next Full layer cannot overtake these gathers:
+                    # its preceding Shared consumer first joins this future.
+                    manager.track_layer_submission(
+                        int(layer_id), future, request_token=request_token
+                    )
+                    continue
+                if (
+                    self._preserve_owner_partition
                     and os.getenv("LMCACHE_GLM_DSA_SHARED_CORRECTION_AT_CONSUMER", "0")
                     == "1"
                 ):
@@ -569,6 +600,9 @@ class GLMDSAPhysicalPrefetchSink:
             return
 
         assert blocks is not None
+        # Every consumer in this IndexShare group uses the same immutable
+        # prediction. Avoid one GPU-to-CPU copy/sync per physical layer.
+        blocks = blocks.to(device="cpu")
         with self._lock:
             if self._staged_request_id != event.request_id:
                 self._pending_prediction_stages.clear()
@@ -824,6 +858,9 @@ class GLMDSAPhysicalPrefetchSink:
     def close(self) -> None:
         """Drain and close background submission workers."""
         self._prediction_executor.shutdown(wait=True, cancel_futures=False)
+        shared_executor = getattr(self, "_shared_correction_executor", None)
+        if shared_executor is not None:
+            shared_executor.shutdown(wait=True, cancel_futures=False)
         self._executor.shutdown(wait=True, cancel_futures=False)
 
     def _topk_to_blocks(
@@ -1032,7 +1069,8 @@ class GLMDSAPhysicalPrefetchSink:
         event: GLMDSAPrefetchEvent,
     ) -> None:
         if prediction_future is not None:
-            prediction_future.result()
+            work = prediction_future.result()
+            self._attention_kv_manager.finalize_deferred_shard_gather(work)
         self._submit_correction(layer_id, blocks, request_token, event)
 
     def _submit_correction(

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 # Standard
 from concurrent.futures import Future
+import threading
 from typing import Any
 
 # Third Party
@@ -192,4 +193,83 @@ def test_shared_correction_waits_only_at_its_consumer(
         assert sink.wait_for_consumer(4)
         assert not manager.events  # no old correction survives teardown
     finally:
+        sink.close()
+
+
+def test_async_shared_correction_owns_prediction_and_preserves_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shared gathers run FIFO off the model thread without self-joining."""
+    monkeypatch.setenv("LMCACHE_GLM_DSA_OWNER_PARTITION", "1")
+    monkeypatch.setenv("LMCACHE_GLM_DSA_ASYNC_SHARED_CORRECTION", "1")
+    monkeypatch.setenv("LMCACHE_GLM_DSA_PREDICT_SHARED_CONSUMERS", "all")
+    release = threading.Event()
+    model_thread = threading.get_ident()
+    gathered: list[tuple[int, int]] = []
+    corrected: list[int] = []
+
+    class Manager:
+        active_request_id = "request"
+        active_request_token = ("request", 1)
+
+        def __init__(self) -> None:
+            self.futures: dict[int, Future[Any]] = {}
+
+        def fire_predicted_reads(self, layer: int, *args: Any, **kwargs: Any) -> int:
+            return layer
+
+        def track_layer_submission(
+            self, layer: int, future: Future[Any], **kwargs: Any
+        ) -> None:
+            self.futures[layer] = future
+
+        def take_layer_submission(self, layer: int) -> Future[Any] | None:
+            return self.futures.pop(layer, None)
+
+        def finalize_deferred_shard_gather(self, work: Any) -> bool:
+            if not isinstance(work, int):
+                return False
+            if work != 2:
+                assert release.wait(2), "Full submission blocked on a Shared gather"
+            gathered.append((work, threading.get_ident()))
+            return True
+
+        def wait_for_tracked_submission(self, layer: int, timeout_s: float = 2) -> bool:
+            future = self.take_layer_submission(layer)
+            if future is not None:
+                self.finalize_deferred_shard_gather(future.result(timeout_s))
+            return True
+
+        def wait_for_layer(self, layer: int, timeout_s: float) -> bool:
+            return self.wait_for_tracked_submission(layer, timeout_s)
+
+        def submit_miss_reads(self, layer: int, *args: Any, **kwargs: Any) -> None:
+            assert layer in [entry[0] for entry in gathered]
+            corrected.append(layer)
+
+    schedule = GLMDSAPredictionSchedule(0, 2, "group-2", (2, 3, 4, 5), True)
+    sink = GLMDSAPhysicalPrefetchSink(
+        Manager(), (schedule,), {2: (2, 3, 4, 5)}, compressed_block_size=64
+    )
+    try:
+        sink.submit(
+            GLMDSAPrefetchEvent(
+                "request", schedule, torch.tensor([[0, 64]]), correction=False
+            )
+        )
+        sink.submit(
+            GLMDSAPrefetchEvent(
+                "request", schedule, torch.tensor([[0, 64, 128]]), correction=True
+            )
+        )
+        assert corrected == [2]
+        release.set()
+        for layer in (3, 4, 5):
+            assert sink.wait_for_consumer(layer)
+        assert corrected == [2, 3, 4, 5]
+        assert gathered[0] == (2, model_thread)
+        assert [layer for layer, _thread in gathered] == [2, 3, 4, 5]
+        assert all(thread != model_thread for _layer, thread in gathered[1:])
+    finally:
+        release.set()
         sink.close()
