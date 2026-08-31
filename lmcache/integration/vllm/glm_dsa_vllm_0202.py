@@ -449,12 +449,20 @@ class VLLM0202GLMDSAHooks:
 
         def _forward(instance: Any, *args: Any, **kwargs: Any) -> Any:
             enabled = self._forward_enabled is None or self._forward_enabled()
-            if enabled and not manager.wait_for_prediction(source_layer):
+            full_indexer_layer = bool(
+                self._indexer_types and self._indexer_types[source_layer] == "full"
+            )
+            if (
+                enabled
+                and not full_indexer_layer
+                and not manager.wait_for_prediction(source_layer)
+            ):
                 raise RuntimeError(
                     f"GLM DSA prediction timed out at layer {source_layer}"
                 )
             if (
                 enabled
+                and not full_indexer_layer
                 and self._consumer_waiter is not None
                 and not self._consumer_waiter(source_layer)
             ):
@@ -490,6 +498,15 @@ class VLLM0202GLMDSAHooks:
         manager = self._manager
 
         def _forward(instance: Any, *args: Any, **kwargs: Any) -> Any:
+            if bool(
+                getattr(
+                    getattr(instance, "indexer_op", None), "skip_k_cache_insert", False
+                )
+            ):
+                # The proxy calls this same module with private output storage.
+                # It must never join its own prediction future or publish an
+                # approximate result through the authoritative observer.
+                return original(*args, **kwargs)
             result = original(*args, **kwargs)
             hidden = args[0] if args else kwargs.get("hidden_states")
             if isinstance(result, torch.Tensor) and isinstance(hidden, torch.Tensor):
@@ -499,6 +516,19 @@ class VLLM0202GLMDSAHooks:
                     if self._disabled_authoritative_observer is not None:
                         self._disabled_authoritative_observer(target_layer, true_topk)
                     return result
+                # Full-indexer computation needs indexer K, not the attention
+                # KV being prefetched. Join only now, before correction and
+                # sparse attention consume that KV, to retain its overlap.
+                if not manager.wait_for_prediction(target_layer):
+                    raise RuntimeError(
+                        f"GLM DSA prediction timed out at layer {target_layer}"
+                    )
+                if self._consumer_waiter is not None and not self._consumer_waiter(
+                    target_layer
+                ):
+                    raise RuntimeError(
+                        f"GLM DSA attention KV gate timed out at layer {target_layer}"
+                    )
                 manager.observe_true_topk(target_layer, true_topk)
                 if self._authoritative_observer is not None:
                     self._authoritative_observer(target_layer, true_topk)
