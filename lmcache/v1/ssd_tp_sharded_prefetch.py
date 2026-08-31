@@ -23,6 +23,11 @@ from typing import Any, Mapping, Optional, Protocol, Sequence
 import torch
 
 # First Party
+try:
+    from lmcache import c_ops as _owner_c_ops
+except ImportError:
+    _owner_c_ops = None
+
 from lmcache.v1.kv_object_store import KVObjectByteRange
 
 
@@ -127,6 +132,53 @@ def compile_layer_major_read_ranges(
             run_start = block_id
             run_length = 1
     return tuple(ranges)
+
+
+def scatter_received_owner_rows(
+    receive: torch.Tensor,
+    source_positions: torch.Tensor,
+    destination: torch.Tensor,
+    destination_rows: torch.Tensor,
+) -> None:
+    """Scatter selected receive rows without an intermediate KV-sized tensor.
+
+    Args:
+        receive: Two-dimensional uint8 AllGather receive buffer.
+        source_positions: Valid receive-row offsets, in destination order.
+        destination: Final uint8 K-cache rows; outer row strides are supported.
+        destination_rows: Final row indices paired with source_positions.
+
+    Returns:
+        None. GPU writes are enqueued on the caller's current CUDA stream.
+        The caller must order that stream after collective completion.
+
+    Notes:
+        Reuses the existing pointer-scatter CUDA op. CPU or older builds retain
+        the equivalent index_select/index_copy path.
+    """
+    if source_positions.numel() == 0:
+        return
+    scatter = getattr(_owner_c_ops, "scatter_rows_from_object_ptrs", None)
+    if (
+        receive.is_cuda
+        and receive.dtype == torch.uint8
+        and destination.dtype == torch.uint8
+        and callable(scatter)
+    ):
+        source_addresses = source_positions * receive.stride(0) + receive.data_ptr()
+        scatter(
+            source_addresses,
+            destination,
+            destination_rows,
+            1,
+            int(receive.shape[1]),
+            0,
+            receive.data_ptr() % 8 == 0 and receive.stride(0) % 8 == 0,
+        )
+    else:
+        destination.index_copy_(
+            0, destination_rows, receive.index_select(0, source_positions)
+        )
 
 
 def owner_gpu_route(
@@ -1335,15 +1387,16 @@ class TorchDistributedShardGather:
                         dtype=torch.int64,
                         device=source_rows.device,
                     )
-                    gathered = slot.receive[:gathered_rows].index_select(
-                        0,
-                        position_tensor,
-                    )
                     destination = logical_destination_rows.index_select(
                         0,
                         union_tensor,
                     )
-                    destination_rows.index_copy_(0, destination, gathered)
+                    scatter_received_owner_rows(
+                        slot.receive[:gathered_rows],
+                        position_tensor,
+                        destination_rows,
+                        destination,
+                    )
                     resident_bitmap[union_tensor] = True
                 event = torch.cuda.Event()
                 event.record(self._stream)
@@ -1452,11 +1505,13 @@ class TorchDistributedShardGather:
                     all_ready = all_ready & torch.all(valid)
                     selected = selected[valid]
                     source_positions = source_positions[valid]
-                    gathered = slot.receive[:gathered_rows].index_select(
-                        0, source_positions
-                    )
                     destination = logical_destination_rows.index_select(0, selected)
-                    destination_rows.index_copy_(0, destination, gathered)
+                    scatter_received_owner_rows(
+                        slot.receive[:gathered_rows],
+                        source_positions,
+                        destination_rows,
+                        destination,
+                    )
                     resident_bitmap[selected] = True
                     event = torch.cuda.Event()
                     event.record(self._stream)

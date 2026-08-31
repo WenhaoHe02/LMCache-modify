@@ -31,7 +31,34 @@ from lmcache.v1.ssd_tp_sharded_prefetch import (
     partition_rank_local_blocks,
     rank_major_inverse_indices,
     stable_union_hash,
+    scatter_received_owner_rows,
 )
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("empty", [False, True])
+def test_direct_owner_scatter_preserves_strided_destination(
+    device: str,
+    empty: bool,
+) -> None:
+    """Direct receive scatter preserves rows and adjacent layer storage."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    receive = torch.arange(128, dtype=torch.uint8, device=device).reshape(8, 16)
+    storage = torch.full((9, 32), 255, dtype=torch.uint8, device=device)
+    destination = storage[:, 8:24]
+    source_ids = torch.tensor(
+        [] if empty else [6, 0, 3], dtype=torch.int64, device=device
+    )
+    destination_ids = torch.tensor(
+        [] if empty else [7, 2, 0], dtype=torch.int64, device=device
+    )
+    expected = storage.clone()
+    expected[:, 8:24].index_copy_(
+        0, destination_ids, receive.index_select(0, source_ids)
+    )
+    scatter_received_owner_rows(receive, source_ids, destination, destination_ids)
+    assert torch.equal(storage, expected)
 
 
 def test_owner_gpu_route_handles_padding_and_duplicate_ids() -> None:
