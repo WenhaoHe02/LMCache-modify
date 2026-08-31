@@ -321,6 +321,77 @@ def test_gate_aligned_owner_reads_can_prepare_four_consumers_concurrently(
         sink.close()
 
 
+def test_full_gate_enqueues_shared_gathers_in_order_without_consuming(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Group-order launch retains each future and exact consumer correction."""
+    monkeypatch.setenv("LMCACHE_GLM_DSA_OWNER_PARTITION", "1")
+    monkeypatch.setenv("LMCACHE_GLM_DSA_PIPELINE_SHARED_GATHERS", "1")
+    monkeypatch.setenv("LMCACHE_GLM_DSA_SHARED_CORRECTION_AT_CONSUMER", "1")
+    monkeypatch.setenv("LMCACHE_GLM_DSA_ASYNC_SHARED_CORRECTION", "0")
+    monkeypatch.setenv("LMCACHE_GLM_DSA_PREFETCH_SHARED_MISSES", "0")
+    monkeypatch.setenv("LMCACHE_GLM_DSA_PREDICT_SHARED_CONSUMERS", "all")
+    monkeypatch.setenv("LMCACHE_INDEXER_PROFILE_ACCURACY", "0")
+    events: list[tuple[str, int]] = []
+
+    class Manager:
+        active_request_id = "request"
+        active_request_token = ("request", 1)
+
+        def __init__(self) -> None:
+            self.futures: dict[int, Future[Any]] = {}
+
+        def fire_predicted_reads(self, layer: int, *args: Any, **kwargs: Any) -> int:
+            return layer
+
+        def track_layer_submission(
+            self, layer: int, future: Future[Any], **kwargs: Any
+        ) -> None:
+            self.futures[layer] = future
+
+        def launch_layer_gather(self, layer: int, timeout_s: float) -> bool:
+            self.futures[layer].result(timeout=timeout_s)
+            events.append(("enqueue", layer))
+            return True
+
+        def wait_for_tracked_submission(self, layer: int, timeout_s: float = 2) -> bool:
+            future = self.futures.pop(layer, None)
+            if future is not None:
+                future.result(timeout=timeout_s)
+                events.append(("finish", layer))
+            return True
+
+        def submit_topk_miss_reads(self, layer: int, *args: Any, **kwargs: Any) -> None:
+            assert ("finish", layer) in events
+            events.append(("exact", layer))
+
+        def wait_for_layer(self, layer: int, timeout_s: float) -> bool:
+            return self.wait_for_tracked_submission(layer, timeout_s)
+
+    manager = Manager()
+    schedule = GLMDSAPredictionSchedule(0, 2, "group-2", (2, 3, 4, 5), True)
+    sink = GLMDSAPhysicalPrefetchSink(
+        manager, (schedule,), {2: (2, 3, 4, 5)}, compressed_block_size=64
+    )
+    try:
+        topk = torch.tensor([[0, 64]])
+        sink.submit(GLMDSAPrefetchEvent("request", schedule, topk, correction=False))
+        sink.submit(GLMDSAPrefetchEvent("request", schedule, topk, correction=True))
+        assert events == [
+            ("finish", 2),
+            ("exact", 2),
+            ("enqueue", 3),
+            ("enqueue", 4),
+            ("enqueue", 5),
+        ]
+        assert set(manager.futures) == {3, 4, 5}
+        for consumer in (3, 4, 5):
+            assert sink.wait_for_consumer(consumer)
+            assert events[-2:] == [("finish", consumer), ("exact", consumer)]
+    finally:
+        sink.close()
+
+
 def test_early_shared_misses_retain_the_prediction_and_final_exact_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

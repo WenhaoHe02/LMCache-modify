@@ -558,6 +558,23 @@ class GLMDSAPhysicalPrefetchSink:
                     and os.getenv("LMCACHE_GLM_DSA_SHARED_CORRECTION_AT_CONSUMER", "0")
                     == "1"
                 ):
+                    if os.getenv("LMCACHE_GLM_DSA_PIPELINE_SHARED_GATHERS", "0") == "1":
+                        # All ranks enqueue Shared consumers in group order at
+                        # this Full gate. The existing GPU route enqueues its
+                        # scatter too, so slot reuse is already protected by
+                        # the final event (no extra parked-slot pool needed).
+                        with self._lock:
+                            early = getattr(self, "_early_shared_misses", {}).get(
+                                int(layer_id)
+                            )
+                        if early is not None:
+                            early.result(timeout=self._gate_timeout_s())
+                        if not manager.launch_layer_gather(
+                            int(layer_id), timeout_s=self._gate_timeout_s()
+                        ):
+                            raise RuntimeError(
+                                f"GLM shared gather enqueue failed at layer {layer_id}"
+                            )
                     # Keep the prediction future tracked until this consumer's
                     # aligned gate. Joining every shared layer here serializes
                     # the entire group before its Full layer can run attention.

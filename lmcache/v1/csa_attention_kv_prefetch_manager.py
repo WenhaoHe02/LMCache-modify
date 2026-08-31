@@ -5239,6 +5239,21 @@ class CSAAttentionKVPrefetchManager:
                         )
                         with state.pending_reads_lock:
                             state.last_drain_event = gather_event
+                            if not wait_on_consumer:
+                                # The gather event follows local SSD scatter
+                                # AND NCCL/routing. Transfer ownership to the
+                                # consumer drain instead of synchronizing the
+                                # local copy on the CPU at the early gate.
+                                state.pending_drains.append(
+                                    (
+                                        gather_event,
+                                        retained_objects,
+                                        None,
+                                        prepared.operation_id,
+                                    )
+                                )
+                                retained_objects = []
+                                prepared.local_ready_event = None
                         if wait_on_consumer:
                             torch.cuda.current_stream(device).wait_event(gather_event)
                         # Do not build a host partition here. Exact top-K
