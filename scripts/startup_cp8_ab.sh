@@ -237,7 +237,6 @@ python3 -m compileall \
   "$LMCACHE_SITE/v1/kv_object_store"
 
 python3 - <<'PY'
-from hashlib import sha256
 from pathlib import Path
 import lmcache
 
@@ -263,7 +262,8 @@ files = (
 )
 for relative in files:
     path = site / relative
-    print(f"DEPLOY_SHA256 {sha256(path.read_bytes()).hexdigest()} {relative}")
+    info = path.stat()
+    print(f"DEPLOY_FILE bytes={info.st_size} mtime_ns={info.st_mtime_ns} {relative}")
 PY
 
 if [ "$CSA_ON" = "1" ]; then

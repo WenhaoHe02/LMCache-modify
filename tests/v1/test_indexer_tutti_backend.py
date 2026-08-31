@@ -712,19 +712,29 @@ def test_prefill_cp_sharded_append_owns_every_k_row_once() -> None:
 
 
 @pytest.mark.parametrize("value_dtype", [torch.uint8, torch.float8_e4m3fn])
+@pytest.mark.parametrize("selected_rows", [[0, 3, 4, 7, 8, 10], []])
+@pytest.mark.parametrize("block_padding", [0, 4])
 def test_prefill_cp_gathers_only_local_paged_k_rows(
     value_dtype: torch.dtype,
+    selected_rows: list[int],
+    block_padding: int,
 ) -> None:
-    """Direct K gather follows the block table without materializing full K."""
-    cache = torch.empty((3, 4, 6), dtype=torch.uint8)
+    """Direct K gather decodes native block-planar values/scales byte-exactly."""
+    storage = torch.full((3, 24 + block_padding), 255, dtype=torch.uint8)
+    cache = storage[:, :24].view(3, 4, 6)
+    expected_values = torch.empty((3, 4, 4), dtype=torch.uint8)
+    expected_scales = torch.empty((3, 4, 2), dtype=torch.uint8)
     for physical_block in range(3):
         for block_offset in range(4):
-            cache[physical_block, block_offset] = torch.arange(
-                6,
-                dtype=torch.uint8,
-            ).add_(physical_block * 40 + block_offset * 6)
+            base = physical_block * 40 + block_offset * 6
+            for byte in range(4):
+                storage[physical_block, block_offset * 4 + byte] = base + byte
+                expected_values[physical_block, block_offset, byte] = base + byte
+            for byte in range(2):
+                storage[physical_block, 16 + block_offset * 2 + byte] = base + 4 + byte
+                expected_scales[physical_block, block_offset, byte] = base + 4 + byte
     block_table = torch.tensor([[2, 0, 1]], dtype=torch.int32)
-    selected = torch.tensor([0, 3, 4, 7, 8, 10], dtype=torch.int64)
+    selected = torch.tensor(selected_rows, dtype=torch.int64)
 
     values, scales = gather_prefill_cp_local_k_rows(
         cache,
@@ -738,11 +748,13 @@ def test_prefill_cp_gathers_only_local_paged_k_rows(
     logical_blocks = selected // 4
     offsets = selected % 4
     physical_blocks = block_table[0].index_select(0, logical_blocks)
-    expected = cache[physical_blocks.long(), offsets]
     assert values.dtype == value_dtype
-    assert torch.equal(values.view(torch.uint8), expected[:, :4])
-    assert torch.equal(scales, expected[:, 4:])
+    assert torch.equal(
+        values.view(torch.uint8), expected_values[physical_blocks.long(), offsets]
+    )
+    assert torch.equal(scales, expected_scales[physical_blocks.long(), offsets])
     assert values.shape[0] == selected.numel()
+    assert values.is_contiguous() and scales.is_contiguous()
 
 
 def test_prefill_cp_block_partition_covers_k_once() -> None:

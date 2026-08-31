@@ -343,7 +343,9 @@ def gather_prefill_cp_local_k_rows(
     """Gather only one speculative rank's K rows from a paged cache.
 
     Args:
-        kv_cache: Paged indexer cache shaped ``[blocks, block_size, stride]``.
+        kv_cache: Byte-sized paged indexer cache shaped
+            ``[blocks, block_size, stride]``. Each native block stores all K
+            value bytes first, followed by all scale bytes (not interleaved).
         block_table: Single-sequence logical-to-physical block table.
         global_key_indices: Sorted global token rows owned by this rank.
         value_bytes: Packed value bytes per cache row.
@@ -362,6 +364,10 @@ def gather_prefill_cp_local_k_rows(
     """
     if kv_cache.ndim != 3:
         raise ValueError("kv_cache must have block, row, and byte dimensions")
+    if kv_cache.element_size() != 1:
+        raise ValueError("paged K-cache storage must be byte-sized")
+    if kv_cache.stride(2) != 1 or kv_cache.stride(1) != kv_cache.shape[2]:
+        raise ValueError("each paged K-cache block must be contiguous")
     if block_table.ndim != 2 or int(block_table.shape[0]) != 1:
         raise ValueError("block_table must describe exactly one sequence")
     if global_key_indices.ndim != 1:
@@ -380,11 +386,21 @@ def gather_prefill_cp_local_k_rows(
     ).to(torch.int64)
     block_offsets = torch.remainder(global_key_indices, block_size).to(torch.int64)
     physical_blocks = block_table[0].index_select(0, logical_blocks).to(torch.int64)
-    packed_rows = kv_cache[physical_blocks, block_offsets]
-    values = packed_rows[:, :value_bytes].contiguous()
+    # Native indexer_k_quant_and_cache packs separate value/scale planes.
+    # These are views: gather only the selected rows, never entire K blocks.
+    num_blocks = int(kv_cache.shape[0])
+    packed_blocks = kv_cache.view(num_blocks, block_size * kv_cache.shape[2])
+    values_end = block_size * value_bytes
+    value_plane = packed_blocks[:, :values_end].view(
+        num_blocks, block_size, value_bytes
+    )
+    scale_plane = packed_blocks[:, values_end : block_size * row_bytes].view(
+        num_blocks, block_size, scale_bytes
+    )
+    values = value_plane[physical_blocks, block_offsets].contiguous()
     if values.dtype != value_dtype:
         values = values.view(value_dtype)
-    scales = packed_rows[:, value_bytes:row_bytes].contiguous()
+    scales = scale_plane[physical_blocks, block_offsets].contiguous()
     return values, scales
 
 
