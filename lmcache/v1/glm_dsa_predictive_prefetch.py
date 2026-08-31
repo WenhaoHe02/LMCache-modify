@@ -340,6 +340,7 @@ class GLMDSAPhysicalPrefetchSink:
         )
         self._lock = RLock()
         self._predicted_blocks: dict[int, torch.Tensor | None] = {}
+        self._true_selection_cache: dict[int, tuple[GLMDSAPrefetchEvent, Any]] = {}
         self._staged_request_id: str | None = None
         self._pending_prediction_stages: dict[int, list[_StagedPrediction]] = (
             defaultdict(list)
@@ -663,6 +664,19 @@ class GLMDSAPhysicalPrefetchSink:
             return
         request_token = getattr(manager, "active_request_token", None)
         submit_topk_misses = getattr(manager, "submit_topk_miss_reads", None)
+        prepare_selection = getattr(manager, "prepare_topk_block_selection", None)
+        submit_selection = getattr(manager, "submit_selection_miss_reads", None)
+        shared_selection = None
+        if (
+            callable(prepare_selection)
+            and callable(submit_selection)
+            and os.getenv("LMCACHE_GLM_DSA_SHARE_TOPK_SELECTION", "1") == "1"
+        ):
+            shared_selection = prepare_selection(target, true_topk)
+            submit_topk_misses = submit_selection
+        submission_topk = (
+            shared_selection if shared_selection is not None else true_topk
+        )
         blocks = None
         if not callable(submit_topk_misses):
             # Compatibility fallback for external/fake managers. Production
@@ -686,7 +700,7 @@ class GLMDSAPhysicalPrefetchSink:
                 if callable(submit_topk_misses):
                     submit_topk_misses(
                         target,
-                        true_topk,
+                        submission_topk,
                         request_token=request_token,
                         **profile_kwargs,
                     )
@@ -709,7 +723,7 @@ class GLMDSAPhysicalPrefetchSink:
                 future = self._executor.submit(
                     submit_topk_misses,
                     int(layer_id),
-                    true_topk,
+                    submission_topk,
                     request_token=request_token,
                     **profile_kwargs,
                 )
@@ -850,6 +864,7 @@ class GLMDSAPhysicalPrefetchSink:
             self._pending_prediction_stages.clear()
             self._staged_prediction_futures.clear()
             getattr(self, "_pending_shared_corrections", {}).clear()
+            getattr(self, "_true_selection_cache", {}).clear()
             self._staged_request_id = None
             self._decode_selected_blocks.clear()
             self._decode_missing_blocks.clear()
@@ -1082,6 +1097,38 @@ class GLMDSAPhysicalPrefetchSink:
     ) -> None:
         """Use the same authoritative GPU-residency filter as no-prefetch."""
         manager = self._attention_kv_manager
+        prepare_selection = getattr(manager, "prepare_topk_block_selection", None)
+        submit_selection = getattr(manager, "submit_selection_miss_reads", None)
+        if (
+            callable(prepare_selection)
+            and callable(submit_selection)
+            and os.getenv("LMCACHE_GLM_DSA_SHARE_TOPK_SELECTION", "1") == "1"
+        ):
+            with self._lock:
+                cache = getattr(self, "_true_selection_cache", None)
+                if cache is None:
+                    cache = {}
+                    self._true_selection_cache = cache
+                target = event.schedule.target_layer
+                previous = cache.get(target)
+                # Identity ties the snapshot to one chunk, even when vLLM
+                # reuses the same top-K storage for subsequent forwards.
+                if previous is None or previous[0] is not event:
+                    selection = prepare_selection(target, event.topk_indices)
+                    cache[target] = (event, selection)
+                else:
+                    selection = previous[1]
+            submit_selection(
+                layer_id,
+                selection,
+                request_token=request_token,
+                **_glm_io_profile_kwargs(event, "correction", int(layer_id)),
+            )
+            if layer_id == event.schedule.consumer_layers[-1]:
+                with self._lock:
+                    if cache.get(target, (None,))[0] is event:
+                        cache.pop(target, None)
+            return
         submit_topk_misses = getattr(manager, "submit_topk_miss_reads", None)
         if callable(submit_topk_misses):
             # GPU owner routing publishes into the GPU bitmap, not its CPU

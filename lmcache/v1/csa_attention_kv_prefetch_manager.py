@@ -230,6 +230,23 @@ def set_csa_attention_kv_prefetch_manager(
 
 
 @dataclass(frozen=True, slots=True)
+class CSATopKBlockSelection:
+    """An immutable, request-scoped top-K block union shared by consumers.
+
+    Args:
+        bitmap: GPU/CPU int32 block bitmap, independent of layer residency.
+        ready_event: CUDA event ordering the bitmap producer, or None on CPU.
+        block_size: Number of indexer entries per block.
+        request_token: Request generation that owns the selection.
+    """
+
+    bitmap: torch.Tensor
+    ready_event: Optional[torch.cuda.Event]
+    block_size: int
+    request_token: Tuple[str, int]
+
+
+@dataclass(frozen=True, slots=True)
 class CSAAttentionKVChunkLoc:
     """LMCache-chunk descriptor for one block of csa_attention_kv bytes.
 
@@ -2108,6 +2125,111 @@ class CSAAttentionKVPrefetchManager:
             profile_operation_id=profile_operation_id,
             profile_kind=profile_kind,
         )
+
+    def prepare_topk_block_selection(
+        self, layer_id: int, true_topk: torch.Tensor
+    ) -> CSATopKBlockSelection:
+        """Snapshot a true top-K union once for an IndexShare consumer group.
+
+        Args:
+            layer_id: Registered Full layer defining the block geometry.
+            true_topk: Authoritative entry IDs, including optional -1 padding.
+
+        Returns:
+            A new bitmap with a producer event. No residency is cached, and
+            the native CUDA path performs no host synchronization.
+
+        Raises:
+            ValueError: The source layer is not registered.
+        """
+        state = self._layers.get(int(layer_id))
+        if state is None:
+            raise ValueError(f"layer {layer_id} is not registered")
+        request_token = self.active_request_token
+        device = state.in_pool_bitmap.device
+        entries = true_topk.detach().to(device).contiguous()
+        bitmap = torch.zeros(
+            state.in_pool_bitmap.numel(), dtype=torch.int32, device=device
+        )
+        mark = getattr(_csa_c_ops, "mark_csa_selected_blocks_into", None)
+        if bitmap.is_cuda and callable(mark):
+            mark(entries, bitmap, bitmap.numel(), state.compressed_block_size)
+        else:
+            blocks = entries.reshape(-1).to(torch.int64) // state.compressed_block_size
+            valid = (entries.reshape(-1) >= 0) & (blocks < bitmap.numel())
+            bitmap[blocks[valid]] = 1
+        ready = None
+        if bitmap.is_cuda:
+            ready = torch.cuda.Event()
+            ready.record(torch.cuda.current_stream(device))
+        return CSATopKBlockSelection(
+            bitmap, ready, state.compressed_block_size, request_token
+        )
+
+    def submit_selection_miss_reads(
+        self,
+        layer_id: int,
+        selection: CSATopKBlockSelection,
+        *,
+        request_token: Optional[Tuple[str, int]] = None,
+        profile_source_layer: Optional[int] = None,
+        profile_operation_id: Optional[str] = None,
+        profile_kind: Optional[str] = None,
+    ) -> None:
+        """Filter a shared top-K union against this consumer's GPU residency.
+
+        Args:
+            layer_id: Physical consumer layer to load.
+            selection: Immutable output of prepare_topk_block_selection.
+            request_token: Optional generation; must match the selection.
+            profile_source_layer: Optional authoritative source layer.
+            profile_operation_id: Optional correlation identifier.
+            profile_kind: Optional I/O classification.
+
+        Notes:
+            Copy fixed-size block masks, then compact on CPU. Unlike CUDA
+            nonzero followed by cpu(), this has only one host wait. Callers
+            must order this consumer after prediction/gather publication.
+
+        Raises:
+            ValueError: Consumers have incompatible block geometry.
+            RuntimeError: The selection belongs to an inactive generation.
+        """
+        token = selection.request_token if request_token is None else request_token
+        if token != selection.request_token or token != self.active_request_token:
+            raise RuntimeError("request read plan is inactive or stale")
+        state = self._layers.get(int(layer_id))
+        if state is None or not state.chunks:
+            return
+        limit = min(
+            int(state.chunks[-1].end_compressed_block), state.in_pool_bitmap.numel()
+        )
+        if (
+            selection.block_size != state.compressed_block_size
+            or selection.bitmap.numel() < limit
+            or selection.bitmap.device != state.in_pool_bitmap.device
+        ):
+            raise ValueError("IndexShare consumers have incompatible block geometry")
+        if selection.ready_event is not None:
+            torch.cuda.current_stream(selection.bitmap.device).wait_event(
+                selection.ready_event
+            )
+        selected = selection.bitmap[:limit].ne(0)
+        masks_cpu = torch.stack(
+            (selected, selected & ~state.in_pool_bitmap[:limit])
+        ).cpu()
+        state.true_selected_blocks_bitmap = selection.bitmap
+        state.true_selected_covers_cached_prefix = bool(masks_cpu[0].all().item())
+        missing = masks_cpu[1].nonzero(as_tuple=False).reshape(-1)
+        if missing.numel():
+            self.submit_miss_reads(
+                layer_id,
+                missing,
+                request_token=token,
+                profile_source_layer=profile_source_layer,
+                profile_operation_id=profile_operation_id,
+                profile_kind=profile_kind,
+            )
 
     def profile_topk_residency(
         self,

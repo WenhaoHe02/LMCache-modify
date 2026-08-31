@@ -27,6 +27,36 @@ def test_dsa_native_indexer_load_has_a_distinct_timeline_kind() -> None:
     assert csa_manager._io_profile_kind("hca_deterministic") == "hca_deterministic"
 
 
+def test_shared_selection_snapshots_topk_but_not_layer_residency() -> None:
+    """Consumers share selection, not one another's missing-block results."""
+    manager = _minimal_lifecycle_manager()
+    for layer in (2, 3):
+        manager._layers[layer] = SimpleNamespace(
+            chunks=[SimpleNamespace(end_compressed_block=4)],
+            compressed_block_size=64,
+            in_pool_bitmap=torch.zeros(6, dtype=torch.bool),
+        )
+    submitted: list[tuple[int, list[int]]] = []
+    manager.submit_miss_reads = lambda layer, ids, **kwargs: submitted.append(
+        (layer, ids.tolist())
+    )
+    topk = torch.tensor([[0, 63, 64, 128, 256, -1, 99999]])
+    selection = manager.prepare_topk_block_selection(2, topk)
+    topk.fill_(192)  # vLLM may recycle its output after snapshot production.
+    manager._layers[2].in_pool_bitmap[0] = True
+    manager._layers[3].in_pool_bitmap[1] = True
+    manager.submit_selection_miss_reads(2, selection)
+    manager.submit_selection_miss_reads(3, selection)
+    assert submitted == [(2, [1, 2]), (3, [0, 2])]
+    assert selection.bitmap.tolist() == [1, 1, 1, 0, 1, 0]
+    manager._layers[3].in_pool_bitmap[:3] = True
+    manager.submit_selection_miss_reads(3, selection)
+    assert len(submitted) == 2
+    manager._request_generation += 1
+    with pytest.raises(RuntimeError, match="inactive or stale"):
+        manager.submit_selection_miss_reads(2, selection)
+
+
 def _init_active_request_state(
     manager: CSAAttentionKVPrefetchManager,
 ) -> None:
