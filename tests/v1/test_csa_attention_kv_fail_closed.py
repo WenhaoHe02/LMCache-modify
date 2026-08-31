@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Standard
+from contextlib import nullcontext
 from types import MethodType, SimpleNamespace
 import threading
+from typing import Any
 
 # Third Party
 import pytest
@@ -1284,6 +1286,114 @@ def test_layer_major_full_read_is_split_into_bounded_segments() -> None:
     ]
     assert captured["max_batch_ios"] == 256
     assert captured["max_batch_bytes"] == 128 * 1024**2
+
+
+@pytest.mark.parametrize("completion_order", [(0, 1, 2), (2, 0)])
+@pytest.mark.parametrize("short_payload", [False, True])
+@pytest.mark.parametrize("slot_scatter", [False, True])
+def test_layer_major_raw_batch_preserves_rows_and_fuses_scatter(
+    monkeypatch: pytest.MonkeyPatch,
+    completion_order: tuple[int, ...],
+    short_payload: bool,
+    slot_scatter: bool,
+) -> None:
+    """Different run lengths share one launch, including partial completions."""
+    row_bytes = 8448
+    selected = torch.tensor([1, 2, 5, 6, 7, 10], dtype=torch.int64)
+    logical_source = torch.arange(16, dtype=torch.uint8).repeat_interleave(row_bytes)
+    staging = torch.full((131072,), 255, dtype=torch.uint8)
+    offsets = [0, 32768, 65536]
+    scatter_calls: list[int] = []
+
+    def scatter(
+        pointers: torch.Tensor,
+        destination: torch.Tensor,
+        rows: torch.Tensor,
+        rows_per_object: int,
+        byte_width: int,
+        slots_per_block: int,
+        aligned: bool,
+    ) -> None:
+        assert rows_per_object == 1
+        assert byte_width == row_bytes and aligned
+        assert slots_per_block == (4 if slot_scatter else 0)
+        scatter_calls.append(int(rows.numel()))
+        flat_destination = destination.reshape(16, row_bytes)
+        for pointer, row in zip(pointers.tolist(), rows.tolist(), strict=True):
+            offset = pointer - staging.data_ptr()
+            flat_destination[row].copy_(staging[offset : offset + row_bytes])
+
+    class Loader:
+        def load_chunks_to_hbm(
+            self, keys: list[Any], disk_metas: list[Any], **kwargs: Any
+        ) -> list[None]:
+            lengths = []
+            for index, ranges in enumerate(kwargs["read_ranges_per_key"]):
+                byte_range = ranges[0]
+                length = byte_range.length
+                lengths.append(length)
+                staging[offsets[index] : offsets[index] + length].copy_(
+                    logical_source[byte_range.offset : byte_range.offset + length]
+                )
+            completed_lengths = [lengths[index] for index in completion_order]
+            if short_payload:
+                completed_lengths[-1] -= 512
+            kwargs["on_raw_batch_loaded"](
+                0,
+                list(completion_order),
+                [offsets[index] for index in completion_order],
+                completed_lengths,
+                staging,
+            )
+            return [None] * len(keys)
+
+    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: nullcontext())
+    monkeypatch.setattr(
+        csa_manager,
+        "_csa_c_ops",
+        SimpleNamespace(scatter_rows_from_object_ptrs=scatter),
+    )
+    manager = object.__new__(CSAAttentionKVPrefetchManager)
+    manager._tutti_loader = Loader()
+    manager._pending_raw_lba_cache = {}
+    manager._scatter_stream_for = lambda _device: SimpleNamespace(
+        synchronize=lambda: None
+    )
+    cache = torch.full((16, row_bytes), 255, dtype=torch.uint8)
+    state = SimpleNamespace(
+        chunks=[
+            SimpleNamespace(
+                key="layer",
+                disk_meta="metadata",
+                n_compressed_blocks=16,
+                bytes_per_block=row_bytes,
+                layer_byte_offset=0,
+            )
+        ],
+        layer_major_dst_rows_table=torch.arange(15, -1, -1, dtype=torch.int64),
+        block_slot_scatter=slot_scatter,
+        block_slot_size=4,
+        k_cache_tensor=cache.view(4, 4, row_bytes) if slot_scatter else cache,
+        in_pool_bitmap=torch.zeros(16, dtype=torch.bool),
+    )
+    if short_payload:
+        with pytest.raises(RuntimeError, match="short payload"):
+            manager._issue_layer_major_read(state, selected, io_priority="demand")
+        assert not scatter_calls and not state.in_pool_bitmap.any()
+        return
+    _, _, completed = manager._issue_layer_major_read(
+        state, selected, io_priority="demand"
+    )
+    selected_runs = ([1, 2], [5, 6, 7], [10])
+    expected = sorted(
+        block for index in completion_order for block in selected_runs[index]
+    )
+    assert completed.tolist() == expected
+    assert scatter_calls == [len(expected)]
+    assert state.in_pool_bitmap.nonzero().flatten().tolist() == expected
+    for logical in range(16):
+        expected_byte = logical if logical in expected else 255
+        assert torch.all(cache[15 - logical] == expected_byte)
 
 
 def test_layer_major_sparse_indexer_reads_are_sector_aligned() -> None:

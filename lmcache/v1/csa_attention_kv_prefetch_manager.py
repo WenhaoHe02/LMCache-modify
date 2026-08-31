@@ -4102,21 +4102,16 @@ class CSAAttentionKVPrefetchManager:
             # The fastest rank can then dereference an unfinished index tensor;
             # the illegal access is reported later by the next I/O-stream sync.
             with torch.inference_mode(), torch.cuda.stream(scatter_stream):
-                segment_rows = [
-                    dst_rows_table.index_select(
-                        0,
-                        segment.to(
-                            device=dst_rows_table.device,
-                            non_blocking=True,
-                        ),
-                    )
-                    for segment in segments
-                ]
-            scatter_stream.synchronize()
+                selected_rows = dst_rows_table.index_select(
+                    0,
+                    selected.to(device=dst_rows_table.device, non_blocking=True),
+                )
+            # The callbacks below consume these indices on scatter_stream,
+            # so its ordering already supplies the dependency. Do not block
+            # the CPU here or launch an upload/gather for every sparse run.
         else:
-            segment_rows = [
-                dst_rows_table.index_select(0, segment) for segment in segments
-            ]
+            selected_rows = dst_rows_table.index_select(0, selected)
+        segment_rows = [selected_rows[start:end] for start, end in segment_bounds]
 
         def _read_plan_for_segment(
             segment: torch.Tensor,
@@ -4217,39 +4212,63 @@ class CSAAttentionKVPrefetchManager:
             )
             if scatter is None:
                 raise RuntimeError("layer-major fused scatter op is unavailable")
+            source_addresses: List[int] = []
+            row_spans: List[Tuple[int, int]] = []
+            batch_completed_ids: List[int] = []
+            staging_base = int(staging.data_ptr())
+            aligned_sources = block_nbytes % 8 == 0
+            for local_index, offset, nbytes in zip(
+                completed_indices,
+                completed_offsets,
+                completed_nbytes,
+                strict=True,
+            ):
+                key_index = batch_start + local_index
+                span_start, span_end = segment_bounds[key_index]
+                segment_nbytes = (span_end - span_start) * block_nbytes
+                payload_skip = segment_read_plans[key_index][1]
+                if int(nbytes) < payload_skip + segment_nbytes:
+                    raise RuntimeError(
+                        "layer-major raw Tutti segment returned a short payload"
+                    )
+                source_ptr = staging_base + int(offset) + payload_skip
+                # One pointer per KV block lets the existing kernel scatter
+                # differently sized runs in ONE launch; the KV payload itself
+                # stays in GPU staging and is never copied through the CPU.
+                source_addresses.extend(
+                    range(source_ptr, source_ptr + segment_nbytes, block_nbytes)
+                )
+                aligned_sources = aligned_sources and source_ptr % 8 == 0
+                row_spans.append((span_start, span_end))
+                batch_completed_ids.extend(selected_ids[span_start:span_end])
+            contiguous_rows = all(
+                previous[1] == current[0]
+                for previous, current in zip(row_spans, row_spans[1:])
+            )
             with torch.inference_mode(), torch.cuda.stream(scatter_stream):
-                for local_index, offset, nbytes in zip(
-                    completed_indices,
-                    completed_offsets,
-                    completed_nbytes,
-                    strict=True,
-                ):
-                    key_index = batch_start + local_index
-                    segment = segments[key_index]
-                    segment_blocks = int(segment.numel())
-                    segment_nbytes = segment_blocks * block_nbytes
-                    payload_skip = segment_read_plans[key_index][1]
-                    if int(nbytes) < payload_skip + segment_nbytes:
-                        raise RuntimeError(
-                            "layer-major raw Tutti segment returned a short payload"
-                        )
-                    source_ptr = int(staging.data_ptr()) + int(offset) + payload_skip
-                    source_ptrs = torch.tensor(
-                        [source_ptr],
-                        dtype=torch.int64,
-                        device=state.k_cache_tensor.device,
+                source_ptrs = torch.tensor(
+                    source_addresses,
+                    dtype=torch.int64,
+                    device=state.k_cache_tensor.device,
+                )
+                rows = (
+                    selected_rows[row_spans[0][0] : row_spans[-1][1]]
+                    if contiguous_rows
+                    else torch.cat(
+                        [selected_rows[start:end] for start, end in row_spans]
                     )
-                    scatter(
-                        source_ptrs,
-                        k_cache,
-                        segment_rows[key_index],
-                        segment_blocks,
-                        block_nbytes,
-                        state.block_slot_size if state.block_slot_scatter else 0,
-                        source_ptr % 8 == 0,
-                    )
-                    completed_block_ids.extend(int(value) for value in segment.tolist())
+                )
+                scatter(
+                    source_ptrs,
+                    k_cache,
+                    rows,
+                    1,
+                    block_nbytes,
+                    state.block_slot_size if state.block_slot_scatter else 0,
+                    aligned_sources,
+                )
             scatter_stream.synchronize()
+            completed_block_ids.extend(batch_completed_ids)
 
         load_kwargs: Dict[str, Any] = {
             "shapes_per_key": None,
