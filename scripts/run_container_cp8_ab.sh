@@ -145,6 +145,26 @@ mkdir -p "$tutti_handoff_dir"
     fi
     sleep 0.05
   done
+  # Weights may live on one of the cache controllers. All rank markers are
+  # published after model/health warmup; the tokenizer is already snapshotted
+  # on the container root. Release that extra bind before detaching NVMe too.
+  model_real=$(readlink -f "$model_host")
+  for cache_mount in "${cache_mounts[@]}"; do
+    if [[ "$model_real" == "$cache_mount/"* ]]; then
+      if ! sudo docker exec "$name" umount "$model_container"; then
+        printf 'model bind release failed: %s\n' "$model_container" \
+          > "$tutti_handoff_dir/host.error"
+        exit 1
+      fi
+      if sudo docker exec "$name" findmnt -nr -M "$model_container"; then
+        printf 'model bind remains mounted: %s\n' "$model_container" \
+          > "$tutti_handoff_dir/host.error"
+        exit 1
+      fi
+      printf 'MODEL_BIND_RELEASED_AFTER_WARMUP %s\n' "$model_container"
+      break
+    fi
+  done
   for cache_mount in "${cache_mounts[@]}"; do
     if mountpoint -q "$cache_mount"; then
       if ! sudo umount "$cache_mount"; then
