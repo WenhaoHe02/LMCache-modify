@@ -2215,7 +2215,7 @@ class CSAAttentionKVPrefetchManager:
         profile_source_layer: Optional[int] = None,
         profile_operation_id: Optional[str] = None,
         profile_kind: Optional[str] = None,
-    ) -> None:
+    ) -> torch.Tensor:
         """Filter a shared top-K union against this consumer's GPU residency.
 
         Args:
@@ -2225,6 +2225,11 @@ class CSAAttentionKVPrefetchManager:
             profile_source_layer: Optional authoritative source layer.
             profile_operation_id: Optional correlation identifier.
             profile_kind: Optional I/O classification.
+
+        Returns:
+            CPU IDs absent from this layer before submission. Other layers
+            may prefetch these as hints, but must still check their own miss
+            sets before attention.
 
         Notes:
             Copy fixed-size block masks, then compact on CPU. Unlike CUDA
@@ -2240,7 +2245,7 @@ class CSAAttentionKVPrefetchManager:
             raise RuntimeError("request read plan is inactive or stale")
         state = self._layers.get(int(layer_id))
         if state is None or not state.chunks:
-            return
+            return torch.empty(0, dtype=torch.int64)
         limit = min(
             int(state.chunks[-1].end_compressed_block), state.in_pool_bitmap.numel()
         )
@@ -2270,6 +2275,7 @@ class CSAAttentionKVPrefetchManager:
                 profile_operation_id=profile_operation_id,
                 profile_kind=profile_kind,
             )
+        return missing
 
     def profile_topk_residency(
         self,

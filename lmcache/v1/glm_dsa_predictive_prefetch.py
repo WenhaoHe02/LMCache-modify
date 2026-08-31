@@ -351,6 +351,7 @@ class GLMDSAPhysicalPrefetchSink:
         self._lock = RLock()
         self._predicted_blocks: dict[int, torch.Tensor | None] = {}
         self._true_selection_cache: dict[int, tuple[GLMDSAPrefetchEvent, Any]] = {}
+        self._early_shared_misses: dict[int, Future[Any]] = {}
         self._staged_request_id: str | None = None
         self._pending_prediction_stages: dict[int, list[_StagedPrediction]] = (
             defaultdict(list)
@@ -798,6 +799,10 @@ class GLMDSAPhysicalPrefetchSink:
         if not self._enable_prediction or not self._preserve_owner_partition:
             return True
         self._release_prediction_stages(int(layer_id))
+        with self._lock:
+            early = getattr(self, "_early_shared_misses", {}).get(int(layer_id))
+        if early is not None:
+            early.result(timeout=self._gate_timeout_s())
         launch = getattr(self._attention_kv_manager, "launch_layer_gather", None)
         return not callable(launch) or bool(
             launch(int(layer_id), timeout_s=self._gate_timeout_s())
@@ -822,9 +827,16 @@ class GLMDSAPhysicalPrefetchSink:
         ):
             self._release_prediction_stages(int(layer_id))
             with self._lock:
+                early = getattr(self, "_early_shared_misses", {}).pop(
+                    int(layer_id), None
+                )
                 correction = getattr(self, "_pending_shared_corrections", {}).pop(
                     int(layer_id), None
                 )
+            if early is not None:
+                # This future contains only local demand I/O, never NCCL.
+                # Join before the owner gather can replace the drain event.
+                early.result(timeout=self._gate_timeout_s())
             if correction is not None:
                 event, blocks, request_token = correction
                 if (
@@ -858,6 +870,11 @@ class GLMDSAPhysicalPrefetchSink:
         manager = self._attention_kv_manager
         if manager.active_request_id != str(request_id):
             return True
+        with self._lock:
+            early = tuple(getattr(self, "_early_shared_misses", {}).values())
+            getattr(self, "_early_shared_misses", {}).clear()
+        for future in early:
+            future.result(timeout=self._gate_timeout_s())
         with self._lock:
             selected = sum(
                 len(values) for values in self._decode_selected_blocks.values()
@@ -1146,12 +1163,39 @@ class GLMDSAPhysicalPrefetchSink:
                     cache[target] = (event, selection)
                 else:
                     selection = previous[1]
-            submit_selection(
+            missing = submit_selection(
                 layer_id,
                 selection,
                 request_token=request_token,
                 **_glm_io_profile_kwargs(event, "correction", int(layer_id)),
             )
+            if (
+                layer_id == target
+                and self._preserve_owner_partition
+                and os.getenv("LMCACHE_GLM_DSA_PREFETCH_SHARED_MISSES", "0") == "1"
+                and isinstance(missing, torch.Tensor)
+                and missing.numel()
+            ):
+                # The same authoritative top-K and prediction serve this
+                # group. Start likely Shared misses during Full attention;
+                # each consumer still performs its exact post-gather check.
+                with self._lock:
+                    early = getattr(self, "_early_shared_misses", None)
+                    if early is None:
+                        early = {}
+                        self._early_shared_misses = early
+                    for consumer in event.schedule.consumer_layers:
+                        if int(consumer) == target:
+                            continue
+                        if int(consumer) in early:
+                            raise RuntimeError("unconsumed GLM early correction")
+                        early[int(consumer)] = self._executor.submit(
+                            self._prefetch_shared_missing,
+                            int(consumer),
+                            missing,
+                            request_token,
+                            event,
+                        )
             if layer_id == event.schedule.consumer_layers[-1]:
                 with self._lock:
                     if cache.get(target, (None,))[0] is event:
@@ -1181,6 +1225,23 @@ class GLMDSAPhysicalPrefetchSink:
                 int(layer_id),
             ),
         )
+
+    def _prefetch_shared_missing(
+        self,
+        layer_id: int,
+        blocks: torch.Tensor,
+        request_token: Any,
+        event: GLMDSAPrefetchEvent,
+    ) -> None:
+        """Preload likely Shared misses without consuming prediction futures."""
+        manager = self._attention_kv_manager
+        manager.submit_miss_reads(
+            layer_id,
+            blocks,
+            request_token=request_token,
+            **_glm_io_profile_kwargs(event, "correction", layer_id),
+        )
+        manager.drain_for_layer(layer_id)
 
     def _drop_pending_target_locked(self, target_layer: int) -> None:
         empty_release_layers: list[int] = []

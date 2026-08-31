@@ -319,3 +319,76 @@ def test_gate_aligned_owner_reads_can_prepare_four_consumers_concurrently(
         } == {2: 2, 3: 3, 4: 4, 5: 5}
     finally:
         sink.close()
+
+
+def test_early_shared_misses_retain_the_prediction_and_final_exact_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Full-layer miss is a prefetch hint, not proof of Shared residency."""
+    monkeypatch.setenv("LMCACHE_GLM_DSA_OWNER_PARTITION", "1")
+    monkeypatch.setenv("LMCACHE_GLM_DSA_PREFETCH_SHARED_MISSES", "1")
+    monkeypatch.setenv("LMCACHE_GLM_DSA_SHARED_CORRECTION_AT_CONSUMER", "1")
+    monkeypatch.setenv("LMCACHE_GLM_DSA_ASYNC_SHARED_CORRECTION", "0")
+    monkeypatch.setenv("LMCACHE_GLM_DSA_PREDICT_SHARED_CONSUMERS", "all")
+    events: list[tuple[str, int]] = []
+
+    class Manager:
+        active_request_id = "request"
+        active_request_token = ("request", 1)
+
+        def __init__(self) -> None:
+            self.futures: dict[int, Future[Any]] = {}
+
+        def fire_predicted_reads(self, layer: int, *args: Any, **kwargs: Any) -> int:
+            return layer
+
+        def track_layer_submission(
+            self, layer: int, future: Future[Any], **kwargs: Any
+        ) -> None:
+            self.futures[layer] = future
+
+        def prepare_topk_block_selection(
+            self, layer: int, topk: torch.Tensor
+        ) -> object:
+            return object()
+
+        def submit_selection_miss_reads(
+            self, layer: int, selection: object, **kwargs: Any
+        ) -> torch.Tensor:
+            events.append(("exact", layer))
+            return torch.tensor([9])
+
+        def submit_miss_reads(
+            self, layer: int, ids: torch.Tensor, **kwargs: Any
+        ) -> None:
+            assert ids.tolist() == [9]
+            events.append(("early", layer))
+
+        def drain_for_layer(self, layer: int) -> None:
+            events.append(("early_complete", layer))
+
+        def wait_for_tracked_submission(self, layer: int, timeout_s: float = 2) -> bool:
+            future = self.futures.pop(layer, None)
+            if future is not None:
+                future.result(timeout=timeout_s)
+                events.append(("gather", layer))
+            return True
+
+        def wait_for_layer(self, layer: int, timeout_s: float) -> bool:
+            return self.wait_for_tracked_submission(layer, timeout_s)
+
+    manager = Manager()
+    schedule = GLMDSAPredictionSchedule(0, 2, "group-2", (2, 3), True)
+    sink = GLMDSAPhysicalPrefetchSink(
+        manager, (schedule,), {2: (2, 3)}, compressed_block_size=64
+    )
+    try:
+        topk = torch.tensor([[0, 64]])
+        sink.submit(GLMDSAPrefetchEvent("request", schedule, topk, correction=False))
+        sink.submit(GLMDSAPrefetchEvent("request", schedule, topk, correction=True))
+        assert 3 in manager.futures
+        assert sink.wait_for_consumer(3)
+        assert events.index(("early_complete", 3)) < events.index(("gather", 3))
+        assert events.index(("gather", 3)) < events.index(("exact", 3))
+    finally:
+        sink.close()
