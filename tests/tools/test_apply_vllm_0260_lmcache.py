@@ -26,6 +26,7 @@ from scripts.apply_vllm_0260_lmcache import (
     _patch_kv_cache_admission,
     _patch_scheduler_oversized_prefill,
     _patch_sparse_indexer,
+    _patch_indexer_metadata_cpu_bounds,
 )
 
 
@@ -36,6 +37,37 @@ def test_api_server_overlay_installs_tool_slack_bootstrap() -> None:
     assert patched.index("install_vllm_tool_slack_hook()") < patched.index(
         'if __name__ == "__main__":'
     )
+
+
+@pytest.mark.parametrize(
+    "prefix,query,start,stop",
+    [(131072, 2048, 0, 2048), (100003, 2049, 1024, 2049), (0, 9, 0, 9)],
+)
+def test_cpu_causal_span_matches_each_row_k_partition(
+    prefix: int, query: int, start: int, stop: int
+) -> None:
+    """Builder CPU endpoints match the exact min/max over every causal row."""
+    source = """def build(total_seq_lens, total_query_len, qs_start, qs_stop, num_reqs=1, compress_ratio=1, dcp_world_size=1):
+    max_local_total_seq_lens = total_seq_lens
+    return DeepseekV32IndexerPrefillChunkMetadata(
+        max_local_total_seq_lens=max_local_total_seq_lens,
+    )
+"""
+    namespace = {"DeepseekV32IndexerPrefillChunkMetadata": SimpleNamespace}
+    exec(
+        compile(_patch_indexer_metadata_cpu_bounds(source), "metadata.py", "exec"),
+        namespace,
+    )
+    first_end, last_end = namespace["build"](
+        prefix + query, query, start, stop
+    ).lmcache_causal_k_bounds
+    for rank in range(8):
+        bounds = [
+            _balanced_causal_k_bounds(0, prefix + row + 1, rank, 8)
+            for row in range(start, stop)
+        ]
+        assert first_end * rank // 8 == min(lo for lo, _hi in bounds)
+        assert last_end * (rank + 1) // 8 == max(hi for _lo, hi in bounds)
 
 
 def test_connector_overlay_adds_hma_contract_and_is_idempotent(

@@ -488,6 +488,51 @@ if _LMCACHE_CSA_PIPELINE_NVTX_ENABLED:
     return source + moe_profile_hooks
 
 
+def _patch_indexer_metadata_cpu_bounds(source: str) -> str:
+    """Retain exact CPU causal endpoints for uncompressed single-request chunks."""
+    source = _replace_once(
+        source,
+        "    return DeepseekV32IndexerPrefillChunkMetadata(\n",
+        "    result = DeepseekV32IndexerPrefillChunkMetadata(\n",
+        "indexer chunk metadata result",
+    )
+    marker = "        max_local_total_seq_lens=max_local_total_seq_lens,\n    )\n"
+    return _replace_once(
+        source,
+        marker,
+        marker
+        + f"""
+    # {_MARKER}: prediction K bounds need not synchronize GPU metadata.
+    # For one uncompressed request, query rows have monotonic causal ends.
+    if num_reqs == 1 and compress_ratio == 1 and dcp_world_size == 1:
+        result.lmcache_causal_k_bounds = (
+            int(total_seq_lens - total_query_len + qs_start + 1),
+            int(total_seq_lens - total_query_len + qs_stop),
+        )
+    return result
+""",
+        "indexer CPU causal endpoint metadata",
+    )
+
+
+def _patch_predicted_k_cpu_bounds(source: str) -> str:
+    """Use scalar builder metadata for prediction-only compact K extents."""
+    old = """                compact_k_global_start = int(cu_seqlen_ks.min().item())
+                compact_k_global_end = int(cu_seqlen_ke.max().item())
+"""
+    new = """                cpu_bounds = getattr(chunk, "lmcache_causal_k_bounds", None)
+                if cpu_bounds is not None and os.getenv("LMCACHE_GLM_DSA_CPU_K_BOUNDS", "1") == "1":
+                    # Row shard starts/ends are monotonic. This equals the GPU
+                    # min/max exactly, including uneven query slices and tails.
+                    compact_k_global_start = cpu_bounds[0] * k_cp_rank // k_cp_world_size
+                    compact_k_global_end = cpu_bounds[1] * (k_cp_rank + 1) // k_cp_world_size
+                else:
+                    compact_k_global_start = int(cu_seqlen_ks.min().item())
+                    compact_k_global_end = int(cu_seqlen_ke.max().item())
+"""
+    return _replace_once(source, old, new, "prediction compact K CPU bounds")
+
+
 def _patch_sparse_indexer(source: str) -> str:
     source = _replace_once(
         source,
@@ -917,6 +962,7 @@ def _lmcache_true_indexer_cp_workspace(
         compact_k_gather,
         "sparse indexer compact prediction K gather",
     )
+    source = _patch_predicted_k_cpu_bounds(source)
     weight_slice = "weights[chunk.token_start : chunk.token_end]"
     if source.count(weight_slice) != 2:
         raise PatchError(
@@ -1544,6 +1590,10 @@ def patch_vllm_0260(vllm_root: Path) -> tuple[Path, ...]:
         (
             vllm_root / "model_executor/layers/sparse_attn_indexer.py",
             _patch_sparse_indexer,
+        ),
+        (
+            vllm_root / "v1/attention/backends/mla/indexer.py",
+            _patch_indexer_metadata_cpu_bounds,
         ),
         (
             vllm_root / "models/deepseek_v4/common/ops/cache_utils.py",
